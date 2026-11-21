@@ -43,3 +43,8 @@ jobs:
           cargo run --locked --bin vn2 -- expand tests/slice1_surface/groups_and_auto.rails > /dev/null
           cargo run --locked --bin vn2 -- emit-llvm tests/slice1_surface/spend.rails > /dev/null
           cargo run --locked --bin vn2 -- emit-c tests/slice1_surface/spend.rails > /dev/null
+          for f in tests/slice2_surface/*.rails; do
+            cargo run --locked --bin vn2 -- expand "$f" > /dev/null
+            cargo run --locked --bin vn2 -- emit-llvm "$f" > /dev/null
+            cargo run --locked --bin vn2 -- emit-c "$f" > /dev/null
+          done

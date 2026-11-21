@@ -675,8 +675,37 @@ fn compute_body_availability(
         }
     }
 
+    // Also record post-end availability at index `stmts.len()` after the last
+    // statement's binders/assignments take effect (`[R4]`).
+    let mut end_snap = vec![None; body.vars.len()];
+    for v in 0..body.vars.len() {
+        if let Some(d) = &defined[v] {
+            end_snap[v] = match &moved[v] {
+                None => Some(d.clone()),
+                Some(Selector::Top) => None,
+                Some(m) => Some(Selector::And(
+                    Box::new(d.clone()),
+                    Box::new(Selector::Not(Box::new(m.clone()))),
+                )),
+            };
+        }
+    }
+    body_avail.push(end_snap);
+
     avail_at[body_id] = body_avail;
     (defined, moved)
+}
+
+pub(crate) fn compute_availability(
+    program: &Program,
+    body: &ControlBody,
+    param_count: usize,
+) -> Vec<Vec<Vec<Option<Selector>>>> {
+    let defined = vec![None; body.vars.len()];
+    let moved = vec![None; body.vars.len()];
+    let mut avail_at = vec![Vec::new(); body.bodies.len()];
+    let _ = compute_body_availability(program, body, 0, param_count, defined, moved, &mut avail_at);
+    avail_at
 }
 
 fn plan(program: &Program, body: &ControlBody, param_count: usize) -> Plan {

@@ -532,10 +532,73 @@ ownership, fault, and boundary constructs of slice 2:
   `.rails` files (over 148 certificates), and confirms every stuck control of
   `tests/slice2/*.core` is rejected by its corresponding Phase 3 clause.
 
-## 14. What this checkpoint leaves open
+## 14. Slice 2 Phase 4: Call Expansion and Typed LLVM IR Backend for Data, Resources, and Boundaries
 
-- **Slice 2 Phase 4.** Call expansion (Theorem 4) and typed LLVM IR / C ABI
-  lowering for slice 2 data, moves, `on fault release` unwinding, and boundaries.
+Slice 2 Phase 4 completes Theorem 4 call expansion (`expand.rs`), the typed
+LLVM IR and C ABI backend (`codegen.rs`), and the Slice 2 differential and
+paired native-performance suite (`v2/tests/backend_slice2.rs`):
+
+- **Theorem 4 call expansion for slice 2 (`expand.rs`).** Extends in-place call
+  expansion across `Declaration::Boundary` (`body` and `contingency`), lexical
+  `Command::Boundary`, `Unpack`, `AssignPlace`, `Supervise`, `Fault`,
+  `Terminate`, `Escalate`, and `Recover`. Evaluates operands in `[E-Operands]`
+  order, substitutes `&τ` shared borrow parameters (either direct place
+  substitution or an owned temporary binding for rvalues) and `&~τ` exclusive
+  borrow parameters (direct caller-place substitution plus `old(y)` /
+  `len(old(y))` snapshots for `⇐` postconditions) without introducing core
+  local borrows (`[W8]`), tracks fault/termination reachability for selector
+  pruning, and leaves `Command::Capture` unexpanded (as core has no outcome
+  expression constructor).
+- **Typed native layouts and portable C ABI (`codegen.rs`, `[R1]`–`[R5]`).**
+  Lowers structs to flat `%vn2.struct.<id>` aggregates, unit variants/outcomes
+  directly to `i32`, payload variants/outcomes to tagged
+  `{ i32, [N x i64] }` layouts, strings and vectors to `{ ptr, usize, usize }`
+  (with string literals using `cap = 0` so `.rodata` is never freed), maps to
+  sorted flat `{ ptr, usize, usize }` arrays with binary-search key lookup
+  matching `BTreeMap` order, and resources/borrows to opaque `ptr` values with
+  zero dynamic value wrappers. Internal `fastcc` functions pass aggregates by
+  value while C ABI boundaries (`@vn2_call_*`, `@vn2_ext_*`, `emit_c_header`)
+  pass aggregates by pointer for portability across Apple `arm64` and Linux
+  `x86_64`.
+- **Static cleanup, resource release, and structured arm-chain lowering
+  (`[R2]`–`[R5]`).** Reuses `erased::compute_availability` (including post-end
+  snapshots for lexical boundary fallthrough) so `[R4]` destruction and `[R5]`
+  `on fault release` unwinding (`@vn2_release_<res>`) are driven purely by
+  static history-bit selectors with zero runtime moved flags. Unchecked vector
+  indexing and `⊥ → unreachable` follow `[R2]`. A general structured arm-chain
+  lowering pass (`plan_structured_flow`) chains mutually exclusive `Decide` and
+  two-sided `Test` arm spans directly into their arm statements, eliminating
+  redundant history-bit checks and speculative arm branches in hot loops.
+- **Verification (`v2/tests/backend_slice2.rs`).** Verifies Theorem 4 expansion
+  plus `check::check` and `kernel::validate` across all 4 Slice 2 `.rails`
+  files and a dedicated `&τ`/`&~τ`/`old(y)`/resource/fault/boundary test;
+  checks LLVM IR and C header erasure; runs differential native tests at `-O0`
+  and `-O2` across 64-bit and 32-bit `usize` on all 4 Slice 2 `.rails` files
+  (original and expanded) and all 15 non-stuck controls of `tests/slice2/*.core`
+  against `oracle::run` and `erased::run`.
+- **Paired native performance (`paired_native_performance_matches_optimized_rust_on_slice_two_data_kernel`).**
+  - **Workload:** Build a `[point]` vector (`copy struct point {x: u64, y: u64}`)
+    by pushing 2,000 elements, run 200 unchecked indexed passes dispatching on
+    `copy variant op: add │ sub │ mix │ scale` (through a Theorem-4-inlined
+    `choose_op` control) with in-place element updates, pop all 2,000 elements
+    into a checksum mod `1_000_000_007`, and drop via `[R4]` (repeated 10×
+    inside a single timed hot region separate from launch/output, 5 paired
+    samples, minimum hot time taken). Both binaries produce identical verified
+    checksum `2426593890`.
+  - **Environment:** Apple M2 (`Darwin arm64`), `Apple clang 21.0.0 -x ir -O3`
+    vs. `rustc 1.97.1 -C opt-level=3`.
+  - **Measured result:** Before structured arm-chain lowering, v2 ran in
+    `27.056 ms` (`2.418×` Rust) because flat history-bit dispatch kept extra
+    conditional branches inside the inner loop. After structured arm-chain
+    lowering, v2 runs in `10.863 ms` (`10,863,000 ns`) vs. Rust `10.600 ms`
+    (`10,599,584 ns`), ratio **`1.025×`** (gap `+0.26 ms` / `+2.5%`, within the
+    `≤ 1.20×` target; Slice 1 scalar `hot_bench` remains `0.997×`).
+  - **Next experiment:** Emit natural alignment hints (`align 8` for `i64`/`ptr`
+    loads and stores) and evaluate pre-sized vector growth in Phase 7 to close
+    the remaining `2.5%` gap.
+
+## 15. What this checkpoint leaves open
+
 - **Later slices in phases 2, 3 and 4.** Slice 3 (borrows and views) and
   slice 4 (tasks), which will allow the oracle, the checker and the typed
   backend to run, verify and compile the full paper corpus.

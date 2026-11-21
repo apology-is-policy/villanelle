@@ -4,7 +4,7 @@ use crate::differential::{Verdict, compare};
 use crate::host::{Answer, Arithmetic, Host, Script};
 use crate::int::Int;
 use crate::oracle::{Config, End, Event, Value};
-use crate::typed::Program;
+use crate::typed::{Program, Type};
 use crate::{check, erased, resolve, surface, text};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -158,6 +158,9 @@ fn resolve_raw_value(program: &Program, raw: &RawValue) -> Result<Value, String>
             })
         }
         RawValue::Variant { name, ctor, fields } => {
+            if name == "outcome" {
+                return resolve_outcome_raw(program, ctor, fields, None);
+            }
             let Some(vid) = program.variants.iter().position(|v| v.name == *name) else {
                 return Err(format!("`{name}` is not a variant in this program"));
             };
@@ -168,9 +171,15 @@ fn resolve_raw_value(program: &Program, raw: &RawValue) -> Result<Value, String>
             else {
                 return Err(format!("`{name}` has no constructor `{ctor}`"));
             };
+            let field_tys: Vec<Type> = program.variants[vid].constructors[cidx]
+                .fields
+                .iter()
+                .map(|f| f.ty.clone())
+                .collect();
             let vals = fields
                 .iter()
-                .map(|f| resolve_raw_value(program, f))
+                .enumerate()
+                .map(|(i, f)| resolve_raw_value_typed(program, f, field_tys.get(i)))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Variant {
                 ty: vid,
@@ -190,6 +199,221 @@ fn resolve_raw_value(program: &Program, raw: &RawValue) -> Result<Value, String>
                 id: *id,
             })
         }
+    }
+}
+
+fn resolve_outcome_raw(
+    program: &Program,
+    alt_name: &str,
+    fields: &[RawValue],
+    expected: Option<&Type>,
+) -> Result<Value, String> {
+    let oid = match expected.map(Type::deref_type) {
+        Some(Type::Outcome(id, _)) => Some(*id),
+        _ => program.outcomes.iter().position(|o| {
+            o.alternatives
+                .iter()
+                .any(|a| a.name == alt_name && a.fields.len() == fields.len())
+        }),
+    }
+    .ok_or_else(|| format!("no outcome in this program has alternative `{alt_name}`"))?;
+    let oc = &program.outcomes[oid];
+    let alt_idx = oc
+        .alternatives
+        .iter()
+        .position(|a| a.name == alt_name)
+        .ok_or_else(|| format!("outcome `{}` has no alternative `{alt_name}`", oc.name))?;
+    let field_tys: Vec<Type> = oc.alternatives[alt_idx]
+        .fields
+        .iter()
+        .map(|f| f.ty.clone())
+        .collect();
+    let payload = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| resolve_raw_value_typed(program, f, field_tys.get(i)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::Outcome {
+        ty: oid,
+        alternative: alt_idx,
+        alternative_name: alt_name.to_string(),
+        payload,
+    })
+}
+
+fn resolve_raw_value_typed(
+    program: &Program,
+    raw: &RawValue,
+    expected: Option<&Type>,
+) -> Result<Value, String> {
+    match raw {
+        RawValue::Variant { name, ctor, fields } if name == "outcome" => {
+            resolve_outcome_raw(program, ctor, fields, expected)
+        }
+        RawValue::Vector(items) => {
+            let elem_ty = match expected.map(Type::deref_type) {
+                Some(Type::Vector(inner)) => Some(&**inner),
+                _ => None,
+            };
+            Ok(Value::Vector(
+                items
+                    .iter()
+                    .map(|i| resolve_raw_value_typed(program, i, elem_ty))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        RawValue::Map(entries) => {
+            let (k_ty, v_ty) = match expected.map(Type::deref_type) {
+                Some(Type::Map(k, v)) => (Some(&**k), Some(&**v)),
+                _ => (None, None),
+            };
+            let mut map = BTreeMap::new();
+            for (k, v) in entries {
+                map.insert(
+                    resolve_raw_value_typed(program, k, k_ty)?,
+                    resolve_raw_value_typed(program, v, v_ty)?,
+                );
+            }
+            Ok(Value::Map(map))
+        }
+        RawValue::Struct { name, fields } => {
+            let Some(sid) = program.structs.iter().position(|s| s.name == *name) else {
+                return Err(format!("`{name}` is not a struct in this program"));
+            };
+            let field_tys: Vec<Type> = program.structs[sid]
+                .fields
+                .iter()
+                .map(|f| f.ty.clone())
+                .collect();
+            let vals = fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| resolve_raw_value_typed(program, f, field_tys.get(i)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Struct {
+                ty: sid,
+                name: name.clone(),
+                fields: vals,
+            })
+        }
+        RawValue::Variant { name, ctor, fields } => {
+            let Some(vid) = program.variants.iter().position(|v| v.name == *name) else {
+                return Err(format!("`{name}` is not a variant in this program"));
+            };
+            let Some(cidx) = program.variants[vid]
+                .constructors
+                .iter()
+                .position(|c| c.name == *ctor)
+            else {
+                return Err(format!("`{name}` has no constructor `{ctor}`"));
+            };
+            let field_tys: Vec<Type> = program.variants[vid].constructors[cidx]
+                .fields
+                .iter()
+                .map(|f| f.ty.clone())
+                .collect();
+            let vals = fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| resolve_raw_value_typed(program, f, field_tys.get(i)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Variant {
+                ty: vid,
+                name: name.clone(),
+                constructor: cidx,
+                constructor_name: ctor.clone(),
+                fields: vals,
+            })
+        }
+        _ => resolve_raw_value(program, raw),
+    }
+}
+
+pub(crate) fn parse_native_event(program: &Program, text: &str) -> Result<Event, String> {
+    let mut reader = Reader {
+        pieces: pieces(text)?,
+        at: 0,
+    };
+    let control = reader.dotted_word("a control")?;
+    reader.need("(")?;
+    let raw_args = reader.values(")")?;
+    reader.need("->")?;
+    let (alternative, raw_payload) = reader.outcome()?;
+    if reader.at != reader.pieces.len() {
+        return Err("trailing tokens in native event".to_string());
+    }
+    let ctrl_ref = program.control(&control).map(|cid| &program.controls[cid]);
+    let arguments = raw_args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let exp_ty = ctrl_ref.and_then(|c| c.parameters.get(i).map(|p| &p.ty));
+            resolve_raw_value_typed(program, a, exp_ty)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let alt_fields = ctrl_ref.and_then(|c| c.contract.iter().find(|a| a.name == alternative));
+    let payload = raw_payload
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let exp_ty = alt_fields.and_then(|a| a.fields.get(i).map(|f| &f.ty));
+            resolve_raw_value_typed(program, p, exp_ty)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Event {
+        control,
+        arguments,
+        alternative,
+        payload,
+    })
+}
+
+pub(crate) fn parse_native_end(
+    program: &Program,
+    entry: &str,
+    text: &str,
+) -> Result<erased::End, String> {
+    let mut reader = Reader {
+        pieces: pieces(text)?,
+        at: 0,
+    };
+    let kind = reader.word("`done` or `faulted`")?;
+    match kind.as_str() {
+        "done" => {
+            let (alternative, raw_payload) = reader.outcome()?;
+            if reader.at != reader.pieces.len() {
+                return Err("trailing tokens in native done outcome".to_string());
+            }
+            let alt_fields = program
+                .control(entry)
+                .and_then(|cid| {
+                    program.controls[cid]
+                        .contract
+                        .iter()
+                        .find(|a| a.name == alternative)
+                })
+                .map(|a| &a.fields);
+            let payload = raw_payload
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let exp_ty = alt_fields.and_then(|fs| fs.get(i).map(|f| &f.ty));
+                    resolve_raw_value_typed(program, p, exp_ty)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(erased::End::Done {
+                alternative,
+                payload,
+            })
+        }
+        "faulted" => {
+            let msg = reader.string_lit("a fault message string")?;
+            if reader.at != reader.pieces.len() {
+                return Err("trailing tokens in native faulted message".to_string());
+            }
+            Ok(erased::End::Faulted(msg))
+        }
+        other => Err(format!("unexpected native end kind `{other}`")),
     }
 }
 
