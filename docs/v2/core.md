@@ -19,9 +19,10 @@ phase 1 documents together, read the tasks for the first time and found four
 programs that the task rules accepted and the semantics left stuck or with a
 lost resource, and that the named boundaries which the corpus added had no
 checking rule. The repairs are in [TK3] to [TK6], [E-Await], [E-AwaitHost],
-[E-Stop], [N5], [F5] and [F6] (choices 25 to 28 of section 11) and have not
-been reviewed again. The author has answered the five questions that draft 1
-raised (section 11).
+[E-Stop], [N5], [F5] and [F6] (choices 25 to 28 of section 11); a second review
+before the task slice checked all of them and folded three further repairs into
+[W11], [E-AwaitHost], [TK6] and [I10] (section 12). The author has answered the
+five questions that draft 1 raised (section 11).
 
 [Index of the v2 design](README.md) · [Fact logic](facts.md) ·
 [Reference model](references.md) · [Surface](surface.md) ·
@@ -265,7 +266,8 @@ Well-formedness:
   `~x : tasks⟨f⟩ := tasks⟨f⟩()`, and of nothing else: not a parameter, a loop
   parameter, a payload field, a field or an element. A task set is never
   moved, lent or assigned. `spawn … into x`, `await next(x)`, `cancel x` and
-  `count(x)` name it directly.
+  `count(x)` name it directly. `await next(x)` occurs only in a decision, not
+  in `capture`.
 - **[W12]** The alternative `cancelled` never has a payload. An
   `extern async control` that lists it is **cancellable**, and there the
   alternative has no condition either: a cancelled task receives it without
@@ -700,16 +702,18 @@ do: the activation that started a run waits at its `run` decision.
   statement of `f`, and is `ready`. No value is between scopes while the task
   waits.
 - **[E-AwaitHost]** `d : Δ await f(ō) ▸ …`, with `f` an `extern async control`.
-  Evaluate `ō`. If the task is cancelled ([E-Cancel]) and `f` is cancellable,
-  the decision completes with `cancelled`: the host is not asked, and the
-  arguments given by value are released as [E-Unwind] releases them.
-  Otherwise the host starts the operation and the task is `waiting`. The host
-  later completes it as in [E-Extern]: the decision completes, its payload
-  names are bound in the task's scope, and the task is `ready`. If the task
-  becomes cancelled while it waits and `f` is cancellable, the host withdraws
-  the operation and the task is `ready` with `cancelled`. An operation that
-  is withdrawn, here or by [E-Stop], has no completion and no event, and the
-  arguments it was given by value are released as [E-Unwind] releases them.
+  Evaluate `ō`, check the precondition of `f` ([E-Extern]) and its effect
+  allowance ([E-Effect]). If the task is cancelled ([E-Cancel]) and `f` is
+  cancellable, the decision completes with `cancelled`, the host is not asked,
+  the arguments given by value are released as [E-Unwind] releases them, and
+  the task gives up its turn and is `ready`. Otherwise the host starts the
+  operation and the task is `waiting`. The host later completes it as in
+  [E-Extern]: the decision completes, its payload names are bound in the task's
+  scope, and the task is `ready`. If the task becomes cancelled while it waits
+  and `f` is cancellable, the host withdraws the operation and the task is
+  `ready` with `cancelled`. An operation that is withdrawn, here or by
+  [E-Stop], has no completion and no event, and the arguments it was given by
+  value are released as [E-Unwind] releases them.
 - **[E-Spawn]** `spawn f(ō) into x`. Evaluate `ō` and check the precondition of
   `f`. A new task with one activation of `f` on those arguments becomes a
   member of the set in `x`, in state `ready`. It does not run yet: `spawn`
@@ -1152,7 +1156,7 @@ the set that owns it.
   | --- | --- |
   | `x := tasks⟨f⟩()` at statement `i` | `Rᵢ ⇒ count(x) = 0` |
   | `spawn f(ō) into x` at statement `i` | `Rᵢ ⇒ count(x′) = count(x) + 1`, for the fresh name `x′` |
-  | `d : Δ await next(x)`, an alternative `a` of `f` | `d.a ⇒ count(x′) = count(x) - 1`, and the condition `φₐ` of `f` with a fresh name for each parameter |
+  | `d : Δ await next(x)`, an alternative `a` of `f` | `d.a ⇒ count(x′) = count(x) - 1`, and the condition `φₐ` of `f` with a fresh name for each parameter and a separate fresh name for `old(y)` of each `&~` parameter `y` |
   | `d : Δ await next(x)`, `empty` | `d.empty ⇒ count(x) = 0` |
 
   `await f(ō)` and `run f(ō)` give the facts of a call of `f` ([N4]). No
@@ -1403,3 +1407,6 @@ and what asked for it:
 | 20 November 2026 | [E-Formula] and [P8] say that a formula reads every name it mentions and that a function call in a formula is the function's body, without its precondition. | The oracle: [P8] said "wherever it occurs", and [S4] of the fact logic says a formula carries no obligations. |
 | 20 November 2026 | [E-Assign] is stuck on a name that has no slot, and X2 names the case. | The oracle: [O4] already required `D(x)`, and the semantics had no stuck state for it. |
 | 20 November 2026 | [C1] states how an integer literal is typed. | The oracle's reader, which has to give every literal a type before anything runs. |
+| 22 November 2026 | [TK6] gives `old(y)` of each `&~` parameter a separate fresh name from `y` in `φₐ` at `await next(x)`. | Second review of the task rules before slice 4: sharing one fresh name turned `y = old(y) + 1` into `u = u + 1` (false), letting a checked program prove `⊥` and stick (`X6`). |
+| 22 November 2026 | [W11] restricts `await next(x)` to decisions (`Δ`), not `capture`. | Second review of the task rules: `capture` records no `d.empty` atom to track `[TK2]` consumption of `x` (the surface grammar already restricted `capture` to calls). |
+| 22 November 2026 | [E-AwaitHost] checks precondition and effect allowance before the `cancelled` shortcut and passes the turn (`ready`) when completing immediately with `cancelled`. | Second review of the task rules: prevents cancellation from bypassing `X7`/`X9` in unchecked programs and aligns immediate `cancelled` completion with choice 22 ("Every `await` passes the turn"). |

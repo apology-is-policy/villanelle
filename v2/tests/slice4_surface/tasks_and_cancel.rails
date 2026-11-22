@@ -1,0 +1,112 @@
+┄ Slice 4 Phase 2 Rails surface conformance: async controls, task sets
+┄ (`tasks<f>`, `tasks()`, `pool.count()`), `spawn ... into`, `await next`,
+┄ `cancel`, `run`, `capture run`, `forward await`, `■ Δ await`, `■ auto`,
+┄ and supervised boundaries catching member faults.
+
+extern resource lease on fault release
+extern control open_lease(id: u32) ■ ok {l: lease} uses io.res
+extern async control fetch(id: u32) ■ ok {value: u32} │ cancelled uses io.net
+extern async control wait_lease(l: lease) ■ ok {value: u32} │ cancelled uses io.net
+
+async control voice(values: &[u32], index: usize) ■ done {value: u32}
+│ ? index < len(values) → ■ done {values[index]}
+│ ■ done {0}
+╵
+
+async control chorus(values: &[u32]) ■ auto
+│ ~pool: tasks<voice> := tasks()
+│ spawn voice(values, 0) into pool
+│ spawn voice(values, 1) into pool
+│ spawned := pool.count()
+│ ~total: u32 := 0
+│ ↻ drain
+│ ║ Δ await next pool: done {v} → total ← total + v │ empty → □
+│ ║ ↑ drain
+│ ■ finished {total, spawned}
+╵
+
+pub control run_chorus() ■ finished {total: u32, spawned: usize}
+│ values: [u32] := [17, 25]
+│ forward run chorus(values)
+╵
+
+//! run run_chorus() => done finished {42, 2}
+
+async control fetch_twice(a: u32, b: u32) ■ auto uses io.net
+│ Δ await fetch(a)
+│ ├ ok {x}
+│ └ cancelled → ■ cancelled
+│ ■ Δ await fetch(b)
+│ ├ ok {y}    → ok {x + y}
+│ └ cancelled → cancelled
+╵
+
+async control forward_fetch(a: u32, b: u32) ■ auto uses io.net
+│ forward await fetch_twice(a, b)
+╵
+
+pub control run_fetch_pair(a: u32, b: u32) ■ ok {value: u32} │ cancelled uses io.net
+│ res := capture run forward_fetch(a, b)
+│ ■ ▾res
+╵
+
+//! run run_fetch_pair(1, 2) with [fetch -> ok {10}; fetch -> ok {32}] => done ok {42} trace [fetch(1) -> ok {10}; fetch(2) -> ok {32}]
+//! run run_fetch_pair(1, 2) with [fetch -> ok {10}] cancel_at 2 => done cancelled trace []
+//! run run_fetch_pair(1, 2) with [fetch -> ok {10}] cancel_at 3 => done cancelled trace [fetch(1) -> ok {10}]
+
+async control leased_worker(id: u32) ■ done {code: u32} uses io.res, io.net
+│ Δ open_lease(id): ok {l}
+│ ■ Δ await wait_lease(▾l)
+│ ├ ok {v}    → done {v}
+│ └ cancelled → done {77}
+╵
+
+async control cancel_demo() ■ done {code: u32} uses io.res, io.net
+│ ~pool: tasks<leased_worker> := tasks()
+│ spawn leased_worker(1) into pool
+│ Δ await fetch(0): ok {v} │ cancelled
+│ cancel pool
+│ ~last: u32 := 0
+│ ↻ drain
+│ ║ Δ await next pool: done {c} → last ← c │ empty → □
+│ ║ ↑ drain
+│ ■ done {last}
+╵
+
+pub control run_cancel_demo() ■ done {code: u32} uses io.res, io.net
+│ forward run cancel_demo()
+╵
+
+//! run run_cancel_demo() with [open_lease -> ok {lease#5}; fetch -> ok {1}] => done done {77} trace [open_lease(1) -> ok {lease#5}; fetch(0) -> ok {1}; lease.release(lease#5) -> released]
+
+async control failing_member(id: u32) ■ ok faults uses io.res, io.net
+│ ? id = 0 → fault "rails member boom"
+│ Δ open_lease(id): ok {l}
+│ Δ await wait_lease(▾l): ok {v} │ cancelled
+│ ■ ok
+╵
+
+async control pool_with_fault() ■ ok faults uses io.res, io.net
+│ ~pool: tasks<failing_member> := tasks()
+│ spawn failing_member(1) into pool
+│ spawn failing_member(0) into pool
+│ ↻ drain
+│ ║ Δ await next pool: ok │ empty → □
+│ ║ ↑ drain
+│ ■ ok
+╵
+
+boundary supervise_pool()
+│ run pool_with_fault()
+│ terminate
+╵
+contingency (msg: string)
+│ terminate
+╵
+
+pub control run_supervised_pool() ■ recovered uses io.res, io.net
+│ supervise supervise_pool()
+│ ■ recovered
+╵
+
+//! run run_supervised_pool() with [open_lease -> ok {lease#9}] => done recovered trace [open_lease(1) -> ok {lease#9}; lease.release(lease#9) -> released]

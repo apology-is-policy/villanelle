@@ -12,14 +12,17 @@
 //! of phase 4 is compared with the oracle in the same way.
 
 use crate::erased;
-use crate::host::{Answer, Host, Script};
+use crate::host::{Answer, Host, Scheduled, Script};
 use crate::oracle::{self, Config, Value};
 use crate::typed::{Control, Program};
 
-/// A host that passes every call on and keeps the answers.
+/// A host that passes every call and scheduling choice on and keeps them for replay.
 pub struct Recording<'a> {
     pub host: &'a mut dyn Host,
     pub answers: Vec<(String, Answer)>,
+    pub turns: Vec<usize>,
+    pub waiting: Vec<usize>,
+    pub cancel_decisions: Vec<bool>,
 }
 
 impl Host for Recording<'_> {
@@ -32,6 +35,24 @@ impl Host for Recording<'_> {
         let answer = self.host.call(control, arguments, config)?;
         self.answers.push((control.name.clone(), answer.clone()));
         Ok(answer)
+    }
+
+    fn pick_turn(&mut self, ready_count: usize) -> usize {
+        let choice = self.host.pick_turn(ready_count);
+        self.turns.push(choice);
+        choice
+    }
+
+    fn pick_waiting(&mut self, waiting: &[(&Control, &[Value])]) -> usize {
+        let choice = self.host.pick_waiting(waiting);
+        self.waiting.push(choice);
+        choice
+    }
+
+    fn should_cancel_root(&mut self, turn: u64) -> bool {
+        let flag = self.host.should_cancel_root(turn);
+        self.cancel_decisions.push(flag);
+        flag
     }
 }
 
@@ -119,6 +140,9 @@ pub fn compare(
     let mut recording = Recording {
         host,
         answers: Vec::new(),
+        turns: Vec::new(),
+        waiting: Vec::new(),
+        cancel_decisions: Vec::new(),
     };
     let oracle = oracle::run(program, entry, arguments.clone(), &mut recording, config);
     let answers = recording.answers;
@@ -133,11 +157,17 @@ pub fn compare(
             verdict: Verdict::NotCompared,
         };
     }
-    let mut replay = Script {
-        answers: answers.iter().cloned().collect(),
+    let mut replay = Scheduled {
+        inner: Script {
+            answers: answers.iter().cloned().collect(),
+        },
+        turns: recording.turns.into_iter().collect(),
+        waiting: recording.waiting.into_iter().collect(),
+        cancel_at_turn: None,
+        cancel_decisions: recording.cancel_decisions.into_iter().collect(),
     };
     let erased = erased::run(program, entry, arguments, &mut replay, config);
-    let verdict = match differ(&oracle, &erased, replay.answers.len()) {
+    let verdict = match differ(&oracle, &erased, replay.inner.answers.len()) {
         None => Verdict::Same,
         Some(difference) => Verdict::Differ(difference),
     };

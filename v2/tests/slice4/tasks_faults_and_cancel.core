@@ -1,0 +1,153 @@
+// Slice 4 Phase 2 core conformance: cancellation (`[E-Cancel]`, `[E-AwaitHost]`,
+// root cancellation via `cancel_at`, propagation across nested `run`), member
+// faults (`[E-MemberFault]`), stopping (`[E-Stop]`), `on fault release` cleanup,
+// and stuck states (`X8 E-Stop`, `X8 E-Unwind`).
+
+extern resource lease on fault release
+extern resource lock
+extern control open_lease(id : u32) ■ { ok {l : lease} } uses io.res
+extern control close_lease(l : lease) ■ { ok {} } uses io.res
+extern control open_lock(id : u32) ■ { ok {k : lock} } uses io.res
+extern control close_lock(k : lock) ■ { ok {} } uses io.res
+extern async control wait_io(id : u32) ■ { done {v : u32} │ cancelled {} } uses io.net
+extern async control wait_with_lease(l : lease) ■ { done {v : u32} │ cancelled {} } uses io.net
+
+// 1. Explicit `cancel pool`: withdraws waiting host op -> `cancelled`, releases
+// `on fault release` resource passed by value to the withdrawn `extern async control`.
+async control holder_worker(id : u32) ■ { finished {code : u32} } uses io.res, io.net
+    1 ⊤ ▷ o : Δ open_lease(id) ▸ ok {l}
+    2 o.ok ▷ w : Δ await wait_with_lease(l) ▸ done {v} │ cancelled {}
+    3 w.done ▷ ■ finished {v}
+    4 w.cancelled ▷ ■ finished {99}
+
+async control cancel_pool_demo() ■ { ok {code : u32} } uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨holder_worker⟩ := tasks⟨holder_worker⟩()
+    2 ⊤ ▷ spawn holder_worker(1) into pool
+    3 ⊤ ▷ d : Δ await wait_io(0) ▸ done {v} │ cancelled {}
+    4 ⊤ ▷ cancel pool
+    5 ⊤ ▷ ~last : u32 := 0
+    6 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ finished {c} │ empty {}
+          2 n.finished ▷ last ← c
+          3 n.finished ▷ ↑ drain()
+          4 n.empty ▷ □ done {}
+        } ▸ done {}
+    7 ⊤ ▷ ■ ok {last}
+
+control run_cancel_pool() ■ { ok {code : u32} } uses io.res, io.net
+    1 ⊤ ▷ d : Δ run cancel_pool_demo() ▸ ok {c}
+    2 d.ok ▷ ■ ok {c}
+
+//! run run_cancel_pool() with [open_lease -> ok {lease#7}; wait_io -> done {1}] => done ok {99} trace [open_lease(1) -> ok {lease#7}; wait_io(0) -> done {1}; lease.release(lease#7) -> released]
+
+// 2. Root cancellation (`cancel_at 1`) propagates into a nested `run` and makes
+// `[E-AwaitHost]` take the immediate `cancelled` path.
+async control inner_wait() ■ { ok {v : u32} │ cancelled {} } uses io.net
+    1 ⊤ ▷ w : Δ await wait_io(5) ▸ done {v} │ cancelled {}
+    2 w.done ▷ ■ ok {v}
+    3 w.cancelled ▷ ■ cancelled {}
+
+control sync_bridge() ■ { ok {v : u32} │ cancelled {} } uses io.net
+    1 ⊤ ▷ d : Δ run inner_wait() ▸ ok {v} │ cancelled {}
+    2 d.ok ▷ ■ ok {v}
+    3 d.cancelled ▷ ■ cancelled {}
+
+async control root_cancel_target() ■ { ok {v : u32} │ cancelled {} } uses io.net
+    1 ⊤ ▷ w0 : Δ await wait_io(1) ▸ done {v} │ cancelled {}
+    2 w0.cancelled ▷ ■ cancelled {}
+    3 w0.done ▷ b : Δ sync_bridge() ▸ ok {v2} │ cancelled {}
+    4 b.ok ▷ ■ ok {v2}
+    5 b.cancelled ▷ ■ cancelled {}
+
+control run_root_cancel() ■ { ok {v : u32} │ cancelled {} } uses io.net
+    1 ⊤ ▷ d : Δ run root_cancel_target() ▸ ok {v} │ cancelled {}
+    2 d.ok ▷ ■ ok {v}
+    3 d.cancelled ▷ ■ cancelled {}
+
+//! run run_root_cancel() with [wait_io -> done {1}] cancel_at 1 => done cancelled trace []
+//! run run_root_cancel() with [wait_io -> done {1}; wait_io -> done {2}] cancel_at 2 => done cancelled trace [wait_io(1) -> done {1}]
+
+// 3. `[E-MemberFault]` + `[E-Stop]`: one sibling faults while another holds an
+// `on fault release` lease and waits at `wait_io`; the sibling is stopped, its
+// lease is released, and the owner's named boundary contingency catches the fault.
+async control maybe_fault(flag : u32) ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ t : ? flag = 0
+    2 t.true ▷ fault "member boom"
+    3 t.false ▷ o : Δ open_lease(flag) ▸ ok {l}
+    4 o.ok ▷ w : Δ await wait_io(flag) ▸ done {v} │ cancelled {}
+    5 o.ok ▷ c : Δ close_lease(l) ▸ ok {}
+    6 o.ok ▷ ■ ok {}
+
+async control supervised_pool() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨maybe_fault⟩ := tasks⟨maybe_fault⟩()
+    2 ⊤ ▷ spawn maybe_fault(2) into pool
+    3 ⊤ ▷ spawn maybe_fault(0) into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ done {}
+        } ▸ done {}
+    5 ⊤ ▷ ■ ok {}
+
+boundary guard_pool() {
+    1 ⊤ ▷ d : Δ run supervised_pool() ▸ ok {}
+    2 d.ok ▷ terminate
+} contingency (msg : string) {
+    1 ⊤ ▷ terminate
+}
+
+control run_member_fault_caught() ■ { caught {} } uses io.res, io.net
+    1 ⊤ ▷ supervise guard_pool()
+    2 ⊤ ▷ ■ caught {}
+
+control run_member_fault_uncaught() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ d : Δ run supervised_pool() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run run_member_fault_caught() with [open_lease -> ok {lease#20}] => done caught trace [open_lease(2) -> ok {lease#20}; lease.release(lease#20) -> released]
+//! run run_member_fault_uncaught() with [open_lease -> ok {lease#20}] => faulted "member boom" trace [open_lease(2) -> ok {lease#20}; lease.release(lease#20) -> released]
+
+// 4. `X8 E-Stop`: stopping a sibling that holds a non-fault-releasable `lock`
+// makes the configuration stuck in X8 E-Stop!
+async control lock_or_fault(flag : u32) ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ t : ? flag = 0
+    2 t.true ▷ fault "boom with lock sibling"
+    3 t.false ▷ o : Δ open_lock(flag) ▸ ok {k}
+    4 o.ok ▷ w : Δ await wait_io(flag) ▸ done {v} │ cancelled {}
+    5 o.ok ▷ c : Δ close_lock(k) ▸ ok {}
+    6 o.ok ▷ ■ ok {}
+
+async control lock_pool() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨lock_or_fault⟩ := tasks⟨lock_or_fault⟩()
+    2 ⊤ ▷ spawn lock_or_fault(3) into pool
+    3 ⊤ ▷ spawn lock_or_fault(0) into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ done {}
+        } ▸ done {}
+    5 ⊤ ▷ ■ ok {}
+
+control run_stop_stuck_lock() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ d : Δ run lock_pool() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run run_stop_stuck_lock() with [open_lock -> ok {lock#30}] => stuck X8 E-Stop
+
+// 5. `X8 E-Unwind`: member faults into an owner that does not permit `faults`
+// and has no enclosing boundary.
+async control unpermitted_fault_pool() ■ { ok {} } uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨maybe_fault⟩ := tasks⟨maybe_fault⟩()
+    2 ⊤ ▷ spawn maybe_fault(0) into pool
+    3 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ done {}
+        } ▸ done {}
+    4 ⊤ ▷ ■ ok {}
+
+control run_member_fault_unpermitted() ■ { ok {} } uses io.res, io.net
+    1 ⊤ ▷ d : Δ run unpermitted_fault_pool() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run run_member_fault_unpermitted() => stuck X8 E-Unwind

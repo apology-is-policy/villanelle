@@ -299,7 +299,7 @@ fn needs_drop(program: &Program, ty: &Type) -> bool {
             .alternatives
             .iter()
             .any(|a| a.fields.iter().any(|f| needs_drop(program, &f.ty))),
-        Type::Named(_) | Type::OutcomeNamed(_) => false,
+        Type::Named(_) | Type::OutcomeNamed(_) | Type::TasksNamed(_) | Type::Tasks(_, _) => false,
     }
 }
 
@@ -457,9 +457,12 @@ fn llvm_ty(program: &Program, ty: &Type, usize_bits: u32) -> String {
                 format!("%vn2.outcome.{oid}")
             }
         }
-        Type::Resource(_, _) | Type::Ref(_, _) | Type::Named(_) | Type::OutcomeNamed(_) => {
-            "ptr".to_string()
-        }
+        Type::Resource(_, _)
+        | Type::Ref(_, _)
+        | Type::Named(_)
+        | Type::OutcomeNamed(_)
+        | Type::TasksNamed(_)
+        | Type::Tasks(_, _) => "ptr".to_string(),
     }
 }
 
@@ -541,7 +544,9 @@ fn c_header_value_ty(program: &Program, ty: &Type, usize_bits: u32) -> String {
                 format!("{} *", c_header_value_ty(program, inner, usize_bits))
             }
         }
-        Type::Named(_) | Type::OutcomeNamed(_) => "void *".to_string(),
+        Type::Named(_) | Type::OutcomeNamed(_) | Type::TasksNamed(_) | Type::Tasks(_, _) => {
+            "void *".to_string()
+        }
     }
 }
 
@@ -574,7 +579,12 @@ fn type_size_align(program: &Program, ty: &Type, usize_bits: u32) -> (usize, usi
             let b = (int_bits(*it, usize_bits) as usize) / 8;
             (b, b)
         }
-        Type::Resource(_, _) | Type::Ref(_, _) | Type::Named(_) | Type::OutcomeNamed(_) => (8, 8),
+        Type::Resource(_, _)
+        | Type::Ref(_, _)
+        | Type::Named(_)
+        | Type::OutcomeNamed(_)
+        | Type::TasksNamed(_)
+        | Type::Tasks(_, _) => (8, 8),
         Type::String | Type::Vector(_) | Type::Map(_, _) => {
             let off1 = align_up(8, u_bytes);
             let off2 = off1 + u_bytes;
@@ -3056,6 +3066,8 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
                     "false".to_string()
                 }
             }
+            Expr::TasksEmpty(_, _) => "null".to_string(),
+            Expr::Count(_) => "0".to_string(),
             Expr::Integer(val, int_ty) => {
                 let bits = int_bits(*int_ty, self.reg.usize_bits);
                 let raw = val.to_i128().unwrap_or(0) as u128;
@@ -3957,6 +3969,9 @@ fn emit_body_unit<'a>(
             }
 
             match &stmt.command {
+                Command::Spawn { .. } | Command::Cancel { .. } => {
+                    let _ = writeln!(emitter.code, "  br label %{next_lbl}");
+                }
                 Command::Bind { var, value } => {
                     let val = emitter.emit_expr(value, &VarAccess::ControlSlots(body));
                     let ll_ty = emitter.llvm_ty(&body.vars[*var].ty);
@@ -4614,6 +4629,9 @@ fn emit_operation_call(
     }
 
     match op_kind {
+        Operation::AwaitControl(_) | Operation::AwaitNext(_, _) | Operation::RunControl(_) => {
+            unreachable!("Slice 4 task codegen is scheduled for Phase 4")
+        }
         Operation::Control(cid) => {
             let callee = &program.controls[*cid];
             let is_extern = callee.body.is_none();

@@ -18,14 +18,14 @@
 
 use crate::host::Host;
 use crate::int::Int;
-use crate::oracle::{Config, Event, RuntimePlace, RuntimeStep, ScopeId, Value, list};
+use crate::oracle::{Config, Event, RuntimePlace, RuntimeStep, ScopeId, TaskSetId, Value, list};
 use crate::syntax::escape_string;
 use crate::typed::{
-    Arithmetic, BodyId, BorrowMode, BoundaryId, BuiltinOp, Command, Comparison, ControlBody,
-    ControlId, Expr, IntType, Kind, Operation, Place, PlaceStep, Program, Selector, SiteId, Type,
-    VarId, VarRef,
+    Arithmetic, BodyId, BorrowMode, BoundaryId, BuiltinOp, Command, Comparison, Control,
+    ControlBody, ControlId, Expr, IntType, Kind, Operation, Place, PlaceStep, Program, Selector,
+    SiteId, Type, VarId, VarRef,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 #[derive(Clone, Debug)]
@@ -212,6 +212,10 @@ impl Arith<'_> {
                 Value::Vector(vals)
             }
             Expr::EmptyMap(_) => Value::Map(BTreeMap::new()),
+            Expr::TasksEmpty(_, _) => {
+                return Err("`tasks()` evaluated in pure function".to_string());
+            }
+            Expr::Count(_) => return Err("`count` evaluated in pure function".to_string()),
             Expr::Len(place) => {
                 let len = match self.eval(place, names)? {
                     Value::Vector(v) => v.len() as u64,
@@ -430,7 +434,9 @@ fn collect_consumed_vars(
         | Expr::String(_)
         | Expr::Var(_, _)
         | Expr::Old(_, _)
-        | Expr::EmptyMap(_) => {}
+        | Expr::EmptyMap(_)
+        | Expr::TasksEmpty(_, _)
+        | Expr::Count(_) => {}
     }
 }
 
@@ -495,13 +501,16 @@ fn compute_body_availability(
                 arguments,
                 ..
             } => match operation {
-                Operation::Control(cid) => {
+                Operation::Control(cid)
+                | Operation::AwaitControl(cid)
+                | Operation::RunControl(cid) => {
                     let callee = &program.controls[*cid];
                     for (arg, param) in arguments.iter().zip(&callee.parameters) {
                         let is_val = !matches!(param.ty, Type::Ref(_, _)) && !arg.lends();
                         collect_consumed_vars(program, body, arg, is_val, &mut consumed);
                     }
                 }
+                Operation::AwaitNext(_, _) => {}
                 Operation::Builtin { op, .. } => {
                     for (i, arg) in arguments.iter().enumerate() {
                         let is_val = match op {
@@ -549,7 +558,17 @@ fn compute_body_availability(
                     }
                 }
             }
-            Command::Oblige(_)
+            Command::Spawn {
+                control, arguments, ..
+            } => {
+                let callee = &program.controls[*control];
+                for (arg, param) in arguments.iter().zip(&callee.parameters) {
+                    let is_val = !matches!(param.ty, Type::Ref(_, _)) && !arg.lends();
+                    collect_consumed_vars(program, body, arg, is_val, &mut consumed);
+                }
+            }
+            Command::Cancel { .. }
+            | Command::Oblige(_)
             | Command::Test { .. }
             | Command::Fault { .. }
             | Command::Impossible
@@ -590,11 +609,21 @@ fn compute_body_availability(
             Command::Assign { var, .. } => {
                 moved[*var] = sel_and_not(moved[*var].take(), g);
             }
-            Command::Decide { site, arms, .. } => {
+            Command::Decide {
+                site,
+                op_kind,
+                arms,
+                ..
+            } => {
                 for (pos, arm) in arms.iter().enumerate() {
                     let atom = Selector::Atom(*site, pos);
                     for &var in &arm.vars {
                         defined[var] = sel_or(defined[var].take(), atom.clone());
+                    }
+                    if let Operation::AwaitNext(set_var, prod_id) = op_kind
+                        && arm.alternative == program.controls[*prod_id].contract.len()
+                    {
+                        moved[*set_var] = sel_or(moved[*set_var].take(), atom);
                     }
                 }
             }
@@ -725,7 +754,8 @@ fn plan(program: &Program, body: &ControlBody, param_count: usize) -> Plan {
     for body_snaps in &plan.avail_at {
         for snap in body_snaps {
             for (var_id, sel) in snap.iter().enumerate() {
-                if program.holds_obligation(&body.vars[var_id].ty)
+                if (program.holds_obligation(&body.vars[var_id].ty)
+                    || matches!(body.vars[var_id].ty, Type::Tasks(_, _)))
                     && let Some(s) = sel
                 {
                     avail_selectors.push(s.clone());
@@ -801,6 +831,44 @@ struct Activation {
     frames: Vec<BodyFrame>,
 }
 
+struct TaskSet {
+    owner_task: usize,
+    owner_act_id: ScopeId,
+    members: Vec<usize>,
+    done_queue: VecDeque<usize>,
+}
+
+enum TaskState {
+    Ready,
+    WaitingHost {
+        callee: ControlId,
+        concrete_args: Vec<Value>,
+    },
+    WaitingNext {
+        set_id: TaskSetId,
+        prod_id: ControlId,
+    },
+    WaitingRun,
+    Done {
+        alternative: usize,
+        payload: Vec<Value>,
+    },
+    Stopped,
+}
+
+struct Task {
+    stack: Vec<Activation>,
+    state: TaskState,
+    member_of: Option<TaskSetId>,
+    cancelled: bool,
+}
+
+struct TaskRun {
+    root_task: usize,
+    caller_task: Option<usize>,
+    tasks: Vec<usize>,
+}
+
 struct Machine<'a> {
     program: &'a Program,
     config: &'a Config,
@@ -812,6 +880,12 @@ struct Machine<'a> {
     entry_slots: Vec<Value>,
     next_act_id: ScopeId,
     stack: Vec<Activation>,
+    tasks: Vec<Task>,
+    task_sets: Vec<TaskSet>,
+    runs: Vec<TaskRun>,
+    current_task: usize,
+    has_turn: bool,
+    turns_taken: u64,
     trace: Vec<Event>,
 }
 
@@ -862,7 +936,7 @@ impl<'a> Machine<'a> {
         }
     }
 
-    fn push_control(&mut self, control: ControlId, arguments: &[Value]) {
+    fn make_control_activation(&mut self, control: ControlId, arguments: &[Value]) -> Activation {
         let body = self.program.controls[control]
             .body
             .as_ref()
@@ -871,7 +945,7 @@ impl<'a> Machine<'a> {
         let mut slots = vec![Value::Int(Int::zero()); body.vars.len()];
         slots[..arguments.len()].clone_from_slice(arguments);
         let id = self.alloc_act_id();
-        self.stack.push(Activation {
+        Activation {
             id,
             kind: ActKind::Control(control),
             slots,
@@ -881,7 +955,49 @@ impl<'a> Machine<'a> {
                 body: 0,
                 kind: FrameKind::Normal,
             }],
-        });
+        }
+    }
+
+    fn push_control(&mut self, control: ControlId, arguments: &[Value]) {
+        let act = self.make_control_activation(control, arguments);
+        self.stack.push(act);
+    }
+
+    fn park_current(&mut self, state: TaskState) {
+        let tid = self.current_task;
+        self.tasks[tid].stack = std::mem::take(&mut self.stack);
+        self.tasks[tid].state = state;
+        self.has_turn = false;
+    }
+
+    fn activate_task(&mut self, tid: usize) {
+        self.current_task = tid;
+        self.stack = std::mem::take(&mut self.tasks[tid].stack);
+        self.tasks[tid].state = TaskState::Ready;
+        self.has_turn = true;
+    }
+
+    /// Whether `tid` is cancelled directly or through an owning task / `run` caller ([E-Cancel]).
+    fn is_task_cancelled(&self, mut tid: usize) -> bool {
+        loop {
+            if self.tasks[tid].cancelled {
+                return true;
+            }
+            if let Some(set_id) = self.tasks[tid].member_of {
+                tid = self.task_sets[set_id as usize].owner_task;
+                continue;
+            }
+            if let Some(caller) = self
+                .runs
+                .iter()
+                .find(|r| r.root_task == tid)
+                .and_then(|r| r.caller_task)
+            {
+                tid = caller;
+                continue;
+            }
+            return false;
+        }
     }
 
     fn wrap_entry_arg(&mut self, value: Value, ty: &Type) -> Value {
@@ -934,6 +1050,16 @@ impl<'a> Machine<'a> {
                     .ok_or_else(|| "invalid slot index".to_string());
             }
         }
+        for task in &self.tasks {
+            for act in task.stack.iter().rev() {
+                if act.id == scope {
+                    return act
+                        .slots
+                        .get(var)
+                        .ok_or_else(|| "invalid slot index".to_string());
+                }
+            }
+        }
         Err("dangling borrow to ended scope".to_string())
     }
 
@@ -950,6 +1076,16 @@ impl<'a> Machine<'a> {
                     .slots
                     .get_mut(var)
                     .ok_or_else(|| "invalid slot index".to_string());
+            }
+        }
+        for task in &mut self.tasks {
+            for act in task.stack.iter_mut().rev() {
+                if act.id == scope {
+                    return act
+                        .slots
+                        .get_mut(var)
+                        .ok_or_else(|| "invalid slot index".to_string());
+                }
             }
         }
         Err("dangling borrow to ended scope".to_string())
@@ -1190,6 +1326,16 @@ impl<'a> Machine<'a> {
                 Value::Vector(vals)
             }
             Expr::EmptyMap(_) => Value::Map(BTreeMap::new()),
+            Expr::TasksEmpty(_, _) => return Err("`tasks()` outside binding".to_string()),
+            Expr::Count(var_id) => {
+                let Value::TaskSet(set_id) =
+                    self.stack.last().expect("an activation").slots[*var_id]
+                else {
+                    return Err("`count` on non-task-set".to_string());
+                };
+                let n = self.task_sets[set_id as usize].members.len() as u64;
+                self.arith.int_value(n, IntType::Usize)
+            }
             Expr::Len(place) => {
                 let v = self.eval_expr(place)?;
                 let v = self.deref_value(&v)?;
@@ -1419,8 +1565,118 @@ impl<'a> Machine<'a> {
                     self.release_value_resources(v);
                 }
             }
+            Value::TaskSet(set_id) => {
+                self.stop_task_set(*set_id);
+            }
             Value::Bool(_) | Value::Int(_) | Value::String(_) | Value::Ref { .. } => {}
         }
+    }
+
+    fn stop_activation(&mut self, mut act: Activation) {
+        self.stack.push(act);
+        while let Some(frame) = self.stack.last_mut().expect("act").frames.pop() {
+            self.unwind_frame(frame.body, &[]);
+            if let FrameKind::LexicalBoundary { captures, .. } = frame.kind {
+                for cap in &captures {
+                    self.release_value_resources(cap);
+                }
+            }
+        }
+        act = self.stack.pop().expect("act");
+        drop(act);
+    }
+
+    fn stop_task(&mut self, tid: usize) {
+        if matches!(self.tasks[tid].state, TaskState::Stopped) {
+            return;
+        }
+        let prev = std::mem::replace(&mut self.tasks[tid].state, TaskState::Stopped);
+        match prev {
+            TaskState::WaitingHost {
+                callee,
+                concrete_args,
+            } => {
+                let param_is_ref: Vec<bool> = self.program.controls[callee]
+                    .parameters
+                    .iter()
+                    .map(|p| matches!(p.ty, Type::Ref(_, _)))
+                    .collect();
+                for (arg, is_ref) in concrete_args.iter().zip(param_is_ref) {
+                    if !is_ref {
+                        self.release_value_resources(arg);
+                    }
+                }
+            }
+            TaskState::Done { payload, .. } => {
+                for v in &payload {
+                    self.release_value_resources(v);
+                }
+            }
+            TaskState::Ready
+            | TaskState::WaitingNext { .. }
+            | TaskState::WaitingRun
+            | TaskState::Stopped => {}
+        }
+        let mut stack = std::mem::take(&mut self.tasks[tid].stack);
+        while let Some(act) = stack.pop() {
+            self.stop_activation(act);
+        }
+    }
+
+    fn stop_task_set(&mut self, set_id: TaskSetId) {
+        let members = std::mem::take(&mut self.task_sets[set_id as usize].members);
+        self.task_sets[set_id as usize].done_queue.clear();
+        for mid in members {
+            self.stop_task(mid);
+        }
+    }
+
+    fn withdraw_cancelled_host_waits(&mut self) -> Result<(), String> {
+        let run_tasks = self.runs.last().expect("a run").tasks.clone();
+        for tid in run_tasks {
+            let should_withdraw = match &self.tasks[tid].state {
+                TaskState::WaitingHost { callee, .. } => {
+                    self.program.controls[*callee].is_cancellable() && self.is_task_cancelled(tid)
+                }
+                _ => false,
+            };
+            if should_withdraw {
+                let TaskState::WaitingHost {
+                    callee,
+                    concrete_args,
+                } = std::mem::replace(&mut self.tasks[tid].state, TaskState::Ready)
+                else {
+                    unreachable!();
+                };
+                let param_is_ref: Vec<bool> = self.program.controls[callee]
+                    .parameters
+                    .iter()
+                    .map(|p| matches!(p.ty, Type::Ref(_, _)))
+                    .collect();
+                for (arg, is_ref) in concrete_args.iter().zip(param_is_ref) {
+                    if !is_ref {
+                        self.release_value_resources(arg);
+                    }
+                }
+                let cancel_idx = self.program.controls[callee]
+                    .contract
+                    .iter()
+                    .position(|a| a.name == "cancelled")
+                    .expect("cancellable control has `cancelled`");
+                let saved_stack = std::mem::take(&mut self.stack);
+                let saved_task = self.current_task;
+                let saved_turn = self.has_turn;
+                self.stack = std::mem::take(&mut self.tasks[tid].stack);
+                self.current_task = tid;
+                let res = self.complete(cancel_idx, &[]);
+                self.tasks[tid].stack = std::mem::take(&mut self.stack);
+                self.stack = saved_stack;
+                self.current_task = saved_task;
+                self.has_turn = saved_turn;
+                res?;
+            }
+        }
+        Ok(())
     }
 
     /// [R4], [R5]: unwinds one body frame using only static history-bit
@@ -1436,7 +1692,7 @@ impl<'a> Machine<'a> {
                 if var.body != frame_body || exclude.contains(&var_id) {
                     continue;
                 }
-                if !self.program.holds_obligation(&var.ty) {
+                if !self.program.holds_obligation(&var.ty) && !matches!(var.ty, Type::Tasks(_, _)) {
                     continue;
                 }
                 if let Some(sel) = &snap[var_id]
@@ -1562,6 +1818,55 @@ impl<'a> Machine<'a> {
 
             let _popped = self.stack.pop().expect("an activation");
             if self.stack.is_empty() {
+                let cur = self.current_task;
+                if let Some(set_id) = self.tasks[cur].member_of {
+                    // [E-MemberFault]: remove member and deliver fault to owner activation `A`.
+                    self.tasks[cur].state = TaskState::Stopped;
+                    self.task_sets[set_id as usize]
+                        .members
+                        .retain(|&m| m != cur);
+                    self.task_sets[set_id as usize]
+                        .done_queue
+                        .retain(|&m| m != cur);
+                    let owner_task = self.task_sets[set_id as usize].owner_task;
+                    let owner_act_id = self.task_sets[set_id as usize].owner_act_id;
+
+                    if let TaskState::WaitingHost {
+                        callee,
+                        concrete_args,
+                    } = std::mem::replace(&mut self.tasks[owner_task].state, TaskState::Ready)
+                    {
+                        let param_is_ref: Vec<bool> = self.program.controls[callee]
+                            .parameters
+                            .iter()
+                            .map(|p| matches!(p.ty, Type::Ref(_, _)))
+                            .collect();
+                        for (arg, is_ref) in concrete_args.iter().zip(param_is_ref) {
+                            if !is_ref {
+                                self.release_value_resources(arg);
+                            }
+                        }
+                    }
+
+                    self.activate_task(owner_task);
+                    let owner_act_idx = self
+                        .stack
+                        .iter()
+                        .position(|act| act.id == owner_act_id)
+                        .expect("owner activation still on owner task stack");
+                    while self.stack.len() > owner_act_idx + 1 {
+                        let above = self.stack.pop().expect("activation above owner");
+                        self.stop_activation(above);
+                    }
+                    continue;
+                }
+                if self.runs.len() > 1 {
+                    let finished_run = self.runs.pop().expect("nested run");
+                    self.tasks[cur].state = TaskState::Stopped;
+                    let caller = finished_run.caller_task.expect("nested run has caller");
+                    self.activate_task(caller);
+                    continue;
+                }
                 return Ok(Some(End::Faulted(message)));
             }
         }
@@ -1772,6 +2077,143 @@ impl<'a> Machine<'a> {
                 }
                 Ok(Some(Ok((index, payload))))
             }
+            Operation::AwaitControl(callee_id) => {
+                let values = self.eval_operands(arguments)?;
+                let callee = &program.controls[*callee_id];
+                if callee.body.is_none() {
+                    let mut concrete_args = Vec::with_capacity(values.len());
+                    for v in &values {
+                        concrete_args.push(self.deref_value(v)?);
+                    }
+                    if self.is_task_cancelled(self.current_task) && callee.is_cancellable() {
+                        let param_is_ref: Vec<bool> = callee
+                            .parameters
+                            .iter()
+                            .map(|p| matches!(p.ty, Type::Ref(_, _)))
+                            .collect();
+                        for (arg, is_ref) in concrete_args.iter().zip(param_is_ref) {
+                            if !is_ref {
+                                self.release_value_resources(arg);
+                            }
+                        }
+                        let cancel_idx = callee
+                            .contract
+                            .iter()
+                            .position(|a| a.name == "cancelled")
+                            .expect("cancellable control has `cancelled`");
+                        self.complete(cancel_idx, &[])?;
+                        self.park_current(TaskState::Ready);
+                        return Ok(None);
+                    }
+                    self.park_current(TaskState::WaitingHost {
+                        callee: *callee_id,
+                        concrete_args,
+                    });
+                    return Ok(None);
+                }
+                self.push_control(*callee_id, &values);
+                self.park_current(TaskState::Ready);
+                Ok(None)
+            }
+            Operation::AwaitNext(set_var, prod_id) => {
+                let Value::TaskSet(set_id) =
+                    self.stack.last().expect("an activation").slots[*set_var]
+                else {
+                    return Err("`await next` on non-task-set".to_string());
+                };
+                self.park_current(TaskState::WaitingNext {
+                    set_id,
+                    prod_id: *prod_id,
+                });
+                Ok(None)
+            }
+            Operation::RunControl(callee_id) => {
+                let values = self.eval_operands(arguments)?;
+                let callee = &program.controls[*callee_id];
+                if callee.body.is_none() {
+                    let mut concrete_args = Vec::with_capacity(values.len());
+                    for v in &values {
+                        concrete_args.push(self.deref_value(v)?);
+                    }
+                    if self.is_task_cancelled(self.current_task) && callee.is_cancellable() {
+                        let param_is_ref: Vec<bool> = callee
+                            .parameters
+                            .iter()
+                            .map(|p| matches!(p.ty, Type::Ref(_, _)))
+                            .collect();
+                        for (arg, is_ref) in concrete_args.iter().zip(param_is_ref) {
+                            if !is_ref {
+                                self.release_value_resources(arg);
+                            }
+                        }
+                        let cancel_idx = callee
+                            .contract
+                            .iter()
+                            .position(|a| a.name == "cancelled")
+                            .expect("cancellable control has `cancelled`");
+                        return Ok(Some(Ok((cancel_idx, Vec::new()))));
+                    }
+                    let answer = match self.host.call(callee, &concrete_args, self.config) {
+                        Ok(answer) => answer,
+                        Err(detail) => return Ok(Some(Err(End::HostFailed(detail)))),
+                    };
+                    let Some(index) = callee
+                        .contract
+                        .iter()
+                        .position(|entry| entry.name == answer.alternative)
+                    else {
+                        return Err(format!(
+                            "`{}` answered `{}`, which its contract does not list",
+                            callee.name, answer.alternative
+                        ));
+                    };
+                    let fields = &callee.contract[index].fields;
+                    if answer.payload.len() != fields.len() {
+                        return Err(format!(
+                            "`{}` answered a payload of the wrong shape",
+                            callee.name
+                        ));
+                    }
+                    let payload: Vec<Value> = answer
+                        .payload
+                        .iter()
+                        .zip(fields)
+                        .map(|(value, field)| arith.normalize(value, &field.ty))
+                        .collect();
+                    if !callee.is_pure() {
+                        let mut concrete_payload = Vec::with_capacity(payload.len());
+                        for v in &payload {
+                            concrete_payload.push(self.deref_value(v)?);
+                        }
+                        self.trace.push(Event {
+                            control: callee.name.clone(),
+                            arguments: concrete_args,
+                            alternative: answer.alternative,
+                            payload: concrete_payload,
+                        });
+                    }
+                    return Ok(Some(Ok((index, payload))));
+                }
+                let caller = self.current_task;
+                self.park_current(TaskState::WaitingRun);
+                let root_id = self.tasks.len();
+                let root_act = self.make_control_activation(*callee_id, &values);
+                self.tasks.push(Task {
+                    stack: Vec::new(),
+                    state: TaskState::Ready,
+                    member_of: None,
+                    cancelled: false,
+                });
+                self.runs.push(TaskRun {
+                    root_task: root_id,
+                    caller_task: Some(caller),
+                    tasks: vec![root_id],
+                });
+                self.stack = vec![root_act];
+                self.current_task = root_id;
+                self.has_turn = true;
+                Ok(None)
+            }
             Operation::Builtin { op, target, .. } => {
                 let (alt, payload) = self.execute_builtin(*op, target.as_ref(), arguments)?;
                 Ok(Some(Ok((alt, payload))))
@@ -1870,7 +2312,19 @@ impl<'a> Machine<'a> {
         let command = statement.command.clone();
         match &command {
             Command::Bind { var, value } => {
-                let val = self.eval_expr(value)?;
+                let val = if let Expr::TasksEmpty(_, _) = value {
+                    let set_id = self.task_sets.len() as TaskSetId;
+                    let owner_act_id = self.stack.last().expect("an activation").id;
+                    self.task_sets.push(TaskSet {
+                        owner_task: self.current_task,
+                        owner_act_id,
+                        members: Vec::new(),
+                        done_queue: VecDeque::new(),
+                    });
+                    Value::TaskSet(set_id)
+                } else {
+                    self.eval_expr(value)?
+                };
                 let top = self.top();
                 top.slots[*var] = val;
                 top.positions[current] += 1;
@@ -2002,6 +2456,40 @@ impl<'a> Machine<'a> {
                     }],
                 });
             }
+            Command::Spawn {
+                control,
+                arguments,
+                set,
+            } => {
+                let values = self.eval_operands(arguments)?;
+                let Value::TaskSet(set_id) = self.stack.last().expect("an activation").slots[*set]
+                else {
+                    return Err("`spawn` into non-task-set".to_string());
+                };
+                let member_act = self.make_control_activation(*control, &values);
+                let tid = self.tasks.len();
+                self.tasks.push(Task {
+                    stack: vec![member_act],
+                    state: TaskState::Ready,
+                    member_of: Some(set_id),
+                    cancelled: false,
+                });
+                self.task_sets[set_id as usize].members.push(tid);
+                self.runs.last_mut().expect("a run").tasks.push(tid);
+                self.top().positions[current] += 1;
+            }
+            Command::Cancel { set } => {
+                let Value::TaskSet(set_id) = self.stack.last().expect("an activation").slots[*set]
+                else {
+                    return Err("`cancel` on non-task-set".to_string());
+                };
+                let members = self.task_sets[set_id as usize].members.clone();
+                for mid in members {
+                    self.tasks[mid].cancelled = true;
+                }
+                self.withdraw_cancelled_host_waits()?;
+                self.top().positions[current] += 1;
+            }
             Command::Again {
                 body: target,
                 arguments,
@@ -2045,6 +2533,24 @@ impl<'a> Machine<'a> {
                 let values = self.eval_operands(payload)?;
                 let popped = self.stack.pop().expect("an activation");
                 if self.stack.is_empty() {
+                    let cur = self.current_task;
+                    if let Some(set_id) = self.tasks[cur].member_of {
+                        self.tasks[cur].state = TaskState::Done {
+                            alternative: *alternative,
+                            payload: values,
+                        };
+                        self.task_sets[set_id as usize].done_queue.push_back(cur);
+                        self.has_turn = false;
+                        return Ok(None);
+                    }
+                    if self.runs.len() > 1 {
+                        let finished_run = self.runs.pop().expect("nested run");
+                        self.tasks[cur].state = TaskState::Stopped;
+                        let caller = finished_run.caller_task.expect("nested run has caller");
+                        self.activate_task(caller);
+                        self.complete(*alternative, &values)?;
+                        return Ok(None);
+                    }
                     let ActKind::Control(control_id) = popped.kind else {
                         return Err("boundary exited as control".to_string());
                     };
@@ -2180,6 +2686,147 @@ impl<'a> Machine<'a> {
             }
         }
         Ok(None)
+    }
+
+    fn complete_waiting_host(&mut self, tid: usize) -> Result<Option<End>, String> {
+        let TaskState::WaitingHost {
+            callee,
+            concrete_args,
+        } = std::mem::replace(&mut self.tasks[tid].state, TaskState::Ready)
+        else {
+            unreachable!();
+        };
+        let callee_ctrl = &self.program.controls[callee];
+        let answer = match self.host.call(callee_ctrl, &concrete_args, self.config) {
+            Ok(answer) => answer,
+            Err(detail) => return Ok(Some(End::HostFailed(detail))),
+        };
+        let Some(index) = callee_ctrl
+            .contract
+            .iter()
+            .position(|entry| entry.name == answer.alternative)
+        else {
+            return Err(format!(
+                "`{}` answered `{}`, which its contract does not list",
+                callee_ctrl.name, answer.alternative
+            ));
+        };
+        let fields = &callee_ctrl.contract[index].fields;
+        if answer.payload.len() != fields.len() {
+            return Err(format!(
+                "`{}` answered a payload of the wrong shape",
+                callee_ctrl.name
+            ));
+        }
+        let arith = self.arith;
+        let payload: Vec<Value> = answer
+            .payload
+            .iter()
+            .zip(fields)
+            .map(|(value, field)| arith.normalize(value, &field.ty))
+            .collect();
+        if !callee_ctrl.is_pure() {
+            let mut concrete_payload = Vec::with_capacity(payload.len());
+            for v in &payload {
+                concrete_payload.push(self.deref_value(v)?);
+            }
+            self.trace.push(Event {
+                control: callee_ctrl.name.clone(),
+                arguments: concrete_args,
+                alternative: answer.alternative,
+                payload: concrete_payload,
+            });
+        }
+        self.stack = std::mem::take(&mut self.tasks[tid].stack);
+        self.current_task = tid;
+        self.complete(index, &payload)?;
+        self.tasks[tid].stack = std::mem::take(&mut self.stack);
+        self.tasks[tid].state = TaskState::Ready;
+        Ok(None)
+    }
+
+    fn step_scheduler(&mut self) -> Result<Option<End>, String> {
+        if self.has_turn {
+            return self.step();
+        }
+        let top_run_root = self.runs.last().expect("a run").root_task;
+        self.turns_taken += 1;
+        if !self.is_task_cancelled(top_run_root) && self.host.should_cancel_root(self.turns_taken) {
+            self.tasks[top_run_root].cancelled = true;
+            self.withdraw_cancelled_host_waits()?;
+        }
+
+        let run_tasks = self.runs.last().expect("a run").tasks.clone();
+        let mut ready = Vec::new();
+        for &tid in &run_tasks {
+            match self.tasks[tid].state {
+                TaskState::Ready => ready.push(tid),
+                TaskState::WaitingNext { set_id, .. } => {
+                    let set = &self.task_sets[set_id as usize];
+                    if set.members.is_empty() || !set.done_queue.is_empty() {
+                        ready.push(tid);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !ready.is_empty() {
+            let choice = self.host.pick_turn(ready.len()) % ready.len();
+            let tid = ready[choice];
+            if let TaskState::WaitingNext { set_id, prod_id } = self.tasks[tid].state {
+                self.activate_task(tid);
+                if self.task_sets[set_id as usize].members.is_empty() {
+                    let empty_idx = self.program.controls[prod_id].contract.len();
+                    self.complete(empty_idx, &[])?;
+                } else {
+                    let done_tid = self.task_sets[set_id as usize]
+                        .done_queue
+                        .pop_front()
+                        .expect("done member");
+                    self.task_sets[set_id as usize]
+                        .members
+                        .retain(|&m| m != done_tid);
+                    let prev =
+                        std::mem::replace(&mut self.tasks[done_tid].state, TaskState::Stopped);
+                    let TaskState::Done {
+                        alternative,
+                        payload,
+                    } = prev
+                    else {
+                        unreachable!();
+                    };
+                    self.complete(alternative, &payload)?;
+                }
+                return Ok(None);
+            }
+            self.activate_task(tid);
+            return Ok(None);
+        }
+
+        let mut waiting_tids = Vec::new();
+        for &tid in &run_tasks {
+            if matches!(self.tasks[tid].state, TaskState::WaitingHost { .. }) {
+                waiting_tids.push(tid);
+            }
+        }
+        if waiting_tids.is_empty() {
+            return Ok(Some(End::HostFailed(
+                "no ready or waiting task in run".to_string(),
+            )));
+        }
+        let descriptors: Vec<(&Control, &[Value])> = waiting_tids
+            .iter()
+            .map(|&tid| match &self.tasks[tid].state {
+                TaskState::WaitingHost {
+                    callee,
+                    concrete_args,
+                } => (&self.program.controls[*callee], concrete_args.as_slice()),
+                _ => unreachable!(),
+            })
+            .collect();
+        let widx = self.host.pick_waiting(&descriptors) % waiting_tids.len();
+        let chosen = waiting_tids[widx];
+        self.complete_waiting_host(chosen)
     }
 }
 
@@ -2321,6 +2968,21 @@ pub fn run(
         entry_slots: Vec::new(),
         next_act_id: 1,
         stack: Vec::new(),
+        tasks: vec![Task {
+            stack: Vec::new(),
+            state: TaskState::Ready,
+            member_of: None,
+            cancelled: false,
+        }],
+        task_sets: Vec::new(),
+        runs: vec![TaskRun {
+            root_task: 0,
+            caller_task: None,
+            tasks: vec![0],
+        }],
+        current_task: 0,
+        has_turn: true,
+        turns_taken: 0,
         trace: Vec::new(),
     };
     let wrapped_args: Vec<Value> = normalized_args
@@ -2335,7 +2997,7 @@ pub fn run(
             break End::OutOfFuel;
         }
         steps += 1;
-        match machine.step() {
+        match machine.step_scheduler() {
             Ok(None) => {}
             Ok(Some(end)) => break end,
             Err(detail) => break End::Undefined(detail),

@@ -10,12 +10,12 @@ v1, the language and compiler at 0.306, is described by the
 
 | Document | Deliverable | State |
 | --- | --- | --- |
-| [Core calculus](core.md) | The core language, its instrumented semantics, the checker's judgments, and the claims to test and mechanize | Draft 2, accepted. The synchronous language has two reviews folded in. Tasks and named boundaries were read by the combined review, which found four programs that the task rules accepted and the semantics left stuck, and no checking rule for named boundaries; the repairs are in and not yet reviewed again. Records the decisions on Q1 to Q5 and Q18. |
+| [Core calculus](core.md) | The core language, its instrumented semantics, the checker's judgments, and the claims to test and mechanize | Draft 2, accepted. The synchronous language has two reviews folded in. Tasks and named boundaries were read by the combined review, which found four programs that the task rules accepted and the semantics left stuck, and no checking rule for named boundaries; a second review before slice 4 checked those repairs and folded three further fixes into `[W11]`, `[E-AwaitHost]`, `[TK6]` and `[I10]` (`core.md` section 12). Records the decisions on Q1 to Q5 and Q18. |
 | [Fact logic](facts.md) | The interpreted fragment behind `⊨`, the decision procedure, certificates, counterexamples, worked examples | Draft 1, accepted; two reviews folded in. Records the decisions on Q6 to Q10. The corpus added the length of a vector literal. |
 | [Reference model](references.md) | Second-class borrows and views: the model, 36 worked examples in Rails and core form with verdicts, the tag semantics on an example | Draft 1, accepted; one review folded in, which found the 36 verdicts to agree with their clauses. Records the decisions on Q16 and Q17. |
 | [Surface](surface.md) | The Rails grammar, layout, and the elaboration into the core, including the acknowledgement rule and outcome groups | Draft 1, accepted, with the task forms of the core's draft 2 and the forms the corpus needed (traits, named boundaries, `copy` types); one review folded in. Records the decisions on Q11 to Q15 and Q19. |
 | [Corpus on paper](corpus.md) | The settings application, the eight collection modules and three new programs, rewritten by hand, with counts and findings | Draft 1, accepted; checked by hand and read by one review, which found no error in the programs. Library 476 to 231 lines, application 635 to 304, no filler arm; thirteen gaps repaired in the other documents, thirteen limits left open. |
-| [Oracle](oracle.md) | Phases 2, 3 and 4: the instrumented semantics, the Rails surface reader, elaborator and formatter, the certificate-producing checker, call expansion (Theorem 4) and the typed LLVM IR and C ABI backend (the crate `v2/`), with the conformance suite | **Slices 1, 2 & 3 complete across phases 2, 3 and 4** (borrows `&τ`/`&~τ`, `view struct`, `∈` origins, borrow tags `[B1]`–`[B5]` & `X4`, static ROBDD loan checking `[L1]`–`[L5]`/`[L2a]`/`[RM7]`, `[O3]`/`[O0]` borrow ownership, `[I7]`/`[I9]` borrow/view facts, Theorem 4 borrow/view call expansion, and direct typed LLVM IR & C ABI backend at `1.021×` vs. Rust on M2). **Slice 4** (tasks) is next. |
+| [Oracle](oracle.md) | Phases 2, 3 and 4: the instrumented semantics, the Rails surface reader, elaborator and formatter, the certificate-producing checker, call expansion (Theorem 4) and the typed LLVM IR and C ABI backend (the crate `v2/`), with the conformance suite | **Slices 1, 2 & 3 complete across phases 2, 3 and 4; Slice 4 Phase 2 complete** (second review of task rules folded in, plus cooperative task scheduler `[E-Run]`–`[E-Stop]`/`[W10]`–`[W12]`/`[TK1]`, erased task semantics `[R6]` with schedule-replaying Theorem 3 differential parity, and Rails task surface `[G7b]`/`[U19]`/`[G3]`/`[G10]`). **Slice 4 Phase 3** (static task checker `[TK1]`–`[TK7]`) is next. |
 | [Reading and repair test](reading-test.md) | v1 and v2 versions of the same programs, given to people and to agents | First run with agents done: 24 runs, 23 fully correct, so no difference between the versions is shown on reading. The repair needs 8 edits in v2 against 14. People have not taken it. |
 
 ## Acceptance
@@ -29,11 +29,12 @@ author.
 
 Three things were open at acceptance, and the author accepted with them named:
 
-- **The task rules.** The repairs that the combined review led to have not
-  been reviewed again: [TK3] to [TK6], [E-Await], [E-AwaitHost], [E-Stop],
-  [N5], [F5] and [F6] of the core, [J3] and [I10] of the fact logic, [G3] of
-  the surface. They get a second review before the task slice, which is the
-  last of the four.
+- **The task rules.** The repairs that the combined review led to
+  ([TK3] to [TK6], [E-Await], [E-AwaitHost], [E-Stop], [N5], [F5] and [F6] of
+  the core, [J3] and [I10] of the fact logic, [G3] of the surface) received
+  their second review on 22 November 2026 before slice 4, folding three further
+  repairs into `[W11]`, `[E-AwaitHost]`, `[TK6]` (`core.md` section 12) and
+  `[I10]` (`facts.md`).
 - **Workarounds.** The plan's exit asks that the corpus show no construct that
   v2 cannot express without a workaround. Three of the thirteen open limits of
   the [corpus](corpus.md) (section 6.2) are workarounds until phase 5:
@@ -111,4 +112,13 @@ Three things were open at acceptance, and the author accepted with them named:
     dereferencing, composable topologically-ordered C ABI headers, and
     non-dangling borrowed host payloads (`codegen.rs`), plus `-O0`/`-O2`
     32/64-bit differential parity and paired M2 benchmark `1.021×` vs. Rust
-    (`tests/backend_slice3.rs`) (done); slice 4 (tasks) is next.
+    (`tests/backend_slice3.rs`) (done).
+16. Second review of task-rule repairs (`core.md` section 12, `facts.md`
+    `[I10]`) and Phase 2 for slice 4: `async control`, `extern async control`,
+    `tasks⟨f⟩`, `tasks⟨f⟩()`, `count(x)`, `spawn … into`, `await`, `await next`,
+    `cancel`, `run`, well-formedness (`[W10]`–`[W12]`, `[TK1]`, `[I10]`),
+    instrumented and erased cooperative task schedulers (`[E-Run]`–`[E-Stop]`,
+    `[R6]`), schedule-replaying differential parity, Rails surface (`[G7b]`,
+    `[U19]`, `[G3]`, `[G10]`), and conformance suites (`tests/slice4/*.core`,
+    `tests/slice4_surface/*.rails`, `tests/slice4.rs`) (done); slice 4 phase 3
+    (static task checker `[TK1]`–`[TK7]`) is next.

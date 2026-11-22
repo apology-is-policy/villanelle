@@ -1,0 +1,163 @@
+// Slice 4 Phase 2 core conformance: tasks, cooperative turns, cross-task
+// borrows, `count(x)`, `capture await/run`, nested `run`, and stuck states
+// (`X4 B1`, `X5 E-Scope`, `X9 E-Effect`).
+
+extern async control host_work(id : u32) ■ { done {value : u32} │ cancelled {} } uses io.net
+extern async control secret_io(id : u32) ■ { done {} } uses io.secret
+
+async control worker(id : u32, tag : string) ■ { ok {value : u32} } uses io.net, console.write
+    1 ⊤ ▷ e : Δ emit(&tag) ▸ done {}
+    2 e.done ▷ d : Δ await host_work(id) ▸ done {v} │ cancelled {}
+    3 d.done ▷ ■ ok {v}
+    4 d.cancelled ▷ ■ ok {0}
+
+async control two_workers(a : u32, b : u32) ■ { sum {total : u32, before : usize, mid : usize} } uses io.net, console.write
+    1 ⊤ ▷ ~pool : tasks⟨worker⟩ := tasks⟨worker⟩()
+    2 ⊤ ▷ b0 : usize := count(pool)
+    3 ⊤ ▷ spawn worker(a, "first") into pool
+    4 ⊤ ▷ spawn worker(b, "second") into pool
+    5 ⊤ ▷ m0 : usize := count(pool)
+    6 ⊤ ▷ ~acc : u32 := 0
+    7 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ nxt : Δ await next(pool) ▸ ok {v} │ empty {}
+          2 nxt.ok ▷ acc ← acc + v
+          3 nxt.ok ▷ ↑ drain()
+          4 nxt.empty ▷ □ finished {}
+        } ▸ finished {}
+    8 ⊤ ▷ ■ sum {acc, b0, m0}
+
+control run_two(a : u32, b : u32) ■ { sum {total : u32, before : usize, mid : usize} } uses io.net, console.write
+    1 ⊤ ▷ d : Δ run two_workers(a, b) ▸ sum {t, b0, m0}
+    2 d.sum ▷ ■ sum {t, b0, m0}
+
+//! run run_two(1, 2) with [host_work -> done {10}; host_work -> done {20}] => done sum {30, 0, 2} trace [emit("first") -> done; emit("second") -> done; host_work(1) -> done {10}; host_work(2) -> done {20}]
+//! run run_two(1, 2) with [host_work -> done {10}; host_work -> done {20}] turns [1, 0, 0, 0, 0, 0, 0, 0] => done sum {30, 0, 2} trace [emit("second") -> done; emit("first") -> done; host_work(1) -> done {10}; host_work(2) -> done {20}]
+
+async control sub_add(x : u32, y : u32) ■ { ok {value : u32} }
+    1 ⊤ ▷ ■ ok {x + y}
+
+async control await_defined(x : u32) ■ { ok {value : u32} }
+    1 ⊤ ▷ cap := capture await sub_add(x, 5)
+    2 ⊤ ▷ d : Δ outcome(cap) ▸ ok {v}
+    3 d.ok ▷ ■ ok {v}
+
+control run_capture(x : u32) ■ { ok {value : u32} }
+    1 ⊤ ▷ cap := capture run await_defined(x)
+    2 ⊤ ▷ d : Δ outcome(cap) ▸ ok {v}
+    3 d.ok ▷ ■ ok {v}
+
+//! run run_capture(7) => done ok {12}
+
+// Cross-task shared borrow (`&[u32]`) and exclusive borrow (`&~u32`).
+async control read_at(xs : &[u32], idx : usize) ■ { val {v : u32} }
+    1 ⊤ ▷ t : ? idx < len(xs)
+    2 t.true ▷ ■ val {xs[idx]}
+    3 t.false ▷ ■ val {0}
+
+async control shared_pool(xs : &[u32]) ■ { sum {total : u32} }
+    1 ⊤ ▷ ~pool : tasks⟨read_at⟩ := tasks⟨read_at⟩()
+    2 ⊤ ▷ spawn read_at(xs, 0) into pool
+    3 ⊤ ▷ spawn read_at(xs, 1) into pool
+    4 ⊤ ▷ ~acc : u32 := 0
+    5 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ val {v} │ empty {}
+          2 n.val ▷ acc ← acc + v
+          3 n.val ▷ ↑ drain()
+          4 n.empty ▷ □ done {}
+        } ▸ done {}
+    6 ⊤ ▷ ■ sum {acc}
+
+control run_shared_pool() ■ { sum {total : u32} }
+    1 ⊤ ▷ xs : [u32] := [11, 31]
+    2 ⊤ ▷ d : Δ run shared_pool(&xs) ▸ sum {t}
+    3 d.sum ▷ ■ sum {t}
+
+//! run run_shared_pool() => done sum {42}
+
+async control bump(target : &~u32, amount : u32) ■ { ok {} }
+    1 ⊤ ▷ target ← target + amount
+    2 ⊤ ▷ ■ ok {}
+
+async control excl_pool(start : u32) ■ { ok {value : u32} }
+    1 ⊤ ▷ ~acc : u32 := start
+    2 ⊤ ▷ ~pool : tasks⟨bump⟩ := tasks⟨bump⟩()
+    3 ⊤ ▷ spawn bump(&~acc, 9) into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ done {}
+        } ▸ done {}
+    5 ⊤ ▷ ■ ok {acc}
+
+control run_excl_pool(start : u32) ■ { ok {value : u32} }
+    1 ⊤ ▷ d : Δ run excl_pool(start) ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+//! run run_excl_pool(33) => done ok {42}
+
+// Nested `run` inside a synchronous helper called from an `async control`.
+control sync_helper(x : u32) ■ { ok {value : u32} }
+    1 ⊤ ▷ d : Δ run await_defined(x) ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+async control outer_nested(x : u32) ■ { ok {value : u32} }
+    1 ⊤ ▷ d : Δ sync_helper(x) ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+control run_nested(x : u32) ■ { ok {value : u32} }
+    1 ⊤ ▷ d : Δ run outer_nested(x) ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+//! run run_nested(10) => done ok {15}
+
+// X4 B1: parent mutates a vector while a spawned member holds a shared borrow `&[u32]`.
+async control race_write() ■ { ok {value : u32} }
+    1 ⊤ ▷ ~xs : [u32] := [10, 20]
+    2 ⊤ ▷ ~pool : tasks⟨read_at⟩ := tasks⟨read_at⟩()
+    3 ⊤ ▷ spawn read_at(&xs, 0) into pool
+    4 ⊤ ▷ p : Δ push(&~xs, 30) ▸ done {}
+    5 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ val {v} │ empty {}
+          2 n.val ▷ ↑ drain()
+          3 n.empty ▷ □ done {}
+        } ▸ done {}
+    6 ⊤ ▷ ■ ok {0}
+
+control run_race_write() ■ { ok {value : u32} }
+    1 ⊤ ▷ d : Δ run race_write() ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+//! run run_race_write() => stuck X4 B1
+
+// X5 E-Scope: leaving a scope while a non-empty task set has not been drained.
+async control leak_pool() ■ { ok {} }
+    1 ⊤ ▷ ~pool : tasks⟨sub_add⟩ := tasks⟨sub_add⟩()
+    2 ⊤ ▷ spawn sub_add(1, 2) into pool
+    3 ⊤ ▷ ■ ok {}
+
+control run_leak_pool() ■ { ok {} }
+    1 ⊤ ▷ d : Δ run leak_pool() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run run_leak_pool() => stuck X5 E-Scope
+
+// X9 E-Effect: spawned member attempts an effect not allowed by its parent chain.
+async control bad_effect_member() ■ { ok {} } uses io.secret
+    1 ⊤ ▷ d : Δ await secret_io(1) ▸ done {}
+    2 d.done ▷ ■ ok {}
+
+async control bad_effect_parent() ■ { ok {} }
+    1 ⊤ ▷ ~pool : tasks⟨bad_effect_member⟩ := tasks⟨bad_effect_member⟩()
+    2 ⊤ ▷ spawn bad_effect_member() into pool
+    3 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ done {}
+        } ▸ done {}
+    4 ⊤ ▷ ■ ok {}
+
+control run_bad_effect() ■ { ok {} }
+    1 ⊤ ▷ d : Δ run bad_effect_parent() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run run_bad_effect() => stuck X9 E-Effect

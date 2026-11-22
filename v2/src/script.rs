@@ -1,7 +1,7 @@
 //! Test directives: runs written beside a program, and what each must yield.
 
 use crate::differential::{Verdict, compare};
-use crate::host::{Answer, Arithmetic, Host, Script};
+use crate::host::{Answer, Arithmetic, Host, Scheduled, Script};
 use crate::int::Int;
 use crate::oracle::{Config, End, Event, Value};
 use crate::typed::{Program, Type};
@@ -643,6 +643,8 @@ struct RawRunSpec {
     arguments: Vec<RawValue>,
     arithmetic: bool,
     answers: Vec<(String, String, Vec<RawValue>)>,
+    turns: Vec<usize>,
+    cancel_at_turn: Option<u64>,
     config: Config,
     expect: RawExpect,
     trace: Option<Vec<RawEvent>>,
@@ -694,6 +696,8 @@ fn directive(line: usize, text: &str) -> Result<Directive, String> {
         arguments,
         arithmetic: false,
         answers: Vec::new(),
+        turns: Vec::new(),
+        cancel_at_turn: None,
         config: Config::default(),
         expect: RawExpect::Other("fuel"),
         trace: None,
@@ -715,6 +719,26 @@ fn directive(line: usize, text: &str) -> Result<Directive, String> {
                     let (alternative, payload) = reader.outcome()?;
                     spec.answers.push((control, alternative, payload));
                 }
+            }
+            "turns" => {
+                reader.need("[")?;
+                while !reader.mark("]") {
+                    if !spec.turns.is_empty() {
+                        reader.need(",")?;
+                    }
+                    let t_str = reader.word("a turn index")?;
+                    let t: usize = t_str
+                        .parse()
+                        .map_err(|_| format!("`{t_str}` is not a turn index"))?;
+                    spec.turns.push(t);
+                }
+            }
+            "cancel_at" => {
+                let t_str = reader.word("a turn number")?;
+                let t: u64 = t_str
+                    .parse()
+                    .map_err(|_| format!("`{t_str}` is not a turn number"))?;
+                spec.cancel_at_turn = Some(t);
             }
             "usize" => {
                 let bits = reader.word("32 or 64")?;
@@ -1084,13 +1108,28 @@ fn check_with(source: &str, is_surface: bool) -> Report {
             }
         };
 
-        let mut host = Arithmetic(Script {
-            answers: answers.into_iter().collect(),
-        });
+        let mut scheduled = Scheduled {
+            inner: Arithmetic(Script {
+                answers: answers.into_iter().collect(),
+            }),
+            turns: raw_spec.turns.iter().copied().collect(),
+            waiting: std::collections::VecDeque::new(),
+            cancel_at_turn: raw_spec.cancel_at_turn,
+            cancel_decisions: std::collections::VecDeque::new(),
+        };
+        let mut plain_scheduled = Scheduled {
+            inner: Script {
+                answers: scheduled.inner.0.answers.clone(),
+            },
+            turns: raw_spec.turns.iter().copied().collect(),
+            waiting: std::collections::VecDeque::new(),
+            cancel_at_turn: raw_spec.cancel_at_turn,
+            cancel_decisions: std::collections::VecDeque::new(),
+        };
         let host: &mut dyn Host = if raw_spec.arithmetic {
-            &mut host
+            &mut scheduled
         } else {
-            &mut host.0
+            &mut plain_scheduled
         };
         if raw_spec.erased {
             let outcome = erased::run(&program, &raw_spec.entry, arguments, host, &raw_spec.config);

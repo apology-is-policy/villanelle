@@ -195,7 +195,11 @@ fn expand_body(
     let mut idx = 0usize;
     while idx < current.len() {
         let is_defined_decide = match &current[idx].command {
-            Command::Decide { operation, .. } => is_expandable_callee(controls, operation),
+            Command::Decide {
+                mode: crate::syntax::CallMode::Sync,
+                operation,
+                ..
+            } => is_expandable_callee(controls, operation),
             _ => false,
         };
         if !is_defined_decide {
@@ -208,6 +212,7 @@ fn expand_body(
         let call_line = call_stmt.line;
         let Command::Decide {
             site: call_site,
+            mode: crate::syntax::CallMode::Sync,
             operation,
             arguments,
             arms: caller_arms,
@@ -468,7 +473,13 @@ fn collect_old_uses(expr: &Expr, len_old: &mut HashSet<String>, val_old: &mut Ha
                 collect_old_uses(a, len_old, val_old);
             }
         }
-        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) | Expr::Name(_) | Expr::EmptyMap => {}
+        Expr::Integer(_)
+        | Expr::Boolean(_)
+        | Expr::String(_)
+        | Expr::Name(_)
+        | Expr::EmptyMap
+        | Expr::TasksEmpty(_)
+        | Expr::Count(_) => {}
     }
 }
 
@@ -893,7 +904,12 @@ fn is_var_used_in_expr(expr: &Expr, name: &str) -> bool {
         | Expr::Struct(_, args)
         | Expr::Variant(_, _, args)
         | Expr::Vector(args) => args.iter().any(|a| is_var_used_in_expr(a, name)),
-        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) | Expr::EmptyMap => false,
+        Expr::Integer(_)
+        | Expr::Boolean(_)
+        | Expr::String(_)
+        | Expr::EmptyMap
+        | Expr::TasksEmpty(_)
+        | Expr::Count(_) => false,
     }
 }
 
@@ -924,6 +940,10 @@ fn is_var_used_in_stmts(stmts: &[Statement], name: &str) -> bool {
         | Command::Again { arguments, .. } => {
             arguments.iter().any(|a| is_var_used_in_expr(a, name))
         }
+        Command::Spawn { arguments, set, .. } => {
+            set == name || arguments.iter().any(|a| is_var_used_in_expr(a, name))
+        }
+        Command::Cancel { set } => set == name,
         Command::Leave { payload, .. } | Command::Exit { payload, .. } => {
             payload.iter().any(|a| is_var_used_in_expr(a, name))
         }
@@ -1226,7 +1246,16 @@ fn subst_and_rename_expr(
     old_exc: Option<(&HashSet<String>, &str)>,
 ) {
     match expr {
-        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) | Expr::EmptyMap => {}
+        Expr::Integer(_)
+        | Expr::Boolean(_)
+        | Expr::String(_)
+        | Expr::EmptyMap
+        | Expr::TasksEmpty(_) => {}
+        Expr::Count(name) => {
+            if let Some(new_name) = var_map.get(name) {
+                *name = new_name.clone();
+            }
+        }
         Expr::Len(inner) => {
             if let Expr::Old(name) = &**inner
                 && let Some((exc_params, prefix)) = old_exc
@@ -1349,12 +1378,14 @@ fn rename_command(
             mutable,
             name,
             ty,
+            mode,
             operation,
             arguments,
         } => Command::Capture {
             mutable: *mutable,
             name: var_map.get(name).cloned().unwrap_or_else(|| name.clone()),
             ty: ty.clone(),
+            mode: *mode,
             operation: operation.clone(),
             arguments: arguments
                 .iter()
@@ -1396,6 +1427,7 @@ fn rename_command(
         }
         Command::Decide {
             site,
+            mode,
             operation,
             arguments,
             arms,
@@ -1421,11 +1453,31 @@ fn rename_command(
                 .collect();
             Command::Decide {
                 site: site_map.get(site).cloned().unwrap_or_else(|| site.clone()),
+                mode: *mode,
                 operation: operation.clone(),
                 arguments: new_args,
                 arms: new_arms,
             }
         }
+        Command::Spawn {
+            control,
+            arguments,
+            set,
+        } => Command::Spawn {
+            control: control.clone(),
+            arguments: arguments
+                .iter()
+                .map(|a| {
+                    let mut c = a.clone();
+                    subst_and_rename_expr(&mut c, var_map, None);
+                    c
+                })
+                .collect(),
+            set: var_map.get(set).cloned().unwrap_or_else(|| set.clone()),
+        },
+        Command::Cancel { set } => Command::Cancel {
+            set: var_map.get(set).cloned().unwrap_or_else(|| set.clone()),
+        },
         Command::Loop {
             site,
             name,

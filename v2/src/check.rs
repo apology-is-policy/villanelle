@@ -189,7 +189,9 @@ fn unfold_functions(program: &Program, expr: &Expr) -> Expr {
         | Expr::String(_)
         | Expr::Var(_, _)
         | Expr::Old(_, _)
-        | Expr::EmptyMap(_) => expr.clone(),
+        | Expr::EmptyMap(_)
+        | Expr::TasksEmpty(_, _)
+        | Expr::Count(_) => expr.clone(),
         Expr::Move(inner, ty) => Expr::Move(Box::new(unfold_functions(program, inner)), ty.clone()),
         Expr::Borrow(mode, place, ty) => {
             Expr::Borrow(*mode, unfold_place(program, place), ty.clone())
@@ -261,7 +263,9 @@ fn subst_parameters(expr: &Expr, args: &[Expr]) -> Expr {
         | Expr::Integer(_, _)
         | Expr::String(_)
         | Expr::Old(_, _)
-        | Expr::EmptyMap(_) => expr.clone(),
+        | Expr::EmptyMap(_)
+        | Expr::TasksEmpty(_, _)
+        | Expr::Count(_) => expr.clone(),
         Expr::Var(VarRef::Parameter(idx), _) => args[*idx].clone(),
         Expr::Var(_, _) => expr.clone(),
         Expr::Move(inner, ty) => Expr::Move(Box::new(subst_parameters(inner, args)), ty.clone()),
@@ -679,6 +683,7 @@ fn translate_term(program: &Program, solver: &mut Solver, expr: &Expr, env: &Env
             solver.instantiate_all();
             LinearTerm::var(id)
         }
+        Expr::TasksEmpty(_, _) | Expr::Count(_) => LinearTerm::from_i128(0),
         Expr::Len(inner) => {
             let bt = translate_term(program, solver, inner, env);
             let id = solver.intern_term(AtomTerm::Len(bt));
@@ -1038,7 +1043,9 @@ fn check_expr_obligations(
         | Expr::String(_)
         | Expr::Var(_, _)
         | Expr::Old(_, _)
-        | Expr::EmptyMap(_) => Ok(()),
+        | Expr::EmptyMap(_)
+        | Expr::TasksEmpty(_, _)
+        | Expr::Count(_) => Ok(()),
         Expr::Move(inner, _)
         | Expr::Field(inner, _, _, _)
         | Expr::Len(inner)
@@ -1407,7 +1414,9 @@ fn check_expr_pure_ownership(
         | Expr::Integer(_, _)
         | Expr::String(_)
         | Expr::Old(_, _)
-        | Expr::EmptyMap(_) => Ok(()),
+        | Expr::EmptyMap(_)
+        | Expr::TasksEmpty(_, _)
+        | Expr::Count(_) => Ok(()),
         Expr::Var(VarRef::Parameter(idx), expr_ty) => {
             if consumed
                 && param_types
@@ -1631,7 +1640,9 @@ fn collect_read_vars(expr: &Expr, out: &mut Vec<VarId>) {
         | Expr::Integer(_, _)
         | Expr::String(_)
         | Expr::Old(_, _)
-        | Expr::EmptyMap(_) => {}
+        | Expr::EmptyMap(_)
+        | Expr::TasksEmpty(_, _) => {}
+        Expr::Count(var) => out.push(*var),
         Expr::Var(VarRef::Local(id), _) => {
             if !out.contains(id) {
                 out.push(*id);
@@ -1775,6 +1786,7 @@ fn find_constant_locals(
         }
         for stmt in &b.statements {
             match &stmt.command {
+                Command::Spawn { .. } | Command::Cancel { .. } => {}
                 Command::Bind { var, value } => {
                     *bind_counts.entry(*var).or_insert(0) += 1;
                     if !matches!(value, Expr::Borrow(BorrowMode::Exclusive, _, _)) {
@@ -2193,7 +2205,9 @@ impl<'a> BodyChecker<'a> {
             | Expr::Integer(_, _)
             | Expr::String(_)
             | Expr::Old(_, _)
-            | Expr::EmptyMap(_) => Ok(()),
+            | Expr::EmptyMap(_)
+            | Expr::TasksEmpty(_, _)
+            | Expr::Count(_) => Ok(()),
             Expr::Var(VarRef::Local(id), _) => {
                 self.check_available(*id, r_i, line, visible_vars, in_loop)
             }
@@ -3235,6 +3249,16 @@ impl<'a> BodyChecker<'a> {
                 .insert((body_id, stmt_idx), visible_vars.clone());
 
             match &statement.command {
+                Command::Spawn { .. } | Command::Cancel { .. } => {
+                    return Err(Error {
+                        control: self.owner_name.clone(),
+                        line,
+                        clause: "TK1",
+                        message: "static checking for Slice 4 tasks is scheduled for Phase 3"
+                            .to_string(),
+                        counterexample: None,
+                    });
+                }
                 Command::Bind { var, value } => {
                     check_expr_obligations(
                         self.program,
@@ -3685,6 +3709,19 @@ impl<'a> BodyChecker<'a> {
 
                     // Check [O0], [F5], [F1]/[F2]/[F6], [F3], [P3] depending on operation kind.
                     match op_kind {
+                        Operation::AwaitControl(_)
+                        | Operation::AwaitNext(_, _)
+                        | Operation::RunControl(_) => {
+                            return Err(Error {
+                                control: self.owner_name.clone(),
+                                line,
+                                clause: "TK1",
+                                message:
+                                    "static checking for Slice 4 tasks is scheduled for Phase 3"
+                                        .to_string(),
+                                counterexample: None,
+                            });
+                        }
                         Operation::Control(cid) => {
                             let callee = &self.program.controls[*cid];
                             if self.in_contingency
@@ -3915,6 +3952,9 @@ impl<'a> BodyChecker<'a> {
                         }
 
                         match op_kind {
+                            Operation::AwaitControl(_)
+                            | Operation::AwaitNext(_, _)
+                            | Operation::RunControl(_) => {}
                             Operation::Control(_) => {
                                 if let Some(cond) = &contract_alt.condition {
                                     let cond_env = Env {
@@ -4847,6 +4887,8 @@ fn max_param_index(expr: &Expr) -> usize {
         | Expr::Integer(_, _)
         | Expr::String(_)
         | Expr::EmptyMap(_)
+        | Expr::TasksEmpty(_, _)
+        | Expr::Count(_)
         | Expr::Var(VarRef::Local(_), _)
         | Expr::Var(VarRef::Field(_), _) => 0,
         Expr::Var(VarRef::Parameter(idx), _) | Expr::Old(idx, _) => *idx + 1,
@@ -5297,7 +5339,11 @@ fn collect_expr_mentions(expr: &Expr, out: &mut HashSet<VarId>) {
         | Expr::Integer(_, _)
         | Expr::String(_)
         | Expr::Old(_, _)
-        | Expr::EmptyMap(_) => {}
+        | Expr::EmptyMap(_)
+        | Expr::TasksEmpty(_, _) => {}
+        Expr::Count(id) => {
+            out.insert(*id);
+        }
         Expr::Var(VarRef::Local(id), _) => {
             out.insert(*id);
         }
@@ -5397,6 +5443,15 @@ fn stmt_direct_mentions(
         }
         Command::Fault { message, .. } => collect_expr_mentions(message, &mut out),
         Command::Terminate(Some(expr)) => collect_expr_mentions(expr, &mut out),
+        Command::Spawn { arguments, set, .. } => {
+            out.insert(*set);
+            for a in arguments {
+                collect_expr_mentions(a, &mut out);
+            }
+        }
+        Command::Cancel { set } => {
+            out.insert(*set);
+        }
         Command::Terminate(None)
         | Command::Escalate
         | Command::Recover { .. }
@@ -5917,7 +5972,9 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
             | Expr::Integer(_, _)
             | Expr::String(_)
             | Expr::Old(_, _)
-            | Expr::EmptyMap(_) => Ok(Vec::new()),
+            | Expr::EmptyMap(_)
+            | Expr::TasksEmpty(_, _)
+            | Expr::Count(_) => Ok(Vec::new()),
             Expr::Var(VarRef::Local(id), expr_ty) => {
                 let var_ty = self.bc.body.vars[*id].ty.clone();
                 if matches!(var_ty, Type::Ref(_, _)) {
@@ -6352,6 +6409,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
         let mut changed = false;
         for stmt in &self.bc.body.bodies[cur_body].statements {
             match &stmt.command {
+                Command::Spawn { .. } | Command::Cancel { .. } => {}
                 Command::Bind { var, value } => {
                     if self
                         .bc
@@ -6609,6 +6667,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
             };
 
             match &stmt.command {
+                Command::Spawn { .. } | Command::Cancel { .. } => {}
                 Command::Bind { var, value } => {
                     let mut temps = Vec::new();
                     let ret = self.eval_loan_expr(value, true, &ctx, &mut temps, line)?;

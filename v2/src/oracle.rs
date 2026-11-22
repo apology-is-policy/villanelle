@@ -13,11 +13,12 @@ use crate::typed::{
     ControlBody, ControlId, Expr, Kind, Operation, OutcomeId, Place, PlaceStep, Program,
     ResourceId, Selector, SiteId, StructId, Type, VarId, VarRef, VariantId,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 
 pub type ScopeId = u64;
 pub type TagId = u64;
+pub type TaskSetId = u64;
 
 /// One concrete step inside a runtime place (`docs/v2/core.md` section 6.1).
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -101,6 +102,7 @@ pub enum Value {
         place: RuntimePlace,
         tag: TagId,
     },
+    TaskSet(TaskSetId),
 }
 
 impl fmt::Display for Value {
@@ -144,6 +146,7 @@ impl fmt::Display for Value {
                 BorrowMode::Shared => write!(formatter, "&ref#{tag}"),
                 BorrowMode::Exclusive => write!(formatter, "&~ref#{tag}"),
             },
+            Value::TaskSet(id) => write!(formatter, "tasks#{id}"),
         }
     }
 }
@@ -387,6 +390,9 @@ fn fail<T>(state: u8, clause: &'static str, detail: impl Into<String>) -> Result
 trait Env {
     fn get(&self, var: VarRef) -> Result<Value, Fail>;
     fn get_old(&self, index: usize) -> Result<Value, Fail>;
+    fn get_task_count(&self, _var: VarId) -> Result<usize, Fail> {
+        fail(10, "E-Formula", "`count` is only available inside a body")
+    }
 }
 
 /// The parameters of a signature and the payload of one alternative.
@@ -625,9 +631,53 @@ struct Activation {
     scopes: Vec<Scope>,
 }
 
+struct TaskSet {
+    owner_task: usize,
+    owner_scope: ScopeId,
+    members: Vec<usize>,
+    done_queue: VecDeque<usize>,
+}
+
+enum TaskState {
+    Ready,
+    WaitingHost {
+        callee: ControlId,
+        arguments: Vec<Value>,
+        concrete_args: Vec<Value>,
+        consumed_resources: Vec<(ResourceId, u64)>,
+    },
+    WaitingNext {
+        set_id: TaskSetId,
+        set_var: VarId,
+        prod_id: ControlId,
+    },
+    WaitingRun,
+    Done {
+        alternative: usize,
+        payload: Vec<Value>,
+    },
+    Stopped,
+}
+
+struct Task {
+    stack: Vec<Activation>,
+    state: TaskState,
+    member_of: Option<TaskSetId>,
+    cancelled: bool,
+    /// Effect allowances inherited from spawning or running ancestor activations ([E-Effect]).
+    parent_allowances: Vec<Vec<String>>,
+}
+
+struct TaskRun {
+    root_task: usize,
+    caller_task: Option<usize>,
+    tasks: Vec<usize>,
+}
+
 fn find_slot_ref<'a>(
     entry_slots: &'a [(VarId, Slot, TagId)],
     stack: &'a [Activation],
+    tasks: &'a [Task],
     place: &RuntimePlace,
 ) -> Option<&'a Slot> {
     if place.scope == 0 {
@@ -647,15 +697,29 @@ fn find_slot_ref<'a>(
             }
         }
     }
+    for task in tasks {
+        for act in task.stack.iter().rev() {
+            for scope in act.scopes.iter().rev() {
+                if scope.id == place.scope {
+                    return scope
+                        .slots
+                        .iter()
+                        .find(|(v, _, _)| *v == place.var)
+                        .map(|(_, s, _)| s);
+                }
+            }
+        }
+    }
     None
 }
 
 fn read_place_from_state(
     entry_slots: &[(VarId, Slot, TagId)],
     stack: &[Activation],
+    tasks: &[Task],
     place: &RuntimePlace,
 ) -> Result<Value, Fail> {
-    let Some(slot) = find_slot_ref(entry_slots, stack, place) else {
+    let Some(slot) = find_slot_ref(entry_slots, stack, tasks, place) else {
         return fail(4, "B1", "borrow refers to a scope that has ended");
     };
     let Slot::Available(mut current) = slot.clone() else {
@@ -723,17 +787,18 @@ fn read_place_from_state(
 fn deref_value_formula(
     entry_slots: &[(VarId, Slot, TagId)],
     stack: &[Activation],
+    tasks: &[Task],
     value: &Value,
 ) -> Result<Value, Fail> {
     match value {
         Value::Ref { place, .. } => {
-            let inner = read_place_from_state(entry_slots, stack, place)?;
-            deref_value_formula(entry_slots, stack, &inner)
+            let inner = read_place_from_state(entry_slots, stack, tasks, place)?;
+            deref_value_formula(entry_slots, stack, tasks, &inner)
         }
         Value::Struct { ty, name, fields } => {
             let mut out = Vec::with_capacity(fields.len());
             for f in fields {
-                out.push(deref_value_formula(entry_slots, stack, f)?);
+                out.push(deref_value_formula(entry_slots, stack, tasks, f)?);
             }
             Ok(Value::Struct {
                 ty: *ty,
@@ -750,7 +815,7 @@ fn deref_value_formula(
         } => {
             let mut out = Vec::with_capacity(fields.len());
             for f in fields {
-                out.push(deref_value_formula(entry_slots, stack, f)?);
+                out.push(deref_value_formula(entry_slots, stack, tasks, f)?);
             }
             Ok(Value::Variant {
                 ty: *ty,
@@ -768,6 +833,8 @@ struct ActivationEnv<'a> {
     body: &'a ControlBody,
     entry_slots: &'a [(VarId, Slot, TagId)],
     stack: &'a [Activation],
+    tasks: &'a [Task],
+    task_sets: &'a [TaskSet],
 }
 
 impl Env for ActivationEnv<'_> {
@@ -781,7 +848,7 @@ impl Env for ActivationEnv<'_> {
             if let Some((_, slot, _)) = scope.slots.iter().find(|(slot, _, _)| *slot == id) {
                 return match slot {
                     Slot::Available(value) => {
-                        deref_value_formula(self.entry_slots, self.stack, value)
+                        deref_value_formula(self.entry_slots, self.stack, self.tasks, value)
                     }
                     Slot::Moved => fail(
                         2,
@@ -807,6 +874,36 @@ impl Env for ActivationEnv<'_> {
             Some(v) => Ok(v.clone()),
             None => fail(10, "E-Formula", "no entry argument for `old`"),
         }
+    }
+
+    fn get_task_count(&self, var: VarId) -> Result<usize, Fail> {
+        let activation = self.stack.last().expect("an activation");
+        for scope in activation.scopes.iter().rev() {
+            if let Some((_, slot, _)) = scope.slots.iter().find(|(s, _, _)| *s == var) {
+                return match slot {
+                    Slot::Available(Value::TaskSet(set_id)) => {
+                        Ok(self.task_sets[*set_id as usize].members.len())
+                    }
+                    Slot::Available(_) => fail(10, "E-Formula", "non-task-set in `count`"),
+                    Slot::Moved => fail(
+                        2,
+                        "E-Var",
+                        format!(
+                            "`{}` has been moved on this history",
+                            self.body.vars[var].name
+                        ),
+                    ),
+                };
+            }
+        }
+        fail(
+            2,
+            "E-Var",
+            format!(
+                "`{}` has no value on this history",
+                self.body.vars[var].name
+            ),
+        )
     }
 }
 
@@ -1071,6 +1168,10 @@ impl Evaluator<'_> {
                 }
                 self.value(&function.body, &inner)?
             }
+            Expr::TasksEmpty(_, _) => {
+                return fail(10, "E-Fn", "`tasks⟨f⟩()` cannot be evaluated in a function");
+            }
+            Expr::Count(var) => Value::Int(Int::from_u64(env.get_task_count(*var)? as u64)),
         })
     }
 
@@ -1213,6 +1314,8 @@ impl Evaluator<'_> {
                 };
                 self.term(&self.program.functions[*id].body, &inner)?
             }
+            Expr::TasksEmpty(_, _) => Value::TaskSet(0),
+            Expr::Count(var) => Value::Int(Int::from_u64(env.get_task_count(*var)? as u64)),
         })
     }
 
@@ -1288,6 +1391,12 @@ struct Machine<'a> {
     tags: TagTable,
     next_scope_id: ScopeId,
     stack: Vec<Activation>,
+    tasks: Vec<Task>,
+    task_sets: Vec<TaskSet>,
+    runs: Vec<TaskRun>,
+    current_task: usize,
+    has_turn: bool,
+    turns_taken: u64,
     trace: Vec<Event>,
     steps: u64,
     rules: BTreeMap<&'static str, u64>,
@@ -1324,7 +1433,11 @@ fn collect_resources(value: &Value, out: &mut Vec<(ResourceId, u64)>) {
                 collect_resources(v, out);
             }
         }
-        Value::Bool(_) | Value::Int(_) | Value::String(_) | Value::Ref { .. } => {}
+        Value::Bool(_)
+        | Value::Int(_)
+        | Value::String(_)
+        | Value::Ref { .. }
+        | Value::TaskSet(_) => {}
     }
 }
 
@@ -1374,13 +1487,14 @@ impl<'a> Machine<'a> {
             .expect("a scope")
     }
 
-    /// Whether `value` contains an open resource or a captured outcome ([6.8]).
+    /// Whether `value` contains an open resource, captured outcome, or non-empty task set ([6.8]).
     fn contains_obligation(&self, value: &Value) -> bool {
         match value {
             Value::Resource { ty, id, .. } => {
                 self.resources.get(&(*ty, *id)).copied().unwrap_or(false)
             }
             Value::Outcome { .. } => true,
+            Value::TaskSet(set_id) => !self.task_sets[*set_id as usize].members.is_empty(),
             Value::Struct { fields, .. }
             | Value::Variant { fields, .. }
             | Value::Vector(fields) => fields.iter().any(|f| self.contains_obligation(f)),
@@ -1420,11 +1534,11 @@ impl<'a> Machine<'a> {
     }
 
     fn read_place(&self, place: &RuntimePlace) -> Result<Value, Fail> {
-        read_place_from_state(&self.entry_slots, &self.stack, place)
+        read_place_from_state(&self.entry_slots, &self.stack, &self.tasks, place)
     }
 
     fn deref_formula(&self, value: &Value) -> Result<Value, Fail> {
-        deref_value_formula(&self.entry_slots, &self.stack, value)
+        deref_value_formula(&self.entry_slots, &self.stack, &self.tasks, value)
     }
 
     /// Recursively materializes any `Value::Ref` by performing a `[B1]` read
@@ -1502,6 +1616,19 @@ impl<'a> Machine<'a> {
                         .iter_mut()
                         .find(|(v, _, _)| *v == var)
                         .map(|(_, s, _)| s);
+                }
+            }
+        }
+        for task in &mut self.tasks {
+            for act in task.stack.iter_mut().rev() {
+                for scope in act.scopes.iter_mut().rev() {
+                    if scope.id == scope_id {
+                        return scope
+                            .slots
+                            .iter_mut()
+                            .find(|(v, _, _)| *v == var)
+                            .map(|(_, s, _)| s);
+                    }
                 }
             }
         }
@@ -1676,7 +1803,9 @@ impl<'a> Machine<'a> {
         check_replaced_obligation: bool,
     ) -> Result<(), Fail> {
         self.access_tag(tag, place, true)?;
-        let Some(slot_clone) = find_slot_ref(&self.entry_slots, &self.stack, place).cloned() else {
+        let Some(slot_clone) =
+            find_slot_ref(&self.entry_slots, &self.stack, &self.tasks, place).cloned()
+        else {
             return fail(4, "B1", "assignment target scope has ended");
         };
         if place.steps.is_empty() {
@@ -2030,6 +2159,31 @@ impl<'a> Machine<'a> {
                 }
                 self.evaluator().value(&function.body, &inner)?
             }
+            Expr::TasksEmpty(_, _) => {
+                let owner_scope = self.scope().id;
+                let set_id = self.task_sets.len() as TaskSetId;
+                self.task_sets.push(TaskSet {
+                    owner_task: self.current_task,
+                    owner_scope,
+                    members: Vec::new(),
+                    done_queue: VecDeque::new(),
+                });
+                Value::TaskSet(set_id)
+            }
+            Expr::Count(var) => {
+                let (scope_id, slot, owner_tag) = self.find_local_slot(*var)?;
+                let Slot::Available(Value::TaskSet(set_id)) = slot else {
+                    let var_name = &self.body().vars[*var].name;
+                    return fail(
+                        2,
+                        "E-Var",
+                        format!("`{var_name}` has been moved on this history"),
+                    );
+                };
+                self.access_tag(owner_tag, &RuntimePlace::root(scope_id, *var), false)?;
+                let count = self.task_sets[set_id as usize].members.len() as u64;
+                Value::Int(Int::from_u64(count))
+            }
         };
         // [E-Temp]: A temporary value that was read and not consumed is
         // destroyed when its reader is done; if it contains an obligation, stuck.
@@ -2069,6 +2223,8 @@ impl<'a> Machine<'a> {
             body: self.body(),
             entry_slots: &self.entry_slots,
             stack: &self.stack,
+            tasks: &self.tasks,
+            task_sets: &self.task_sets,
         };
         self.evaluator().holds(formula, &env)
     }
@@ -2130,16 +2286,20 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
-    /// [E-Unwind]: releases fault-releasable obligations in `value` and gets
-    /// stuck with X8 on any open resource not declared `on fault release`.
-    fn unwind_value(&mut self, value: &Value) -> Result<(), Fail> {
+    /// [E-Unwind] / [E-Stop]: releases fault-releasable obligations in `value`
+    /// and gets stuck with X8 on any open resource not declared `on fault release`.
+    fn unwind_value_with_clause(
+        &mut self,
+        value: &Value,
+        clause: &'static str,
+    ) -> Result<(), Fail> {
         match value {
             Value::Resource { ty, name, id } => {
                 if self.resources.get(&(*ty, *id)).copied().unwrap_or(false) {
                     if !self.program.resources[*ty].on_fault_release {
                         return fail(
                             8,
-                            "E-Unwind",
+                            clause,
                             format!(
                                 "open resource `{name}#{id}` is not declared `on fault release`"
                             ),
@@ -2155,9 +2315,10 @@ impl<'a> Machine<'a> {
                 }
                 Ok(())
             }
+            Value::TaskSet(set_id) => self.stop_task_set(*set_id),
             Value::Outcome { payload, .. } => {
                 for item in payload {
-                    self.unwind_value(item)?;
+                    self.unwind_value_with_clause(item, clause)?;
                 }
                 Ok(())
             }
@@ -2165,14 +2326,14 @@ impl<'a> Machine<'a> {
             | Value::Variant { fields, .. }
             | Value::Vector(fields) => {
                 for item in fields {
-                    self.unwind_value(item)?;
+                    self.unwind_value_with_clause(item, clause)?;
                 }
                 Ok(())
             }
             Value::Map(entries) => {
                 for (k, v) in entries {
-                    self.unwind_value(k)?;
-                    self.unwind_value(v)?;
+                    self.unwind_value_with_clause(k, clause)?;
+                    self.unwind_value_with_clause(v, clause)?;
                 }
                 Ok(())
             }
@@ -2180,14 +2341,185 @@ impl<'a> Machine<'a> {
         }
     }
 
-    fn unwind_scope(&mut self, scope: &Scope) -> Result<(), Fail> {
+    fn unwind_scope_with_clause(
+        &mut self,
+        scope: &Scope,
+        clause: &'static str,
+        release_boundary_captures: bool,
+    ) -> Result<(), Fail> {
         for (_, slot, owner_tag) in scope.slots.iter().rev() {
             if let Slot::Available(val) = slot {
-                self.unwind_value(val)?;
+                self.unwind_value_with_clause(val, clause)?;
             }
             self.tags.kill_with_descendants(*owner_tag);
         }
-        self.count("E-Unwind");
+        if release_boundary_captures
+            && let ScopeKind::LexicalBoundary { captures, .. } = &scope.kind
+        {
+            for val in captures {
+                self.unwind_value_with_clause(val, clause)?;
+            }
+        }
+        self.count(clause);
+        Ok(())
+    }
+
+    fn unwind_scope(&mut self, scope: &Scope) -> Result<(), Fail> {
+        self.unwind_scope_with_clause(scope, "E-Unwind", false)
+    }
+
+    /// [E-Stop]: stops one activation, ending all of its scopes innermost first
+    /// (including boundary captures) without running contingencies or checking `faults`.
+    fn stop_activation(&mut self, mut act: Activation) -> Result<(), Fail> {
+        while let Some(scope) = act.scopes.pop() {
+            self.unwind_scope_with_clause(&scope, "E-Stop", true)?;
+        }
+        Ok(())
+    }
+
+    /// [E-Stop]: stops a task, withdrawing any waiting host operation, releasing
+    /// any `Done` payload, and stopping all of its activations last-first.
+    fn stop_task(&mut self, tid: usize) -> Result<(), Fail> {
+        let prev_state = std::mem::replace(&mut self.tasks[tid].state, TaskState::Stopped);
+        match prev_state {
+            TaskState::WaitingHost {
+                callee,
+                concrete_args,
+                ..
+            } => {
+                // Withdrawn host operation has no completion and no event; release by-value args.
+                let param_is_ref: Vec<bool> = self.program.controls[callee]
+                    .parameters
+                    .iter()
+                    .map(|p| matches!(p.ty, Type::Ref(_, _)))
+                    .collect();
+                for (arg, is_ref) in concrete_args.iter().zip(param_is_ref) {
+                    if !is_ref {
+                        self.unwind_value_with_clause(arg, "E-Stop")?;
+                    }
+                }
+            }
+            TaskState::Done { payload, .. } => {
+                for val in &payload {
+                    self.unwind_value_with_clause(val, "E-Stop")?;
+                }
+            }
+            TaskState::Stopped => return Ok(()),
+            TaskState::Ready | TaskState::WaitingNext { .. } | TaskState::WaitingRun => {}
+        }
+        let mut stack = std::mem::take(&mut self.tasks[tid].stack);
+        while let Some(act) = stack.pop() {
+            self.stop_activation(act)?;
+        }
+        self.count("E-Stop");
+        Ok(())
+    }
+
+    /// [E-Stop]: stops every member of task set `set_id`.
+    fn stop_task_set(&mut self, set_id: TaskSetId) -> Result<(), Fail> {
+        let members = std::mem::take(&mut self.task_sets[set_id as usize].members);
+        self.task_sets[set_id as usize].done_queue.clear();
+        for mid in members {
+            self.stop_task(mid)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `tid` is effectively cancelled ([E-Cancel]): its own flag is set,
+    /// its owner task is cancelled, or the caller of its nested run is cancelled.
+    fn is_task_cancelled(&self, mut tid: usize) -> bool {
+        loop {
+            if self.tasks[tid].cancelled {
+                return true;
+            }
+            if let Some(set_id) = self.tasks[tid].member_of {
+                tid = self.task_sets[set_id as usize].owner_task;
+                continue;
+            }
+            if let Some(run) = self.runs.iter().find(|r| r.root_task == tid)
+                && let Some(caller) = run.caller_task
+            {
+                tid = caller;
+                continue;
+            }
+            return false;
+        }
+    }
+
+    /// Snapshot of effect allowances currently active on the call stack and
+    /// spawning/running ancestor chain ([E-Effect]).
+    fn collect_allowances(&self) -> Vec<Vec<String>> {
+        let mut out = self.tasks[self.current_task].parent_allowances.clone();
+        for act in &self.stack {
+            if let ActivationKind::Control(cid) = act.kind {
+                out.push(self.program.controls[cid].uses.clone());
+            }
+        }
+        out
+    }
+
+    fn park_current(&mut self, state: TaskState) {
+        let tid = self.current_task;
+        self.tasks[tid].stack = std::mem::take(&mut self.stack);
+        self.tasks[tid].state = state;
+        self.has_turn = false;
+    }
+
+    fn activate_task(&mut self, tid: usize) {
+        self.stack = std::mem::take(&mut self.tasks[tid].stack);
+        self.tasks[tid].state = TaskState::Ready;
+        self.current_task = tid;
+        self.has_turn = true;
+    }
+
+    /// Withdraws any `WaitingHost` cancellable operation in the innermost run
+    /// whose task is now effectively cancelled ([E-Cancel], [E-AwaitHost]).
+    fn withdraw_cancelled_host_waits(&mut self) -> Result<(), Fail> {
+        let run_tasks = self.runs.last().expect("a run").tasks.clone();
+        for tid in run_tasks {
+            let is_waiting_cancellable = matches!(
+                self.tasks[tid].state,
+                TaskState::WaitingHost { callee, .. } if self.program.controls[callee].is_cancellable()
+            );
+            if !is_waiting_cancellable || !self.is_task_cancelled(tid) {
+                continue;
+            }
+            let prev = std::mem::replace(&mut self.tasks[tid].state, TaskState::Ready);
+            let TaskState::WaitingHost {
+                callee,
+                concrete_args,
+                ..
+            } = prev
+            else {
+                unreachable!();
+            };
+            let param_is_ref: Vec<bool> = self.program.controls[callee]
+                .parameters
+                .iter()
+                .map(|p| matches!(p.ty, Type::Ref(_, _)))
+                .collect();
+            for (arg, is_ref) in concrete_args.iter().zip(param_is_ref) {
+                if !is_ref {
+                    self.unwind_value_with_clause(arg, "E-Unwind")?;
+                }
+            }
+            let cancel_idx = self.program.controls[callee]
+                .contract
+                .iter()
+                .position(|a| a.name == "cancelled")
+                .expect("cancellable control has `cancelled`");
+            // Temporarily swap `tid`'s stack in to complete its waiting decision/capture.
+            let saved_stack = std::mem::take(&mut self.stack);
+            let saved_tid = self.current_task;
+            self.stack = std::mem::take(&mut self.tasks[tid].stack);
+            self.current_task = tid;
+            let res = self.complete(cancel_idx, Vec::new());
+            self.tasks[tid].stack = std::mem::take(&mut self.stack);
+            self.stack = saved_stack;
+            self.current_task = saved_tid;
+            res?;
+            self.count("E-AwaitHost");
+        }
         Ok(())
     }
 
@@ -2264,6 +2596,91 @@ impl<'a> Machine<'a> {
             // Pop activation.
             let _popped = self.stack.pop().expect("an activation");
             if self.stack.is_empty() {
+                let cur = self.current_task;
+                if let Some(set_id) = self.tasks[cur].member_of {
+                    // [E-MemberFault]: remove member and deliver fault to the owner activation `A`.
+                    self.tasks[cur].state = TaskState::Stopped;
+                    self.task_sets[set_id as usize]
+                        .members
+                        .retain(|&m| m != cur);
+                    self.task_sets[set_id as usize]
+                        .done_queue
+                        .retain(|&m| m != cur);
+                    let owner_task = self.task_sets[set_id as usize].owner_task;
+                    let owner_scope = self.task_sets[set_id as usize].owner_scope;
+                    self.count("E-MemberFault");
+
+                    // If the owner task was waiting on a host operation, withdraw it ([E-Stop]).
+                    if let TaskState::WaitingHost {
+                        callee,
+                        concrete_args,
+                        ..
+                    } = std::mem::replace(&mut self.tasks[owner_task].state, TaskState::Ready)
+                    {
+                        let param_is_ref: Vec<bool> = self.program.controls[callee]
+                            .parameters
+                            .iter()
+                            .map(|p| matches!(p.ty, Type::Ref(_, _)))
+                            .collect();
+                        for (arg, is_ref) in concrete_args.iter().zip(param_is_ref) {
+                            if !is_ref {
+                                self.unwind_value_with_clause(arg, "E-Stop")?;
+                            }
+                        }
+                    }
+
+                    self.activate_task(owner_task);
+                    let owner_act_idx = self
+                        .stack
+                        .iter()
+                        .position(|act| act.scopes.iter().any(|s| s.id == owner_scope))
+                        .expect("owner scope still in owner task stack");
+                    // Stop every activation above `A` ([E-Stop]).
+                    while self.stack.len() > owner_act_idx + 1 {
+                        let above = self.stack.pop().expect("activation above owner");
+                        self.stop_activation(above)?;
+                    }
+                    self.locate();
+                    if !self.current_permits_faults() {
+                        let owner_name = self.current_name();
+                        return fail(
+                            8,
+                            "E-Unwind",
+                            format!(
+                                "a member fault reached `{owner_name}`, which does not permit `faults` and has no enclosing boundary"
+                            ),
+                        );
+                    }
+                    return self.trigger_unwind(message);
+                }
+
+                // Root of a nested `run`: propagate the fault to the caller waiting at `run` ([E-Run]).
+                if self.runs.len() > 1 {
+                    let finished_run = self.runs.pop().expect("nested run");
+                    self.tasks[cur].state = TaskState::Stopped;
+                    let caller = finished_run.caller_task.expect("nested run has caller");
+                    self.activate_task(caller);
+                    self.locate();
+                    if let ActivationKind::Boundary {
+                        id,
+                        in_contingency: None,
+                    } = self.stack.last().expect("an activation").kind
+                    {
+                        return self.enter_named_contingency(id, message);
+                    }
+                    if !self.current_permits_faults() {
+                        let caller_name = self.current_name();
+                        return fail(
+                            8,
+                            "E-Unwind",
+                            format!(
+                                "a fault from `run` reached `{caller_name}`, which does not permit `faults` and has no enclosing boundary"
+                            ),
+                        );
+                    }
+                    return self.trigger_unwind(message);
+                }
+
                 self.count("E-Root");
                 return Ok(Some(End::Faulted(message)));
             }
@@ -2611,6 +3028,17 @@ impl<'a> Machine<'a> {
                             ),
                         );
                     }
+                }
+            }
+            for allowed in &self.tasks[self.current_task].parent_allowances {
+                if !allowed.contains(effect) {
+                    return fail(
+                        9,
+                        "E-Effect",
+                        format!(
+                            "`{callee_name}` has the effect `{effect}`, which an enclosing task activation does not allow"
+                        ),
+                    );
                 }
             }
         }
@@ -3050,6 +3478,237 @@ impl<'a> Machine<'a> {
                 self.count("E-Call");
                 Ok(None)
             }
+            Operation::AwaitControl(callee_id) => {
+                let arg_values = self.eval_operands(arguments)?;
+                let callee = &self.program.controls[*callee_id];
+                if callee.body.is_none() {
+                    // [E-AwaitHost]: check precondition, effects, and resources before waiting or cancelling.
+                    let mut concrete_args = Vec::with_capacity(arg_values.len());
+                    for arg in &arg_values {
+                        concrete_args.push(self.deref_checked(arg)?);
+                    }
+                    let callee = &self.program.controls[*callee_id];
+                    if let Some(precondition) = &callee.precondition {
+                        let env = SignatureEnv {
+                            parameters: &concrete_args,
+                            old_parameters: &concrete_args,
+                            fields: &[],
+                        };
+                        if !self.evaluator().holds(precondition, &env)? {
+                            return fail(
+                                7,
+                                "E-Extern",
+                                format!(
+                                    "the precondition of `{}` is false for ({})",
+                                    callee.name,
+                                    list(&concrete_args)
+                                ),
+                            );
+                        }
+                    }
+                    self.check_effects(&callee.uses, &callee.name)?;
+                    let mut consumed_resources = Vec::new();
+                    for (arg, param) in concrete_args.iter().zip(&callee.parameters) {
+                        let mut arg_res = Vec::new();
+                        collect_resources(arg, &mut arg_res);
+                        for &(rid, handle_id) in &arg_res {
+                            if !self
+                                .resources
+                                .get(&(rid, handle_id))
+                                .copied()
+                                .unwrap_or(false)
+                            {
+                                return fail(
+                                    5,
+                                    "E-Resource",
+                                    format!(
+                                        "resource `{}#{handle_id}` passed to `{}` is not open",
+                                        self.program.resources[rid].name, callee.name
+                                    ),
+                                );
+                            }
+                        }
+                        if !matches!(param.ty, Type::Ref(_, _)) {
+                            consumed_resources.extend(arg_res);
+                        }
+                    }
+                    let is_cancellable = callee.is_cancellable();
+                    if self.is_task_cancelled(self.current_task) && is_cancellable {
+                        let param_is_ref: Vec<bool> = callee
+                            .parameters
+                            .iter()
+                            .map(|p| matches!(p.ty, Type::Ref(_, _)))
+                            .collect();
+                        for (arg, is_ref) in concrete_args.iter().zip(param_is_ref) {
+                            if !is_ref {
+                                self.unwind_value_with_clause(arg, "E-Unwind")?;
+                            }
+                        }
+                        let cancel_idx = self.program.controls[*callee_id]
+                            .contract
+                            .iter()
+                            .position(|a| a.name == "cancelled")
+                            .expect("cancellable control has `cancelled`");
+                        self.complete(cancel_idx, Vec::new())?;
+                        self.park_current(TaskState::Ready);
+                        self.count("E-AwaitHost");
+                        return Ok(None);
+                    }
+                    self.park_current(TaskState::WaitingHost {
+                        callee: *callee_id,
+                        arguments: arg_values,
+                        concrete_args,
+                        consumed_resources,
+                    });
+                    self.count("E-AwaitHost");
+                    return Ok(None);
+                }
+                // [E-Await]: defined async control — bind parameters in the same task and give up turn.
+                let mut entry_snapshots = Vec::with_capacity(arg_values.len());
+                for v in &arg_values {
+                    entry_snapshots.push(self.deref_formula(v)?);
+                }
+                if let Some(precondition) = &callee.precondition {
+                    let env = SignatureEnv {
+                        parameters: &entry_snapshots,
+                        old_parameters: &entry_snapshots,
+                        fields: &[],
+                    };
+                    if !self.evaluator().holds(precondition, &env)? {
+                        return fail(
+                            7,
+                            "E-Call",
+                            format!(
+                                "the precondition of `{}` is false for ({})",
+                                callee.name,
+                                list(&entry_snapshots)
+                            ),
+                        );
+                    }
+                }
+                self.push_control(*callee_id, arg_values, entry_snapshots);
+                self.park_current(TaskState::Ready);
+                self.count("E-Await");
+                Ok(None)
+            }
+            Operation::AwaitNext(set_var, prod_id) => {
+                let (scope_id, slot, owner_tag) = self.find_local_slot(*set_var)?;
+                let Slot::Available(Value::TaskSet(set_id)) = slot else {
+                    let var_name = &self.body().vars[*set_var].name;
+                    return fail(
+                        2,
+                        "E-Var",
+                        format!("`{var_name}` has been moved on this history"),
+                    );
+                };
+                self.access_tag(owner_tag, &RuntimePlace::root(scope_id, *set_var), true)?;
+                self.park_current(TaskState::WaitingNext {
+                    set_id,
+                    set_var: *set_var,
+                    prod_id: *prod_id,
+                });
+                self.count("E-Next");
+                Ok(None)
+            }
+            Operation::RunControl(callee_id) => {
+                let arg_values = self.eval_operands(arguments)?;
+                let callee = &self.program.controls[*callee_id];
+                if callee.body.is_none() {
+                    // Running an `extern async control` directly via `run f(ō)` ([E-Run], [E-Cancel]).
+                    let mut concrete_args = Vec::with_capacity(arg_values.len());
+                    for arg in &arg_values {
+                        concrete_args.push(self.deref_checked(arg)?);
+                    }
+                    let callee = &self.program.controls[*callee_id];
+                    if let Some(precondition) = &callee.precondition {
+                        let env = SignatureEnv {
+                            parameters: &concrete_args,
+                            old_parameters: &concrete_args,
+                            fields: &[],
+                        };
+                        if !self.evaluator().holds(precondition, &env)? {
+                            return fail(
+                                7,
+                                "E-Extern",
+                                format!(
+                                    "the precondition of `{}` is false for ({})",
+                                    callee.name,
+                                    list(&concrete_args)
+                                ),
+                            );
+                        }
+                    }
+                    self.check_effects(&callee.uses, &callee.name)?;
+                    let is_cancellable = callee.is_cancellable();
+                    if self.is_task_cancelled(self.current_task) && is_cancellable {
+                        let param_is_ref: Vec<bool> = callee
+                            .parameters
+                            .iter()
+                            .map(|p| matches!(p.ty, Type::Ref(_, _)))
+                            .collect();
+                        for (arg, is_ref) in concrete_args.iter().zip(param_is_ref) {
+                            if !is_ref {
+                                self.unwind_value_with_clause(arg, "E-Unwind")?;
+                            }
+                        }
+                        let cancel_idx = self.program.controls[*callee_id]
+                            .contract
+                            .iter()
+                            .position(|a| a.name == "cancelled")
+                            .expect("cancellable control has `cancelled`");
+                        self.count("E-Run");
+                        return Ok(Some(Answered::Completed(cancel_idx, Vec::new())));
+                    }
+                    self.count("E-Run");
+                    return Ok(Some(self.external(*callee_id, arg_values)?));
+                }
+                // Defined `async control` started as a nested run ([E-Run]).
+                let mut entry_snapshots = Vec::with_capacity(arg_values.len());
+                for v in &arg_values {
+                    entry_snapshots.push(self.deref_formula(v)?);
+                }
+                if let Some(precondition) = &callee.precondition {
+                    let env = SignatureEnv {
+                        parameters: &entry_snapshots,
+                        old_parameters: &entry_snapshots,
+                        fields: &[],
+                    };
+                    if !self.evaluator().holds(precondition, &env)? {
+                        return fail(
+                            7,
+                            "E-Call",
+                            format!(
+                                "the precondition of `{}` is false for ({})",
+                                callee.name,
+                                list(&entry_snapshots)
+                            ),
+                        );
+                    }
+                }
+                let caller = self.current_task;
+                let allowances = self.collect_allowances();
+                self.park_current(TaskState::WaitingRun);
+                let root_id = self.tasks.len();
+                let root_act =
+                    self.make_control_activation(*callee_id, arg_values, entry_snapshots);
+                self.tasks.push(Task {
+                    stack: Vec::new(),
+                    state: TaskState::Ready,
+                    member_of: None,
+                    cancelled: false,
+                    parent_allowances: allowances,
+                });
+                self.runs.push(TaskRun {
+                    root_task: root_id,
+                    caller_task: Some(caller),
+                    tasks: vec![root_id],
+                });
+                self.stack = vec![root_act];
+                self.current_task = root_id;
+                self.has_turn = true;
+                self.count("E-Run");
+                Ok(None)
+            }
             Operation::Builtin { op, target, .. } => {
                 let (alt, payload) = self.execute_builtin(*op, target.as_ref(), arguments)?;
                 Ok(Some(Answered::Completed(alt, payload)))
@@ -3335,6 +3994,80 @@ impl<'a> Machine<'a> {
                 });
                 self.count("E-Supervise");
             }
+            Command::Spawn {
+                control,
+                arguments,
+                set,
+            } => {
+                let arg_values = self.eval_operands(arguments)?;
+                let (scope_id, slot, owner_tag) = self.find_local_slot(*set)?;
+                let Slot::Available(Value::TaskSet(set_id)) = slot else {
+                    let var_name = &self.body().vars[*set].name;
+                    return fail(
+                        2,
+                        "E-Var",
+                        format!("`{var_name}` has been moved on this history"),
+                    );
+                };
+                self.access_tag(owner_tag, &RuntimePlace::root(scope_id, *set), true)?;
+                let mut entry_snapshots = Vec::with_capacity(arg_values.len());
+                for v in &arg_values {
+                    entry_snapshots.push(self.deref_formula(v)?);
+                }
+                let callee = &self.program.controls[*control];
+                if let Some(precondition) = &callee.precondition {
+                    let env = SignatureEnv {
+                        parameters: &entry_snapshots,
+                        old_parameters: &entry_snapshots,
+                        fields: &[],
+                    };
+                    if !self.evaluator().holds(precondition, &env)? {
+                        return fail(
+                            7,
+                            "E-Spawn",
+                            format!(
+                                "the precondition of `{}` is false for ({})",
+                                callee.name,
+                                list(&entry_snapshots)
+                            ),
+                        );
+                    }
+                }
+                let allowances = self.collect_allowances();
+                let member_act =
+                    self.make_control_activation(*control, arg_values, entry_snapshots);
+                let tid = self.tasks.len();
+                self.tasks.push(Task {
+                    stack: vec![member_act],
+                    state: TaskState::Ready,
+                    member_of: Some(set_id),
+                    cancelled: false,
+                    parent_allowances: allowances,
+                });
+                self.task_sets[set_id as usize].members.push(tid);
+                self.runs.last_mut().expect("a run").tasks.push(tid);
+                self.scope().pc += 1;
+                self.count("E-Spawn");
+            }
+            Command::Cancel { set } => {
+                let (scope_id, slot, owner_tag) = self.find_local_slot(*set)?;
+                let Slot::Available(Value::TaskSet(set_id)) = slot else {
+                    let var_name = &self.body().vars[*set].name;
+                    return fail(
+                        2,
+                        "E-Var",
+                        format!("`{var_name}` has been moved on this history"),
+                    );
+                };
+                self.access_tag(owner_tag, &RuntimePlace::root(scope_id, *set), false)?;
+                let members = self.task_sets[set_id as usize].members.clone();
+                for mid in members {
+                    self.tasks[mid].cancelled = true;
+                }
+                self.withdraw_cancelled_host_waits()?;
+                self.scope().pc += 1;
+                self.count("E-Cancel");
+            }
             Command::Again {
                 body: target,
                 arguments,
@@ -3443,6 +4176,29 @@ impl<'a> Machine<'a> {
                 let _popped = self.stack.pop().expect("an activation");
                 self.count("E-Exit");
                 if self.stack.is_empty() {
+                    let cur = self.current_task;
+                    if let Some(set_id) = self.tasks[cur].member_of {
+                        // [E-Done]: member finishes and keeps payload until `[E-Next]`.
+                        self.tasks[cur].state = TaskState::Done {
+                            alternative: *alternative,
+                            payload: values,
+                        };
+                        self.task_sets[set_id as usize].done_queue.push_back(cur);
+                        self.has_turn = false;
+                        self.count("E-Done");
+                        return Ok(None);
+                    }
+                    if self.runs.len() > 1 {
+                        // Nested `run` root finishes: deliver outcome to caller waiting at `run` ([E-Run]).
+                        let finished_run = self.runs.pop().expect("nested run");
+                        self.tasks[cur].state = TaskState::Stopped;
+                        let caller = finished_run.caller_task.expect("nested run has caller");
+                        self.activate_task(caller);
+                        self.locate();
+                        self.complete(*alternative, values)?;
+                        self.count("E-Done");
+                        return Ok(None);
+                    }
                     // Materialize final observable payload after scope-end tag kills
                     // so returning a dangling borrow of a local triggers X4 B1.
                     let mut observable = Vec::with_capacity(values.len());
@@ -3630,12 +4386,12 @@ impl<'a> Machine<'a> {
         Ok(None)
     }
 
-    fn push_control(
+    fn make_control_activation(
         &mut self,
         control: ControlId,
         arguments: Vec<Value>,
         entry_snapshots: Vec<Value>,
-    ) {
+    ) -> Activation {
         let scope_id = self.alloc_scope_id();
         let mut slots = Vec::with_capacity(arguments.len());
         for (i, v) in arguments.into_iter().enumerate() {
@@ -3650,11 +4406,307 @@ impl<'a> Machine<'a> {
             history: Vec::new(),
             kind: ScopeKind::Normal,
         };
-        self.stack.push(Activation {
+        Activation {
             kind: ActivationKind::Control(control),
             arguments: entry_snapshots,
             scopes: vec![scope],
-        });
+        }
+    }
+
+    fn push_control(
+        &mut self,
+        control: ControlId,
+        arguments: Vec<Value>,
+        entry_snapshots: Vec<Value>,
+    ) {
+        let act = self.make_control_activation(control, arguments, entry_snapshots);
+        self.stack.push(act);
+    }
+
+    /// Completes one `WaitingHost` task chosen by the host ([E-Turn], [E-AwaitHost]).
+    fn complete_waiting_host(&mut self, tid: usize) -> Result<Option<End>, Fail> {
+        let prev = std::mem::replace(&mut self.tasks[tid].state, TaskState::Ready);
+        let TaskState::WaitingHost {
+            callee,
+            arguments,
+            concrete_args,
+            consumed_resources,
+        } = prev
+        else {
+            unreachable!();
+        };
+        // Swap `tid`'s stack in so `deref_formula`, `complete`, and `locate` see `tid`.
+        self.stack = std::mem::take(&mut self.tasks[tid].stack);
+        self.current_task = tid;
+        self.locate();
+
+        let callee_ctrl = &self.program.controls[callee];
+        let answer = match self.host.call(callee_ctrl, &concrete_args, self.config) {
+            Ok(answer) => answer,
+            Err(detail) => {
+                self.tasks[tid].stack = std::mem::take(&mut self.stack);
+                return Ok(Some(End::HostFailed(detail)));
+            }
+        };
+        let finish_violation = |machine: &mut Machine<'_>, detail: String| {
+            machine.tasks[tid].stack = std::mem::take(&mut machine.stack);
+            Ok(Some(End::HostViolation(detail)))
+        };
+        let Some(index) = callee_ctrl
+            .contract
+            .iter()
+            .position(|entry| entry.name == answer.alternative)
+        else {
+            let detail = format!(
+                "`{}` answered `{}`, which its contract does not list",
+                callee_ctrl.name, answer.alternative
+            );
+            return finish_violation(self, detail);
+        };
+        let alternative = &callee_ctrl.contract[index];
+        let typed = answer.payload.len() == alternative.fields.len()
+            && answer
+                .payload
+                .iter()
+                .zip(&alternative.fields)
+                .all(|(value, field)| self.config.fits_in_program(self.program, value, &field.ty));
+        if !typed {
+            let detail = format!(
+                "`{}` answered `{} {{{}}}`, which is not a payload of that alternative",
+                callee_ctrl.name,
+                answer.alternative,
+                list(&answer.payload)
+            );
+            return finish_violation(self, detail);
+        }
+
+        // [E-Host]: validate returned borrows/views against declared origins.
+        fn collect_refs(v: &Value, out: &mut Vec<(BorrowMode, RuntimePlace, TagId)>) {
+            match v {
+                Value::Ref { mode, place, tag } => out.push((*mode, place.clone(), *tag)),
+                Value::Struct { fields, .. } => {
+                    for f in fields {
+                        collect_refs(f, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut all_payload_refs = Vec::new();
+        for (val, field) in answer.payload.iter().zip(&alternative.fields) {
+            if self.program.contains_borrow_or_view(&field.ty) {
+                let mut frefs = Vec::new();
+                collect_refs(val, &mut frefs);
+                if frefs.is_empty() && matches!(field.ty, Type::Ref(_, _)) {
+                    let detail = format!(
+                        "`{}` answered a non-borrow value for borrowed payload `{}`",
+                        callee_ctrl.name, field.name
+                    );
+                    return finish_violation(self, detail);
+                }
+                let mut allowed_sources = Vec::new();
+                for &oidx in &field.origins {
+                    collect_refs(&arguments[oidx], &mut allowed_sources);
+                }
+                for (rmode, rplace, rtag) in &frefs {
+                    if !self.tags.is_alive(*rtag) {
+                        let detail = format!(
+                            "`{}` returned a dead borrow in `{}`",
+                            callee_ctrl.name, field.name
+                        );
+                        return finish_violation(self, detail);
+                    }
+                    let anc = self.tags.ancestors(*rtag);
+                    let valid_origin = allowed_sources
+                        .iter()
+                        .any(|(_, aplace, atag)| anc.contains(atag) && aplace.contains(rplace));
+                    if !valid_origin {
+                        let detail = format!(
+                            "`{}` returned a borrow in `{}` not derived from its declared origins",
+                            callee_ctrl.name, field.name
+                        );
+                        return finish_violation(self, detail);
+                    }
+                    all_payload_refs.push((*rmode, rplace.clone(), *rtag));
+                }
+            }
+        }
+        for i in 0..all_payload_refs.len() {
+            for j in (i + 1)..all_payload_refs.len() {
+                let (m1, p1, _) = &all_payload_refs[i];
+                let (m2, p2, _) = &all_payload_refs[j];
+                if (*m1 == BorrowMode::Exclusive || *m2 == BorrowMode::Exclusive) && p1.overlaps(p2)
+                {
+                    let detail = format!(
+                        "`{}` returned overlapping exclusive borrows in its payload",
+                        callee_ctrl.name
+                    );
+                    return finish_violation(self, detail);
+                }
+            }
+        }
+
+        // [E-Resource]: update resource table.
+        for &(rid, handle_id) in &consumed_resources {
+            self.resources.insert((rid, handle_id), false);
+        }
+        let mut returned_resources = Vec::new();
+        for val in &answer.payload {
+            collect_resources(val, &mut returned_resources);
+        }
+        for &(rid, handle_id) in &returned_resources {
+            if consumed_resources.contains(&(rid, handle_id)) {
+                self.resources.insert((rid, handle_id), true);
+            } else if let std::collections::btree_map::Entry::Vacant(e) =
+                self.resources.entry((rid, handle_id))
+            {
+                e.insert(true);
+            } else {
+                let detail = format!(
+                    "`{}` returned an already-used resource handle `{}#{handle_id}`",
+                    callee_ctrl.name, self.program.resources[rid].name
+                );
+                return finish_violation(self, detail);
+            }
+        }
+        if !consumed_resources.is_empty() || !returned_resources.is_empty() {
+            self.count("E-Resource");
+        }
+
+        let mut concrete_payload = Vec::with_capacity(answer.payload.len());
+        for val in &answer.payload {
+            concrete_payload.push(self.deref_formula(val)?);
+        }
+        if let Some(condition) = &alternative.condition {
+            let env = SignatureEnv {
+                parameters: &concrete_args,
+                old_parameters: &concrete_args,
+                fields: &concrete_payload,
+            };
+            if !self.evaluator().holds(condition, &env)? {
+                let detail = format!(
+                    "`{}` answered `{} {{{}}}` for ({}), and the condition of the alternative is false",
+                    callee_ctrl.name,
+                    answer.alternative,
+                    list(&concrete_payload),
+                    list(&concrete_args)
+                );
+                return finish_violation(self, detail);
+            }
+        }
+        if !callee_ctrl.is_pure() {
+            self.trace.push(Event {
+                control: callee_ctrl.name.clone(),
+                arguments: concrete_args,
+                alternative: answer.alternative,
+                payload: concrete_payload,
+            });
+        }
+        self.count("E-Extern");
+        self.complete(index, answer.payload)?;
+        self.tasks[tid].stack = std::mem::take(&mut self.stack);
+        self.tasks[tid].state = TaskState::Ready;
+        Ok(None)
+    }
+
+    /// Top-level step with cooperative task scheduling ([E-Turn]).
+    fn step_scheduler(&mut self) -> Result<Option<End>, Fail> {
+        if self.has_turn {
+            return self.step();
+        }
+        let top_run_root = self.runs.last().expect("a run").root_task;
+        self.turns_taken += 1;
+        if !self.is_task_cancelled(top_run_root) && self.host.should_cancel_root(self.turns_taken) {
+            self.tasks[top_run_root].cancelled = true;
+            self.withdraw_cancelled_host_waits()?;
+        }
+
+        let run_tasks = self.runs.last().expect("a run").tasks.clone();
+        let mut ready = Vec::new();
+        for &tid in &run_tasks {
+            match self.tasks[tid].state {
+                TaskState::Ready => ready.push(tid),
+                TaskState::WaitingNext { set_id, .. } => {
+                    let set = &self.task_sets[set_id as usize];
+                    if set.members.is_empty() || !set.done_queue.is_empty() {
+                        ready.push(tid);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !ready.is_empty() {
+            let choice = self.host.pick_turn(ready.len()) % ready.len();
+            let tid = ready[choice];
+            self.count("E-Turn");
+            if let TaskState::WaitingNext {
+                set_id,
+                set_var,
+                prod_id,
+            } = self.tasks[tid].state
+            {
+                self.activate_task(tid);
+                self.locate();
+                if self.task_sets[set_id as usize].members.is_empty() {
+                    // Mark `x`'s slot moved (`◌`) and complete with `empty` ([E-Next]).
+                    let (scope_id, _, _) = self.find_local_slot(set_var)?;
+                    if let Some(slot_ref) = self.slot_mut(scope_id, set_var) {
+                        *slot_ref = Slot::Moved;
+                    }
+                    let empty_idx = self.program.controls[prod_id].contract.len();
+                    self.complete(empty_idx, Vec::new())?;
+                } else {
+                    let done_tid = self.task_sets[set_id as usize]
+                        .done_queue
+                        .pop_front()
+                        .expect("done member");
+                    self.task_sets[set_id as usize]
+                        .members
+                        .retain(|&m| m != done_tid);
+                    let prev =
+                        std::mem::replace(&mut self.tasks[done_tid].state, TaskState::Stopped);
+                    let TaskState::Done {
+                        alternative,
+                        payload,
+                    } = prev
+                    else {
+                        unreachable!();
+                    };
+                    self.complete(alternative, payload)?;
+                }
+                return Ok(None);
+            }
+            self.activate_task(tid);
+            return Ok(None);
+        }
+
+        // No task is ready: let the host complete a waiting extern async operation ([E-Turn]).
+        let mut waiting_tids = Vec::new();
+        for &tid in &run_tasks {
+            if matches!(self.tasks[tid].state, TaskState::WaitingHost { .. }) {
+                waiting_tids.push(tid);
+            }
+        }
+        if waiting_tids.is_empty() {
+            return Ok(Some(End::HostFailed(
+                "no ready or waiting task in run".to_string(),
+            )));
+        }
+        let descriptors: Vec<(&Control, &[Value])> = waiting_tids
+            .iter()
+            .map(|&tid| match &self.tasks[tid].state {
+                TaskState::WaitingHost {
+                    callee,
+                    concrete_args,
+                    ..
+                } => (&self.program.controls[*callee], concrete_args.as_slice()),
+                _ => unreachable!(),
+            })
+            .collect();
+        let widx = self.host.pick_waiting(&descriptors) % waiting_tids.len();
+        let chosen = waiting_tids[widx];
+        self.count("E-Turn");
+        self.complete_waiting_host(chosen)
     }
 
     /// Wraps top-level entry arguments that have borrow or view types in
@@ -3803,6 +4855,22 @@ pub fn run(
         tags: TagTable::new(),
         next_scope_id: 1,
         stack: Vec::new(),
+        tasks: vec![Task {
+            stack: Vec::new(),
+            state: TaskState::Ready,
+            member_of: None,
+            cancelled: false,
+            parent_allowances: Vec::new(),
+        }],
+        task_sets: Vec::new(),
+        runs: vec![TaskRun {
+            root_task: 0,
+            caller_task: None,
+            tasks: vec![0],
+        }],
+        current_task: 0,
+        has_turn: true,
+        turns_taken: 0,
         trace: Vec::new(),
         steps: 0,
         rules: BTreeMap::new(),
@@ -3880,7 +4948,7 @@ pub fn run(
             break End::OutOfFuel;
         }
         machine.steps += 1;
-        match machine.step() {
+        match machine.step_scheduler() {
             Ok(None) => {}
             Ok(Some(end)) => break end,
             Err(stuck) => {

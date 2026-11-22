@@ -25,6 +25,26 @@ pub trait Host {
         arguments: &[Value],
         config: &Config,
     ) -> Result<Answer, String>;
+
+    /// Choose which ready task (index in `0..ready_count`) takes the next turn ([E-Turn]).
+    fn pick_turn(&mut self, ready_count: usize) -> usize {
+        let _ = ready_count;
+        0
+    }
+
+    /// Choose which waiting extern async operation completes next when no task is ready
+    /// ([E-Turn], [E-AwaitHost]).
+    fn pick_waiting(&mut self, waiting: &[(&Control, &[Value])]) -> usize {
+        let _ = waiting;
+        0
+    }
+
+    /// Whether the host cancels the root task of the innermost run before the next turn
+    /// ([E-Cancel]). Called only when the root is not yet cancelled.
+    fn should_cancel_root(&mut self, turn: u64) -> bool {
+        let _ = turn;
+        false
+    }
 }
 
 /// A host that answers from a list, in order. Each entry names the control
@@ -51,6 +71,76 @@ impl Host for Script {
                 control.name
             )),
             Some((_, answer)) => Ok(answer),
+        }
+    }
+
+    fn pick_waiting(&mut self, waiting: &[(&Control, &[Value])]) -> usize {
+        if let Some((next_name, _)) = self.answers.front()
+            && let Some(idx) = waiting.iter().position(|(c, _)| c.name == *next_name)
+        {
+            return idx;
+        }
+        0
+    }
+}
+
+/// A host wrapper that supplies explicit turn choices, waiting-operation choices,
+/// and optional root cancellation at a given turn ([E-Turn], [E-Cancel]).
+#[derive(Clone, Debug)]
+pub struct Scheduled<H: Host> {
+    pub inner: H,
+    pub turns: VecDeque<usize>,
+    pub waiting: VecDeque<usize>,
+    pub cancel_at_turn: Option<u64>,
+    pub cancel_decisions: VecDeque<bool>,
+}
+
+impl<H: Host> Scheduled<H> {
+    pub fn new(inner: H) -> Self {
+        Self {
+            inner,
+            turns: VecDeque::new(),
+            waiting: VecDeque::new(),
+            cancel_at_turn: None,
+            cancel_decisions: VecDeque::new(),
+        }
+    }
+}
+
+impl<H: Host> Host for Scheduled<H> {
+    fn call(
+        &mut self,
+        control: &Control,
+        arguments: &[Value],
+        config: &Config,
+    ) -> Result<Answer, String> {
+        self.inner.call(control, arguments, config)
+    }
+
+    fn pick_turn(&mut self, ready_count: usize) -> usize {
+        if let Some(choice) = self.turns.pop_front() {
+            choice % ready_count.max(1)
+        } else {
+            self.inner.pick_turn(ready_count)
+        }
+    }
+
+    fn pick_waiting(&mut self, waiting: &[(&Control, &[Value])]) -> usize {
+        if let Some(choice) = self.waiting.pop_front() {
+            choice % waiting.len().max(1)
+        } else {
+            self.inner.pick_waiting(waiting)
+        }
+    }
+
+    fn should_cancel_root(&mut self, turn: u64) -> bool {
+        if let Some(flag) = self.cancel_decisions.pop_front() {
+            return flag;
+        }
+        if let Some(at) = self.cancel_at_turn {
+            turn >= at
+        } else {
+            self.inner.should_cancel_root(turn)
         }
     }
 }
@@ -134,6 +224,18 @@ impl<H: Host> Host for Arithmetic<H> {
             Some(answer) => answer,
             None => self.0.call(control, arguments, config),
         }
+    }
+
+    fn pick_turn(&mut self, ready_count: usize) -> usize {
+        self.0.pick_turn(ready_count)
+    }
+
+    fn pick_waiting(&mut self, waiting: &[(&Control, &[Value])]) -> usize {
+        self.0.pick_waiting(waiting)
+    }
+
+    fn should_cancel_root(&mut self, turn: u64) -> bool {
+        self.0.should_cancel_root(turn)
     }
 }
 
@@ -362,6 +464,10 @@ fn push_value(words: &mut Vec<u64>, value: &Value) {
             words.push(u64::from(*mode == crate::typed::BorrowMode::Exclusive));
             words.push(*tag);
         }
+        Value::TaskSet(id) => {
+            words.push(11);
+            words.push(*id);
+        }
     }
 }
 
@@ -443,5 +549,13 @@ impl Host for Seeded<'_> {
             "no answer found that satisfies the contract of `{}`",
             control.name
         ))
+    }
+
+    fn pick_turn(&mut self, ready_count: usize) -> usize {
+        self.rng.index(ready_count)
+    }
+
+    fn pick_waiting(&mut self, waiting: &[(&Control, &[Value])]) -> usize {
+        self.rng.index(waiting.len())
     }
 }

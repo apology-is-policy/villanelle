@@ -136,12 +136,15 @@ pub enum Type {
     Named(String),
     /// Unresolved `outcome⟨name⟩` in `syntax::Program` before `resolve::resolve`.
     OutcomeNamed(String),
+    /// Unresolved `tasks⟨f⟩` in `syntax::Program` before `resolve::resolve`.
+    TasksNamed(String),
     Struct(StructId, String),
     Variant(VariantId, String),
     Resource(ResourceId, String),
     Vector(Box<Type>),
     Map(Box<Type>, Box<Type>),
     Outcome(OutcomeId, String),
+    Tasks(ControlId, String),
     Ref(BorrowMode, Box<Type>),
 }
 
@@ -181,6 +184,9 @@ impl fmt::Display for Type {
             | Type::Resource(_, name) => formatter.write_str(name),
             Type::OutcomeNamed(name) | Type::Outcome(_, name) => {
                 write!(formatter, "outcome⟨{name}⟩")
+            }
+            Type::TasksNamed(name) | Type::Tasks(_, name) => {
+                write!(formatter, "tasks⟨{name}⟩")
             }
             Type::Vector(elem) => write!(formatter, "[{elem}]"),
             Type::Map(k, v) => write!(formatter, "{k} ⇀ {v}"),
@@ -264,6 +270,10 @@ pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Call(FunctionId, Vec<Expr>, Type),
+    /// `tasks⟨f⟩()` empty task set constructor ([W11], [TK6]).
+    TasksEmpty(ControlId, Type),
+    /// `count(x)` member count of a task set ([W11], [TK1], [A3]).
+    Count(VarId),
 }
 
 impl Expr {
@@ -278,7 +288,7 @@ impl Expr {
                 Type::Int(*ty)
             }
             Expr::String(_) | Expr::Trim(_) => Type::String,
-            Expr::Len(_) => Type::Int(IntType::Usize),
+            Expr::Len(_) | Expr::Count(_) => Type::Int(IntType::Usize),
             Expr::Var(_, ty)
             | Expr::Old(_, ty)
             | Expr::Move(_, ty)
@@ -290,7 +300,8 @@ impl Expr {
             | Expr::Vector(_, ty)
             | Expr::EmptyMap(ty)
             | Expr::Clone(_, ty)
-            | Expr::Call(_, _, ty) => ty.clone(),
+            | Expr::Call(_, _, ty)
+            | Expr::TasksEmpty(_, ty) => ty.clone(),
         }
     }
 
@@ -396,6 +407,7 @@ pub struct Alternative {
 pub struct Control {
     pub name: String,
     pub public: bool,
+    pub is_async: bool,
     pub contingent: bool,
     pub faults: bool,
     pub parameters: Vec<Parameter>,
@@ -408,10 +420,16 @@ pub struct Control {
 }
 
 impl Control {
-    /// Whether the operation is a function of its arguments ([I10]): no
-    /// effects and no resource types in parameters or payloads.
+    /// Whether this extern async control is cancellable (`[W12]`): lists `cancelled`.
+    pub fn is_cancellable(&self) -> bool {
+        self.is_async && self.body.is_none() && self.contract.iter().any(|a| a.name == "cancelled")
+    }
+
+    /// Whether the operation is locally pure ([I10]): not `async`, no effects,
+    /// and no resource types in parameters or payloads. For defined controls that
+    /// may transitively invoke `run`, use `Program::control_is_pure`.
     pub fn is_pure(&self) -> bool {
-        if !self.uses.is_empty() {
+        if self.is_async || !self.uses.is_empty() {
             return false;
         }
         let has_resource = |ty: &Type| {
@@ -535,6 +553,12 @@ impl BuiltinOp {
 #[derive(Clone, Debug)]
 pub enum Operation {
     Control(ControlId),
+    /// `await f(ō)` on a defined or extern `async control` ([E-Await], [E-AwaitHost]).
+    AwaitControl(ControlId),
+    /// `await next(x)` on a task set `x : tasks⟨f⟩` ([E-Next]).
+    AwaitNext(VarId, ControlId),
+    /// `run f(ō)` starting a task run from a synchronous control ([E-Run]).
+    RunControl(ControlId),
     Builtin {
         op: BuiltinOp,
         /// For `Push`, `Pop`, `Insert`, `Remove`: the mutable target place.
@@ -553,7 +577,10 @@ pub enum Operation {
 impl Operation {
     pub fn name<'a>(&'a self, program: &'a Program) -> &'a str {
         match self {
-            Operation::Control(id) => &program.controls[*id].name,
+            Operation::Control(id) | Operation::AwaitControl(id) | Operation::RunControl(id) => {
+                &program.controls[*id].name
+            }
+            Operation::AwaitNext(_, _) => "next",
             Operation::Builtin { op, .. } => op.name(),
             Operation::Outcome(_) => "outcome",
             Operation::Variant { id, .. } => &program.variants[*id].name,
@@ -562,7 +589,18 @@ impl Operation {
 
     pub fn contract<'a>(&'a self, program: &'a Program) -> Vec<Alternative> {
         match self {
-            Operation::Control(id) => program.controls[*id].contract.clone(),
+            Operation::Control(id) | Operation::AwaitControl(id) | Operation::RunControl(id) => {
+                program.controls[*id].contract.clone()
+            }
+            Operation::AwaitNext(_, prod_id) => {
+                let mut alts = program.controls[*prod_id].contract.clone();
+                alts.push(Alternative {
+                    name: "empty".to_string(),
+                    fields: Vec::new(),
+                    condition: None,
+                });
+                alts
+            }
             Operation::Builtin { contract, .. } => contract.clone(),
             Operation::Outcome(id) => program.outcomes[*id].alternatives.clone(),
             Operation::Variant { id, borrow } => program.variants[*id]
@@ -654,6 +692,16 @@ pub enum Command {
         boundary: BoundaryId,
         arguments: Vec<Expr>,
     },
+    /// `spawn f(ō) into x` ([E-Spawn], [TK1]–[TK3]).
+    Spawn {
+        control: ControlId,
+        arguments: Vec<Expr>,
+        set: VarId,
+    },
+    /// `cancel x` ([E-Cancel], [TK1]).
+    Cancel {
+        set: VarId,
+    },
     Again {
         body: BodyId,
         arguments: Vec<Expr>,
@@ -742,7 +790,11 @@ impl Program {
             Type::String | Type::Ref(BorrowMode::Exclusive, _) => Kind::Drop,
             Type::Struct(id, _) => self.structs[*id].kind,
             Type::Variant(id, _) => self.variants[*id].kind,
-            Type::Resource(_, _) | Type::Outcome(_, _) | Type::OutcomeNamed(_) => Kind::Must,
+            Type::Resource(_, _)
+            | Type::Outcome(_, _)
+            | Type::OutcomeNamed(_)
+            | Type::Tasks(_, _)
+            | Type::TasksNamed(_) => Kind::Must,
             Type::Vector(elem) => Kind::Drop.max(self.kind(elem)),
             Type::Map(k, v) => Kind::Drop.max(self.kind(k)).max(self.kind(v)),
             Type::Named(_) => Kind::Drop,
@@ -752,7 +804,12 @@ impl Program {
     /// Whether `ty` is fault-releasable ([T3]).
     pub fn is_fault_releasable(&self, ty: &Type) -> bool {
         match ty {
-            Type::Bool | Type::Int(_) | Type::String | Type::Ref(_, _) => true,
+            Type::Bool
+            | Type::Int(_)
+            | Type::String
+            | Type::Ref(_, _)
+            | Type::Tasks(_, _)
+            | Type::TasksNamed(_) => true,
             Type::Struct(id, _) => self.structs[*id].fault_releasable,
             Type::Variant(id, _) => self.variants[*id].fault_releasable,
             Type::Resource(id, _) => self.resources[*id].on_fault_release,
@@ -767,7 +824,12 @@ impl Program {
     /// or an aggregate with a component that does.
     pub fn holds_obligation(&self, ty: &Type) -> bool {
         match ty {
-            Type::Bool | Type::Int(_) | Type::String | Type::Ref(_, _) => false,
+            Type::Bool
+            | Type::Int(_)
+            | Type::String
+            | Type::Ref(_, _)
+            | Type::Tasks(_, _)
+            | Type::TasksNamed(_) => false,
             Type::Struct(id, _) => self.structs[*id].holds_obligation,
             Type::Variant(id, _) => self.variants[*id].holds_obligation,
             Type::Resource(_, _) | Type::Outcome(_, _) | Type::OutcomeNamed(_) => true,
@@ -784,7 +846,11 @@ impl Program {
             Type::Bool | Type::Int(_) | Type::String => true,
             Type::Struct(id, _) => self.structs[*id].clonable,
             Type::Variant(id, _) => self.variants[*id].clonable,
-            Type::Resource(_, _) | Type::Outcome(_, _) | Type::OutcomeNamed(_) => false,
+            Type::Resource(_, _)
+            | Type::Outcome(_, _)
+            | Type::OutcomeNamed(_)
+            | Type::Tasks(_, _)
+            | Type::TasksNamed(_) => false,
             Type::Vector(elem) => self.is_clonable(elem),
             Type::Map(k, v) => self.is_clonable(k) && self.is_clonable(v),
             Type::Ref(_, _) | Type::Named(_) => false,
@@ -800,5 +866,66 @@ impl Program {
             Type::Variant(id, _) => self.variants[*id].comparable,
             _ => false,
         }
+    }
+
+    /// Full purity check ([I10]): not `async`, no effects, no resource types, and
+    /// no `run` occurring in its body, in any control it calls, or in any named
+    /// boundary it supervises.
+    pub fn control_is_pure(&self, id: ControlId) -> bool {
+        fn body_has_run(
+            program: &Program,
+            cb: &ControlBody,
+            seen_ctrl: &mut Vec<bool>,
+            seen_bnd: &mut Vec<bool>,
+        ) -> bool {
+            for body in &cb.bodies {
+                for stmt in &body.statements {
+                    match &stmt.command {
+                        Command::Decide { op_kind, .. }
+                        | Command::Capture {
+                            operation: op_kind, ..
+                        } => match op_kind {
+                            Operation::RunControl(_)
+                            | Operation::AwaitControl(_)
+                            | Operation::AwaitNext(_, _) => return true,
+                            Operation::Control(cid) if !seen_ctrl[*cid] => {
+                                seen_ctrl[*cid] = true;
+                                if let Some(sub) = &program.controls[*cid].body
+                                    && body_has_run(program, sub, seen_ctrl, seen_bnd)
+                                {
+                                    return true;
+                                }
+                            }
+                            _ => {}
+                        },
+                        Command::Supervise { boundary, .. } => {
+                            if !seen_bnd[*boundary] {
+                                seen_bnd[*boundary] = true;
+                                let b = &program.boundaries[*boundary];
+                                if body_has_run(program, &b.body, seen_ctrl, seen_bnd)
+                                    || body_has_run(program, &b.contingency, seen_ctrl, seen_bnd)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        Command::Spawn { .. } | Command::Cancel { .. } => return true,
+                        _ => {}
+                    }
+                }
+            }
+            false
+        }
+        let ctrl = &self.controls[id];
+        if !ctrl.is_pure() {
+            return false;
+        }
+        let Some(body) = &ctrl.body else {
+            return true;
+        };
+        let mut seen_ctrl = vec![false; self.controls.len()];
+        let mut seen_bnd = vec![false; self.boundaries.len()];
+        seen_ctrl[id] = true;
+        !body_has_run(self, body, &mut seen_ctrl, &mut seen_bnd)
     }
 }

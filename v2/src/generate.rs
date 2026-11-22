@@ -18,8 +18,8 @@ use crate::int::Int;
 use crate::oracle::{Config, Value, signature_holds};
 use crate::rng::Rng;
 use crate::syntax::{
-    Alternative, Arm, Binary, Command, Control, Declaration, Expr, Function, LoopParameter,
-    Parameter, Program, Selector, Statement, Unary,
+    Alternative, Arm, Binary, CallMode, Command, Control, Declaration, Expr, Function,
+    LoopParameter, Parameter, Program, Selector, Statement, Unary,
 };
 use crate::typed::{self, IntType, Type};
 use std::collections::BTreeMap;
@@ -533,6 +533,7 @@ pub fn valid(rng: &mut Rng) -> Program {
         name: "ext_pure".to_string(),
         public: false,
         external: true,
+        is_async: false,
         contingent: false,
         faults: false,
         parameters: vec![Parameter {
@@ -571,6 +572,7 @@ pub fn valid(rng: &mut Rng) -> Program {
         name: "ext_io".to_string(),
         public: false,
         external: true,
+        is_async: false,
         contingent: false,
         faults: false,
         parameters: vec![Parameter {
@@ -609,6 +611,7 @@ pub fn valid(rng: &mut Rng) -> Program {
         name: "helper".to_string(),
         public: false,
         external: false,
+        is_async: false,
         contingent: false,
         faults: false,
         parameters: vec![
@@ -855,6 +858,7 @@ pub fn valid(rng: &mut Rng) -> Program {
             pos_true.clone(),
             Command::Decide {
                 site: "d_ext".to_string(),
+                mode: CallMode::Sync,
                 operation: "ext_pure".to_string(),
                 arguments: vec![name("a")],
                 arms: vec![
@@ -880,6 +884,7 @@ pub fn valid(rng: &mut Rng) -> Program {
             pos_true,
             Command::Decide {
                 site: "d_help".to_string(),
+                mode: CallMode::Sync,
                 operation: "helper".to_string(),
                 arguments: vec![name("a"), name("s"), name("flag")],
                 arms: vec![
@@ -906,6 +911,7 @@ pub fn valid(rng: &mut Rng) -> Program {
             Selector::Top,
             Command::Decide {
                 site: "d_io".to_string(),
+                mode: CallMode::Sync,
                 operation: "ext_io".to_string(),
                 arguments: vec![name("b")],
                 arms: vec![
@@ -1053,6 +1059,7 @@ pub fn valid(rng: &mut Rng) -> Program {
         name: "main".to_string(),
         public: true,
         external: false,
+        is_async: false,
         contingent: false,
         faults: false,
         parameters: vec![
@@ -1409,6 +1416,7 @@ pub fn free(rng: &mut Rng) -> Program {
         name: "ext0".to_string(),
         public: false,
         external: true,
+        is_async: false,
         contingent: false,
         faults: false,
         parameters: vec![Parameter {
@@ -1579,6 +1587,7 @@ pub fn free(rng: &mut Rng) -> Program {
                     selector,
                     Command::Decide {
                         site,
+                        mode: CallMode::Sync,
                         operation: "ext0".to_string(),
                         arguments: vec![arg],
                         arms,
@@ -1732,6 +1741,7 @@ pub fn free(rng: &mut Rng) -> Program {
         name: "entry".to_string(),
         public: rng.chance(1, 2),
         external: false,
+        is_async: false,
         contingent: false,
         faults: false,
         parameters: vec![

@@ -742,11 +742,83 @@ consumption (`erased.rs`), and direct typed LLVM IR and C ABI code generation
   `sum_window`; next experiment: inspect generated arm64 assembly and align
   unsigned `mod` constant strength-reduction).
 
-## 18. What this checkpoint leaves open
+## 18. Slice 4 Phase 2: Second Review of Task Rules, Instrumented/Erased Task Scheduler, and Rails Task Surface
 
-- **Later slices.** Slices 1, 2, and 3 are complete across Phases 2, 3, and 4;
-  Slice 4 (tasks) is next, allowing the oracle, the checker, and the typed
-  backend to run, verify, and compile the full paper corpus.
+Before coding Slice 4, the task-rule repairs named at Phase 1 acceptance
+(`[TK3]`–`[TK6]`, `[E-Await]`, `[E-AwaitHost]`, `[E-Stop]`, `[N5]`, `[F5]`,
+`[F6]` of [`core.md`](core.md); `[J3]`, `[I10]` of [`facts.md`](facts.md);
+`[G3]` of [`surface.md`](surface.md)) received their second review and three
+further specification repairs were folded in (`core.md` section 12):
+
+1. **`[TK6]` `old(y)` freshness.** `d : Δ await next(x)` instantiates each
+   alternative condition `φₐ` with a fresh logical name for each parameter and
+   a separate fresh logical name for `old(y)` of each `&~` parameter `y`, so
+   postconditions like `y = old(y) + 1` do not collapse to `u = u + 1` and
+   falsely prove `⊥`.
+2. **`[W11]` `await next(x)` in decisions only.** `await next(x)` is permitted
+   only in a decision (`Δ`), never in `capture`, because `capture` records no
+   `d.empty` atom to track `[TK2]` consumption of `x`.
+3. **`[E-AwaitHost]` ordering and turn handoff + `[I10]` supervised `run`.**
+   `[E-AwaitHost]` checks its precondition (`[E-Extern]`) and effect allowance
+   (`[E-Effect]`) before taking the immediate `cancelled` shortcut and passes
+   the turn (`ready`) when it does; `[I10]` in [`facts.md`](facts.md) excludes
+   any `run` inside a named boundary supervised by a control from purity.
+
+Slice 4 Phase 2 then implements tasks across core syntax, resolution, the
+instrumented oracle, the erased interpreter, differential scheduling, and the
+Rails surface:
+
+- **Core syntax, parser, and well-formedness (`typed.rs`, `syntax.rs`,
+  `text.rs`, `resolve.rs`).** Adds `async control`, `extern async control`,
+  `tasks⟨f⟩` (`Kind::Must`, fault-releasable, non-obligation), `tasks⟨f⟩()`,
+  `count(x)`, `spawn f(ō) into x`, `cancel x`, `await f(ō)`, `await next(x)`,
+  `run f(ō)`, and `capture [await | run] f(ō)` (keeping `next`, `tasks`,
+  `into`, and `count` contextual), enforcing `[W10]`–`[W12]`, `[TK1]`, and
+  transitive `[I10]` purity (`Program::control_is_pure`).
+- **Instrumented cooperative scheduler (`oracle.rs`, `host.rs`, `script.rs`).**
+  Implements `TaskSet`, `TaskState`, `Task`, `TaskRun`, cross-task borrow
+  resolution (`find_slot_ref`/`slot_mut`), `[E-Run]`, `[E-Turn]`, `[E-Await]`,
+  `[E-AwaitHost]` (with precondition/effect checks before the `cancelled`
+  shortcut and `on fault release` unwinding on cancellation/withdrawal),
+  `[E-Spawn]`, `[E-Next]` (marking `x` moved on `empty`), `[E-Cancel]` (with
+  root cancellation propagating through spawned members and nested `run`),
+  `[E-Done]`, `[E-MemberFault]`, `[E-Stop]` (stopping activations and sibling
+  task sets without running contingencies or asking fault permission, sticking
+  in `X8 E-Stop` on non-fault-releasable open resources), `X5 E-Scope` on
+  undrained non-empty task sets, and `[E-Effect]` across parent task
+  allowances. Extends `Host` with non-breaking default scheduling methods
+  (`pick_turn`, `pick_waiting`, `should_cancel_root`), `Scheduled<H>`, and
+  `turns [...]` / `cancel_at N` options in `//! run`.
+- **Erased task scheduler and Theorem 3 replay (`erased.rs`,
+  `differential.rs`).** Implements `[R6]` in `erased.rs` with zero borrow tags,
+  zero contract checks, and static history-bit availability formulas
+  (`d.empty` marking `x` moved so `[R4]`/`[R5]`/`[R6]` unwind and stop live
+  task sets with zero runtime moved flags), preserving exact step-count parity.
+  `differential::Recording` records every turn choice, waiting-host completion,
+  and root-cancellation decision and replays them identically via
+  `Scheduled<Script>` into `erased::run`.
+- **Rails surface, elaboration, and canonical formatter (`surface.rs`).**
+  Implements `[G7b]` and `[U19]` (`async control`, `extern async control`,
+  `tasks<f>`, `tasks()`, `x.count()`, `spawn f(ā) into x`, `cancel x`,
+  `Δ await f(ā)`, `Δ await next x`, `Δ run f(ā)`, single-alternative
+  `await f(ā)`/`run f(ā)`, `capture await/run`, `forward await/run`,
+  `■ Δ await/run/await next`, `[G3]` `■ auto` inference across `await`/`run`,
+  and idempotent `[G10]` canonical formatting).
+- **Conformance suite (`tests/slice4/*.core`, `tests/slice4_surface/*.rails`,
+  `tests/slice4.rs`).** Exercises every Slice 4 dynamic rule (`E-Run` through
+  `E-Stop`), turn-schedule interleavings, cross-task shared and exclusive
+  borrows plus `X4 B1`, `X5 E-Scope`, `X7 E-Extern` before cancel shortcut,
+  `X8 E-Stop`, `X8 E-Unwind`, `X9 E-Effect`, `on fault release` cleanup on
+  cancel and member-fault stop, all `[W10]`–`[W12]`/`[TK1]`/`[U19]` refusals,
+  `[I10]` supervised-`run` impurity, `[G3]` `■ auto`, `[G10]` canonical
+  formatting, and oracle-vs-erased differential parity.
+
+## 19. What this checkpoint leaves open
+
+- **Later slices.** Slices 1, 2, and 3 are complete across Phases 2, 3, and 4,
+  and Slice 4 (tasks) is complete for Phase 2; Slice 4 Phase 3 (static checker
+  `[TK1]`–`[TK7]`, `count(x)` facts, and kernel certificates) and Phase 4
+  (Theorem 4 expansion and LLVM IR/C ABI backend for tasks) are next.
 - **Operators that the surface does not have yet.** The wrapping and
   saturating operators and the numeric conversions are named in the core and
   the fact logic and have no spelling. They belong to phase 5.

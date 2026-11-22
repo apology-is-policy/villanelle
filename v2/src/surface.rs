@@ -7,8 +7,8 @@
 
 use crate::int::Int;
 use crate::syntax::{
-    Alternative, Arm, Binary, BoundaryDecl, Command, Control, Declaration, Expr, Function,
-    LoopParameter, OutcomeDecl as CoreOutcomeDecl, Parameter, Place, PlaceStep, Program,
+    Alternative, Arm, Binary, BoundaryDecl, CallMode, Command, Control, Declaration, Expr,
+    Function, LoopParameter, OutcomeDecl as CoreOutcomeDecl, Parameter, Place, PlaceStep, Program,
     ResourceDecl, Selector, Statement, StructDecl, Unary, VariantConstructor, VariantDecl,
 };
 use crate::typed::{BorrowMode, IntType, Type};
@@ -1031,6 +1031,11 @@ enum Tok {
     Not,
     Control,
     Extern,
+    Async,
+    Await,
+    Run,
+    Spawn,
+    Cancel,
     Function,
     Outcome,
     Struct,
@@ -1082,6 +1087,11 @@ fn word_token(word: &str) -> Tok {
         "mutable" => Tok::Tilde,
         "control" => Tok::Control,
         "extern" => Tok::Extern,
+        "async" => Tok::Async,
+        "await" => Tok::Await,
+        "run" => Tok::Run,
+        "spawn" => Tok::Spawn,
+        "cancel" => Tok::Cancel,
         "function" => Tok::Function,
         "outcome" => Tok::Outcome,
         "struct" => Tok::Struct,
@@ -1345,6 +1355,7 @@ struct SurfaceControl {
     name: String,
     public: bool,
     external: bool,
+    is_async: bool,
     contingent: bool,
     faults: bool,
     multiline_contract: bool,
@@ -1359,6 +1370,7 @@ struct SurfaceControl {
 #[derive(Clone, Debug)]
 enum SurfaceCall {
     Direct {
+        mode: CallMode,
         operation: String,
         arguments: Vec<Expr>,
     },
@@ -1372,6 +1384,7 @@ enum SurfaceCall {
 #[derive(Clone, Debug)]
 enum SurfaceOperand {
     Call(SurfaceCall),
+    AwaitNext(String),
     Expr(Expr),
 }
 
@@ -1494,13 +1507,25 @@ enum SurfaceStmt {
     },
     Forward {
         line: u32,
+        mode: CallMode,
         operation: String,
         arguments: Vec<Expr>,
     },
     Call {
         line: u32,
+        mode: CallMode,
         operation: String,
         arguments: Vec<Expr>,
+    },
+    Spawn {
+        line: u32,
+        operation: String,
+        arguments: Vec<Expr>,
+        set: String,
+    },
+    Cancel {
+        line: u32,
+        set: String,
     },
     MethodCall {
         line: u32,
@@ -1694,6 +1719,13 @@ impl Parser {
                 let value = self.map_ty(clause)?;
                 self.expect(Tok::Greater, clause, "`>`")?;
                 return Ok(Type::Map(Box::new(key), Box::new(value)));
+            }
+            if name == "tasks" && self.peek_next() == &Tok::Less {
+                self.advance();
+                self.advance();
+                let prod = self.qname(clause, "an async control name")?;
+                self.expect(Tok::Greater, clause, "`>`")?;
+                return Ok(Type::TasksNamed(prod));
             }
         }
         let name = self.name(clause, "a type")?;
@@ -2060,6 +2092,15 @@ impl Parser {
                     let var = self.name("W7", "a parameter name")?;
                     self.expect(Tok::RightParen, "G8", "`)`")?;
                     Expr::Old(var)
+                } else if name == "tasks" && next.tok == Tok::LeftParen && !next.first_on_line {
+                    self.advance();
+                    self.expect(Tok::RightParen, "G8", "`)`")?;
+                    Expr::TasksEmpty(String::new())
+                } else if name == "count" && next.tok == Tok::LeftParen && !next.first_on_line {
+                    self.advance();
+                    let var = self.name("U19", "a task set name")?;
+                    self.expect(Tok::RightParen, "G8", "`)`")?;
+                    Expr::Count(var)
                 } else if next.tok == Tok::LeftParen && !next.first_on_line {
                     Expr::Call(name, self.arguments()?)
                 } else if self.allow_brace_literal
@@ -2102,6 +2143,11 @@ impl Parser {
                         base = Expr::Clone(Box::new(base));
                     } else if field == "trim" && args.is_empty() {
                         base = Expr::Call("trim".to_string(), vec![base]);
+                    } else if field == "count" && args.is_empty() {
+                        let Expr::Name(var) = base else {
+                            return fail(line, "U19", "`count()` applies to a task set variable");
+                        };
+                        base = Expr::Count(var);
                     } else {
                         return fail(
                             line,
@@ -2188,18 +2234,72 @@ impl Parser {
     }
 
     fn parse_call(&mut self, clause: &'static str) -> Result<SurfaceCall, Error> {
-        if let Some(method_call) = self.try_parse_method_call()? {
+        let mode = if self.eat(&Tok::Await) {
+            if matches!(self.peek(), Tok::Name(w) if w == "next")
+                && matches!(self.peek_next(), Tok::Name(_) | Tok::LeftParen)
+            {
+                return fail(
+                    self.line(),
+                    "W11",
+                    "`await next` may only appear in a decision, not in `capture`",
+                );
+            }
+            CallMode::Await
+        } else if self.eat(&Tok::Run) {
+            CallMode::Run
+        } else {
+            CallMode::Sync
+        };
+        if mode == CallMode::Sync
+            && let Some(method_call) = self.try_parse_method_call()?
+        {
             return Ok(method_call);
         }
         let operation = self.name(clause, "an operation name")?;
         let arguments = self.arguments()?;
         Ok(SurfaceCall::Direct {
+            mode,
             operation,
             arguments,
         })
     }
 
     fn parse_operand(&mut self, allow_braced_arms: bool) -> Result<SurfaceOperand, Error> {
+        if self.eat(&Tok::Await) {
+            if matches!(self.peek(), Tok::Name(w) if w == "next") {
+                let saved = self.pos;
+                self.advance();
+                if matches!(self.peek(), Tok::Name(_)) {
+                    let set = self.name("U19", "a task set name")?;
+                    return Ok(SurfaceOperand::AwaitNext(set));
+                }
+                if self.eat(&Tok::LeftParen)
+                    && matches!(self.peek(), Tok::Name(_))
+                    && self.peek_next() == &Tok::RightParen
+                {
+                    let set = self.name("U19", "a task set name")?;
+                    self.advance();
+                    return Ok(SurfaceOperand::AwaitNext(set));
+                }
+                self.pos = saved;
+            }
+            let operation = self.name("U19", "an async control name")?;
+            let arguments = self.arguments()?;
+            return Ok(SurfaceOperand::Call(SurfaceCall::Direct {
+                mode: CallMode::Await,
+                operation,
+                arguments,
+            }));
+        }
+        if self.eat(&Tok::Run) {
+            let operation = self.name("U19", "an async control name")?;
+            let arguments = self.arguments()?;
+            return Ok(SurfaceOperand::Call(SurfaceCall::Direct {
+                mode: CallMode::Run,
+                operation,
+                arguments,
+            }));
+        }
         if let Some(method_call) = self.try_parse_method_call()? {
             return Ok(SurfaceOperand::Call(method_call));
         }
@@ -2212,6 +2312,7 @@ impl Parser {
         let expr = expr?;
         if let Expr::Call(operation, arguments) = expr {
             return Ok(SurfaceOperand::Call(SurfaceCall::Direct {
+                mode: CallMode::Sync,
                 operation,
                 arguments,
             }));
@@ -2358,6 +2459,10 @@ impl Parser {
             Tok::Leave
             | Tok::Again
             | Tok::Forward
+            | Tok::Await
+            | Tok::Run
+            | Tok::Spawn
+            | Tok::Cancel
             | Tok::Fault
             | Tok::Assume
             | Tok::Supervise
@@ -2566,13 +2671,64 @@ impl Parser {
             }
             Tok::Forward => {
                 self.advance();
+                let mode = if self.eat(&Tok::Await) {
+                    CallMode::Await
+                } else if self.eat(&Tok::Run) {
+                    CallMode::Run
+                } else {
+                    CallMode::Sync
+                };
                 let operation = self.name("U14", "a control name")?;
                 let arguments = self.arguments()?;
                 Ok(SurfaceStmt::Forward {
                     line,
+                    mode,
                     operation,
                     arguments,
                 })
+            }
+            Tok::Await => {
+                self.advance();
+                let operation = self.name("U19", "an async control name")?;
+                let arguments = self.arguments()?;
+                Ok(SurfaceStmt::Call {
+                    line,
+                    mode: CallMode::Await,
+                    operation,
+                    arguments,
+                })
+            }
+            Tok::Run => {
+                self.advance();
+                let operation = self.name("U19", "an async control name")?;
+                let arguments = self.arguments()?;
+                Ok(SurfaceStmt::Call {
+                    line,
+                    mode: CallMode::Run,
+                    operation,
+                    arguments,
+                })
+            }
+            Tok::Spawn => {
+                self.advance();
+                let operation = self.name("U19", "an async control name")?;
+                let arguments = self.arguments()?;
+                let into_kw = self.name("U19", "`into`")?;
+                if into_kw != "into" {
+                    return fail(line, "U19", format!("expected `into`, found `{into_kw}`"));
+                }
+                let set = self.name("U19", "a task set name")?;
+                Ok(SurfaceStmt::Spawn {
+                    line,
+                    operation,
+                    arguments,
+                    set,
+                })
+            }
+            Tok::Cancel => {
+                self.advance();
+                let set = self.name("U19", "a task set name")?;
+                Ok(SurfaceStmt::Cancel { line, set })
             }
             Tok::Delta => {
                 self.advance();
@@ -2747,6 +2903,7 @@ impl Parser {
                     let arguments = self.arguments()?;
                     return Ok(SurfaceStmt::Call {
                         line,
+                        mode: CallMode::Sync,
                         operation: first,
                         arguments,
                     });
@@ -3127,6 +3284,7 @@ fn starts_top_decl(trimmed: &str) -> bool {
         "outcome ",
         "function ",
         "extern ",
+        "async ",
         "contingent ",
         "control ",
         "boundary ",
@@ -3774,6 +3932,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
             continue;
         }
         let contingent = parser.eat(&Tok::Contingent);
+        let is_async = parser.eat(&Tok::Async);
         parser.expect(Tok::Control, "G8", "`control`")?;
         let name = parser.name("G8", "a control name")?;
         let parameters = parser.parameters("G8")?;
@@ -3817,6 +3976,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                 name,
                 public,
                 external: true,
+                is_async,
                 contingent,
                 faults,
                 multiline_contract,
@@ -3840,6 +4000,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                 name,
                 public,
                 external: false,
+                is_async,
                 contingent,
                 faults,
                 multiline_contract,
@@ -3870,6 +4031,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
             name,
             public,
             external: false,
+            is_async,
             contingent,
             faults,
             multiline_contract,
@@ -4050,7 +4212,12 @@ impl Elaborator {
         fn inner(elab: &Elaborator, ty: &Type, seen: &mut HashSet<String>) -> bool {
             match ty {
                 Type::Resource(_, _) | Type::Outcome(_, _) | Type::OutcomeNamed(_) => true,
-                Type::Ref(_, _) | Type::Bool | Type::Int(_) | Type::String => false,
+                Type::Ref(_, _)
+                | Type::Bool
+                | Type::Int(_)
+                | Type::String
+                | Type::TasksNamed(_)
+                | Type::Tasks(_, _) => false,
                 Type::Vector(elem) => inner(elab, elem, seen),
                 Type::Map(k, v) => inner(elab, k, seen) || inner(elab, v, seen),
                 Type::Named(name) => {
@@ -4419,7 +4586,14 @@ impl Elaborator {
             Expr::Borrow(mode, inner) => self
                 .expr_type(inner, scopes)
                 .map(|t| Type::Ref(*mode, Box::new(t.deref_type().clone()))),
-            Expr::Len(_) => Some(Type::Int(IntType::Usize)),
+            Expr::Len(_) | Expr::Count(_) => Some(Type::Int(IntType::Usize)),
+            Expr::TasksEmpty(prod) => {
+                if prod.is_empty() {
+                    None
+                } else {
+                    Some(Type::TasksNamed(prod.clone()))
+                }
+            }
             Expr::Struct(name, _) => Some(Type::Named(name.clone())),
             Expr::Variant(name, _, _) => Some(Type::Named(name.clone())),
             Expr::Vector(items) => items
@@ -4685,10 +4859,11 @@ impl Elaborator {
                 }
             }
             SurfaceCall::Direct {
+                mode,
                 operation,
                 arguments,
             } => {
-                if self.controls.contains_key(operation) {
+                if *mode != CallMode::Sync || self.controls.contains_key(operation) {
                     return Ok(None);
                 }
                 match operation.as_str() {
@@ -4966,6 +5141,7 @@ impl Elaborator {
                 name: control.name.clone(),
                 public: control.public,
                 external: true,
+                is_async: control.is_async,
                 contingent: control.contingent,
                 faults: control.faults,
                 parameters: control.parameters.clone(),
@@ -5046,6 +5222,7 @@ impl Elaborator {
             name: control.name.clone(),
             public: control.public,
             external: false,
+            is_async: control.is_async,
             contingent: control.contingent,
             faults: control.faults,
             parameters: control.parameters.clone(),
@@ -5515,10 +5692,23 @@ impl Elaborator {
                 ty,
                 value,
             } => {
+                let value_with_prod = match (value, ty) {
+                    (Expr::TasksEmpty(prod), Some(Type::TasksNamed(f))) if prod.is_empty() => {
+                        Expr::TasksEmpty(f.clone())
+                    }
+                    (Expr::TasksEmpty(prod), _) if prod.is_empty() => {
+                        return fail(
+                            *line,
+                            "U19",
+                            "`tasks()` requires a `: tasks<f>` type annotation",
+                        );
+                    }
+                    _ => value.clone(),
+                };
                 let checked_value = if let Some(declared_ty) = ty {
-                    self.check_arg_into(value, declared_ty, selection, ctx, out, *line)?
+                    self.check_arg_into(&value_with_prod, declared_ty, selection, ctx, out, *line)?
                 } else {
-                    self.check_untyped_value_into(value, selection, ctx, out, *line)?
+                    self.check_untyped_value_into(&value_with_prod, selection, ctx, out, *line)?
                 };
                 let inferred = ty
                     .clone()
@@ -5594,10 +5784,15 @@ impl Elaborator {
                 ty,
                 call,
             } => {
+                let call_mode = match call {
+                    SurfaceCall::Direct { mode, .. } => *mode,
+                    SurfaceCall::Method { .. } => CallMode::Sync,
+                };
                 let (op_name, core_args, contract) = match call {
                     SurfaceCall::Direct {
                         operation,
                         arguments,
+                        ..
                     } if self.controls.contains_key(operation) => {
                         let callee = self.ensure_contract(operation, *line)?;
                         let param_types: Vec<Type> = self.controls[operation]
@@ -5642,6 +5837,7 @@ impl Elaborator {
                         mutable: *mutable,
                         name: name.clone(),
                         ty: ty.clone(),
+                        mode: call_mode,
                         operation: op_name,
                         arguments: core_args,
                     },
@@ -5910,6 +6106,7 @@ impl Elaborator {
                     selector: selection.clone(),
                     command: Command::Decide {
                         site: core_site.clone(),
+                        mode: CallMode::Sync,
                         operation: "outcome".to_string(),
                         arguments: vec![Expr::Name(name.clone())],
                         arms: core_arms,
@@ -5985,6 +6182,7 @@ impl Elaborator {
                     selector: selection.clone(),
                     command: Command::Decide {
                         site: core_site,
+                        mode: CallMode::Sync,
                         operation: op_name,
                         arguments: core_args,
                         arms: vec![Arm {
@@ -5995,8 +6193,49 @@ impl Elaborator {
                     line: *line,
                 });
             }
+            SurfaceStmt::Spawn {
+                line,
+                operation,
+                arguments,
+                set,
+            } => {
+                if !self.controls.contains_key(operation) {
+                    return fail(*line, "C1", format!("`{operation}` is not a control"));
+                }
+                let _ = self.ensure_contract(operation, *line)?;
+                let param_types: Vec<Type> = self.controls[operation]
+                    .parameters
+                    .iter()
+                    .map(|p| p.ty.clone())
+                    .collect();
+                let checked = self.check_args_against_into(
+                    arguments,
+                    &param_types,
+                    selection,
+                    ctx,
+                    out,
+                    *line,
+                )?;
+                out.push(Statement {
+                    selector: selection.clone(),
+                    command: Command::Spawn {
+                        control: operation.clone(),
+                        arguments: checked,
+                        set: set.clone(),
+                    },
+                    line: *line,
+                });
+            }
+            SurfaceStmt::Cancel { line, set } => {
+                out.push(Statement {
+                    selector: selection.clone(),
+                    command: Command::Cancel { set: set.clone() },
+                    line: *line,
+                });
+            }
             SurfaceStmt::Call {
                 line,
+                mode,
                 operation,
                 arguments,
             } => {
@@ -6018,16 +6257,19 @@ impl Elaborator {
                         *line,
                     )?;
                     (operation.clone(), checked, contract)
-                } else if let Some(res) = self.resolve_builtin_call(
-                    &SurfaceCall::Direct {
-                        operation: operation.clone(),
-                        arguments: arguments.clone(),
-                    },
-                    selection,
-                    ctx,
-                    out,
-                    *line,
-                )? {
+                } else if *mode == CallMode::Sync
+                    && let Some(res) = self.resolve_builtin_call(
+                        &SurfaceCall::Direct {
+                            mode: CallMode::Sync,
+                            operation: operation.clone(),
+                            arguments: arguments.clone(),
+                        },
+                        selection,
+                        ctx,
+                        out,
+                        *line,
+                    )?
+                {
                     res
                 } else {
                     return fail(*line, "C1", format!("`{operation}` is not a control"));
@@ -6051,6 +6293,7 @@ impl Elaborator {
                     selector: selection.clone(),
                     command: Command::Decide {
                         site: core_site,
+                        mode: *mode,
                         operation: core_op,
                         arguments: core_args,
                         arms: vec![Arm {
@@ -6063,10 +6306,11 @@ impl Elaborator {
             }
             SurfaceStmt::Forward {
                 line,
+                mode,
                 operation,
                 arguments,
             } => {
-                // [U14]: forward ω(ā) requires every entry of the callee's
+                // [U14]: forward [await | run] ω(ā) requires every entry of the callee's
                 // contract (single alternative or group included by name) to be
                 // an entry of the caller's contract with the same payload types.
                 let callee = self.ensure_contract(operation, *line)?;
@@ -6111,6 +6355,7 @@ impl Elaborator {
                     selector: selection.clone(),
                     command: Command::Decide {
                         site: core_site.clone(),
+                        mode: *mode,
                         operation: operation.clone(),
                         arguments: checked_args,
                         arms: core_arms,
@@ -6136,8 +6381,44 @@ impl Elaborator {
                 arms,
                 ..
             } => match operand {
+                SurfaceOperand::AwaitNext(set_name) => {
+                    let Some(Type::TasksNamed(prod_name)) = ctx
+                        .scopes
+                        .iter()
+                        .rev()
+                        .find_map(|s| s.vars.get(set_name).cloned())
+                    else {
+                        return fail(
+                            *line,
+                            "U19",
+                            format!("`{set_name}` is not a task set of type `tasks<f>`"),
+                        );
+                    };
+                    let mut next_contract = self.ensure_contract(&prod_name, *line)?;
+                    next_contract.alternatives.push(Alternative {
+                        name: "empty".to_string(),
+                        fields: Vec::new(),
+                        condition: None,
+                    });
+                    next_contract.own_alternatives.push("empty".to_string());
+                    self.elaborate_resolved_decision(
+                        *line,
+                        site.as_deref(),
+                        *adapter,
+                        CallMode::AwaitNext,
+                        "next",
+                        set_name,
+                        &[],
+                        &next_contract,
+                        arms,
+                        selection,
+                        ctx,
+                        out,
+                    )?;
+                }
                 SurfaceOperand::Call(call) => {
                     if let SurfaceCall::Direct {
+                        mode,
                         operation,
                         arguments,
                     } = call
@@ -6161,6 +6442,7 @@ impl Elaborator {
                             *line,
                             site.as_deref(),
                             *adapter,
+                            *mode,
                             operation,
                             operation,
                             &checked_args,
@@ -6177,6 +6459,7 @@ impl Elaborator {
                             *line,
                             site.as_deref(),
                             *adapter,
+                            CallMode::Sync,
                             &op_name,
                             &op_name,
                             &core_args,
@@ -6187,6 +6470,7 @@ impl Elaborator {
                             out,
                         )?;
                     } else if let SurfaceCall::Direct {
+                        mode: CallMode::Sync,
                         operation,
                         arguments,
                     } = call
@@ -6226,6 +6510,7 @@ impl Elaborator {
                             *line,
                             site.as_deref(),
                             *adapter,
+                            CallMode::Sync,
                             var_name,
                             "outcome",
                             &[Expr::Name(var_name.clone())],
@@ -6306,6 +6591,7 @@ impl Elaborator {
                             *line,
                             site.as_deref(),
                             *adapter,
+                            CallMode::Sync,
                             &default_site,
                             &vname,
                             &[core_arg],
@@ -6564,6 +6850,7 @@ impl Elaborator {
         line: u32,
         explicit_site: Option<&str>,
         adapter: bool,
+        mode: CallMode,
         default_site: &str,
         core_operation: &str,
         arguments: &[Expr],
@@ -6783,6 +7070,7 @@ impl Elaborator {
             selector: selection.clone(),
             command: Command::Decide {
                 site: core_site.clone(),
+                mode,
                 operation: core_operation.to_string(),
                 arguments: arguments.to_vec(),
                 arms: core_arms,
@@ -7500,6 +7788,9 @@ fn collect_stmt_paths(
                     SurfaceOperand::Call(SurfaceCall::Method { method, .. }) => {
                         sites.insert(method.clone());
                     }
+                    SurfaceOperand::AwaitNext(_) => {
+                        sites.insert("next".to_string());
+                    }
                     SurfaceOperand::Expr(expr) => {
                         if let Some(n) = Elaborator::place_last_name(expr) {
                             sites.insert(n);
@@ -7631,8 +7922,12 @@ fn collect_inner_declarations(statements: &[Statement], out: &mut HashSet<String
 
 fn rename_expr(expr: &mut Expr, renames: &HashMap<String, String>) {
     match expr {
-        Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) | Expr::EmptyMap => {}
-        Expr::Name(name) | Expr::Old(name) => {
+        Expr::Integer(_)
+        | Expr::Boolean(_)
+        | Expr::String(_)
+        | Expr::EmptyMap
+        | Expr::TasksEmpty(_) => {}
+        Expr::Name(name) | Expr::Old(name) | Expr::Count(name) => {
             if let Some(new_name) = renames.get(name) {
                 *name = new_name.clone();
             }
@@ -7719,6 +8014,19 @@ fn rename_statements(statements: &mut [Statement], renames: &HashMap<String, Str
             Command::Leave { payload, .. } | Command::Exit { payload, .. } => {
                 for item in payload {
                     rename_expr(item, renames);
+                }
+            }
+            Command::Spawn { arguments, set, .. } => {
+                for arg in arguments {
+                    rename_expr(arg, renames);
+                }
+                if let Some(new_name) = renames.get(set) {
+                    *set = new_name.clone();
+                }
+            }
+            Command::Cancel { set } => {
+                if let Some(new_name) = renames.get(set) {
+                    *set = new_name.clone();
                 }
             }
             Command::Impossible => {}
@@ -8076,6 +8384,17 @@ fn format_contract_entry(entry: &SurfaceContractEntry) -> String {
     }
 }
 
+fn format_surface_type(ty: &Type) -> String {
+    match ty {
+        Type::TasksNamed(name) | Type::Tasks(_, name) => format!("tasks<{name}>"),
+        Type::Ref(BorrowMode::Shared, inner) => format!("&{}", format_surface_type(inner)),
+        Type::Ref(BorrowMode::Exclusive, inner) => format!("&~{}", format_surface_type(inner)),
+        Type::Vector(elem) => format!("[{}]", format_surface_type(elem)),
+        Type::Map(k, v) => format!("{} ⇀ {}", format_surface_type(k), format_surface_type(v)),
+        other => other.to_string(),
+    }
+}
+
 fn format_control(control: &SurfaceControl, lines: &mut Vec<String>) {
     let mut head = String::new();
     if control.public {
@@ -8086,6 +8405,9 @@ fn format_control(control: &SurfaceControl, lines: &mut Vec<String>) {
     }
     if control.contingent {
         head.push_str("contingent ");
+    }
+    if control.is_async {
+        head.push_str("async ");
     }
     head.push_str(&format!(
         "control {}({})",
@@ -8354,6 +8676,11 @@ fn format_surface_expr_prec(out: &mut String, expr: &Expr, minimum: u8) {
             out.push(' ');
             format_surface_expr_prec(out, right, level + 1);
         }
+        Expr::TasksEmpty(_) => out.push_str("tasks()"),
+        Expr::Count(name) => {
+            out.push_str(name);
+            out.push_str(".count()");
+        }
         other => out.push_str(&other.to_string()),
     }
     if level < minimum {
@@ -8408,9 +8735,18 @@ fn format_arm_target_inline(target: &ArmTarget) -> Option<String> {
 fn format_surface_call(call: &SurfaceCall) -> String {
     match call {
         SurfaceCall::Direct {
+            mode,
             operation,
             arguments,
-        } => format!("{operation}({})", format_expr_list(arguments)),
+        } => {
+            let prefix = match mode {
+                CallMode::Sync => "",
+                CallMode::Await => "await ",
+                CallMode::Run => "run ",
+                CallMode::AwaitNext => "await next ",
+            };
+            format!("{prefix}{operation}({})", format_expr_list(arguments))
+        }
         SurfaceCall::Method {
             receiver,
             method,
@@ -8426,6 +8762,7 @@ fn format_surface_call(call: &SurfaceCall) -> String {
 fn format_surface_operand(operand: &SurfaceOperand) -> String {
     match operand {
         SurfaceOperand::Call(call) => format_surface_call(call),
+        SurfaceOperand::AwaitNext(set) => format!("await next {set}"),
         SurfaceOperand::Expr(expr) => format_surface_expr(expr),
     }
 }
@@ -8461,7 +8798,7 @@ fn format_simple_stmt_inline(stmt: &SurfaceStmt) -> String {
             }
             s.push_str(name);
             if let Some(ty) = ty {
-                s.push_str(&format!(": {ty}"));
+                s.push_str(&format!(": {}", format_surface_type(ty)));
             }
             s.push_str(&format!(" := {}", format_surface_expr(value)));
             s
@@ -8494,21 +8831,58 @@ fn format_simple_stmt_inline(stmt: &SurfaceStmt) -> String {
             s.push_str(&format!(" := capture {}", format_surface_call(call)));
             s
         }
-        SurfaceStmt::Assign { name, value, .. } => format!("{name} ← {value}"),
-        SurfaceStmt::AssignPlace { target, value, .. } => {
-            format!("{} ← {value}", format_place_inline(target))
+        SurfaceStmt::Assign { name, value, .. } => {
+            format!("{name} ← {}", format_surface_expr(value))
         }
-        SurfaceStmt::Oblige { formula, .. } => format!("⊢ {formula}"),
+        SurfaceStmt::AssignPlace { target, value, .. } => {
+            format!(
+                "{} ← {}",
+                format_place_inline(target),
+                format_surface_expr(value)
+            )
+        }
+        SurfaceStmt::Oblige { formula, .. } => format!("⊢ {}", format_surface_expr(formula)),
         SurfaceStmt::Forward {
+            mode,
             operation,
             arguments,
             ..
-        } => format!("forward {operation}({})", format_expr_list(arguments)),
+        } => {
+            let prefix = match mode {
+                CallMode::Sync => "",
+                CallMode::Await => "await ",
+                CallMode::Run => "run ",
+                CallMode::AwaitNext => "await next ",
+            };
+            format!(
+                "forward {prefix}{operation}({})",
+                format_expr_list(arguments)
+            )
+        }
         SurfaceStmt::Call {
+            mode,
             operation,
             arguments,
             ..
-        } => format!("{operation}({})", format_expr_list(arguments)),
+        } => {
+            let prefix = match mode {
+                CallMode::Sync => "",
+                CallMode::Await => "await ",
+                CallMode::Run => "run ",
+                CallMode::AwaitNext => "await next ",
+            };
+            format!("{prefix}{operation}({})", format_expr_list(arguments))
+        }
+        SurfaceStmt::Spawn {
+            operation,
+            arguments,
+            set,
+            ..
+        } => format!(
+            "spawn {operation}({}) into {set}",
+            format_expr_list(arguments)
+        ),
+        SurfaceStmt::Cancel { set, .. } => format!("cancel {set}"),
         SurfaceStmt::MethodCall {
             receiver,
             method,
@@ -8610,6 +8984,8 @@ fn is_short_inline_stmt(stmt: &SurfaceStmt) -> bool {
             | SurfaceStmt::Oblige { .. }
             | SurfaceStmt::Forward { .. }
             | SurfaceStmt::Call { .. }
+            | SurfaceStmt::Spawn { .. }
+            | SurfaceStmt::Cancel { .. }
             | SurfaceStmt::MethodCall { .. }
             | SurfaceStmt::Supervise { .. }
             | SurfaceStmt::Again { .. }

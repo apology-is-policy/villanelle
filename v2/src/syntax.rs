@@ -107,6 +107,7 @@ pub struct Control {
     pub name: String,
     pub public: bool,
     pub external: bool,
+    pub is_async: bool,
     pub contingent: bool,
     pub faults: bool,
     pub parameters: Vec<Parameter>,
@@ -115,6 +116,15 @@ pub struct Control {
     pub uses: Vec<String>,
     pub body: Vec<Statement>,
     pub line: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CallMode {
+    #[default]
+    Sync,
+    Await,
+    AwaitNext,
+    Run,
 }
 
 #[derive(Clone, Debug)]
@@ -174,11 +184,12 @@ pub enum Command {
         names: Vec<String>,
         value: Expr,
     },
-    /// `[~]x [: τ] := capture ω(ō)` ([E-Capture]).
+    /// `[~]x [: τ] := capture [await | run] ω(ō)` ([E-Capture]).
     Capture {
         mutable: bool,
         name: String,
         ty: Option<Type>,
+        mode: CallMode,
         operation: String,
         arguments: Vec<Expr>,
     },
@@ -198,6 +209,7 @@ pub enum Command {
     },
     Decide {
         site: String,
+        mode: CallMode,
         operation: String,
         arguments: Vec<Expr>,
         arms: Vec<Arm>,
@@ -222,6 +234,16 @@ pub enum Command {
     Supervise {
         boundary: String,
         arguments: Vec<Expr>,
+    },
+    /// `spawn f(ō) into x` ([E-Spawn]).
+    Spawn {
+        control: String,
+        arguments: Vec<Expr>,
+        set: String,
+    },
+    /// `cancel x` ([E-Cancel]).
+    Cancel {
+        set: String,
     },
     Again {
         name: String,
@@ -338,6 +360,10 @@ pub enum Expr {
     Unary(Unary, Box<Expr>),
     Binary(Binary, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
+    /// `tasks⟨f⟩()` empty task set constructor ([W11]).
+    TasksEmpty(String),
+    /// `count(x)` member count of a task set ([W11], [TK1]).
+    Count(String),
 }
 
 // Printing. The output is the glyph form, and reading it back gives the same
@@ -476,6 +502,12 @@ fn print_expr(out: &mut String, expr: &Expr, minimum: u8) {
             print_list(out, arguments);
             out.push(')');
         }
+        Expr::TasksEmpty(producer) => {
+            let _ = write!(out, "tasks⟨{producer}⟩()");
+        }
+        Expr::Count(set) => {
+            let _ = write!(out, "count({set})");
+        }
     }
     if level < minimum {
         out.push(')');
@@ -598,6 +630,7 @@ fn print_statements(out: &mut String, statements: &[Statement], indent: usize) {
                 mutable,
                 name,
                 ty,
+                mode,
                 operation,
                 arguments,
             } => {
@@ -608,7 +641,14 @@ fn print_statements(out: &mut String, statements: &[Statement], indent: usize) {
                 if let Some(ty) = ty {
                     let _ = write!(out, " : {ty}");
                 }
-                let _ = write!(out, " := capture {operation}(");
+                out.push_str(" := capture ");
+                match mode {
+                    CallMode::Sync => {}
+                    CallMode::Await => out.push_str("await "),
+                    CallMode::AwaitNext => out.push_str("await next "),
+                    CallMode::Run => out.push_str("run "),
+                }
+                let _ = write!(out, "{operation}(");
                 print_list(out, arguments);
                 out.push(')');
             }
@@ -631,13 +671,32 @@ fn print_statements(out: &mut String, statements: &[Statement], indent: usize) {
             }
             Command::Decide {
                 site,
+                mode,
                 operation,
                 arguments,
                 arms,
             } => {
-                let _ = write!(out, "{site} : Δ {operation}(");
-                print_list(out, arguments);
-                out.push(')');
+                let _ = write!(out, "{site} : Δ ");
+                match mode {
+                    CallMode::Sync => {
+                        let _ = write!(out, "{operation}(");
+                        print_list(out, arguments);
+                        out.push(')');
+                    }
+                    CallMode::Await => {
+                        let _ = write!(out, "await {operation}(");
+                        print_list(out, arguments);
+                        out.push(')');
+                    }
+                    CallMode::AwaitNext => {
+                        let _ = write!(out, "await next({operation})");
+                    }
+                    CallMode::Run => {
+                        let _ = write!(out, "run {operation}(");
+                        print_list(out, arguments);
+                        out.push(')');
+                    }
+                }
                 print_arms(out, arms);
             }
             Command::Loop {
@@ -696,6 +755,18 @@ fn print_statements(out: &mut String, statements: &[Statement], indent: usize) {
                 let _ = write!(out, "supervise {boundary}(");
                 print_list(out, arguments);
                 out.push(')');
+            }
+            Command::Spawn {
+                control,
+                arguments,
+                set,
+            } => {
+                let _ = write!(out, "spawn {control}(");
+                print_list(out, arguments);
+                let _ = write!(out, ") into {set}");
+            }
+            Command::Cancel { set } => {
+                let _ = write!(out, "cancel {set}");
             }
             Command::Again { name, arguments } => {
                 let _ = write!(out, "↑ {name}(");
@@ -859,6 +930,9 @@ impl Program {
                     }
                     if control.external {
                         out.push_str("extern ");
+                    }
+                    if control.is_async {
+                        out.push_str("async ");
                     }
                     let _ = write!(out, "control {}(", control.name);
                     print_parameters(&mut out, &control.parameters);

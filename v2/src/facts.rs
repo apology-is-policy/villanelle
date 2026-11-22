@@ -157,7 +157,11 @@ impl SortTag {
             Type::Outcome(id, _) => Some(SortTag::Outcome(*id)),
             Type::Vector(elem) => Some(SortTag::Vector(elem.to_string())),
             Type::Map(k, v) => Some(SortTag::Map(k.to_string(), v.to_string())),
-            Type::Named(_) | Type::OutcomeNamed(_) | Type::Ref(_, _) => None,
+            Type::Named(_)
+            | Type::OutcomeNamed(_)
+            | Type::TasksNamed(_)
+            | Type::Tasks(_, _)
+            | Type::Ref(_, _) => None,
         }
     }
 

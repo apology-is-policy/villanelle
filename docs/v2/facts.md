@@ -281,8 +281,8 @@ piece of program text denotes at a statement.
   across the event, the loop included.
 - **[I10] Pure operations.** An operation is **pure** when its set of effects
   is empty, whether declared or inferred ([F3]), it is not `async`, no `run`
-  occurs in its body or in the body of a control it calls, and no
-  resource type occurs in its parameters or payloads. It neither changes nor
+  occurs in its body, in the body of a control it calls, or in a named boundary
+  it supervises, and no resource type occurs in its parameters or payloads. It neither changes nor
   observes the world, and no order of turns can reach it ([E-Turn]), so its
   alternative and its payload are functions of the values it was given. A decision at site
   `d` on a pure operation `f` with argument terms `t̄` (borrows as the values

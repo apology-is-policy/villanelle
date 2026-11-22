@@ -187,6 +187,11 @@ impl Globals<'_> {
                 };
                 Ok(Type::Outcome(id, self.outcomes[id].name.clone()))
             }
+            Type::TasksNamed(_) | Type::Tasks(_, _) => fail(
+                line,
+                "W11",
+                "`tasks⟨f⟩` is only allowed as the type of a mutable local bound by `~x : tasks⟨f⟩ := tasks⟨f⟩()`",
+            ),
             Type::Named(name) => {
                 if let Some(t) = Type::from_name(name) {
                     return Ok(t);
@@ -255,7 +260,11 @@ impl Globals<'_> {
             Type::Bool | Type::Int(_) | Type::String => true,
             Type::Struct(id, _) => self.structs[*id].clonable,
             Type::Variant(id, _) => self.variants[*id].clonable,
-            Type::Resource(_, _) | Type::Outcome(_, _) | Type::OutcomeNamed(_) => false,
+            Type::Resource(_, _)
+            | Type::Outcome(_, _)
+            | Type::OutcomeNamed(_)
+            | Type::Tasks(_, _)
+            | Type::TasksNamed(_) => false,
             Type::Vector(elem) => self.is_clonable(elem),
             Type::Map(k, v) => self.is_clonable(k) && self.is_clonable(v),
             Type::Ref(_, _) | Type::Named(_) => false,
@@ -277,7 +286,11 @@ impl Globals<'_> {
             Type::String | Type::Ref(BorrowMode::Exclusive, _) => Kind::Drop,
             Type::Struct(id, _) => self.structs[*id].kind,
             Type::Variant(id, _) => self.variants[*id].kind,
-            Type::Resource(_, _) | Type::Outcome(_, _) | Type::OutcomeNamed(_) => Kind::Must,
+            Type::Resource(_, _)
+            | Type::Outcome(_, _)
+            | Type::OutcomeNamed(_)
+            | Type::Tasks(_, _)
+            | Type::TasksNamed(_) => Kind::Must,
             Type::Vector(elem) => Kind::Drop.max(self.kind(elem)),
             Type::Map(k, v) => Kind::Drop.max(self.kind(k)).max(self.kind(v)),
             Type::Named(_) => Kind::Drop,
@@ -286,7 +299,12 @@ impl Globals<'_> {
 
     fn is_fault_releasable(&self, ty: &Type) -> bool {
         match ty {
-            Type::Bool | Type::Int(_) | Type::String | Type::Ref(_, _) => true,
+            Type::Bool
+            | Type::Int(_)
+            | Type::String
+            | Type::Ref(_, _)
+            | Type::Tasks(_, _)
+            | Type::TasksNamed(_) => true,
             Type::Struct(id, _) => self.structs[*id].fault_releasable,
             Type::Variant(id, _) => self.variants[*id].fault_releasable,
             Type::Resource(id, _) => self.resources[*id].on_fault_release,
@@ -299,7 +317,12 @@ impl Globals<'_> {
 
     fn holds_obligation(&self, ty: &Type) -> bool {
         match ty {
-            Type::Bool | Type::Int(_) | Type::String | Type::Ref(_, _) => false,
+            Type::Bool
+            | Type::Int(_)
+            | Type::String
+            | Type::Ref(_, _)
+            | Type::Tasks(_, _)
+            | Type::TasksNamed(_) => false,
             Type::Struct(id, _) => self.structs[*id].holds_obligation,
             Type::Variant(id, _) => self.variants[*id].holds_obligation,
             Type::Resource(_, _) | Type::Outcome(_, _) | Type::OutcomeNamed(_) => true,
@@ -457,6 +480,14 @@ impl Typer<'_> {
                 }
                 Some(self.globals.function_types[self.function(name)?].1.clone())
             }
+            syntax::Expr::TasksEmpty(_) => {
+                return fail(
+                    self.line,
+                    "W11",
+                    "`tasks⟨f⟩()` may only initialize a `~x : tasks⟨f⟩` local",
+                );
+            }
+            syntax::Expr::Count(_) => Some(Type::Int(IntType::Usize)),
         })
     }
 
@@ -541,6 +572,13 @@ impl Typer<'_> {
                 let Some((VarRef::Local(var), ty)) = self.scope.find(name) else {
                     return self.error(format!("`{name}` is not a place here"));
                 };
+                if matches!(ty, Type::Tasks(_, _)) {
+                    return fail(
+                        self.line,
+                        "W11",
+                        format!("task set `{name}` cannot be lent or assigned"),
+                    );
+                }
                 let through_exc = matches!(ty, Type::Ref(BorrowMode::Exclusive, _));
                 let val_ty = ty.deref_type().clone();
                 Ok((
@@ -715,6 +753,15 @@ impl Typer<'_> {
                 let Some((var, ty)) = self.scope.find(name) else {
                     return self.error(format!("`{name}` is not a name here"));
                 };
+                if matches!(ty, Type::Tasks(_, _)) {
+                    return fail(
+                        self.line,
+                        "W11",
+                        format!(
+                            "task set `{name}` cannot be used as a value; use `spawn`, `await next`, `cancel` or `count`"
+                        ),
+                    );
+                }
                 // [W8]: A name of borrow type stands for the value it refers to
                 // everywhere a value is expected.
                 let val_ty = ty.deref_type();
@@ -964,6 +1011,33 @@ impl Typer<'_> {
                 }
                 Ok(Expr::Call(id, built, result.clone()))
             }
+            syntax::Expr::TasksEmpty(_) => fail(
+                self.line,
+                "W11",
+                "`tasks⟨f⟩()` may only initialize a `~x : tasks⟨f⟩` local",
+            ),
+            syntax::Expr::Count(set_name) => {
+                if *expected != Type::Int(IntType::Usize) {
+                    return self.error(format!(
+                        "`count({set_name})` yields usize, and {expected} is expected"
+                    ));
+                }
+                let Some((VarRef::Local(vid), ty)) = self.scope.find(set_name) else {
+                    return fail(
+                        self.line,
+                        "TK1",
+                        format!("`{set_name}` is not a task set in scope"),
+                    );
+                };
+                if !matches!(ty, Type::Tasks(_, _)) {
+                    return fail(
+                        self.line,
+                        "TK1",
+                        format!("`count({set_name})` requires a task set, found {ty}"),
+                    );
+                }
+                Ok(Expr::Count(vid))
+            }
         }
     }
 
@@ -1078,6 +1152,7 @@ struct Frame {
 struct Builder<'g, 'a> {
     globals: &'g mut Globals<'a>,
     controls: &'g [Control],
+    control_is_external: &'g [bool],
     boundaries: &'g [(String, Vec<Parameter>, bool, Vec<String>)],
     control: Option<ControlId>,
     in_boundary: bool,
@@ -1087,6 +1162,12 @@ struct Builder<'g, 'a> {
     bodies: Vec<Body>,
     site_names: HashSet<String>,
     frames: Vec<Frame>,
+}
+
+impl Builder<'_, '_> {
+    fn in_async_body(&self) -> bool {
+        !self.in_contingency && self.control.is_some_and(|cid| self.controls[cid].is_async)
+    }
 }
 
 impl Scope for Builder<'_, '_> {
@@ -1329,11 +1410,152 @@ impl<'g, 'a> Builder<'g, 'a> {
 
     fn resolve_operation(
         &mut self,
+        mode: syntax::CallMode,
+        is_capture: bool,
         operation: &str,
         arguments: &[syntax::Expr],
         line: u32,
     ) -> Result<(ControlId, Operation, Vec<Expr>, Vec<Alternative>), Error> {
+        match mode {
+            syntax::CallMode::AwaitNext => {
+                if is_capture {
+                    return fail(
+                        line,
+                        "W11",
+                        "`await next(x)` occurs only in a decision, not in `capture`",
+                    );
+                }
+                if !self.in_async_body() {
+                    return fail(
+                        line,
+                        "W10",
+                        "`await next` occurs only in the body of an `async control`",
+                    );
+                }
+                let Some((VarRef::Local(vid), ty)) = self.find(operation) else {
+                    return fail(
+                        line,
+                        "TK1",
+                        format!("`{operation}` is not a task set in scope"),
+                    );
+                };
+                let Type::Tasks(prod_id, _) = ty else {
+                    return fail(
+                        line,
+                        "TK1",
+                        format!("`await next({operation})` requires a task set, found {ty}"),
+                    );
+                };
+                let mut contract = self.controls[prod_id].contract.clone();
+                contract.push(Alternative {
+                    name: "empty".to_string(),
+                    fields: Vec::new(),
+                    condition: None,
+                });
+                return Ok((
+                    prod_id,
+                    Operation::AwaitNext(vid, prod_id),
+                    Vec::new(),
+                    contract,
+                ));
+            }
+            syntax::CallMode::Await => {
+                if !self.in_async_body() {
+                    return fail(
+                        line,
+                        "W10",
+                        "`await` occurs only in the body of an `async control`",
+                    );
+                }
+                let Some(callee) = self.globals.control_ids.get(operation).copied() else {
+                    return fail(line, "C1", format!("`{operation}` is not a control"));
+                };
+                if !self.controls[callee].is_async {
+                    return fail(
+                        line,
+                        "W10",
+                        format!(
+                            "`await {operation}` requires `{operation}` to be an `async control`"
+                        ),
+                    );
+                }
+                let types: Vec<Type> = self.controls[callee]
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.ty.clone())
+                    .collect();
+                let built_args = self.arguments(
+                    &format!("`await {operation}`"),
+                    arguments,
+                    &types,
+                    "TK1",
+                    line,
+                )?;
+                let contract = self.controls[callee].contract.clone();
+                return Ok((
+                    callee,
+                    Operation::AwaitControl(callee),
+                    built_args,
+                    contract,
+                ));
+            }
+            syntax::CallMode::Run => {
+                if self.in_async_body() {
+                    return fail(
+                        line,
+                        "W10",
+                        "`run` occurs only in a control that is not `async`",
+                    );
+                }
+                let Some(callee) = self.globals.control_ids.get(operation).copied() else {
+                    return fail(line, "C1", format!("`{operation}` is not a control"));
+                };
+                if !self.controls[callee].is_async {
+                    return fail(
+                        line,
+                        "W10",
+                        format!(
+                            "`run {operation}` requires `{operation}` to be an `async control`"
+                        ),
+                    );
+                }
+                if self.in_contingency && !self.controls[callee].contingent {
+                    return fail(
+                        line,
+                        "F6",
+                        format!(
+                            "`{operation}` is not marked `contingent` and cannot be run inside a contingency"
+                        ),
+                    );
+                }
+                let types: Vec<Type> = self.controls[callee]
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.ty.clone())
+                    .collect();
+                let built_args = self.arguments(
+                    &format!("`run {operation}`"),
+                    arguments,
+                    &types,
+                    "TK1",
+                    line,
+                )?;
+                let contract = self.controls[callee].contract.clone();
+                return Ok((callee, Operation::RunControl(callee), built_args, contract));
+            }
+            syntax::CallMode::Sync => {}
+        }
+
         if let Some(callee) = self.globals.control_ids.get(operation).copied() {
+            if self.controls[callee].is_async {
+                return fail(
+                    line,
+                    "W10",
+                    format!(
+                        "`async control` `{operation}` must be invoked with `await`, `run`, or `spawn`"
+                    ),
+                );
+            }
             if self.in_contingency && !self.controls[callee].contingent {
                 return fail(
                     line,
@@ -1883,6 +2105,98 @@ impl<'g, 'a> Builder<'g, 'a> {
                 ty,
                 value,
             } => {
+                // [W10], [W11], [W12]: task set local `~x : tasks⟨f⟩ := tasks⟨f⟩()`.
+                let task_ty_prod = match ty {
+                    Some(Type::TasksNamed(p)) | Some(Type::Tasks(_, p)) => Some(p.as_str()),
+                    _ => None,
+                };
+                let task_val_prod = match value {
+                    syntax::Expr::TasksEmpty(p) => Some(p.as_str()),
+                    _ => None,
+                };
+                if task_ty_prod.is_some() || task_val_prod.is_some() {
+                    if !self.in_async_body() {
+                        return fail(
+                            line,
+                            "W10",
+                            "`tasks⟨f⟩()` occurs only in the body of an `async control`",
+                        );
+                    }
+                    if !*mutable {
+                        return fail(
+                            line,
+                            "W11",
+                            format!("task set `{name}` must be declared mutable (`~{name}`)"),
+                        );
+                    }
+                    let Some(val_prod) = task_val_prod else {
+                        return fail(
+                            line,
+                            "W11",
+                            format!("task set `{name}` must be initialized with `tasks⟨f⟩()`"),
+                        );
+                    };
+                    if let Some(ty_prod) = task_ty_prod
+                        && ty_prod != val_prod
+                    {
+                        return fail(
+                            line,
+                            "TK1",
+                            format!(
+                                "task set `{name}` has type `tasks⟨{ty_prod}⟩`, and `tasks⟨{val_prod}⟩()` is given"
+                            ),
+                        );
+                    }
+                    let Some(&pid) = self.globals.control_ids.get(val_prod) else {
+                        return fail(
+                            line,
+                            "W10",
+                            format!(
+                                "producer `{val_prod}` of `tasks⟨{val_prod}⟩` is not a control"
+                            ),
+                        );
+                    };
+                    if !self.controls[pid].is_async || self.control_is_external[pid] {
+                        return fail(
+                            line,
+                            "W10",
+                            format!(
+                                "producer `{val_prod}` of `tasks⟨{val_prod}⟩` must be a defined `async control`"
+                            ),
+                        );
+                    }
+                    if self.controls[pid]
+                        .contract
+                        .iter()
+                        .any(|a| a.name == "empty")
+                    {
+                        return fail(
+                            line,
+                            "W12",
+                            format!(
+                                "producer `{val_prod}` may not declare an alternative named `empty`"
+                            ),
+                        );
+                    }
+                    if self
+                        .frames
+                        .last()
+                        .is_some_and(|frame| frame.names.contains_key(name))
+                    {
+                        return fail(
+                            line,
+                            "W11",
+                            format!("task set `{name}` may only be bound once"),
+                        );
+                    }
+                    let task_ty = Type::Tasks(pid, val_prod.to_string());
+                    let var = self.declare(name, task_ty.clone(), true, line)?;
+                    return Ok(Command::Bind {
+                        var,
+                        value: Expr::TasksEmpty(pid, task_ty),
+                    });
+                }
+
                 let resolved_ty = match ty {
                     Some(t) => Some(self.globals.resolve_type(t, true, false, line)?),
                     None => None,
@@ -1945,11 +2259,12 @@ impl<'g, 'a> Builder<'g, 'a> {
                 mutable,
                 name,
                 ty,
+                mode,
                 operation,
                 arguments,
             } => {
                 let (_, op_kind, built_args, contract) =
-                    self.resolve_operation(operation, arguments, line)?;
+                    self.resolve_operation(*mode, true, operation, arguments, line)?;
                 // [T6]: outcome<K> is allowed only when no payload of K contains a borrow or view.
                 for alt in &contract {
                     for f in &alt.fields {
@@ -2002,6 +2317,9 @@ impl<'g, 'a> Builder<'g, 'a> {
                 }
                 if self.globals.is_view(&ty) {
                     return fail(line, "W8", format!("view `{name}` cannot be assigned"));
+                }
+                if matches!(ty, Type::Tasks(_, _)) {
+                    return fail(line, "W11", format!("task set `{name}` cannot be assigned"));
                 }
                 let through_exc = matches!(ty, Type::Ref(BorrowMode::Exclusive, _));
                 if !self.vars[var].mutable && !through_exc {
@@ -2066,10 +2384,11 @@ impl<'g, 'a> Builder<'g, 'a> {
             }
             syntax::Command::Decide {
                 site,
+                mode,
                 operation,
                 arguments,
                 arms,
-            } => self.decide(site, operation, arguments, arms, line),
+            } => self.decide(site, *mode, operation, arguments, arms, line),
             syntax::Command::Loop {
                 site,
                 name,
@@ -2108,6 +2427,85 @@ impl<'g, 'a> Builder<'g, 'a> {
                     boundary: bid,
                     arguments: built_args,
                 })
+            }
+            syntax::Command::Spawn {
+                control,
+                arguments,
+                set,
+            } => {
+                if !self.in_async_body() {
+                    return fail(
+                        line,
+                        "W10",
+                        "`spawn` occurs only in the body of an `async control`",
+                    );
+                }
+                let Some(&callee) = self.globals.control_ids.get(control.as_str()) else {
+                    return fail(line, "C1", format!("`{control}` is not a control"));
+                };
+                if !self.controls[callee].is_async || self.control_is_external[callee] {
+                    return fail(
+                        line,
+                        "W10",
+                        format!("`spawn {control}` requires a defined `async control`"),
+                    );
+                }
+                let Some((VarRef::Local(set_var), set_ty)) = self.find(set) else {
+                    return fail(line, "TK1", format!("`{set}` is not a task set in scope"));
+                };
+                let Type::Tasks(prod_id, prod_name) = set_ty else {
+                    return fail(
+                        line,
+                        "TK1",
+                        format!("`spawn … into {set}` requires a task set, found {set_ty}"),
+                    );
+                };
+                if prod_id != callee {
+                    return fail(
+                        line,
+                        "TK1",
+                        format!(
+                            "`{set}` has type `tasks⟨{prod_name}⟩`, and cannot spawn `{control}`"
+                        ),
+                    );
+                }
+                let types: Vec<Type> = self.controls[callee]
+                    .parameters
+                    .iter()
+                    .map(|p| p.ty.clone())
+                    .collect();
+                let built_args = self.arguments(
+                    &format!("`spawn {control}`"),
+                    arguments,
+                    &types,
+                    "TK1",
+                    line,
+                )?;
+                Ok(Command::Spawn {
+                    control: callee,
+                    arguments: built_args,
+                    set: set_var,
+                })
+            }
+            syntax::Command::Cancel { set } => {
+                if !self.in_async_body() {
+                    return fail(
+                        line,
+                        "W10",
+                        "`cancel` occurs only in the body of an `async control`",
+                    );
+                }
+                let Some((VarRef::Local(set_var), set_ty)) = self.find(set) else {
+                    return fail(line, "TK1", format!("`{set}` is not a task set in scope"));
+                };
+                if !matches!(set_ty, Type::Tasks(_, _)) {
+                    return fail(
+                        line,
+                        "TK1",
+                        format!("`cancel {set}` requires a task set, found {set_ty}"),
+                    );
+                }
+                Ok(Command::Cancel { set: set_var })
             }
             syntax::Command::Again { name, arguments } => {
                 let Some(frame) = self.frames.iter().rev().find(|frame| {
@@ -2277,13 +2675,14 @@ impl<'g, 'a> Builder<'g, 'a> {
     fn decide(
         &mut self,
         site: &str,
+        mode: syntax::CallMode,
         operation: &str,
         arguments: &[syntax::Expr],
         arms: &[syntax::Arm],
         line: u32,
     ) -> Result<Command, Error> {
         let (callee_id, op_kind, built_args, contract) =
-            self.resolve_operation(operation, arguments, line)?;
+            self.resolve_operation(mode, false, operation, arguments, line)?;
         let mut listed = Vec::new();
         for arm in arms {
             let Some(index) = contract
@@ -2371,6 +2770,13 @@ impl<'g, 'a> Builder<'g, 'a> {
                     line,
                     "F5",
                     format!("captured name `{cap}` in boundary must own its value"),
+                );
+            }
+            if matches!(ty, Type::Tasks(_, _)) {
+                return fail(
+                    line,
+                    "W11",
+                    format!("task set `{cap}` cannot be moved into a boundary contingency"),
                 );
             }
             capture_vars.push(var);
@@ -2656,7 +3062,9 @@ fn calls(expr: &Expr, out: &mut Vec<FunctionId>) {
         | Expr::String(_)
         | Expr::Var(_, _)
         | Expr::Old(_, _)
-        | Expr::EmptyMap(_) => {}
+        | Expr::EmptyMap(_)
+        | Expr::TasksEmpty(_, _)
+        | Expr::Count(_) => {}
         Expr::Move(inner, _)
         | Expr::Negate(inner, _)
         | Expr::Not(inner)
@@ -3021,6 +3429,16 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
                     format!("outcome `{}` lists `{}` twice", o.name, alt.name),
                 );
             }
+            if alt.name == "cancelled" && !alt.fields.is_empty() {
+                return fail(
+                    o.line,
+                    "W12",
+                    format!(
+                        "alternative `cancelled` in outcome `{}` may not have a payload",
+                        o.name
+                    ),
+                );
+            }
             let fields = resolve_parameters(
                 &globals,
                 &alt.fields,
@@ -3131,6 +3549,28 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
                     format!("the contract lists `{}` twice", alternative.name),
                 );
             }
+            if alternative.name == "cancelled" {
+                if !alternative.fields.is_empty() {
+                    return fail(
+                        line,
+                        "W12",
+                        format!(
+                            "alternative `cancelled` in `{}` may not have a payload",
+                            control.name
+                        ),
+                    );
+                }
+                if control.external && control.is_async && alternative.condition.is_some() {
+                    return fail(
+                        line,
+                        "W12",
+                        format!(
+                            "alternative `cancelled` in extern async control `{}` may not have a condition",
+                            control.name
+                        ),
+                    );
+                }
+            }
             let mut fields = resolve_parameters(
                 &globals,
                 &alternative.fields,
@@ -3239,9 +3679,17 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
                 alternatives: contract.clone(),
             });
         }
+        if control.contingent && control.is_async {
+            return fail(
+                control.line,
+                "W10",
+                format!("contingent control `{}` may not be `async`", control.name),
+            );
+        }
         controls.push(Control {
             name: control.name.clone(),
             public: control.public,
+            is_async: control.is_async,
             contingent: control.contingent,
             faults: control.faults,
             parameters,
@@ -3392,6 +3840,8 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
         }
     }
 
+    let control_is_external: Vec<bool> = source_controls.iter().map(|c| c.external).collect();
+
     // Resolve named boundaries first so `supervise` knows their effects and fault behavior.
     let mut boundaries: Vec<BoundaryDef> = Vec::with_capacity(source_boundaries.len());
     let summary_for_builder: Vec<(String, Vec<Parameter>, bool, Vec<String>)> = boundary_headers
@@ -3404,6 +3854,7 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
         let mut b1_builder = Builder {
             globals: &mut globals,
             controls: &controls,
+            control_is_external: &control_is_external,
             boundaries: &summary_for_builder,
             control: None,
             in_boundary: true,
@@ -3438,6 +3889,7 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
         let mut b2_builder = Builder {
             globals: &mut globals,
             controls: &controls,
+            control_is_external: &control_is_external,
             boundaries: &summary_for_builder,
             control: None,
             in_boundary: true,
@@ -3499,7 +3951,9 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
                         | Command::Capture {
                             operation: op_kind, ..
                         } => match op_kind {
-                            Operation::Control(cid) => {
+                            Operation::Control(cid)
+                            | Operation::RunControl(cid)
+                            | Operation::AwaitControl(cid) => {
                                 for u in &controls[*cid].uses {
                                     if !uses.contains(u) {
                                         uses.push(u.clone());
@@ -3557,6 +4011,7 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
         let mut builder = Builder {
             globals: &mut globals,
             controls: &controls,
+            control_is_external: &control_is_external,
             boundaries: &boundary_summary,
             control: Some(id),
             in_boundary: false,

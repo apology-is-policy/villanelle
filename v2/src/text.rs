@@ -7,9 +7,9 @@
 
 use crate::int::Int;
 use crate::syntax::{
-    Alternative, Arm, Binary, BoundaryDecl, Command, Control, Declaration, Expr, Function,
-    LoopParameter, OutcomeDecl, Parameter, Place, PlaceStep, Program, ResourceDecl, Selector,
-    Statement, StructDecl, Unary, VariantConstructor, VariantDecl,
+    Alternative, Arm, Binary, BoundaryDecl, CallMode, Command, Control, Declaration, Expr,
+    Function, LoopParameter, OutcomeDecl, Parameter, Place, PlaceStep, Program, ResourceDecl,
+    Selector, Statement, StructDecl, Unary, VariantConstructor, VariantDecl,
 };
 use crate::typed::{BorrowMode, Type};
 use std::fmt;
@@ -98,6 +98,11 @@ enum Tok {
     Recover,
     Capture,
     Contingent,
+    Async,
+    Await,
+    Run,
+    Spawn,
+    Cancel,
     Mod,
     True,
     False,
@@ -148,6 +153,11 @@ fn word(text: &str) -> Tok {
         "recover" => Tok::Recover,
         "capture" => Tok::Capture,
         "contingent" => Tok::Contingent,
+        "async" => Tok::Async,
+        "await" => Tok::Await,
+        "run" => Tok::Run,
+        "spawn" => Tok::Spawn,
+        "cancel" => Tok::Cancel,
         "mod" => Tok::Mod,
         "true" => Tok::True,
         "false" => Tok::False,
@@ -500,6 +510,11 @@ impl Parser {
             self.expect_close_angle()?;
             return Ok(Type::Map(Box::new(k), Box::new(v)));
         }
+        if name == "tasks" && self.eat_open_angle() {
+            let producer = self.name("a producer control name")?;
+            self.expect_close_angle()?;
+            return Ok(Type::TasksNamed(producer));
+        }
         Ok(Type::from_name(&name).unwrap_or(Type::Named(name)))
     }
 
@@ -592,6 +607,7 @@ impl Parser {
                 | Tok::Function
                 | Tok::Pub
                 | Tok::Extern
+                | Tok::Async
                 | Tok::Control
                 | Tok::Contingent
                 | Tok::Copy
@@ -626,6 +642,7 @@ impl Parser {
                 }
                 Tok::Pub
                 | Tok::Extern
+                | Tok::Async
                 | Tok::Control
                 | Tok::Contingent
                 | Tok::Copy
@@ -670,12 +687,13 @@ impl Parser {
                     if !contingent {
                         contingent = self.eat(&Tok::Contingent);
                     }
-                    if external && !public && !contingent && self.eat(&Tok::Resource) {
+                    let is_async = self.eat(&Tok::Async);
+                    if external && !public && !contingent && !is_async && self.eat(&Tok::Resource) {
                         declarations.push(Declaration::Resource(self.resource_decl(line)?));
                         continue;
                     }
                     declarations.push(Declaration::Control(
-                        self.control(public, external, contingent, line)?,
+                        self.control(public, external, is_async, contingent, line)?,
                     ));
                 }
                 other => {
@@ -829,6 +847,7 @@ impl Parser {
         &mut self,
         public: bool,
         external: bool,
+        is_async: bool,
         contingent: bool,
         line: u32,
     ) -> Parsed<Control> {
@@ -862,6 +881,7 @@ impl Parser {
             name,
             public,
             external,
+            is_async,
             contingent,
             faults,
             parameters,
@@ -1021,6 +1041,26 @@ impl Parser {
                     arguments,
                 })
             }
+            Tok::Spawn => {
+                self.advance();
+                let control = self.name("an async control name")?;
+                let arguments = self.arguments()?;
+                let into_word = self.name("`into`")?;
+                if into_word != "into" {
+                    return self.error(format!("expected `into`, found `{into_word}`"));
+                }
+                let set = self.name("a task set name")?;
+                Ok(Command::Spawn {
+                    control,
+                    arguments,
+                    set,
+                })
+            }
+            Tok::Cancel => {
+                self.advance();
+                let set = self.name("a task set name")?;
+                Ok(Command::Cancel { set })
+            }
             Tok::Terminate => {
                 self.advance();
                 let status = if !self.first_on_line()
@@ -1135,10 +1175,10 @@ impl Parser {
                         }
                         Tok::Delta => {
                             self.position += 2;
-                            let operation = self.name("an operation")?;
-                            let arguments = self.arguments()?;
+                            let (mode, operation, arguments) = self.operation_call()?;
                             Ok(Command::Decide {
                                 site: name,
+                                mode,
                                 operation,
                                 arguments,
                                 arms: self.arms()?,
@@ -1164,6 +1204,35 @@ impl Parser {
         }
     }
 
+    fn operation_call(&mut self) -> Parsed<(CallMode, String, Vec<Expr>)> {
+        if self.eat(&Tok::Await) {
+            if matches!(self.peek(), Tok::Name(w) if w == "next")
+                && (self.peek_at(1) == &Tok::LeftParen || matches!(self.peek_at(1), Tok::Name(_)))
+            {
+                self.advance();
+                let set = if self.eat(&Tok::LeftParen) {
+                    let s = self.name("a task set name")?;
+                    self.expect(Tok::RightParen, "`)`")?;
+                    s
+                } else {
+                    self.name("a task set name")?
+                };
+                return Ok((CallMode::AwaitNext, set, Vec::new()));
+            }
+            let operation = self.name("an async control name")?;
+            let arguments = self.arguments()?;
+            return Ok((CallMode::Await, operation, arguments));
+        }
+        if self.eat(&Tok::Run) {
+            let operation = self.name("an async control name")?;
+            let arguments = self.arguments()?;
+            return Ok((CallMode::Run, operation, arguments));
+        }
+        let operation = self.name("an operation")?;
+        let arguments = self.arguments()?;
+        Ok((CallMode::Sync, operation, arguments))
+    }
+
     fn bind_or_capture(&mut self, mutable: bool, name: String) -> Parsed<Command> {
         let ty = if self.eat(&Tok::Colon) {
             Some(self.ty()?)
@@ -1172,12 +1241,12 @@ impl Parser {
         };
         self.expect(Tok::Bind, "`:=`")?;
         if self.eat(&Tok::Capture) {
-            let operation = self.name("an operation")?;
-            let arguments = self.arguments()?;
+            let (mode, operation, arguments) = self.operation_call()?;
             return Ok(Command::Capture {
                 mutable,
                 name,
                 ty,
+                mode,
                 operation,
                 arguments,
             });
@@ -1356,6 +1425,12 @@ impl Parser {
                         left = Expr::Len(Box::new(left));
                     } else if member == "clone" && args.is_empty() {
                         left = Expr::Clone(Box::new(left));
+                    } else if member == "count" && args.is_empty() {
+                        if let Expr::Name(set) = left {
+                            left = Expr::Count(set);
+                        } else {
+                            return self.error("`count()` applies directly to a task set name");
+                        }
                     } else {
                         let mut all_args = Vec::with_capacity(args.len() + 1);
                         all_args.push(left);
@@ -1428,6 +1503,13 @@ impl Parser {
                     self.advance();
                     return Ok(Expr::EmptyMap);
                 }
+                if name == "tasks" && !self.first_on_line() && self.eat_open_angle() {
+                    let producer = self.name("a producer control name")?;
+                    self.expect_close_angle()?;
+                    self.expect(Tok::LeftParen, "`(` after `tasks⟨…⟩`")?;
+                    self.expect(Tok::RightParen, "`)` after `tasks⟨…⟩(`")?;
+                    return Ok(Expr::TasksEmpty(producer));
+                }
                 if !self.first_on_line() && self.peek() == &Tok::LeftParen {
                     let mut args = self.arguments()?;
                     if name == "len" && args.len() == 1 {
@@ -1435,6 +1517,12 @@ impl Parser {
                     }
                     if name == "clone" && args.len() == 1 {
                         return Ok(Expr::Clone(Box::new(args.remove(0))));
+                    }
+                    if name == "count" && args.len() == 1 {
+                        if let Expr::Name(set) = args.remove(0) {
+                            return Ok(Expr::Count(set));
+                        }
+                        return self.error("`count(…)` takes a task set name directly");
                     }
                     if name == "old" && args.len() == 1 {
                         if let Expr::Name(inner) = args.remove(0) {
