@@ -651,13 +651,49 @@ formatter, and conformance suite for second-class borrows and views
   refusals, ASCII `in`/`from` and `[U11]`/Q16 surface refusals, and `[E-Host]`
   host borrow violation checks.
 
-## 16. What this checkpoint leaves open
+## 16. Slice 3 Phase 3: Static ROBDD Loan Checking and Borrow/View Fact Logic
 
-- **Later phases and slices.** Slice 3 Phase 3 (static loan checking
-  `[L1]`–`[L5]`/`[L2a]`) and Slice 3 Phase 4 (Theorem 4 call expansion and
-  typed LLVM IR backend for borrows and views), followed by Slice 4 (tasks),
-  which will allow the oracle, the checker and the typed backend to run, verify
-  and compile the full paper corpus.
+Slice 3 Phase 3 adds static borrow/view ownership refinements, borrow and view
+fact propagation/invalidation, and Pass 2 static ROBDD loan checking to
+`v2/src/check.rs`:
+
+- **Borrow ownership refinements (`[O0]`, `[O3]`).** Rejects moving non-`copy`
+  values out through shared or exclusive borrows in `check_expr_pure_ownership`
+  and `check_consume_expr` without marking the borrow itself moved (`[O3]`),
+  orders `view struct` constructor fields non-lending before lending matching
+  `[E-Operands]`, and evaluates `Operation::Variant { borrow: Some(_), .. }`
+  using `check_consume_expr`.
+- **Borrow and view fact logic (`[I7]`, `[I9]`).** Tracks multi-hop
+  `local_borrows` with functional updates when owners change (`[I7]`), tracks
+  `var_loan_roots` across `Bind`, `Unpack`, `Decide` (controls, builtins, and
+  borrowed variants), `Loop`, and `Leave` (`LeaveRecord::payload_roots`),
+  invalidates dependent roots on non-local borrow/view writes and exclusive view
+  arguments (`apply_call_exclusive_updates`, `invalidate_exclusive_view_arg`)
+  (`I9`), and transitively closes `modified_outer` across loops and lexical
+  boundaries (`collect_operand_modified`, `close_modified_with_borrows`).
+- **Static ROBDD loan checker (`LoanChecker`, `[L1]`–`[L5]`, `[L2a]`, `[RM7]`).**
+  Runs Pass 2 after Pass 1 (`check_control` and `check_boundary`), tracking
+  `LoanRoot::{Owned, Behind, ParamOrigin}` with `[RM7]` structural place overlap
+  (`LoanPlace::overlaps`), path-sensitive ROBDD holder liveness including
+  cross-iteration loop `repeat_g` and lexical boundary fallthrough/contingency
+  flow (`compute_body_liveness`), fixed-point loop back-edge loan seeding
+  (`seed_loop_again_loans`), operand temporary lifetimes in `eval_loan_operands`
+  (covering `Expr::Var`, `Expr::Field`, `Expr::Borrow`, and view constructors),
+  reassignment loan attachment (`Command::Assign`), `[L3]` conflict queries
+  validated through `require_entailment` and `kernel::validate`, `[L4]` exit
+  origin checking, and scope-end loan checks (`check_scope_end_loans`).
+- **Conformance (`v2/tests/checker_slice3.rs`, `tests/slice3_surface/*.rails`).**
+  Verifies all 34 synchronous worked examples from [`references.md`](references.md)
+  (§§4–10), `[I7]`/`[I9]`/`[O3]` checks, both `tests/slice3_surface/*.rails`
+  programs under `vn2 check --certificates`, and all 9 stuck controls plus
+  `[RM7]` `disjoint_elements` from `tests/slice3/*.core`.
+
+## 17. What this checkpoint leaves open
+
+- **Later phases and slices.** Slice 3 Phase 4 (Theorem 4 call expansion and
+  typed LLVM IR and C ABI backend for borrows and views), followed by Slice 4
+  (tasks), which will allow the oracle, the checker and the typed backend to run,
+  verify and compile the full paper corpus.
 - **Operators that the surface does not have yet.** The wrapping and
   saturating operators and the numeric conversions are named in the core and
   the fact logic and have no spelling. They belong to phase 5.

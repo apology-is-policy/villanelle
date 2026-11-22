@@ -12,9 +12,15 @@
 //!   contract is listed).
 //! - **[O0] to [O6]** Ownership and availability (`D(x)` and `M(x)` on
 //!   histories: operand order [O0], no double bind [O1], available at use [O2],
-//!   move-on-consume and no partial moves [O3], no discarded `must`
+//!   move-on-consume and no partial/borrowed moves [O3], no discarded `must`
 //!   temporaries [O3a], overwrite/component assignment rules [O4], scope-exit
 //!   obligations [O5], outer names across loops [O6]).
+//! - **[L1] to [L5], [L2a]** Second-class borrow and view loan checking (loan
+//!   creation and inheritance across `&`/`&~`, `view struct`, `∈` contracts,
+//!   and borrowed variant decisions [L1]; history-conditioned backward liveness
+//!   [L2] and loop cross-iteration liveness [L2a]; place-overlap access
+//!   conflicts and scope-end invalidations [L3]; outcome origin escape
+//!   checking [L4]; view borrow aggregation [L5]).
 //! - **[P1] to [P8]** Proof obligations: `⊢ φ` ([P1]), loop invariants at
 //!   entry and `↑` ([P2]), preconditions of functions and controls ([P3]),
 //!   contract exit conditions `⇐ φ` with `old(y)` ([P4]), arithmetic bounds,
@@ -24,14 +30,14 @@
 //!   faulting statements ([F2]), effects within `uses` ([F3]), `assume ⊥`
 //!   ([F4]), lexical boundaries ([F5]), and named boundaries ([F6]).
 
-use crate::bdd::{self, Formula};
+use crate::bdd::{self, Bdd, Formula};
 use crate::facts::{AtomTerm, Certificate, Counterexample, Decision, LinearTerm, Solver, TermId};
 use crate::int::Int;
 use crate::kernel;
 use crate::typed::{
     Alternative, Arithmetic, BodyId, BorrowMode, BoundaryDef, BuiltinOp, Command, Comparison,
-    Control, ControlBody, Expr, Function, FunctionId, IntType, Kind, Operation, Place, PlaceStep,
-    Program, Selector, SiteId, StructId, Type, VarId, VarRef,
+    Control, ControlBody, ControlId, Expr, Function, FunctionId, IntType, Kind, Operation, Place,
+    PlaceStep, Program, Selector, SiteId, StructId, Type, VarId, VarRef,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1101,7 +1107,55 @@ fn check_expr_obligations(
                 certificates,
             )
         }
-        Expr::Struct(_, items, _) | Expr::Variant(_, _, items, _) | Expr::Vector(items, _) => {
+        Expr::Struct(sid, items, _) => {
+            if program.structs[*sid].is_view {
+                for item in items.iter().filter(|e| !e.lends()) {
+                    check_expr_obligations(
+                        program,
+                        solver,
+                        item,
+                        guard,
+                        env,
+                        control,
+                        line,
+                        visible_vars,
+                        in_loop,
+                        certificates,
+                    )?;
+                }
+                for item in items.iter().filter(|e| e.lends()) {
+                    check_expr_obligations(
+                        program,
+                        solver,
+                        item,
+                        guard,
+                        env,
+                        control,
+                        line,
+                        visible_vars,
+                        in_loop,
+                        certificates,
+                    )?;
+                }
+            } else {
+                for item in items {
+                    check_expr_obligations(
+                        program,
+                        solver,
+                        item,
+                        guard,
+                        env,
+                        control,
+                        line,
+                        visible_vars,
+                        in_loop,
+                        certificates,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        Expr::Variant(_, _, items, _) | Expr::Vector(items, _) => {
             for item in items {
                 check_expr_obligations(
                     program,
@@ -1342,6 +1396,7 @@ fn check_expr_obligations(
 
 fn check_expr_pure_ownership(
     program: &Program,
+    param_types: &[Type],
     expr: &Expr,
     consumed: bool,
     control: &str,
@@ -1351,20 +1406,40 @@ fn check_expr_pure_ownership(
         Expr::Boolean(_)
         | Expr::Integer(_, _)
         | Expr::String(_)
-        | Expr::Var(_, _)
         | Expr::Old(_, _)
         | Expr::EmptyMap(_) => Ok(()),
+        Expr::Var(VarRef::Parameter(idx), expr_ty) => {
+            if consumed
+                && param_types
+                    .get(*idx)
+                    .is_some_and(|pt| matches!(pt, Type::Ref(_, _)))
+                && !matches!(expr_ty, Type::Ref(_, _))
+                && program.kind(expr_ty) != Kind::Copy
+            {
+                return Err(Error {
+                    control: control.to_string(),
+                    line,
+                    clause: "O3",
+                    message: format!("cannot move `{expr_ty}` value out through a borrow"),
+                    counterexample: None,
+                });
+            }
+            Ok(())
+        }
+        Expr::Var(_, _) => Ok(()),
         Expr::Borrow(_, place, _) => {
             for step in &place.steps {
                 if let PlaceStep::Index(idx, _) = step {
-                    check_expr_pure_ownership(program, idx, false, control, line)?;
+                    check_expr_pure_ownership(program, param_types, idx, false, control, line)?;
                 }
             }
             Ok(())
         }
-        Expr::Move(inner, _) => check_expr_pure_ownership(program, inner, true, control, line),
+        Expr::Move(inner, _) => {
+            check_expr_pure_ownership(program, param_types, inner, true, control, line)
+        }
         Expr::Field(base, _, _, fty) => {
-            check_expr_pure_ownership(program, base, false, control, line)?;
+            check_expr_pure_ownership(program, param_types, base, false, control, line)?;
             if consumed && program.kind(fty) != Kind::Copy {
                 return Err(Error {
                     control: control.to_string(),
@@ -1377,8 +1452,8 @@ fn check_expr_pure_ownership(
             Ok(())
         }
         Expr::Index(base, idx, ety) => {
-            check_expr_pure_ownership(program, base, false, control, line)?;
-            check_expr_pure_ownership(program, idx, false, control, line)?;
+            check_expr_pure_ownership(program, param_types, base, false, control, line)?;
+            check_expr_pure_ownership(program, param_types, idx, false, control, line)?;
             if consumed && program.kind(ety) != Kind::Copy {
                 return Err(Error {
                     control: control.to_string(),
@@ -1390,7 +1465,31 @@ fn check_expr_pure_ownership(
             }
             Ok(())
         }
-        Expr::Struct(_, items, ty) | Expr::Variant(_, _, items, ty) | Expr::Vector(items, ty) => {
+        Expr::Struct(sid, items, ty) => {
+            if !consumed && program.kind(ty) == Kind::Must {
+                return Err(Error {
+                    control: control.to_string(),
+                    line,
+                    clause: "O3a",
+                    message: "temporary value of kind `must` cannot be discarded".to_string(),
+                    counterexample: None,
+                });
+            }
+            if program.structs[*sid].is_view {
+                for item in items.iter().filter(|e| !e.lends()) {
+                    check_expr_pure_ownership(program, param_types, item, true, control, line)?;
+                }
+                for item in items.iter().filter(|e| e.lends()) {
+                    check_expr_pure_ownership(program, param_types, item, true, control, line)?;
+                }
+            } else {
+                for item in items {
+                    check_expr_pure_ownership(program, param_types, item, true, control, line)?;
+                }
+            }
+            Ok(())
+        }
+        Expr::Variant(_, _, items, ty) | Expr::Vector(items, ty) => {
             if !consumed && program.kind(ty) == Kind::Must {
                 return Err(Error {
                     control: control.to_string(),
@@ -1401,7 +1500,7 @@ fn check_expr_pure_ownership(
                 });
             }
             for item in items {
-                check_expr_pure_ownership(program, item, true, control, line)?;
+                check_expr_pure_ownership(program, param_types, item, true, control, line)?;
             }
             Ok(())
         }
@@ -1409,22 +1508,33 @@ fn check_expr_pure_ownership(
         | Expr::Clone(inner, _)
         | Expr::Trim(inner)
         | Expr::Negate(inner, _)
-        | Expr::Not(inner) => check_expr_pure_ownership(program, inner, false, control, line),
+        | Expr::Not(inner) => {
+            check_expr_pure_ownership(program, param_types, inner, false, control, line)
+        }
         Expr::Arithmetic(_, l, r, _)
         | Expr::Compare(_, l, r)
         | Expr::And(l, r)
         | Expr::Or(l, r) => {
-            check_expr_pure_ownership(program, l, false, control, line)?;
-            check_expr_pure_ownership(program, r, false, control, line)
+            check_expr_pure_ownership(program, param_types, l, false, control, line)?;
+            check_expr_pure_ownership(program, param_types, r, false, control, line)
         }
         Expr::Call(fn_id, args, _) => {
-            let param_tys = &program.functions[*fn_id].parameters;
+            let callee_params = &program.functions[*fn_id].parameters;
             for (i, arg) in args.iter().enumerate() {
-                let lends = arg.lends()
-                    || param_tys
+                if !arg.lends() {
+                    let is_ref = callee_params
                         .get(i)
                         .is_some_and(|p| matches!(p.ty, Type::Ref(_, _)));
-                check_expr_pure_ownership(program, arg, !lends, control, line)?;
+                    check_expr_pure_ownership(program, param_types, arg, !is_ref, control, line)?;
+                }
+            }
+            for (i, arg) in args.iter().enumerate() {
+                if arg.lends() {
+                    let is_ref = callee_params
+                        .get(i)
+                        .is_some_and(|p| matches!(p.ty, Type::Ref(_, _)));
+                    check_expr_pure_ownership(program, param_types, arg, !is_ref, control, line)?;
+                }
             }
             Ok(())
         }
@@ -1492,7 +1602,15 @@ fn check_function(
         solver.add_fact(bdd::TRUE, pre_formula);
     }
 
-    check_expr_pure_ownership(program, &function.body, true, &function.name, 1)?;
+    let fn_param_tys: Vec<Type> = function.parameters.iter().map(|p| p.ty.clone()).collect();
+    check_expr_pure_ownership(
+        program,
+        &fn_param_tys,
+        &function.body,
+        true,
+        &function.name,
+        1,
+    )?;
     check_expr_obligations(
         program,
         &mut solver,
@@ -1556,19 +1674,30 @@ fn collect_read_vars(expr: &Expr, out: &mut Vec<VarId>) {
     }
 }
 
-fn collect_operand_modified(arg: &Expr, out: &mut HashSet<VarId>) {
+fn collect_operand_modified(program: &Program, arg: &Expr, out: &mut HashSet<VarId>) {
     match arg {
         Expr::Borrow(BorrowMode::Exclusive, place, _) => {
             out.insert(place.root);
         }
-        Expr::Var(VarRef::Local(id), Type::Ref(BorrowMode::Exclusive, _)) => {
+        Expr::Var(VarRef::Local(id), ty) if program.has_exclusive_borrow(ty) => {
             out.insert(*id);
         }
+        Expr::Struct(sid, fields, _) if program.structs[*sid].is_view => {
+            for field in fields {
+                collect_operand_modified(program, field, out);
+            }
+        }
+        Expr::Move(inner, _) => collect_operand_modified(program, inner, out),
         _ => {}
     }
 }
 
-fn collect_modified_vars(body: &ControlBody, body_id: BodyId, out: &mut HashSet<VarId>) {
+fn collect_modified_vars(
+    program: &Program,
+    body: &ControlBody,
+    body_id: BodyId,
+    out: &mut HashSet<VarId>,
+) {
     for stmt in &body.bodies[body_id].statements {
         match &stmt.command {
             Command::Assign { var, .. } => {
@@ -1588,7 +1717,7 @@ fn collect_modified_vars(body: &ControlBody, body_id: BodyId, out: &mut HashSet<
                     out.insert(place.root);
                 }
                 for arg in arguments {
-                    collect_operand_modified(arg, out);
+                    collect_operand_modified(program, arg, out);
                 }
             }
             Command::Capture {
@@ -1604,19 +1733,19 @@ fn collect_modified_vars(body: &ControlBody, body_id: BodyId, out: &mut HashSet<
                     out.insert(place.root);
                 }
                 for arg in arguments {
-                    collect_operand_modified(arg, out);
+                    collect_operand_modified(program, arg, out);
                 }
             }
             Command::Loop { body: inner, .. } => {
-                collect_modified_vars(body, *inner, out);
+                collect_modified_vars(program, body, *inner, out);
             }
             Command::Boundary {
                 body: b1,
                 contingency: b2,
                 ..
             } => {
-                collect_modified_vars(body, *b1, out);
-                collect_modified_vars(body, *b2, out);
+                collect_modified_vars(program, body, *b1, out);
+                collect_modified_vars(program, body, *b2, out);
             }
             _ => {}
         }
@@ -1739,6 +1868,8 @@ struct FrozenPlace {
     steps: Vec<FrozenStep>,
 }
 
+type VisibleVars = Vec<(String, TermId, bool)>;
+
 type LeaveRecord = (
     usize,
     Formula,
@@ -1746,6 +1877,7 @@ type LeaveRecord = (
     Vec<Vec<(Formula, TermId)>>,
     Vec<Formula>,
     Vec<Formula>,
+    Vec<Vec<(Formula, VarId)>>,
 );
 
 struct BodyChecker<'a> {
@@ -1771,8 +1903,16 @@ struct BodyChecker<'a> {
     constants: HashMap<VarId, Int>,
     /// Captured operation metadata for outcome variables ([I12]).
     captured: HashMap<VarId, Vec<(Formula, CapturedInfo)>>,
-    /// Frozen place abbreviated by a local borrow variable ([I7], [I9]).
-    local_borrows: HashMap<VarId, FrozenPlace>,
+    /// Frozen place(s) abbreviated by a local borrow variable ([I7], [I9]).
+    local_borrows: HashMap<VarId, Vec<(Formula, FrozenPlace)>>,
+    /// Underlying loan root variables held by each borrow/view variable ([I9]).
+    var_loan_roots: Vec<Vec<(Formula, VarId)>>,
+    /// Recorded `Rᵢ` for each `(BodyId, stmt_idx)` for Pass 2 loan checking.
+    stmt_r: HashMap<(BodyId, usize), Formula>,
+    /// Recorded visible variables at `(BodyId, stmt_idx)` for Pass 2 counterexamples.
+    stmt_visible: HashMap<(BodyId, usize), VisibleVars>,
+    /// Recorded fallthrough `live` at end of lexical boundary `B₁` for Pass 2.
+    boundary_fallthrough_live: HashMap<BodyId, Formula>,
     /// Entry availability snapshot `D(v) ∧ ¬M(v)` per loop body ([O6]).
     loop_entry_avail: HashMap<BodyId, Vec<Formula>>,
     /// Stack of enclosing active body scopes (outermost first).
@@ -1946,9 +2086,27 @@ impl<'a> BodyChecker<'a> {
         in_loop: bool,
     ) -> Result<(), Error> {
         match expr {
-            Expr::Var(VarRef::Local(id), ty) => {
+            Expr::Var(VarRef::Local(id), expr_ty) => {
                 self.check_available(*id, r_i, line, visible_vars, in_loop)?;
-                if self.program.kind(ty) != Kind::Copy {
+                let var_ty = &self.body.vars[*id].ty;
+                if matches!(var_ty, Type::Ref(_, _)) && !matches!(expr_ty, Type::Ref(_, _)) {
+                    // Dereferencing a borrow in a consumed slot never moves the
+                    // borrow itself; only `copy` values may leave behind a borrow ([O3]).
+                    if self.program.kind(expr_ty) != Kind::Copy
+                        && self.is_feasible(r_i, visible_vars, in_loop)
+                    {
+                        return Err(Error {
+                            control: self.owner_name.clone(),
+                            line,
+                            clause: "O3",
+                            message: format!(
+                                "cannot move `{expr_ty}` value out through borrow `{}`",
+                                self.body.vars[*id].name
+                            ),
+                            counterexample: None,
+                        });
+                    }
+                } else if self.program.kind(var_ty) != Kind::Copy {
                     self.moved[*id] = self.solver.bdd.or(self.moved[*id], r_i);
                 }
                 Ok(())
@@ -1987,7 +2145,22 @@ impl<'a> BodyChecker<'a> {
                 }
                 Ok(())
             }
-            Expr::Struct(_, items, _) | Expr::Variant(_, _, items, _) | Expr::Vector(items, _) => {
+            Expr::Struct(sid, items, _) => {
+                if self.program.structs[*sid].is_view {
+                    for item in items.iter().filter(|e| !e.lends()) {
+                        self.check_consume_expr(item, r_i, line, visible_vars, in_loop)?;
+                    }
+                    for item in items.iter().filter(|e| e.lends()) {
+                        self.check_consume_expr(item, r_i, line, visible_vars, in_loop)?;
+                    }
+                } else {
+                    for item in items {
+                        self.check_consume_expr(item, r_i, line, visible_vars, in_loop)?;
+                    }
+                }
+                Ok(())
+            }
+            Expr::Variant(_, _, items, _) | Expr::Vector(items, _) => {
                 for item in items {
                     self.check_consume_expr(item, r_i, line, visible_vars, in_loop)?;
                 }
@@ -2034,9 +2207,33 @@ impl<'a> BodyChecker<'a> {
                 }
                 Ok(())
             }
-            Expr::Struct(_, items, ty)
-            | Expr::Variant(_, _, items, ty)
-            | Expr::Vector(items, ty) => {
+            Expr::Struct(sid, items, ty) => {
+                if self.program.kind(ty) == Kind::Must
+                    && self.is_feasible(r_i, visible_vars, in_loop)
+                {
+                    return Err(Error {
+                        control: self.owner_name.clone(),
+                        line,
+                        clause: "O3a",
+                        message: "temporary value of kind `must` cannot be discarded".to_string(),
+                        counterexample: None,
+                    });
+                }
+                if self.program.structs[*sid].is_view {
+                    for item in items.iter().filter(|e| !e.lends()) {
+                        self.check_consume_expr(item, r_i, line, visible_vars, in_loop)?;
+                    }
+                    for item in items.iter().filter(|e| e.lends()) {
+                        self.check_consume_expr(item, r_i, line, visible_vars, in_loop)?;
+                    }
+                } else {
+                    for item in items {
+                        self.check_consume_expr(item, r_i, line, visible_vars, in_loop)?;
+                    }
+                }
+                Ok(())
+            }
+            Expr::Variant(_, _, items, ty) | Expr::Vector(items, ty) => {
                 if self.program.kind(ty) == Kind::Must
                     && self.is_feasible(r_i, visible_vars, in_loop)
                 {
@@ -2098,22 +2295,16 @@ impl<'a> BodyChecker<'a> {
     fn check_operands_o0(
         &mut self,
         arguments: &[Expr],
-        param_types: Option<&[Type]>,
+        _param_types: Option<&[Type]>,
         r_i: Formula,
         env: &Env,
         line: u32,
         visible_vars: &[(String, TermId, bool)],
         in_loop: bool,
     ) -> Result<(), Error> {
-        let is_lending = |i: usize, arg: &Expr| -> bool {
-            arg.lends()
-                || param_types
-                    .and_then(|tys| tys.get(i))
-                    .is_some_and(|ty| matches!(ty, Type::Ref(_, _)))
-        };
-        // [O0] Pass 1: non-lending operands left to right, each consumed before the next.
-        for (i, arg) in arguments.iter().enumerate() {
-            if !is_lending(i, arg) {
+        // [O0] Pass 1: non-lending operands (`!arg.lends()`, matching [E-Operands]) left to right.
+        for arg in arguments {
+            if !arg.lends() {
                 check_expr_obligations(
                     self.program,
                     &mut self.solver,
@@ -2130,8 +2321,8 @@ impl<'a> BodyChecker<'a> {
             }
         }
         // [O0] Pass 2: lending operands left to right.
-        for (i, arg) in arguments.iter().enumerate() {
-            if is_lending(i, arg) {
+        for arg in arguments {
+            if arg.lends() {
                 check_expr_obligations(
                     self.program,
                     &mut self.solver,
@@ -2144,7 +2335,7 @@ impl<'a> BodyChecker<'a> {
                     in_loop,
                     self.certificates,
                 )?;
-                self.check_read_expr(arg, r_i, line, visible_vars, in_loop)?;
+                self.check_consume_expr(arg, r_i, line, visible_vars, in_loop)?;
             }
         }
         Ok(())
@@ -2319,77 +2510,408 @@ impl<'a> BodyChecker<'a> {
         term_id
     }
 
+    fn var_in_body_tree(&self, var: VarId, root_body: BodyId) -> bool {
+        let mut cur = Some(self.body.vars[var].body);
+        while let Some(b) = cur {
+            if b == root_body {
+                return true;
+            }
+            cur = self.body.bodies[b].parent;
+        }
+        false
+    }
+
+    fn bind_local_borrow(&mut self, var: VarId, r_i: Formula, place: &Place, env: &Env) {
+        if r_i == bdd::FALSE {
+            return;
+        }
+        let tail = freeze_place(self.program, &mut self.solver, place, env);
+        if let Some(parent_entries) = self.local_borrows.get(&place.root).cloned() {
+            let mut covered = bdd::FALSE;
+            let dest = self.local_borrows.entry(var).or_default();
+            for (bg, parent_fp) in &parent_entries {
+                let g = self.solver.bdd.and(r_i, *bg);
+                if g != bdd::FALSE {
+                    covered = self.solver.bdd.or(covered, g);
+                    let mut combined_steps = parent_fp.steps.clone();
+                    combined_steps.extend(tail.steps.clone());
+                    dest.push((
+                        g,
+                        FrozenPlace {
+                            root: parent_fp.root,
+                            root_ty: parent_fp.root_ty.clone(),
+                            steps: combined_steps,
+                        },
+                    ));
+                }
+            }
+            let rest = self.solver.bdd.minus(r_i, covered);
+            if rest != bdd::FALSE {
+                dest.push((rest, tail));
+            }
+        } else {
+            self.local_borrows.entry(var).or_default().push((r_i, tail));
+        }
+    }
+
+    fn push_var_loan_root(&mut self, var: VarId, guard: Formula, root_v: VarId) {
+        if guard == bdd::FALSE {
+            return;
+        }
+        let entries = &mut self.var_loan_roots[var];
+        for (eg, rv) in entries.iter_mut() {
+            if *rv == root_v {
+                *eg = self.solver.bdd.or(*eg, guard);
+                return;
+            }
+        }
+        entries.push((guard, root_v));
+    }
+
+    fn expr_loan_roots(&mut self, expr: &Expr, r_i: Formula) -> Vec<(Formula, VarId)> {
+        let mut out = Vec::new();
+        if r_i == bdd::FALSE {
+            return out;
+        }
+        match expr {
+            Expr::Borrow(_, place, _) => {
+                out.push((r_i, place.root));
+                for (lg, rv) in self.var_loan_roots[place.root].clone() {
+                    let g = self.solver.bdd.and(r_i, lg);
+                    if g != bdd::FALSE {
+                        out.push((g, rv));
+                    }
+                }
+            }
+            Expr::Var(VarRef::Local(id), ty) if self.program.contains_borrow_or_view(ty) => {
+                out.push((r_i, *id));
+                for (lg, rv) in self.var_loan_roots[*id].clone() {
+                    let g = self.solver.bdd.and(r_i, lg);
+                    if g != bdd::FALSE {
+                        out.push((g, rv));
+                    }
+                }
+            }
+            Expr::Field(base, _, _, ty) if self.program.contains_borrow_or_view(ty) => {
+                return self.expr_loan_roots(base, r_i);
+            }
+            Expr::Struct(sid, fields, _) if self.program.structs[*sid].is_view => {
+                for field in fields {
+                    out.extend(self.expr_loan_roots(field, r_i));
+                }
+            }
+            Expr::Move(inner, _) => return self.expr_loan_roots(inner, r_i),
+            _ => {}
+        }
+        out
+    }
+
+    fn record_expr_loan_roots(&mut self, dest_var: VarId, expr: &Expr, guard: Formula) {
+        if !self
+            .program
+            .contains_borrow_or_view(&self.body.vars[dest_var].ty)
+        {
+            return;
+        }
+        let roots = self.expr_loan_roots(expr, guard);
+        for (lg, rv) in roots {
+            self.push_var_loan_root(dest_var, lg, rv);
+        }
+    }
+
+    fn invalidate_loan_roots(&mut self, var: VarId, guard: Formula) {
+        if guard == bdd::FALSE
+            || !self
+                .program
+                .contains_borrow_or_view(&self.body.vars[var].ty)
+        {
+            return;
+        }
+        let local_fps: Vec<VarId> = self
+            .local_borrows
+            .get(&var)
+            .map(|entries| entries.iter().map(|(_, fp)| fp.root).collect())
+            .unwrap_or_default();
+        let roots = self.var_loan_roots[var].clone();
+        for (lg, root_v) in roots {
+            if root_v == var || local_fps.contains(&root_v) {
+                continue;
+            }
+            let g = self.solver.bdd.and(guard, lg);
+            if g != bdd::FALSE
+                && self.defined[root_v] != bdd::FALSE
+                && self.active_scopes.contains(&self.body.vars[root_v].body)
+            {
+                let fresh_tid = self.alloc_var_term(root_v);
+                self.set_version(root_v, g, fresh_tid);
+            }
+        }
+    }
+
+    fn refresh_dependent_local_borrows(&mut self, written_root: VarId, guard: Formula) {
+        if guard == bdd::FALSE {
+            return;
+        }
+        let mut raw_deps: Vec<(VarId, Formula, FrozenPlace)> = Vec::new();
+        for (&lb_var, entries) in &self.local_borrows {
+            if self.defined[lb_var] == bdd::FALSE
+                || !self.active_scopes.contains(&self.body.vars[lb_var].body)
+            {
+                continue;
+            }
+            for (bg, fp) in entries {
+                if fp.root == written_root {
+                    raw_deps.push((lb_var, *bg, fp.clone()));
+                }
+            }
+        }
+        let mut dependents: Vec<(VarId, Formula, FrozenPlace)> = Vec::new();
+        for (lb_var, bg, fp) in raw_deps {
+            let g = self.solver.bdd.and(guard, bg);
+            if g != bdd::FALSE {
+                dependents.push((lb_var, g, fp));
+            }
+        }
+        if dependents.is_empty() {
+            return;
+        }
+        let (env, _) = self.current_env();
+        let root_term = env
+            .locals
+            .get(&written_root)
+            .cloned()
+            .unwrap_or_else(|| LinearTerm::from_i128(0));
+        for (lb_var, g, fp) in dependents {
+            let mut sub_term = root_term.clone();
+            for step in &fp.steps {
+                match step {
+                    FrozenStep::Field(sid, fidx, fty) => {
+                        sub_term =
+                            translate_field_term(&mut self.solver, sub_term, *sid, *fidx, fty);
+                    }
+                    FrozenStep::Index(idx_t, ety) => {
+                        sub_term =
+                            translate_index_term(&mut self.solver, sub_term, idx_t.clone(), ety);
+                    }
+                }
+            }
+            let _ = self.bind_value_term(lb_var, g, sub_term);
+        }
+    }
+
+    fn invalidate_exclusive_view_arg(&mut self, arg: &Expr, guard: Formula, env: &Env) {
+        if guard == bdd::FALSE {
+            return;
+        }
+        match arg {
+            Expr::Borrow(BorrowMode::Exclusive, place, _) => {
+                let z_tid = self.alloc_type_term("_mut", &place.ty);
+                self.apply_place_write(place, guard, LinearTerm::var(z_tid), env);
+            }
+            Expr::Var(VarRef::Local(vid), ty) if self.program.has_exclusive_borrow(ty) => {
+                if matches!(ty, Type::Ref(BorrowMode::Exclusive, _)) {
+                    let inner_ty = ty.deref_type();
+                    let z_tid = self.alloc_type_term("_mut", inner_ty);
+                    let place = Place {
+                        root: *vid,
+                        root_ty: ty.clone(),
+                        steps: Vec::new(),
+                        ty: inner_ty.clone(),
+                    };
+                    self.apply_place_write(&place, guard, LinearTerm::var(z_tid), env);
+                } else {
+                    let fresh_tid = self.alloc_var_term(*vid);
+                    self.set_version(*vid, guard, fresh_tid);
+                    self.invalidate_loan_roots(*vid, guard);
+                }
+            }
+            Expr::Struct(sid, fields, _) if self.program.structs[*sid].is_view => {
+                for field in fields {
+                    if self.program.has_exclusive_borrow(&field.ty()) {
+                        self.invalidate_exclusive_view_arg(field, guard, env);
+                    }
+                }
+            }
+            Expr::Move(inner, _) => self.invalidate_exclusive_view_arg(inner, guard, env),
+            _ => {}
+        }
+    }
+
+    fn close_modified_with_borrows(&self, vars: &mut HashSet<VarId>) {
+        let mut stack: Vec<VarId> = vars.iter().copied().collect();
+        while let Some(v) = stack.pop() {
+            if let Some(entries) = self.local_borrows.get(&v) {
+                for (_, fp) in entries {
+                    if vars.insert(fp.root) {
+                        stack.push(fp.root);
+                    }
+                }
+            }
+            for (_, rv) in &self.var_loan_roots[v] {
+                if vars.insert(*rv) {
+                    stack.push(*rv);
+                }
+            }
+        }
+    }
+
+    fn collect_loop_again_root_vars(&mut self, loop_body: BodyId, r_i: Formula) {
+        let Some(head) = self.body.bodies[loop_body].head.clone() else {
+            return;
+        };
+        let mut collected: Vec<Vec<VarId>> = vec![Vec::new(); head.parameters.len()];
+        self.scan_again_roots_in_body(loop_body, loop_body, &mut collected);
+        for (&lp_var, raw_roots) in head.parameters.iter().zip(collected) {
+            if !self
+                .program
+                .contains_borrow_or_view(&self.body.vars[lp_var].ty)
+            {
+                continue;
+            }
+            let mut root_set: HashSet<VarId> = raw_roots.into_iter().collect();
+            self.close_modified_with_borrows(&mut root_set);
+            for rv in root_set {
+                if !self.var_in_body_tree(rv, loop_body) {
+                    self.push_var_loan_root(lp_var, r_i, rv);
+                }
+            }
+        }
+    }
+
+    fn scan_again_roots_in_body(
+        &self,
+        cur_body: BodyId,
+        target_loop: BodyId,
+        out: &mut [Vec<VarId>],
+    ) {
+        fn collect_expr_vars(expr: &Expr, out: &mut Vec<VarId>) {
+            match expr {
+                Expr::Borrow(_, place, _) => out.push(place.root),
+                Expr::Var(VarRef::Local(id), _) => out.push(*id),
+                Expr::Field(base, _, _, _) | Expr::Move(base, _) => collect_expr_vars(base, out),
+                Expr::Struct(_, fields, _) => {
+                    for f in fields {
+                        collect_expr_vars(f, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for stmt in &self.body.bodies[cur_body].statements {
+            match &stmt.command {
+                Command::Again { body, arguments } if *body == target_loop => {
+                    for (slot, arg) in out.iter_mut().zip(arguments) {
+                        collect_expr_vars(arg, slot);
+                    }
+                }
+                Command::Loop { body: inner, .. } => {
+                    self.scan_again_roots_in_body(*inner, target_loop, out);
+                }
+                Command::Boundary {
+                    body: b1,
+                    contingency: b2,
+                    ..
+                } => {
+                    self.scan_again_roots_in_body(*b1, target_loop, out);
+                    self.scan_again_roots_in_body(*b2, target_loop, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn apply_place_write(&mut self, place: &Place, guard: Formula, new_val: LinearTerm, env: &Env) {
         if guard == bdd::FALSE {
             return;
         }
-        if let Some(frozen) = self.local_borrows.get(&place.root).cloned() {
-            let cur_root_term = env
-                .locals
-                .get(&frozen.root)
-                .cloned()
-                .unwrap_or_else(|| LinearTerm::from_i128(0));
-            let updated_sub = if place.steps.is_empty() {
-                new_val.clone()
-            } else {
-                let mut sub_term = cur_root_term.clone();
-                let mut sub_ty = frozen.root_ty.deref_type().clone();
-                for fstep in &frozen.steps {
-                    match fstep {
-                        FrozenStep::Field(sid, fidx, fty) => {
-                            sub_term =
-                                translate_field_term(&mut self.solver, sub_term, *sid, *fidx, fty);
-                            sub_ty = fty.clone();
-                        }
-                        FrozenStep::Index(idx_t, ety) => {
-                            sub_term = translate_index_term(
-                                &mut self.solver,
-                                sub_term,
-                                idx_t.clone(),
-                                ety,
-                            );
-                            sub_ty = ety.clone();
-                        }
-                    }
-                }
-                functional_update(
-                    self.program,
-                    &mut self.solver,
-                    sub_term,
-                    &sub_ty,
-                    &place.steps,
-                    new_val.clone(),
-                    env,
-                )
-            };
-            let new_root = functional_update_frozen(
-                self.program,
-                &mut self.solver,
-                cur_root_term,
-                frozen.root_ty.deref_type(),
-                &frozen.steps,
-                updated_sub,
-            );
-            let _ = self.bind_value_term(frozen.root, guard, new_root);
-            let _ = self.bind_value_term(place.root, guard, new_val);
-            return;
-        }
-        let root_term = env
+        let local_root_term = env
             .locals
             .get(&place.root)
             .cloned()
             .unwrap_or_else(|| LinearTerm::from_i128(0));
-        let root_ty = self.body.vars[place.root].ty.deref_type().clone();
-        let updated = functional_update(
+        let local_root_ty = self.body.vars[place.root].ty.deref_type().clone();
+        let updated_local = functional_update(
             self.program,
             &mut self.solver,
-            root_term,
-            &root_ty,
+            local_root_term,
+            &local_root_ty,
             &place.steps,
-            new_val,
+            new_val.clone(),
             env,
         );
-        let _ = self.bind_value_term(place.root, guard, updated);
+        if let Some(entries) = self.local_borrows.get(&place.root).cloned() {
+            let mut covered = bdd::FALSE;
+            for (bg, frozen) in &entries {
+                let g = self.solver.bdd.and(guard, *bg);
+                if g == bdd::FALSE {
+                    continue;
+                }
+                covered = self.solver.bdd.or(covered, g);
+                let cur_root_term = env
+                    .locals
+                    .get(&frozen.root)
+                    .cloned()
+                    .unwrap_or_else(|| LinearTerm::from_i128(0));
+                let updated_sub = if place.steps.is_empty() {
+                    new_val.clone()
+                } else {
+                    let mut sub_term = cur_root_term.clone();
+                    let mut sub_ty = frozen.root_ty.deref_type().clone();
+                    for fstep in &frozen.steps {
+                        match fstep {
+                            FrozenStep::Field(sid, fidx, fty) => {
+                                sub_term = translate_field_term(
+                                    &mut self.solver,
+                                    sub_term,
+                                    *sid,
+                                    *fidx,
+                                    fty,
+                                );
+                                sub_ty = fty.clone();
+                            }
+                            FrozenStep::Index(idx_t, ety) => {
+                                sub_term = translate_index_term(
+                                    &mut self.solver,
+                                    sub_term,
+                                    idx_t.clone(),
+                                    ety,
+                                );
+                                sub_ty = ety.clone();
+                            }
+                        }
+                    }
+                    functional_update(
+                        self.program,
+                        &mut self.solver,
+                        sub_term,
+                        &sub_ty,
+                        &place.steps,
+                        new_val.clone(),
+                        env,
+                    )
+                };
+                let new_root = functional_update_frozen(
+                    self.program,
+                    &mut self.solver,
+                    cur_root_term,
+                    frozen.root_ty.deref_type(),
+                    &frozen.steps,
+                    updated_sub,
+                );
+                let _ = self.bind_value_term(frozen.root, g, new_root);
+                self.invalidate_loan_roots(frozen.root, g);
+                self.refresh_dependent_local_borrows(frozen.root, g);
+            }
+            let uncovered = self.solver.bdd.minus(guard, covered);
+            if uncovered != bdd::FALSE {
+                self.invalidate_loan_roots(place.root, uncovered);
+            }
+            let _ = self.bind_value_term(place.root, guard, updated_local);
+            return;
+        }
+        let _ = self.bind_value_term(place.root, guard, updated_local);
+        self.invalidate_loan_roots(place.root, guard);
+        self.refresh_dependent_local_borrows(place.root, guard);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2640,6 +3162,46 @@ impl<'a> BodyChecker<'a> {
         Ok(())
     }
 
+    fn apply_call_exclusive_updates(
+        &mut self,
+        cid: ControlId,
+        arguments: &[Expr],
+        r_i: Formula,
+        post_args: &mut [LinearTerm],
+        env: &Env,
+    ) {
+        let param_tys: Vec<Type> = self.program.controls[cid]
+            .parameters
+            .iter()
+            .map(|p| p.ty.clone())
+            .collect();
+        for (pidx, (arg, pty)) in arguments.iter().zip(&param_tys).enumerate() {
+            if matches!(pty, Type::Ref(BorrowMode::Exclusive, _)) {
+                let inner_ty = pty.deref_type();
+                let z_tid = self.alloc_type_term("_mut", inner_ty);
+                let z_term = LinearTerm::var(z_tid);
+                post_args[pidx] = z_term.clone();
+                match arg {
+                    Expr::Borrow(BorrowMode::Exclusive, place, _) => {
+                        self.apply_place_write(place, r_i, z_term, env);
+                    }
+                    Expr::Var(VarRef::Local(vid), _) => {
+                        let place = Place {
+                            root: *vid,
+                            root_ty: pty.clone(),
+                            steps: Vec::new(),
+                            ty: inner_ty.clone(),
+                        };
+                        self.apply_place_write(&place, r_i, z_term, env);
+                    }
+                    _ => {}
+                }
+            } else if self.program.has_exclusive_borrow(pty) {
+                self.invalidate_exclusive_view_arg(arg, r_i, env);
+            }
+        }
+    }
+
     fn check_body(
         &mut self,
         body_id: BodyId,
@@ -2662,12 +3224,15 @@ impl<'a> BodyChecker<'a> {
         let statements = self.body.bodies[body_id].statements.clone();
         let last_line = statements.last().map_or(1, |s| s.line);
 
-        for statement in &statements {
+        for (stmt_idx, statement) in statements.iter().enumerate() {
             let line = statement.line;
             let g_i = self.selector(&statement.selector);
             // [K2]: Rᵢ = Lᵢ ∧ gᵢ
             let r_i = self.solver.bdd.and(live, g_i);
             let (env, visible_vars) = self.current_env();
+            self.stmt_r.insert((body_id, stmt_idx), r_i);
+            self.stmt_visible
+                .insert((body_id, stmt_idx), visible_vars.clone());
 
             match &statement.command {
                 Command::Bind { var, value } => {
@@ -2706,9 +3271,20 @@ impl<'a> BodyChecker<'a> {
                     let not_ri = self.solver.bdd.not(r_i);
                     self.moved[*var] = self.solver.bdd.and(self.moved[*var], not_ri);
                     if let Expr::Borrow(_, place, _) = value {
-                        let frozen = freeze_place(self.program, &mut self.solver, place, &env);
-                        self.local_borrows.insert(*var, frozen);
+                        self.bind_local_borrow(*var, r_i, place, &env);
+                    } else if let Expr::Var(VarRef::Local(src), ty) = value
+                        && matches!(ty, Type::Ref(_, _))
+                        && let Some(entries) = self.local_borrows.get(src).cloned()
+                    {
+                        let dest = self.local_borrows.entry(*var).or_default();
+                        for (bg, fp) in entries {
+                            let g = self.solver.bdd.and(r_i, bg);
+                            if g != bdd::FALSE {
+                                dest.push((g, fp));
+                            }
+                        }
                     }
+                    self.record_expr_loan_roots(*var, value, r_i);
                 }
                 Command::Unpack {
                     struct_id,
@@ -2759,6 +3335,7 @@ impl<'a> BodyChecker<'a> {
                         self.defined[var_id] = self.solver.bdd.or(self.defined[var_id], r_i);
                         let not_ri = self.solver.bdd.not(r_i);
                         self.moved[var_id] = self.solver.bdd.and(self.moved[var_id], not_ri);
+                        self.record_expr_loan_roots(var_id, value, r_i);
                         field_terms.push(LinearTerm::var(tid));
                     }
                     let cid = self
@@ -2828,6 +3405,7 @@ impl<'a> BodyChecker<'a> {
                         self.apply_place_write(&place, r_i, new_val, &env);
                     } else {
                         self.bind_value(*var, r_i, value, &env);
+                        self.refresh_dependent_local_borrows(*var, r_i);
                     }
                     let not_ri = self.solver.bdd.not(r_i);
                     self.moved[*var] = self.solver.bdd.and(self.moved[*var], not_ri);
@@ -3026,34 +3604,13 @@ impl<'a> BodyChecker<'a> {
                                 self.solver.add_fact(r_i, pre_formula);
                             }
 
-                            let param_tys: Vec<Type> = self.program.controls[*cid]
-                                .parameters
-                                .iter()
-                                .map(|p| p.ty.clone())
-                                .collect();
-                            for (pidx, (arg, pty)) in arguments.iter().zip(&param_tys).enumerate() {
-                                if matches!(pty, Type::Ref(BorrowMode::Exclusive, _)) {
-                                    let inner_ty = pty.deref_type();
-                                    let z_tid = self.alloc_type_term("_mut", inner_ty);
-                                    let z_term = LinearTerm::var(z_tid);
-                                    post_args[pidx] = z_term.clone();
-                                    match arg {
-                                        Expr::Borrow(BorrowMode::Exclusive, place, _) => {
-                                            self.apply_place_write(place, r_i, z_term, &env);
-                                        }
-                                        Expr::Var(VarRef::Local(vid), _) => {
-                                            let place = Place {
-                                                root: *vid,
-                                                root_ty: pty.clone(),
-                                                steps: Vec::new(),
-                                                ty: inner_ty.clone(),
-                                            };
-                                            self.apply_place_write(&place, r_i, z_term, &env);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
+                            self.apply_call_exclusive_updates(
+                                *cid,
+                                arguments,
+                                r_i,
+                                &mut post_args,
+                                &env,
+                            );
                         }
                         Operation::Builtin {
                             op: BuiltinOp::Emit,
@@ -3191,34 +3748,13 @@ impl<'a> BodyChecker<'a> {
                                 self.solver.add_fact(r_i, pre_formula);
                             }
 
-                            let param_tys: Vec<Type> = self.program.controls[*cid]
-                                .parameters
-                                .iter()
-                                .map(|p| p.ty.clone())
-                                .collect();
-                            for (pidx, (arg, pty)) in arguments.iter().zip(&param_tys).enumerate() {
-                                if matches!(pty, Type::Ref(BorrowMode::Exclusive, _)) {
-                                    let inner_ty = pty.deref_type();
-                                    let z_tid = self.alloc_type_term("_mut", inner_ty);
-                                    let z_term = LinearTerm::var(z_tid);
-                                    post_arg_terms[pidx] = z_term.clone();
-                                    match arg {
-                                        Expr::Borrow(BorrowMode::Exclusive, place, _) => {
-                                            self.apply_place_write(place, r_i, z_term, &env);
-                                        }
-                                        Expr::Var(VarRef::Local(vid), _) => {
-                                            let place = Place {
-                                                root: *vid,
-                                                root_ty: pty.clone(),
-                                                steps: Vec::new(),
-                                                ty: inner_ty.clone(),
-                                            };
-                                            self.apply_place_write(&place, r_i, z_term, &env);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
+                            self.apply_call_exclusive_updates(
+                                *cid,
+                                arguments,
+                                r_i,
+                                &mut post_arg_terms,
+                                &env,
+                            );
                         }
                         Operation::Builtin { op, .. } => {
                             self.check_operands_o0(
@@ -3253,7 +3789,7 @@ impl<'a> BodyChecker<'a> {
                                 in_loop,
                             )?;
                         }
-                        Operation::Variant { borrow, .. } => {
+                        Operation::Variant { .. } => {
                             if let Some(arg) = arguments.first() {
                                 check_expr_obligations(
                                     self.program,
@@ -3267,17 +3803,7 @@ impl<'a> BodyChecker<'a> {
                                     in_loop,
                                     self.certificates,
                                 )?;
-                                if borrow.is_none() {
-                                    self.check_consume_expr(
-                                        arg,
-                                        r_i,
-                                        line,
-                                        &visible_vars,
-                                        in_loop,
-                                    )?;
-                                } else {
-                                    self.check_read_expr(arg, r_i, line, &visible_vars, in_loop)?;
-                                }
+                                self.check_consume_expr(arg, r_i, line, &visible_vars, in_loop)?;
                             }
                         }
                     }
@@ -3357,6 +3883,15 @@ impl<'a> BodyChecker<'a> {
                             self.defined[var_id] = self.solver.bdd.or(self.defined[var_id], atom);
                             let not_atom = self.solver.bdd.not(atom);
                             self.moved[var_id] = self.solver.bdd.and(self.moved[var_id], not_atom);
+                            if let Some(field) = contract_alt.fields.get(field_idx)
+                                && self.program.contains_borrow_or_view(&field.ty)
+                            {
+                                for &oidx in &field.origins {
+                                    if let Some(arg) = arguments.get(oidx) {
+                                        self.record_expr_loan_roots(var_id, arg, atom);
+                                    }
+                                }
+                            }
 
                             if let Some(cid) = pure_cid {
                                 let pay_id = self.solver.intern_term(AtomTerm::PurePay(
@@ -3577,15 +4112,16 @@ impl<'a> BodyChecker<'a> {
                     }
                     self.loop_entry_avail.insert(*loop_body, entry_avail);
 
+                    for (&param_var, init_expr) in head.parameters.iter().zip(initial) {
+                        self.record_expr_loan_roots(param_var, init_expr, r_i);
+                    }
+                    self.collect_loop_again_root_vars(*loop_body, r_i);
+
                     // [N5], [I9]: Give fresh logical names to loop parameters
                     // and to outer names that the loop body can change.
                     let mut modified_outer = HashSet::new();
-                    collect_modified_vars(self.body, *loop_body, &mut modified_outer);
-                    let extra_roots: Vec<VarId> = modified_outer
-                        .iter()
-                        .filter_map(|v| self.local_borrows.get(v).map(|fp| fp.root))
-                        .collect();
-                    modified_outer.extend(extra_roots);
+                    collect_modified_vars(self.program, self.body, *loop_body, &mut modified_outer);
+                    self.close_modified_with_borrows(&mut modified_outer);
                     for &var in &modified_outer {
                         if self.body.vars[var].body != *loop_body && self.defined[var] != bdd::FALSE
                         {
@@ -3636,7 +4172,7 @@ impl<'a> BodyChecker<'a> {
 
                         // [K8]: d.a ↔ R_{j₁} ∨ … ∨ R_{jₖ}
                         let mut leave_disj = bdd::FALSE;
-                        for (leave_alt, r_j, _, _, _, _) in &leaves {
+                        for (leave_alt, r_j, _, _, _, _, _) in &leaves {
                             if *leave_alt == alt_idx {
                                 leave_disj = self.solver.bdd.or(leave_disj, *r_j);
                             }
@@ -3653,7 +4189,7 @@ impl<'a> BodyChecker<'a> {
                     }
 
                     // Update modified outer variables on the histories where the loop left ([K8]).
-                    for (_, r_j, _, leave_versions, _, _) in &leaves {
+                    for (_, r_j, _, leave_versions, _, _, _) in &leaves {
                         for &var in &modified_outer {
                             if self.body.vars[var].body != *loop_body {
                                 let mux = self.alloc_var_term(var);
@@ -3683,7 +4219,7 @@ impl<'a> BodyChecker<'a> {
                             let mut avail_bad = bdd::FALSE;
                             let entry_a = self.avail(var);
                             let mut has_leaf = false;
-                            for (leave_alt, r_j, _, _, l_def, l_mov) in &leaves {
+                            for (leave_alt, r_j, _, _, l_def, l_mov, _) in &leaves {
                                 if *leave_alt != alt_idx {
                                     continue;
                                 }
@@ -3772,15 +4308,34 @@ impl<'a> BodyChecker<'a> {
                                 self.certificates,
                             )?;
                             let out_tid = self.alloc_var_term(var_id);
-                            for (leave_alt, r_j, payload_terms, _, _, _) in &leaves {
-                                if *leave_alt == alt_idx
-                                    && let Some(val_term) = payload_terms.get(field_pos)
-                                {
-                                    if *self.body.vars[var_id].ty.deref_type() == Type::Bool {
-                                        let b = self.solver.le(&LinearTerm::from_i128(1), val_term);
-                                        self.solver.add_def_bool(*r_j, out_tid, b);
-                                    } else {
-                                        self.solver.add_def_linear(*r_j, out_tid, val_term.clone());
+                            let out_is_borrow_or_view = self
+                                .program
+                                .contains_borrow_or_view(&self.body.vars[var_id].ty);
+                            for (leave_alt, r_j, payload_terms, _, _, _, payload_roots) in &leaves {
+                                if *leave_alt == alt_idx {
+                                    if let Some(val_term) = payload_terms.get(field_pos) {
+                                        if *self.body.vars[var_id].ty.deref_type() == Type::Bool {
+                                            let b =
+                                                self.solver.le(&LinearTerm::from_i128(1), val_term);
+                                            self.solver.add_def_bool(*r_j, out_tid, b);
+                                        } else {
+                                            self.solver.add_def_linear(
+                                                *r_j,
+                                                out_tid,
+                                                val_term.clone(),
+                                            );
+                                        }
+                                    }
+                                    if out_is_borrow_or_view
+                                        && let Some(proots) = payload_roots.get(field_pos)
+                                    {
+                                        for &(lg, rv) in proots {
+                                            if !self.var_in_body_tree(rv, *loop_body) {
+                                                let rj_lg = self.solver.bdd.and(*r_j, lg);
+                                                let g = self.solver.bdd.and(atom, rj_lg);
+                                                self.push_var_loan_root(var_id, g, rv);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3830,6 +4385,8 @@ impl<'a> BodyChecker<'a> {
                     self.in_contingency = false;
                     let b1_exit_live =
                         self.check_body_inner(*b1_body, r_i, in_loop, loop_leaves, true)?;
+                    self.boundary_fallthrough_live
+                        .insert(*b1_body, b1_exit_live);
                     let (_, b1_visible) = self.current_env();
                     self.check_scope_obligations(
                         &[*b1_body],
@@ -3848,12 +4405,8 @@ impl<'a> BodyChecker<'a> {
                     self.moved = outer_moved.clone();
                     self.versions = outer_versions.clone();
                     let mut b1_modified = HashSet::new();
-                    collect_modified_vars(self.body, *b1_body, &mut b1_modified);
-                    let b1_extra_roots: Vec<VarId> = b1_modified
-                        .iter()
-                        .filter_map(|v| self.local_borrows.get(v).map(|fp| fp.root))
-                        .collect();
-                    b1_modified.extend(b1_extra_roots);
+                    collect_modified_vars(self.program, self.body, *b1_body, &mut b1_modified);
+                    self.close_modified_with_borrows(&mut b1_modified);
                     for &var in &b1_modified {
                         if self.active_scopes.contains(&self.body.vars[var].body)
                             && self.defined[var] != bdd::FALSE
@@ -4009,6 +4562,10 @@ impl<'a> BodyChecker<'a> {
                         .iter()
                         .map(|e| translate_term(self.program, &mut self.solver, e, &env))
                         .collect();
+                    let payload_roots: Vec<Vec<(Formula, VarId)>> = payload
+                        .iter()
+                        .map(|e| self.expr_loan_roots(e, bdd::TRUE))
+                        .collect();
                     let target_loop_pos = self
                         .active_scopes
                         .iter()
@@ -4025,6 +4582,7 @@ impl<'a> BodyChecker<'a> {
                                 self.versions.clone(),
                                 self.defined.clone(),
                                 self.moved.clone(),
+                                payload_roots,
                             ));
                         }
                     }
@@ -4048,7 +4606,7 @@ impl<'a> BodyChecker<'a> {
                             .iter()
                             .enumerate()
                             .map(|(pidx, pty)| {
-                                if matches!(pty, Type::Ref(BorrowMode::Exclusive, _)) {
+                                if self.program.has_exclusive_borrow(pty) {
                                     env.locals
                                         .get(&pidx)
                                         .cloned()
@@ -4364,6 +4922,10 @@ fn check_boundary(
         constants: constants1,
         captured: HashMap::new(),
         local_borrows: HashMap::new(),
+        var_loan_roots: vec![Vec::new(); var_count1],
+        stmt_r: HashMap::new(),
+        stmt_visible: HashMap::new(),
+        boundary_fallthrough_live: HashMap::new(),
         loop_entry_avail: HashMap::new(),
         active_scopes: vec![0],
         permits_faults: true,
@@ -4381,6 +4943,7 @@ fn check_boundary(
     }
     let mut loop_leaves1 = HashMap::new();
     checker1.check_body(0, bdd::TRUE, false, &mut loop_leaves1)?;
+    checker1.check_loans()?;
 
     // 2. Check `B₂` (`boundary.contingency`) with `retains` + `message` bound ([F6]).
     let cont_param_count = boundary.retains.len() + 1;
@@ -4409,6 +4972,10 @@ fn check_boundary(
         constants: constants2,
         captured: HashMap::new(),
         local_borrows: HashMap::new(),
+        var_loan_roots: vec![Vec::new(); var_count2],
+        stmt_r: HashMap::new(),
+        stmt_visible: HashMap::new(),
+        boundary_fallthrough_live: HashMap::new(),
         loop_entry_avail: HashMap::new(),
         active_scopes: vec![0],
         permits_faults: true,
@@ -4426,6 +4993,7 @@ fn check_boundary(
     }
     let mut loop_leaves2 = HashMap::new();
     checker2.check_body(0, bdd::TRUE, false, &mut loop_leaves2)?;
+    checker2.check_loans()?;
     Ok(checker2.boundary_can_fault)
 }
 
@@ -4458,6 +5026,10 @@ fn check_control(
         constants,
         captured: HashMap::new(),
         local_borrows: HashMap::new(),
+        var_loan_roots: vec![Vec::new(); var_count],
+        stmt_r: HashMap::new(),
+        stmt_visible: HashMap::new(),
+        boundary_fallthrough_live: HashMap::new(),
         loop_entry_avail: HashMap::new(),
         active_scopes: vec![0],
         permits_faults: control.faults,
@@ -4482,5 +5054,2002 @@ fn check_control(
     }
 
     let mut loop_leaves = HashMap::new();
-    checker.check_body(0, bdd::TRUE, false, &mut loop_leaves)
+    checker.check_body(0, bdd::TRUE, false, &mut loop_leaves)?;
+    checker.check_loans()
+}
+
+// ============================================================================
+// Pass 2: Static ROBDD Loan Checking ([L1]-[L5], [L2a])
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum LoanRoot {
+    Owned(VarId),
+    Behind(VarId, Vec<(StructId, usize)>),
+    ParamOrigin(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum LoanStep {
+    Field(StructId, usize),
+    Elem,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LoanPlace {
+    root: LoanRoot,
+    steps: Vec<LoanStep>,
+}
+
+impl LoanPlace {
+    fn overlaps(&self, other: &LoanPlace) -> bool {
+        self.root == other.root && self.steps.iter().zip(&other.steps).all(|(a, b)| a == b)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Holder {
+    Var(VarId),
+    Temp(usize),
+}
+
+#[derive(Clone, Debug)]
+struct Loan {
+    place: LoanPlace,
+    mode: BorrowMode,
+    created_on: Formula,
+    holders: Vec<(Holder, Formula)>,
+}
+
+type LeaveLoanRecord = (BodyId, usize, Formula, Vec<Vec<(usize, Formula)>>);
+
+struct EvalCtx<'c> {
+    r_i: Formula,
+    after_live: &'c HashMap<VarId, Formula>,
+    later_in_stmt: &'c HashSet<VarId>,
+    in_loop: bool,
+    visible: &'c [(String, TermId, bool)],
+}
+
+impl<'c> EvalCtx<'c> {
+    fn with_later<'n>(&self, later: &'n HashSet<VarId>) -> EvalCtx<'n>
+    where
+        'c: 'n,
+    {
+        EvalCtx {
+            r_i: self.r_i,
+            after_live: self.after_live,
+            later_in_stmt: later,
+            in_loop: self.in_loop,
+            visible: self.visible,
+        }
+    }
+}
+
+fn view_borrow_field_paths(
+    program: &Program,
+    ty: &Type,
+) -> Vec<(Vec<(StructId, usize)>, BorrowMode)> {
+    fn collect(
+        program: &Program,
+        ty: &Type,
+        prefix: &mut Vec<(StructId, usize)>,
+        out: &mut Vec<(Vec<(StructId, usize)>, BorrowMode)>,
+    ) {
+        match ty {
+            Type::Ref(mode, _) => out.push((prefix.clone(), *mode)),
+            Type::Struct(sid, _) if program.structs[*sid].is_view => {
+                for (fidx, fdef) in program.structs[*sid].fields.iter().enumerate() {
+                    prefix.push((*sid, fidx));
+                    collect(program, &fdef.ty, prefix, out);
+                    prefix.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut prefix = Vec::new();
+    let mut out = Vec::new();
+    collect(program, ty, &mut prefix, &mut out);
+    out
+}
+
+fn place_to_loan_place(program: &Program, body: &ControlBody, place: &Place) -> LoanPlace {
+    let root_ty = &body.vars[place.root].ty;
+    let convert_steps = |steps: &[PlaceStep]| -> Vec<LoanStep> {
+        steps
+            .iter()
+            .map(|s| match s {
+                PlaceStep::Field(sid, fidx, _) => LoanStep::Field(*sid, *fidx),
+                PlaceStep::Index(_, _) => LoanStep::Elem,
+            })
+            .collect()
+    };
+    if matches!(root_ty, Type::Ref(_, _)) {
+        return LoanPlace {
+            root: LoanRoot::Behind(place.root, Vec::new()),
+            steps: convert_steps(&place.steps),
+        };
+    }
+    if program.is_view(root_ty) {
+        let mut prefix = Vec::new();
+        for (idx, step) in place.steps.iter().enumerate() {
+            if let PlaceStep::Field(sid, fidx, fty) = step {
+                prefix.push((*sid, *fidx));
+                if matches!(fty, Type::Ref(_, _)) {
+                    return LoanPlace {
+                        root: LoanRoot::Behind(place.root, prefix),
+                        steps: convert_steps(&place.steps[idx + 1..]),
+                    };
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    LoanPlace {
+        root: LoanRoot::Owned(place.root),
+        steps: convert_steps(&place.steps),
+    }
+}
+
+enum RawStep<'e> {
+    Field(StructId, usize, Type),
+    Index(&'e Expr),
+}
+
+struct DecomposedPlace<'e> {
+    root: VarId,
+    loan_place: LoanPlace,
+    raw_field_steps: Vec<LoanStep>,
+    view_prefix: Vec<(StructId, usize)>,
+    index_exprs: Vec<&'e Expr>,
+}
+
+fn decompose_place_expr<'e>(
+    program: &Program,
+    body: &ControlBody,
+    expr: &'e Expr,
+) -> Option<DecomposedPlace<'e>> {
+    let mut raw_rev: Vec<RawStep<'e>> = Vec::new();
+    let mut cur = expr;
+    let root = loop {
+        match cur {
+            Expr::Move(inner, _) => cur = inner,
+            Expr::Field(base, sid, fidx, _) => {
+                let decl_ty = program.structs[*sid].fields[*fidx].ty.clone();
+                raw_rev.push(RawStep::Field(*sid, *fidx, decl_ty));
+                cur = base;
+            }
+            Expr::Index(base, idx, _) => {
+                raw_rev.push(RawStep::Index(idx));
+                cur = base;
+            }
+            Expr::Var(VarRef::Local(id), _) => break *id,
+            _ => return None,
+        }
+    };
+    raw_rev.reverse();
+    let index_exprs: Vec<&'e Expr> = raw_rev
+        .iter()
+        .filter_map(|s| match s {
+            RawStep::Index(e) => Some(*e),
+            RawStep::Field(_, _, _) => None,
+        })
+        .collect();
+    let raw_field_steps: Vec<LoanStep> = raw_rev
+        .iter()
+        .map(|s| match s {
+            RawStep::Field(sid, fidx, _) => LoanStep::Field(*sid, *fidx),
+            RawStep::Index(_) => LoanStep::Elem,
+        })
+        .collect();
+    let root_ty = &body.vars[root].ty;
+    if matches!(root_ty, Type::Ref(_, _)) {
+        return Some(DecomposedPlace {
+            root,
+            loan_place: LoanPlace {
+                root: LoanRoot::Behind(root, Vec::new()),
+                steps: raw_field_steps.clone(),
+            },
+            raw_field_steps,
+            view_prefix: Vec::new(),
+            index_exprs,
+        });
+    }
+    let mut prefix = Vec::new();
+    if program.is_view(root_ty) {
+        for (idx, step) in raw_rev.iter().enumerate() {
+            if let RawStep::Field(sid, fidx, decl_ty) = step {
+                prefix.push((*sid, *fidx));
+                if matches!(decl_ty, Type::Ref(_, _)) {
+                    return Some(DecomposedPlace {
+                        root,
+                        loan_place: LoanPlace {
+                            root: LoanRoot::Behind(root, prefix.clone()),
+                            steps: raw_field_steps[idx + 1..].to_vec(),
+                        },
+                        raw_field_steps,
+                        view_prefix: prefix,
+                        index_exprs,
+                    });
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    Some(DecomposedPlace {
+        root,
+        loan_place: LoanPlace {
+            root: LoanRoot::Owned(root),
+            steps: raw_field_steps.clone(),
+        },
+        raw_field_steps,
+        view_prefix: prefix,
+        index_exprs,
+    })
+}
+
+fn collect_expr_mentions(expr: &Expr, out: &mut HashSet<VarId>) {
+    match expr {
+        Expr::Boolean(_)
+        | Expr::Integer(_, _)
+        | Expr::String(_)
+        | Expr::Old(_, _)
+        | Expr::EmptyMap(_) => {}
+        Expr::Var(VarRef::Local(id), _) => {
+            out.insert(*id);
+        }
+        Expr::Var(_, _) => {}
+        Expr::Borrow(_, place, _) => {
+            out.insert(place.root);
+            for step in &place.steps {
+                if let PlaceStep::Index(idx, _) = step {
+                    collect_expr_mentions(idx, out);
+                }
+            }
+        }
+        Expr::Move(inner, _)
+        | Expr::Field(inner, _, _, _)
+        | Expr::Len(inner)
+        | Expr::Clone(inner, _)
+        | Expr::Trim(inner)
+        | Expr::Negate(inner, _)
+        | Expr::Not(inner) => collect_expr_mentions(inner, out),
+        Expr::Index(l, r, _)
+        | Expr::Arithmetic(_, l, r, _)
+        | Expr::Compare(_, l, r)
+        | Expr::And(l, r)
+        | Expr::Or(l, r) => {
+            collect_expr_mentions(l, out);
+            collect_expr_mentions(r, out);
+        }
+        Expr::Struct(_, items, _)
+        | Expr::Variant(_, _, items, _)
+        | Expr::Vector(items, _)
+        | Expr::Call(_, items, _) => {
+            for item in items {
+                collect_expr_mentions(item, out);
+            }
+        }
+    }
+}
+
+fn stmt_direct_mentions(
+    program: &Program,
+    body: &ControlBody,
+    stmt: &crate::typed::Statement,
+) -> HashSet<VarId> {
+    let mut out = HashSet::new();
+    match &stmt.command {
+        Command::Bind { value, .. } | Command::Unpack { value, .. } => {
+            collect_expr_mentions(value, &mut out);
+        }
+        Command::Assign { var, value } => {
+            if matches!(body.vars[*var].ty, Type::Ref(_, _)) {
+                out.insert(*var);
+            }
+            collect_expr_mentions(value, &mut out);
+        }
+        Command::AssignPlace { target, value } => {
+            if program.contains_borrow_or_view(&body.vars[target.root].ty) {
+                out.insert(target.root);
+            }
+            for step in &target.steps {
+                if let PlaceStep::Index(idx, _) = step {
+                    collect_expr_mentions(idx, &mut out);
+                }
+            }
+            collect_expr_mentions(value, &mut out);
+        }
+        Command::Oblige(f) => collect_expr_mentions(f, &mut out),
+        Command::Test { condition, .. } => collect_expr_mentions(condition, &mut out),
+        Command::Capture { arguments, .. }
+        | Command::Decide { arguments, .. }
+        | Command::Supervise { arguments, .. }
+        | Command::Again { arguments, .. } => {
+            for a in arguments {
+                collect_expr_mentions(a, &mut out);
+            }
+        }
+        Command::Loop {
+            body: loop_body,
+            initial,
+            ..
+        } => {
+            for a in initial {
+                collect_expr_mentions(a, &mut out);
+            }
+            if let Some(head) = &body.bodies[*loop_body].head
+                && let Some(inv) = &head.invariant
+            {
+                collect_expr_mentions(inv, &mut out);
+            }
+        }
+        Command::Boundary { captures, .. } => {
+            out.extend(captures.iter().copied());
+        }
+        Command::Leave { payload, .. } | Command::Exit { payload, .. } => {
+            for p in payload {
+                collect_expr_mentions(p, &mut out);
+            }
+        }
+        Command::Fault { message, .. } => collect_expr_mentions(message, &mut out),
+        Command::Terminate(Some(expr)) => collect_expr_mentions(expr, &mut out),
+        Command::Terminate(None)
+        | Command::Escalate
+        | Command::Recover { .. }
+        | Command::Impossible => {}
+    }
+    out
+}
+
+fn or_guard_map(map: &mut HashMap<VarId, Formula>, var: VarId, guard: Formula, bdd: &mut Bdd) {
+    if guard == bdd::FALSE {
+        return;
+    }
+    match map.get_mut(&var) {
+        Some(existing) => *existing = bdd.or(*existing, guard),
+        None => {
+            map.insert(var, guard);
+        }
+    }
+}
+
+struct LoanChecker<'a, 'b> {
+    bc: &'a mut BodyChecker<'b>,
+    loans: Vec<Loan>,
+    next_temp: usize,
+    mentions_in_body: HashMap<BodyId, HashMap<VarId, Formula>>,
+    feasible_mentions: HashMap<BodyId, HashSet<VarId>>,
+    live_after_stmt: HashMap<(BodyId, usize), HashMap<VarId, Formula>>,
+    boundary_after_live: HashMap<BodyId, HashMap<VarId, Formula>>,
+}
+
+impl<'a, 'b> LoanChecker<'a, 'b> {
+    fn new(bc: &'a mut BodyChecker<'b>) -> Self {
+        let mut loans = Vec::new();
+        for (pidx, pty) in bc.param_types.iter().enumerate() {
+            if bc.program.contains_borrow_or_view(pty) {
+                let mode = if bc.program.has_exclusive_borrow(pty) {
+                    BorrowMode::Exclusive
+                } else {
+                    BorrowMode::Shared
+                };
+                loans.push(Loan {
+                    place: LoanPlace {
+                        root: LoanRoot::ParamOrigin(pidx),
+                        steps: Vec::new(),
+                    },
+                    mode,
+                    created_on: bdd::TRUE,
+                    holders: vec![(Holder::Var(pidx), bdd::TRUE)],
+                });
+            }
+        }
+        LoanChecker {
+            bc,
+            loans,
+            next_temp: 0,
+            mentions_in_body: HashMap::new(),
+            feasible_mentions: HashMap::new(),
+            live_after_stmt: HashMap::new(),
+            boundary_after_live: HashMap::new(),
+        }
+    }
+
+    fn fresh_temp(&mut self) -> Holder {
+        let id = self.next_temp;
+        self.next_temp += 1;
+        Holder::Temp(id)
+    }
+
+    fn describe_place(&self, place: &LoanPlace) -> String {
+        let mut s = match &place.root {
+            LoanRoot::Owned(v) => self.bc.body.vars[*v].name.clone(),
+            LoanRoot::Behind(v, prefix) => {
+                let mut base = format!("*{}", self.bc.body.vars[*v].name);
+                for &(sid, fidx) in prefix {
+                    base.push('.');
+                    base.push_str(&self.bc.program.structs[sid].fields[fidx].name);
+                }
+                base
+            }
+            LoanRoot::ParamOrigin(pidx) => {
+                format!("origin({})", self.bc.body.vars[*pidx].name)
+            }
+        };
+        for step in &place.steps {
+            match step {
+                LoanStep::Field(sid, fidx) => {
+                    s.push('.');
+                    s.push_str(&self.bc.program.structs[*sid].fields[*fidx].name);
+                }
+                LoanStep::Elem => s.push_str("[…]"),
+            }
+        }
+        s
+    }
+
+    fn collect_body_mentions(&mut self, body_id: BodyId, in_loop: bool) -> HashMap<VarId, Formula> {
+        let mut map = HashMap::new();
+        let stmts = self.bc.body.bodies[body_id].statements.clone();
+        for (stmt_idx, stmt) in stmts.iter().enumerate() {
+            let r_i = self
+                .bc
+                .stmt_r
+                .get(&(body_id, stmt_idx))
+                .copied()
+                .unwrap_or(bdd::FALSE);
+            for v in stmt_direct_mentions(self.bc.program, self.bc.body, stmt) {
+                or_guard_map(&mut map, v, r_i, &mut self.bc.solver.bdd);
+            }
+            match &stmt.command {
+                Command::Loop { body: inner, .. } => {
+                    let inner_m = self.collect_body_mentions(*inner, true);
+                    for (v, g) in inner_m {
+                        or_guard_map(&mut map, v, g, &mut self.bc.solver.bdd);
+                    }
+                }
+                Command::Boundary {
+                    body: b1,
+                    contingency: b2,
+                    ..
+                } => {
+                    let m1 = self.collect_body_mentions(*b1, in_loop);
+                    for (v, g) in m1 {
+                        or_guard_map(&mut map, v, g, &mut self.bc.solver.bdd);
+                    }
+                    let m2 = self.collect_body_mentions(*b2, in_loop);
+                    for (v, g) in m2 {
+                        or_guard_map(&mut map, v, g, &mut self.bc.solver.bdd);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut feasible = HashSet::new();
+        for (&v, &g) in &map {
+            if self
+                .bc
+                .program
+                .contains_borrow_or_view(&self.bc.body.vars[v].ty)
+                && self.bc.is_feasible(g, &[], in_loop)
+            {
+                feasible.insert(v);
+            }
+        }
+        self.mentions_in_body.insert(body_id, map.clone());
+        self.feasible_mentions.insert(body_id, feasible);
+        map
+    }
+
+    fn collect_repeat_and_leave_guards(
+        &mut self,
+        cur_body: BodyId,
+        targets: &[BodyId],
+        in_inner_loop: bool,
+    ) -> (Formula, Formula) {
+        let mut rep = bdd::FALSE;
+        let mut lv = bdd::FALSE;
+        let stmts = &self.bc.body.bodies[cur_body].statements;
+        for (stmt_idx, stmt) in stmts.iter().enumerate() {
+            let r_i = self
+                .bc
+                .stmt_r
+                .get(&(cur_body, stmt_idx))
+                .copied()
+                .unwrap_or(bdd::FALSE);
+            match &stmt.command {
+                Command::Again { body: target, .. } | Command::Recover { body: target }
+                    if targets.contains(target) =>
+                {
+                    rep = self.bc.solver.bdd.or(rep, r_i);
+                }
+                Command::Leave { .. } if !in_inner_loop => {
+                    lv = self.bc.solver.bdd.or(lv, r_i);
+                }
+                Command::Loop { body: inner, .. } => {
+                    let (ir, _) = self.collect_repeat_and_leave_guards(*inner, targets, true);
+                    rep = self.bc.solver.bdd.or(rep, ir);
+                }
+                Command::Boundary {
+                    body: b1,
+                    contingency: b2,
+                    ..
+                } => {
+                    let (r1, l1) =
+                        self.collect_repeat_and_leave_guards(*b1, targets, in_inner_loop);
+                    rep = self.bc.solver.bdd.or(rep, r1);
+                    lv = self.bc.solver.bdd.or(lv, l1);
+                    let (r2, _) = self.collect_repeat_and_leave_guards(*b2, targets, in_inner_loop);
+                    rep = self.bc.solver.bdd.or(rep, r2);
+                }
+                _ => {}
+            }
+        }
+        (rep, lv)
+    }
+
+    fn collect_recover_guard(&mut self, cur_body: BodyId) -> (Formula, HashSet<BodyId>) {
+        let mut rec_g = bdd::FALSE;
+        let mut targets = HashSet::new();
+        for (stmt_idx, stmt) in self.bc.body.bodies[cur_body].statements.iter().enumerate() {
+            let r_i = self
+                .bc
+                .stmt_r
+                .get(&(cur_body, stmt_idx))
+                .copied()
+                .unwrap_or(bdd::FALSE);
+            match &stmt.command {
+                Command::Recover { body: target } => {
+                    rec_g = self.bc.solver.bdd.or(rec_g, r_i);
+                    targets.insert(*target);
+                }
+                Command::Loop { body: inner, .. } => {
+                    let (ig, it) = self.collect_recover_guard(*inner);
+                    rec_g = self.bc.solver.bdd.or(rec_g, ig);
+                    targets.extend(it);
+                }
+                Command::Boundary {
+                    body: b1,
+                    contingency: b2,
+                    ..
+                } => {
+                    let (g1, t1) = self.collect_recover_guard(*b1);
+                    let (g2, t2) = self.collect_recover_guard(*b2);
+                    rec_g = self.bc.solver.bdd.or(rec_g, g1);
+                    rec_g = self.bc.solver.bdd.or(rec_g, g2);
+                    targets.extend(t1);
+                    targets.extend(t2);
+                }
+                _ => {}
+            }
+        }
+        (rec_g, targets)
+    }
+
+    fn compute_body_liveness(
+        &mut self,
+        body_id: BodyId,
+        after_body_live: &HashMap<VarId, Formula>,
+        ancestors: &[BodyId],
+        loop_ancestors: &[BodyId],
+    ) {
+        let mut running = if let Some(head) = &self.bc.body.bodies[body_id].head.clone() {
+            let mut loop_targets = loop_ancestors.to_vec();
+            loop_targets.push(body_id);
+            let (repeat_g, leave_g) =
+                self.collect_repeat_and_leave_guards(body_id, &loop_targets, false);
+            let mut seeded = HashMap::new();
+            for (&v, &g) in after_body_live {
+                let mut inner_g = self.bc.solver.bdd.and(g, leave_g);
+                if g != bdd::FALSE && self.bc.is_feasible(g, &[], true) {
+                    inner_g = self.bc.solver.bdd.or(inner_g, repeat_g);
+                }
+                if inner_g != bdd::FALSE {
+                    seeded.insert(v, inner_g);
+                }
+            }
+            let feasible = self
+                .feasible_mentions
+                .get(&body_id)
+                .cloned()
+                .unwrap_or_default();
+            for v in feasible {
+                let var_body = self.bc.body.vars[v].body;
+                if head.parameters.contains(&v) || ancestors.contains(&var_body) {
+                    or_guard_map(&mut seeded, v, repeat_g, &mut self.bc.solver.bdd);
+                }
+            }
+            seeded
+        } else {
+            after_body_live.clone()
+        };
+
+        let stmts = self.bc.body.bodies[body_id].statements.clone();
+        for (stmt_idx, stmt) in stmts.iter().enumerate().rev() {
+            self.live_after_stmt
+                .insert((body_id, stmt_idx), running.clone());
+            let r_i = self
+                .bc
+                .stmt_r
+                .get(&(body_id, stmt_idx))
+                .copied()
+                .unwrap_or(bdd::FALSE);
+            match &stmt.command {
+                Command::Loop {
+                    body: inner,
+                    initial,
+                    ..
+                } => {
+                    let mut next_anc = ancestors.to_vec();
+                    next_anc.push(body_id);
+                    let mut next_loop_anc = loop_ancestors.to_vec();
+                    if self.bc.body.bodies[body_id].head.is_some() {
+                        next_loop_anc.push(body_id);
+                    }
+                    self.compute_body_liveness(*inner, &running, &next_anc, &next_loop_anc);
+                    let inner_m = self
+                        .mentions_in_body
+                        .get(inner)
+                        .cloned()
+                        .unwrap_or_default();
+                    for (v, g) in inner_m {
+                        if self.bc.body.vars[v].body != *inner {
+                            or_guard_map(&mut running, v, g, &mut self.bc.solver.bdd);
+                        }
+                    }
+                    let mut head_vars = HashSet::new();
+                    for a in initial {
+                        collect_expr_mentions(a, &mut head_vars);
+                    }
+                    if let Some(head) = &self.bc.body.bodies[*inner].head
+                        && let Some(inv) = &head.invariant
+                    {
+                        collect_expr_mentions(inv, &mut head_vars);
+                    }
+                    for v in head_vars {
+                        or_guard_map(&mut running, v, r_i, &mut self.bc.solver.bdd);
+                    }
+                }
+                Command::Boundary {
+                    body: b1,
+                    captures,
+                    contingency: b2,
+                    ..
+                } => {
+                    let b1_exit = self
+                        .bc
+                        .boundary_fallthrough_live
+                        .get(b1)
+                        .copied()
+                        .unwrap_or(bdd::FALSE);
+                    let (b1_rep, b1_lv) =
+                        self.collect_repeat_and_leave_guards(*b1, loop_ancestors, false);
+                    let b1_rl = self.bc.solver.bdd.or(b1_rep, b1_lv);
+                    let b1_cont = self.bc.solver.bdd.or(b1_exit, b1_rl);
+                    let mut b1_after = HashMap::new();
+                    for (&v, &g) in &running {
+                        let fg = self.bc.solver.bdd.and(g, b1_cont);
+                        or_guard_map(&mut b1_after, v, fg, &mut self.bc.solver.bdd);
+                    }
+                    let b2_feasible = self.feasible_mentions.get(b2).cloned().unwrap_or_default();
+                    for v in b2_feasible {
+                        if !self.bc.var_in_body_tree(v, *b2) {
+                            or_guard_map(&mut b1_after, v, r_i, &mut self.bc.solver.bdd);
+                        }
+                    }
+                    self.boundary_after_live.insert(*b1, b1_after.clone());
+
+                    let mut next_anc = ancestors.to_vec();
+                    next_anc.push(body_id);
+                    let mut next_loop_anc = loop_ancestors.to_vec();
+                    if self.bc.body.bodies[body_id].head.is_some() {
+                        next_loop_anc.push(body_id);
+                    }
+                    self.compute_body_liveness(*b1, &b1_after, &next_anc, &next_loop_anc);
+
+                    let mut b2_after = HashMap::new();
+                    let (rec_g, rec_targets) = self.collect_recover_guard(*b2);
+                    if rec_g != bdd::FALSE {
+                        for &target in &rec_targets {
+                            let feas = self
+                                .feasible_mentions
+                                .get(&target)
+                                .cloned()
+                                .unwrap_or_default();
+                            for v in feas {
+                                if self.bc.body.vars[v].body != target
+                                    && !self.bc.var_in_body_tree(v, *b2)
+                                {
+                                    or_guard_map(&mut b2_after, v, rec_g, &mut self.bc.solver.bdd);
+                                }
+                            }
+                            for (&v, &g) in &running {
+                                let fg = self.bc.solver.bdd.and(g, rec_g);
+                                or_guard_map(&mut b2_after, v, fg, &mut self.bc.solver.bdd);
+                            }
+                        }
+                    }
+                    self.compute_body_liveness(*b2, &b2_after, &next_anc, &next_loop_anc);
+
+                    for sub in [*b1, *b2] {
+                        let subm = self.mentions_in_body.get(&sub).cloned().unwrap_or_default();
+                        for (v, g) in subm {
+                            if self.bc.body.vars[v].body != sub {
+                                or_guard_map(&mut running, v, g, &mut self.bc.solver.bdd);
+                            }
+                        }
+                    }
+                    for &c in captures {
+                        or_guard_map(&mut running, c, r_i, &mut self.bc.solver.bdd);
+                    }
+                }
+                _ => {
+                    for v in stmt_direct_mentions(self.bc.program, self.bc.body, stmt) {
+                        or_guard_map(&mut running, v, r_i, &mut self.bc.solver.bdd);
+                    }
+                }
+            }
+        }
+    }
+
+    fn loans_for_holder(&mut self, holder: Holder, r_i: Formula) -> Vec<(usize, Formula)> {
+        let mut out = Vec::new();
+        for lid in 0..self.loans.len() {
+            let holders = self.loans[lid].holders.clone();
+            for (h, hg) in holders {
+                if h == holder {
+                    let g = self.bc.solver.bdd.and(r_i, hg);
+                    if g != bdd::FALSE {
+                        out.push((lid, g));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn attach_holder_loans(&mut self, holder: Holder, src: &[(usize, Formula)], guard: Formula) {
+        if guard == bdd::FALSE {
+            return;
+        }
+        for &(lid, shg) in src {
+            let g = self.bc.solver.bdd.and(guard, shg);
+            if g == bdd::FALSE {
+                continue;
+            }
+            let holders = &mut self.loans[lid].holders;
+            if let Some((_, existing)) = holders.iter_mut().find(|(h, _)| *h == holder) {
+                *existing = self.bc.solver.bdd.or(*existing, g);
+            } else {
+                holders.push((holder, g));
+            }
+        }
+    }
+
+    fn check_access(
+        &mut self,
+        access_place: &LoanPlace,
+        is_write: bool,
+        through: Option<Holder>,
+        ctx: &EvalCtx<'_>,
+        active_temps: &[Holder],
+        line: u32,
+    ) -> Result<(), Error> {
+        let loan_count = self.loans.len();
+        for lid in 0..loan_count {
+            let (l_place, l_mode, l_created, l_holders) = {
+                let l = &self.loans[lid];
+                (l.place.clone(), l.mode, l.created_on, l.holders.clone())
+            };
+            if !l_place.overlaps(access_place) {
+                continue;
+            }
+            if !is_write && l_mode == BorrowMode::Shared {
+                continue;
+            }
+            let mut through_guard = bdd::FALSE;
+            let mut holder_live = bdd::FALSE;
+            for (h, hg) in &l_holders {
+                if Some(*h) == through {
+                    through_guard = self.bc.solver.bdd.or(through_guard, *hg);
+                }
+                let used = match h {
+                    Holder::Temp(_) => {
+                        if active_temps.contains(h) {
+                            ctx.r_i
+                        } else {
+                            bdd::FALSE
+                        }
+                    }
+                    Holder::Var(vid) => {
+                        let after = ctx.after_live.get(vid).copied().unwrap_or(bdd::FALSE);
+                        if ctx.later_in_stmt.contains(vid) {
+                            self.bc.solver.bdd.or(after, ctx.r_i)
+                        } else {
+                            after
+                        }
+                    }
+                };
+                let h_live = self.bc.solver.bdd.and(*hg, used);
+                holder_live = self.bc.solver.bdd.or(holder_live, h_live);
+            }
+            let not_through = self.bc.solver.bdd.not(through_guard);
+            let r_not_through = self.bc.solver.bdd.and(ctx.r_i, not_through);
+            let created_and_live = self.bc.solver.bdd.and(l_created, holder_live);
+            let conflict = self.bc.solver.bdd.and(r_not_through, created_and_live);
+            if conflict != bdd::FALSE {
+                let desc = self.describe_place(&l_place);
+                let action = if is_write { "write" } else { "read" };
+                let access_desc = self.describe_place(access_place);
+                let msg = format!(
+                    "cannot {action} `{access_desc}` while `{desc}` is lent and its borrow is still used"
+                );
+                require_entailment(
+                    &mut self.bc.solver,
+                    conflict,
+                    &self.bc.owner_name,
+                    line,
+                    "L3",
+                    msg,
+                    ctx.visible,
+                    ctx.in_loop,
+                    self.bc.certificates,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn eval_loan_expr(
+        &mut self,
+        expr: &Expr,
+        consumed: bool,
+        ctx: &EvalCtx<'_>,
+        active_temps: &mut Vec<Holder>,
+        line: u32,
+    ) -> Result<Vec<(usize, Formula)>, Error> {
+        match expr {
+            Expr::Boolean(_)
+            | Expr::Integer(_, _)
+            | Expr::String(_)
+            | Expr::Old(_, _)
+            | Expr::EmptyMap(_) => Ok(Vec::new()),
+            Expr::Var(VarRef::Local(id), expr_ty) => {
+                let var_ty = self.bc.body.vars[*id].ty.clone();
+                if matches!(var_ty, Type::Ref(_, _)) {
+                    let is_ref_val = matches!(expr_ty, Type::Ref(_, _));
+                    let is_write =
+                        is_ref_val && matches!(var_ty, Type::Ref(BorrowMode::Exclusive, _));
+                    let lp = LoanPlace {
+                        root: LoanRoot::Behind(*id, Vec::new()),
+                        steps: Vec::new(),
+                    };
+                    self.check_access(
+                        &lp,
+                        is_write,
+                        Some(Holder::Var(*id)),
+                        ctx,
+                        active_temps,
+                        line,
+                    )?;
+                    Ok(if is_ref_val {
+                        self.loans_for_holder(Holder::Var(*id), ctx.r_i)
+                    } else {
+                        Vec::new()
+                    })
+                } else if self.bc.program.is_view(&var_ty) {
+                    let is_write = consumed && self.bc.program.kind(&var_ty) != Kind::Copy;
+                    self.check_access(
+                        &LoanPlace {
+                            root: LoanRoot::Owned(*id),
+                            steps: Vec::new(),
+                        },
+                        is_write,
+                        None,
+                        ctx,
+                        active_temps,
+                        line,
+                    )?;
+                    for (prefix, mode) in view_borrow_field_paths(self.bc.program, &var_ty) {
+                        self.check_access(
+                            &LoanPlace {
+                                root: LoanRoot::Behind(*id, prefix),
+                                steps: Vec::new(),
+                            },
+                            mode == BorrowMode::Exclusive,
+                            Some(Holder::Var(*id)),
+                            ctx,
+                            active_temps,
+                            line,
+                        )?;
+                    }
+                    Ok(self.loans_for_holder(Holder::Var(*id), ctx.r_i))
+                } else {
+                    let is_write = consumed && self.bc.program.kind(&var_ty) != Kind::Copy;
+                    self.check_access(
+                        &LoanPlace {
+                            root: LoanRoot::Owned(*id),
+                            steps: Vec::new(),
+                        },
+                        is_write,
+                        None,
+                        ctx,
+                        active_temps,
+                        line,
+                    )?;
+                    Ok(Vec::new())
+                }
+            }
+            Expr::Var(_, _) => Ok(Vec::new()),
+            Expr::Move(inner, _) => self.eval_loan_expr(inner, true, ctx, active_temps, line),
+            Expr::Borrow(mode, place, _) => {
+                let idx_exprs: Vec<&Expr> = place
+                    .steps
+                    .iter()
+                    .filter_map(|s| match s {
+                        PlaceStep::Index(e, _) => Some(e),
+                        PlaceStep::Field(_, _, _) => None,
+                    })
+                    .collect();
+                let root_borrow_or_view = self
+                    .bc
+                    .program
+                    .contains_borrow_or_view(&self.bc.body.vars[place.root].ty);
+                for (k, ie) in idx_exprs.iter().enumerate() {
+                    let mut ilater = ctx.later_in_stmt.clone();
+                    if root_borrow_or_view {
+                        ilater.insert(place.root);
+                    }
+                    for rem in &idx_exprs[k + 1..] {
+                        collect_expr_mentions(rem, &mut ilater);
+                    }
+                    let ictx = ctx.with_later(&ilater);
+                    self.eval_loan_expr(ie, false, &ictx, active_temps, line)?;
+                }
+                let lp = place_to_loan_place(self.bc.program, self.bc.body, place);
+                let through = match &lp.root {
+                    LoanRoot::Behind(v, _) => Some(Holder::Var(*v)),
+                    _ => None,
+                };
+                self.check_access(
+                    &lp,
+                    *mode == BorrowMode::Exclusive,
+                    through,
+                    ctx,
+                    active_temps,
+                    line,
+                )?;
+                let temp = self.fresh_temp();
+                active_temps.push(temp);
+                let lid = self.loans.len();
+                self.loans.push(Loan {
+                    place: lp.clone(),
+                    mode: *mode,
+                    created_on: ctx.r_i,
+                    holders: vec![(temp, ctx.r_i)],
+                });
+                let mut ret = vec![(lid, ctx.r_i)];
+                if matches!(lp.root, LoanRoot::Behind(_, _)) {
+                    let inherited = self.loans_for_holder(Holder::Var(place.root), ctx.r_i);
+                    self.attach_holder_loans(temp, &inherited, ctx.r_i);
+                    ret.extend(inherited);
+                }
+                Ok(ret)
+            }
+            Expr::Field(base, _, _, expr_ty) | Expr::Index(base, _, expr_ty) => {
+                if let Some(decomp) = decompose_place_expr(self.bc.program, self.bc.body, expr) {
+                    let root_borrow_or_view = self
+                        .bc
+                        .program
+                        .contains_borrow_or_view(&self.bc.body.vars[decomp.root].ty);
+                    for (k, ie) in decomp.index_exprs.iter().enumerate() {
+                        let mut ilater = ctx.later_in_stmt.clone();
+                        if root_borrow_or_view {
+                            ilater.insert(decomp.root);
+                        }
+                        for rem in &decomp.index_exprs[k + 1..] {
+                            collect_expr_mentions(rem, &mut ilater);
+                        }
+                        let ictx = ctx.with_later(&ilater);
+                        self.eval_loan_expr(ie, false, &ictx, active_temps, line)?;
+                    }
+                    if let Type::Ref(fmode, _) = expr_ty {
+                        self.check_access(
+                            &LoanPlace {
+                                root: LoanRoot::Owned(decomp.root),
+                                steps: decomp.raw_field_steps.clone(),
+                            },
+                            false,
+                            None,
+                            ctx,
+                            active_temps,
+                            line,
+                        )?;
+                        self.check_access(
+                            &LoanPlace {
+                                root: LoanRoot::Behind(decomp.root, decomp.view_prefix),
+                                steps: Vec::new(),
+                            },
+                            *fmode == BorrowMode::Exclusive,
+                            Some(Holder::Var(decomp.root)),
+                            ctx,
+                            active_temps,
+                            line,
+                        )?;
+                        return Ok(self.loans_for_holder(Holder::Var(decomp.root), ctx.r_i));
+                    } else if self.bc.program.is_view(expr_ty) {
+                        let is_write = consumed && self.bc.program.kind(expr_ty) != Kind::Copy;
+                        self.check_access(
+                            &LoanPlace {
+                                root: LoanRoot::Owned(decomp.root),
+                                steps: decomp.raw_field_steps,
+                            },
+                            is_write,
+                            None,
+                            ctx,
+                            active_temps,
+                            line,
+                        )?;
+                        for (sub_prefix, sub_mode) in
+                            view_borrow_field_paths(self.bc.program, expr_ty)
+                        {
+                            let mut full = decomp.view_prefix.clone();
+                            full.extend(sub_prefix);
+                            self.check_access(
+                                &LoanPlace {
+                                    root: LoanRoot::Behind(decomp.root, full),
+                                    steps: Vec::new(),
+                                },
+                                sub_mode == BorrowMode::Exclusive,
+                                Some(Holder::Var(decomp.root)),
+                                ctx,
+                                active_temps,
+                                line,
+                            )?;
+                        }
+                        return Ok(self.loans_for_holder(Holder::Var(decomp.root), ctx.r_i));
+                    }
+                    let through = match &decomp.loan_place.root {
+                        LoanRoot::Behind(v, _) => Some(Holder::Var(*v)),
+                        _ => None,
+                    };
+                    self.check_access(&decomp.loan_place, false, through, ctx, active_temps, line)?;
+                    return Ok(Vec::new());
+                }
+                if let Expr::Index(b, idx, _) = expr {
+                    let mut blater = ctx.later_in_stmt.clone();
+                    collect_expr_mentions(idx, &mut blater);
+                    let bctx = ctx.with_later(&blater);
+                    let ret = self.eval_loan_expr(b, false, &bctx, active_temps, line)?;
+                    self.eval_loan_expr(idx, false, ctx, active_temps, line)?;
+                    return Ok(if self.bc.program.contains_borrow_or_view(expr_ty) {
+                        ret
+                    } else {
+                        Vec::new()
+                    });
+                }
+                let ret = self.eval_loan_expr(base, false, ctx, active_temps, line)?;
+                Ok(if self.bc.program.contains_borrow_or_view(expr_ty) {
+                    ret
+                } else {
+                    Vec::new()
+                })
+            }
+            Expr::Struct(sid, items, _) => {
+                if self.bc.program.structs[*sid].is_view {
+                    let per_arg = self.eval_loan_operands(items, ctx, active_temps, line)?;
+                    let mut out = Vec::new();
+                    for item in per_arg {
+                        out.extend(item);
+                    }
+                    Ok(out)
+                } else {
+                    for (k, item) in items.iter().enumerate() {
+                        let mut ilater = ctx.later_in_stmt.clone();
+                        for rem in &items[k + 1..] {
+                            collect_expr_mentions(rem, &mut ilater);
+                        }
+                        let ictx = ctx.with_later(&ilater);
+                        self.eval_loan_expr(item, true, &ictx, active_temps, line)?;
+                    }
+                    Ok(Vec::new())
+                }
+            }
+            Expr::Variant(_, _, items, _) | Expr::Vector(items, _) => {
+                for (k, item) in items.iter().enumerate() {
+                    let mut ilater = ctx.later_in_stmt.clone();
+                    for rem in &items[k + 1..] {
+                        collect_expr_mentions(rem, &mut ilater);
+                    }
+                    let ictx = ctx.with_later(&ilater);
+                    self.eval_loan_expr(item, true, &ictx, active_temps, line)?;
+                }
+                Ok(Vec::new())
+            }
+            Expr::Len(inner)
+            | Expr::Clone(inner, _)
+            | Expr::Trim(inner)
+            | Expr::Negate(inner, _)
+            | Expr::Not(inner) => {
+                self.eval_loan_expr(inner, false, ctx, active_temps, line)?;
+                Ok(Vec::new())
+            }
+            Expr::Arithmetic(_, l, r, _)
+            | Expr::Compare(_, l, r)
+            | Expr::And(l, r)
+            | Expr::Or(l, r) => {
+                let mut llater = ctx.later_in_stmt.clone();
+                collect_expr_mentions(r, &mut llater);
+                let lctx = ctx.with_later(&llater);
+                self.eval_loan_expr(l, false, &lctx, active_temps, line)?;
+                self.eval_loan_expr(r, false, ctx, active_temps, line)?;
+                Ok(Vec::new())
+            }
+            Expr::Call(_, args, _) => {
+                let mut call_temps = Vec::new();
+                let _ = self.eval_loan_operands(args, ctx, &mut call_temps, line)?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn eval_loan_operands(
+        &mut self,
+        exprs: &[Expr],
+        ctx: &EvalCtx<'_>,
+        active_temps: &mut Vec<Holder>,
+        line: u32,
+    ) -> Result<Vec<Vec<(usize, Formula)>>, Error> {
+        let mut results: Vec<Option<Vec<(usize, Formula)>>> = vec![None; exprs.len()];
+        let pass1: Vec<usize> = (0..exprs.len()).filter(|&i| !exprs[i].lends()).collect();
+        let pass2: Vec<usize> = (0..exprs.len()).filter(|&i| exprs[i].lends()).collect();
+
+        for (pos, &i) in pass1.iter().enumerate() {
+            let mut later = ctx.later_in_stmt.clone();
+            for &j in &pass1[pos + 1..] {
+                collect_expr_mentions(&exprs[j], &mut later);
+            }
+            for &j in &pass2 {
+                collect_expr_mentions(&exprs[j], &mut later);
+            }
+            let ictx = ctx.with_later(&later);
+            let loans = self.eval_loan_expr(&exprs[i], true, &ictx, active_temps, line)?;
+            if !loans.is_empty() {
+                let temp = self.fresh_temp();
+                active_temps.push(temp);
+                self.attach_holder_loans(temp, &loans, ctx.r_i);
+            }
+            results[i] = Some(loans);
+        }
+        for (pos, &i) in pass2.iter().enumerate() {
+            let mut later = ctx.later_in_stmt.clone();
+            for &j in &pass2[pos + 1..] {
+                collect_expr_mentions(&exprs[j], &mut later);
+            }
+            let ictx = ctx.with_later(&later);
+            let loans = self.eval_loan_expr(&exprs[i], true, &ictx, active_temps, line)?;
+            if !loans.is_empty() {
+                let temp = self.fresh_temp();
+                active_temps.push(temp);
+                self.attach_holder_loans(temp, &loans, ctx.r_i);
+            }
+            results[i] = Some(loans);
+        }
+        Ok(results
+            .into_iter()
+            .map(|r| r.expect("operand evaluated"))
+            .collect())
+    }
+
+    fn seed_loop_again_loans(&mut self, loop_body: BodyId, r_loop: Formula) {
+        let Some(head) = self.bc.body.bodies[loop_body].head.clone() else {
+            return;
+        };
+        let mut ancestors = HashSet::new();
+        let mut cur = self.bc.body.bodies[loop_body].parent;
+        while let Some(p) = cur {
+            ancestors.insert(p);
+            cur = self.bc.body.bodies[p].parent;
+        }
+        let is_outside = |root: &LoanRoot| -> bool {
+            match root {
+                LoanRoot::ParamOrigin(_) => true,
+                LoanRoot::Owned(v) | LoanRoot::Behind(v, _) => {
+                    ancestors.contains(&self.bc.body.vars[*v].body)
+                }
+            }
+        };
+
+        let mut env_map: HashMap<VarId, Vec<(LoanPlace, BorrowMode)>> = HashMap::new();
+        for loan in &self.loans {
+            for &(holder, hg) in &loan.holders {
+                if let Holder::Var(v) = holder
+                    && (ancestors.contains(&self.bc.body.vars[v].body)
+                        || head.parameters.contains(&v))
+                    && self.bc.solver.bdd.and(r_loop, hg) != bdd::FALSE
+                {
+                    env_map
+                        .entry(v)
+                        .or_default()
+                        .push((loan.place.clone(), loan.mode));
+                }
+            }
+        }
+        for list in env_map.values_mut() {
+            dedup_loan_pairs(list);
+        }
+
+        let program = self.bc.program;
+        let body = self.bc.body;
+        let mut eval_struct_loans =
+            |expr: &Expr, env: &HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>| {
+                expr_structural_external_loans(program, body, expr, env, &is_outside)
+            };
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            changed |= self.propagate_loop_body_loans(
+                loop_body,
+                loop_body,
+                &head.parameters,
+                &mut env_map,
+                &mut eval_struct_loans,
+            );
+        }
+
+        for &lp_var in &head.parameters {
+            if !self
+                .bc
+                .program
+                .contains_borrow_or_view(&self.bc.body.vars[lp_var].ty)
+            {
+                continue;
+            }
+            let Some(pairs) = env_map.get(&lp_var) else {
+                continue;
+            };
+            for (place, mode) in pairs {
+                let already_covered = self.loans.iter().any(|l| {
+                    l.place == *place
+                        && l.mode == *mode
+                        && self.bc.solver.bdd.implies(r_loop, l.created_on) == bdd::TRUE
+                        && l.holders.iter().any(|&(h, hg)| {
+                            h == Holder::Var(lp_var)
+                                && self.bc.solver.bdd.implies(r_loop, hg) == bdd::TRUE
+                        })
+                });
+                if !already_covered {
+                    self.loans.push(Loan {
+                        place: place.clone(),
+                        mode: *mode,
+                        created_on: r_loop,
+                        holders: vec![(Holder::Var(lp_var), r_loop)],
+                    });
+                }
+            }
+        }
+    }
+
+    fn propagate_loop_body_loans<F>(
+        &self,
+        cur_body: BodyId,
+        target_loop: BodyId,
+        target_params: &[VarId],
+        env_map: &mut HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
+        eval_struct: &mut F,
+    ) -> bool
+    where
+        F: FnMut(
+            &Expr,
+            &HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
+        ) -> Vec<(LoanPlace, BorrowMode)>,
+    {
+        let mut changed = false;
+        for stmt in &self.bc.body.bodies[cur_body].statements {
+            match &stmt.command {
+                Command::Bind { var, value } => {
+                    if self
+                        .bc
+                        .program
+                        .contains_borrow_or_view(&self.bc.body.vars[*var].ty)
+                    {
+                        let items = eval_struct(value, env_map);
+                        changed |= extend_loan_pairs(env_map.entry(*var).or_default(), items);
+                    }
+                }
+                Command::Unpack { vars, value, .. } => {
+                    let items = eval_struct(value, env_map);
+                    for &v in vars {
+                        if self
+                            .bc
+                            .program
+                            .contains_borrow_or_view(&self.bc.body.vars[v].ty)
+                        {
+                            changed |=
+                                extend_loan_pairs(env_map.entry(v).or_default(), items.clone());
+                        }
+                    }
+                }
+                Command::Decide {
+                    op_kind,
+                    arguments,
+                    arms,
+                    ..
+                } => {
+                    let contract = op_kind.contract(self.bc.program);
+                    let arg_items: Vec<Vec<(LoanPlace, BorrowMode)>> =
+                        arguments.iter().map(|a| eval_struct(a, env_map)).collect();
+                    for arm in arms {
+                        let alt = &contract[arm.alternative];
+                        for (fidx, &v) in arm.vars.iter().enumerate() {
+                            if let Some(field) = alt.fields.get(fidx)
+                                && self.bc.program.contains_borrow_or_view(&field.ty)
+                            {
+                                for &oidx in &field.origins {
+                                    if let Some(items) = arg_items.get(oidx) {
+                                        changed |= extend_loan_pairs(
+                                            env_map.entry(v).or_default(),
+                                            items.clone(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Command::Loop {
+                    body: inner,
+                    initial,
+                    arms,
+                    ..
+                } => {
+                    if let Some(inner_head) = &self.bc.body.bodies[*inner].head {
+                        for (&lp, init_e) in inner_head.parameters.iter().zip(initial) {
+                            let items = eval_struct(init_e, env_map);
+                            changed |= extend_loan_pairs(env_map.entry(lp).or_default(), items);
+                        }
+                    }
+                    changed |= self.propagate_loop_body_loans(
+                        *inner,
+                        target_loop,
+                        target_params,
+                        env_map,
+                        eval_struct,
+                    );
+                    changed |= self.propagate_inner_leaves(*inner, arms, env_map, eval_struct);
+                }
+                Command::Boundary {
+                    body: b1,
+                    contingency: b2,
+                    ..
+                } => {
+                    changed |= self.propagate_loop_body_loans(
+                        *b1,
+                        target_loop,
+                        target_params,
+                        env_map,
+                        eval_struct,
+                    );
+                    changed |= self.propagate_loop_body_loans(
+                        *b2,
+                        target_loop,
+                        target_params,
+                        env_map,
+                        eval_struct,
+                    );
+                }
+                Command::Again { body, arguments } if *body == target_loop => {
+                    for (&lp, arg) in target_params.iter().zip(arguments) {
+                        if self
+                            .bc
+                            .program
+                            .contains_borrow_or_view(&self.bc.body.vars[lp].ty)
+                        {
+                            let items = eval_struct(arg, env_map);
+                            changed |= extend_loan_pairs(env_map.entry(lp).or_default(), items);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    fn propagate_inner_leaves<F>(
+        &self,
+        cur_body: BodyId,
+        arms: &[Vec<VarId>],
+        env_map: &mut HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
+        eval_struct: &mut F,
+    ) -> bool
+    where
+        F: FnMut(
+            &Expr,
+            &HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
+        ) -> Vec<(LoanPlace, BorrowMode)>,
+    {
+        let mut changed = false;
+        for stmt in &self.bc.body.bodies[cur_body].statements {
+            match &stmt.command {
+                Command::Leave {
+                    alternative,
+                    payload,
+                } => {
+                    if let Some(arm_vars) = arms.get(*alternative) {
+                        for (&v, p) in arm_vars.iter().zip(payload) {
+                            if self
+                                .bc
+                                .program
+                                .contains_borrow_or_view(&self.bc.body.vars[v].ty)
+                            {
+                                let items = eval_struct(p, env_map);
+                                changed |= extend_loan_pairs(env_map.entry(v).or_default(), items);
+                            }
+                        }
+                    }
+                }
+                Command::Boundary {
+                    body: b1,
+                    contingency: b2,
+                    ..
+                } => {
+                    changed |= self.propagate_inner_leaves(*b1, arms, env_map, eval_struct);
+                    changed |= self.propagate_inner_leaves(*b2, arms, env_map, eval_struct);
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    fn scopes_down_to(&self, target_body: BodyId, mut cur_body: BodyId) -> Vec<BodyId> {
+        let mut ended = Vec::new();
+        loop {
+            ended.push(cur_body);
+            if cur_body == target_body {
+                break;
+            }
+            match self.bc.body.bodies[cur_body].parent {
+                Some(p) => cur_body = p,
+                None => break,
+            }
+        }
+        ended
+    }
+
+    fn enclosing_loop(&self, mut cur_body: BodyId) -> Option<BodyId> {
+        loop {
+            if self.bc.body.bodies[cur_body].head.is_some() {
+                return Some(cur_body);
+            }
+            cur_body = self.bc.body.bodies[cur_body].parent?;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_scope_end_loans(
+        &mut self,
+        ended_scopes: &[BodyId],
+        r_i: Formula,
+        after_live: &HashMap<VarId, Formula>,
+        active_temps: &[Holder],
+        line: u32,
+        in_loop: bool,
+        visible: &[(String, TermId, bool)],
+    ) -> Result<(), Error> {
+        let empty = HashSet::new();
+        let ctx = EvalCtx {
+            r_i,
+            after_live,
+            later_in_stmt: &empty,
+            in_loop,
+            visible,
+        };
+        for var in 0..self.bc.body.vars.len() {
+            if !ended_scopes.contains(&self.bc.body.vars[var].body) {
+                continue;
+            }
+            if matches!(self.bc.body.vars[var].ty, Type::Ref(_, _)) {
+                continue;
+            }
+            self.check_access(
+                &LoanPlace {
+                    root: LoanRoot::Owned(var),
+                    steps: Vec::new(),
+                },
+                true,
+                None,
+                &ctx,
+                active_temps,
+                line,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn check_body_loans(
+        &mut self,
+        body_id: BodyId,
+        in_loop: bool,
+    ) -> Result<Vec<LeaveLoanRecord>, Error> {
+        let mut leaves = Vec::new();
+        let stmts = self.bc.body.bodies[body_id].statements.clone();
+        for (stmt_idx, stmt) in stmts.iter().enumerate() {
+            let line = stmt.line;
+            let r_i = self
+                .bc
+                .stmt_r
+                .get(&(body_id, stmt_idx))
+                .copied()
+                .unwrap_or(bdd::FALSE);
+            let visible = self
+                .bc
+                .stmt_visible
+                .get(&(body_id, stmt_idx))
+                .cloned()
+                .unwrap_or_default();
+            let after_live = self
+                .live_after_stmt
+                .get(&(body_id, stmt_idx))
+                .cloned()
+                .unwrap_or_default();
+            let empty = HashSet::new();
+            let ctx = EvalCtx {
+                r_i,
+                after_live: &after_live,
+                later_in_stmt: &empty,
+                in_loop,
+                visible: &visible,
+            };
+
+            match &stmt.command {
+                Command::Bind { var, value } => {
+                    let mut temps = Vec::new();
+                    let ret = self.eval_loan_expr(value, true, &ctx, &mut temps, line)?;
+                    if self
+                        .bc
+                        .program
+                        .contains_borrow_or_view(&self.bc.body.vars[*var].ty)
+                    {
+                        self.attach_holder_loans(Holder::Var(*var), &ret, r_i);
+                    }
+                }
+                Command::Unpack { vars, value, .. } => {
+                    let mut temps = Vec::new();
+                    let ret = self.eval_loan_expr(value, true, &ctx, &mut temps, line)?;
+                    for &v in vars {
+                        if self
+                            .bc
+                            .program
+                            .contains_borrow_or_view(&self.bc.body.vars[v].ty)
+                        {
+                            self.attach_holder_loans(Holder::Var(v), &ret, r_i);
+                        }
+                    }
+                }
+                Command::Assign { var, value } => {
+                    let mut temps = Vec::new();
+                    let is_ref = matches!(self.bc.body.vars[*var].ty, Type::Ref(_, _));
+                    let mut later = HashSet::new();
+                    if is_ref {
+                        later.insert(*var);
+                    }
+                    let vctx = ctx.with_later(&later);
+                    let ret = self.eval_loan_expr(value, true, &vctx, &mut temps, line)?;
+                    let (lp, through) = if is_ref {
+                        (
+                            LoanPlace {
+                                root: LoanRoot::Behind(*var, Vec::new()),
+                                steps: Vec::new(),
+                            },
+                            Some(Holder::Var(*var)),
+                        )
+                    } else {
+                        (
+                            LoanPlace {
+                                root: LoanRoot::Owned(*var),
+                                steps: Vec::new(),
+                            },
+                            None,
+                        )
+                    };
+                    self.check_access(&lp, true, through, &ctx, &temps, line)?;
+                    if self
+                        .bc
+                        .program
+                        .contains_borrow_or_view(&self.bc.body.vars[*var].ty)
+                    {
+                        self.attach_holder_loans(Holder::Var(*var), &ret, r_i);
+                    }
+                }
+                Command::AssignPlace { target, value } => {
+                    let mut temps = Vec::new();
+                    let target_has_ref_or_view =
+                        self.bc.program.contains_borrow_or_view(&target.root_ty);
+                    let idx_exprs: Vec<&Expr> = target
+                        .steps
+                        .iter()
+                        .filter_map(|s| match s {
+                            PlaceStep::Index(e, _) => Some(e),
+                            PlaceStep::Field(_, _, _) => None,
+                        })
+                        .collect();
+                    let mut value_later = HashSet::new();
+                    if target_has_ref_or_view {
+                        value_later.insert(target.root);
+                    }
+                    for ie in &idx_exprs {
+                        collect_expr_mentions(ie, &mut value_later);
+                    }
+                    let vctx = ctx.with_later(&value_later);
+                    self.eval_loan_expr(value, true, &vctx, &mut temps, line)?;
+                    for (k, ie) in idx_exprs.iter().enumerate() {
+                        let mut ilater = HashSet::new();
+                        if target_has_ref_or_view {
+                            ilater.insert(target.root);
+                        }
+                        for rem in &idx_exprs[k + 1..] {
+                            collect_expr_mentions(rem, &mut ilater);
+                        }
+                        let ictx = ctx.with_later(&ilater);
+                        self.eval_loan_expr(ie, false, &ictx, &mut temps, line)?;
+                    }
+                    let lp = place_to_loan_place(self.bc.program, self.bc.body, target);
+                    let through = match &lp.root {
+                        LoanRoot::Behind(v, _) => Some(Holder::Var(*v)),
+                        _ => None,
+                    };
+                    self.check_access(&lp, true, through, &ctx, &temps, line)?;
+                }
+                Command::Oblige(_) | Command::Escalate | Command::Impossible => {}
+                Command::Test { condition, .. } => {
+                    let mut temps = Vec::new();
+                    self.eval_loan_expr(condition, false, &ctx, &mut temps, line)?;
+                }
+                Command::Capture { arguments, .. } => {
+                    let mut temps = Vec::new();
+                    let _ = self.eval_loan_operands(arguments, &ctx, &mut temps, line)?;
+                }
+                Command::Decide {
+                    site,
+                    op_kind,
+                    arguments,
+                    arms,
+                    ..
+                } => {
+                    let mut temps = Vec::new();
+                    let arg_loans = self.eval_loan_operands(arguments, &ctx, &mut temps, line)?;
+                    let contract = op_kind.contract(self.bc.program);
+                    for (pos, arm) in arms.iter().enumerate() {
+                        let atom = self.bc.atom(*site, pos);
+                        let g = self.bc.solver.bdd.and(r_i, atom);
+                        let alt = &contract[arm.alternative];
+                        for (fidx, &var_id) in arm.vars.iter().enumerate() {
+                            if let Some(field) = alt.fields.get(fidx)
+                                && self.bc.program.contains_borrow_or_view(&field.ty)
+                            {
+                                for &oidx in &field.origins {
+                                    if let Some(src) = arg_loans.get(oidx) {
+                                        self.attach_holder_loans(Holder::Var(var_id), src, g);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Command::Loop {
+                    site,
+                    body: inner,
+                    initial,
+                    arms,
+                } => {
+                    let mut temps = Vec::new();
+                    let init_loans = self.eval_loan_operands(initial, &ctx, &mut temps, line)?;
+                    let head = self.bc.body.bodies[*inner]
+                        .head
+                        .clone()
+                        .expect("a loop head");
+                    for (&lp_var, iloans) in head.parameters.iter().zip(&init_loans) {
+                        if self
+                            .bc
+                            .program
+                            .contains_borrow_or_view(&self.bc.body.vars[lp_var].ty)
+                        {
+                            self.attach_holder_loans(Holder::Var(lp_var), iloans, r_i);
+                        }
+                    }
+                    self.seed_loop_again_loans(*inner, r_i);
+                    let inner_leaves = self.check_body_loans(*inner, true)?;
+                    for (target_loop, leave_alt, leave_r, pay_loans) in inner_leaves {
+                        if target_loop != *inner {
+                            leaves.push((target_loop, leave_alt, leave_r, pay_loans));
+                            continue;
+                        }
+                        let atom = self.bc.atom(*site, leave_alt);
+                        let g = self.bc.solver.bdd.and(atom, leave_r);
+                        if let Some(arm_vars) = arms.get(leave_alt) {
+                            for (&var_id, ploans) in arm_vars.iter().zip(&pay_loans) {
+                                if self
+                                    .bc
+                                    .program
+                                    .contains_borrow_or_view(&self.bc.body.vars[var_id].ty)
+                                {
+                                    self.attach_holder_loans(Holder::Var(var_id), ploans, g);
+                                }
+                            }
+                        }
+                    }
+                }
+                Command::Boundary {
+                    body: b1,
+                    captures,
+                    contingency: b2,
+                    ..
+                } => {
+                    for &cap_var in captures {
+                        let is_write =
+                            self.bc.program.kind(&self.bc.body.vars[cap_var].ty) != Kind::Copy;
+                        self.check_access(
+                            &LoanPlace {
+                                root: LoanRoot::Owned(cap_var),
+                                steps: Vec::new(),
+                            },
+                            is_write,
+                            None,
+                            &ctx,
+                            &[],
+                            line,
+                        )?;
+                    }
+                    let b1_leaves = self.check_body_loans(*b1, in_loop)?;
+                    leaves.extend(b1_leaves);
+                    let b1_exit = self
+                        .bc
+                        .boundary_fallthrough_live
+                        .get(b1)
+                        .copied()
+                        .unwrap_or(bdd::FALSE);
+                    if b1_exit != bdd::FALSE {
+                        let b1_end_after = self
+                            .boundary_after_live
+                            .get(b1)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.check_scope_end_loans(
+                            &[*b1],
+                            b1_exit,
+                            &b1_end_after,
+                            &[],
+                            line,
+                            in_loop,
+                            &visible,
+                        )?;
+                    }
+                    let b2_leaves = self.check_body_loans(*b2, in_loop)?;
+                    leaves.extend(b2_leaves);
+                }
+                Command::Supervise { arguments, .. } => {
+                    let mut temps = Vec::new();
+                    let _ = self.eval_loan_operands(arguments, &ctx, &mut temps, line)?;
+                }
+                Command::Again {
+                    body: target,
+                    arguments,
+                } => {
+                    let mut temps = Vec::new();
+                    let _ = self.eval_loan_operands(arguments, &ctx, &mut temps, line)?;
+                    let ended = self.scopes_down_to(*target, body_id);
+                    self.check_scope_end_loans(
+                        &ended,
+                        r_i,
+                        &after_live,
+                        &temps,
+                        line,
+                        in_loop,
+                        &visible,
+                    )?;
+                }
+                Command::Leave {
+                    alternative,
+                    payload,
+                } => {
+                    let mut temps = Vec::new();
+                    let pay_loans = self.eval_loan_operands(payload, &ctx, &mut temps, line)?;
+                    if let Some(target_loop) = self.enclosing_loop(body_id) {
+                        let ended = self.scopes_down_to(target_loop, body_id);
+                        self.check_scope_end_loans(
+                            &ended,
+                            r_i,
+                            &after_live,
+                            &temps,
+                            line,
+                            in_loop,
+                            &visible,
+                        )?;
+                        leaves.push((target_loop, *alternative, r_i, pay_loans));
+                    }
+                }
+                Command::Exit {
+                    alternative,
+                    payload,
+                } => {
+                    let mut temps = Vec::new();
+                    let pay_loans = self.eval_loan_operands(payload, &ctx, &mut temps, line)?;
+                    let alt = &self.bc.contract[*alternative];
+                    for (fidx, field) in alt.fields.iter().enumerate() {
+                        if self.bc.program.contains_borrow_or_view(&field.ty)
+                            && let Some(ploans) = pay_loans.get(fidx)
+                        {
+                            for &(lid, hg) in ploans {
+                                let loan = &self.loans[lid];
+                                let allowed = match &loan.place.root {
+                                    LoanRoot::ParamOrigin(pidx) => field.origins.contains(pidx),
+                                    LoanRoot::Behind(v, _) if *v < self.bc.param_types.len() => {
+                                        field.origins.contains(v)
+                                    }
+                                    LoanRoot::Behind(_, _) => true,
+                                    LoanRoot::Owned(_) => false,
+                                };
+                                if !allowed {
+                                    let created_and_held =
+                                        self.bc.solver.bdd.and(loan.created_on, hg);
+                                    let bad = self.bc.solver.bdd.and(r_i, created_and_held);
+                                    if bad != bdd::FALSE {
+                                        let desc = self.describe_place(&loan.place);
+                                        let msg = format!(
+                                            "borrowed payload `{}` in exit `{}` holds a loan on `{desc}`, which does not match its allowed origins",
+                                            field.name, alt.name
+                                        );
+                                        require_entailment(
+                                            &mut self.bc.solver,
+                                            bad,
+                                            &self.bc.owner_name,
+                                            line,
+                                            "L4",
+                                            msg,
+                                            &visible,
+                                            in_loop,
+                                            self.bc.certificates,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let ended = self.scopes_down_to(0, body_id);
+                    self.check_scope_end_loans(
+                        &ended,
+                        r_i,
+                        &after_live,
+                        &temps,
+                        line,
+                        in_loop,
+                        &visible,
+                    )?;
+                }
+                Command::Fault { message, .. } => {
+                    let mut temps = Vec::new();
+                    self.eval_loan_expr(message, true, &ctx, &mut temps, line)?;
+                }
+                Command::Terminate(opt_expr) => {
+                    let mut temps = Vec::new();
+                    if let Some(e) = opt_expr {
+                        self.eval_loan_expr(e, true, &ctx, &mut temps, line)?;
+                    }
+                    let ended = self.scopes_down_to(0, body_id);
+                    self.check_scope_end_loans(
+                        &ended,
+                        r_i,
+                        &after_live,
+                        &temps,
+                        line,
+                        in_loop,
+                        &visible,
+                    )?;
+                }
+                Command::Recover { body: target } => {
+                    let ended = self.scopes_down_to(*target, body_id);
+                    self.check_scope_end_loans(
+                        &ended,
+                        r_i,
+                        &after_live,
+                        &[],
+                        line,
+                        in_loop,
+                        &visible,
+                    )?;
+                }
+            }
+        }
+        Ok(leaves)
+    }
+}
+
+fn dedup_loan_pairs(list: &mut Vec<(LoanPlace, BorrowMode)>) {
+    let mut out = Vec::with_capacity(list.len());
+    for item in list.drain(..) {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    *list = out;
+}
+
+fn extend_loan_pairs(
+    dest: &mut Vec<(LoanPlace, BorrowMode)>,
+    items: Vec<(LoanPlace, BorrowMode)>,
+) -> bool {
+    let mut changed = false;
+    for item in items {
+        if !dest.contains(&item) {
+            dest.push(item);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn expr_structural_external_loans(
+    program: &Program,
+    body: &ControlBody,
+    expr: &Expr,
+    env: &HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
+    is_outside: &dyn Fn(&LoanRoot) -> bool,
+) -> Vec<(LoanPlace, BorrowMode)> {
+    let mut out = Vec::new();
+    match expr {
+        Expr::Borrow(mode, place, _) => {
+            let lp = place_to_loan_place(program, body, place);
+            if is_outside(&lp.root) {
+                out.push((lp.clone(), *mode));
+            }
+            if matches!(lp.root, LoanRoot::Behind(_, _))
+                && let Some(inherited) = env.get(&place.root)
+            {
+                out.extend(inherited.iter().cloned());
+            }
+        }
+        Expr::Var(VarRef::Local(id), ty) if program.contains_borrow_or_view(ty) => {
+            if let Some(items) = env.get(id) {
+                out.extend(items.iter().cloned());
+            }
+        }
+        Expr::Field(base, _, _, ty) if program.contains_borrow_or_view(ty) => {
+            out.extend(expr_structural_external_loans(
+                program, body, base, env, is_outside,
+            ));
+        }
+        Expr::Struct(sid, fields, _) if program.structs[*sid].is_view => {
+            for field in fields {
+                out.extend(expr_structural_external_loans(
+                    program, body, field, env, is_outside,
+                ));
+            }
+        }
+        Expr::Move(inner, _) => {
+            out.extend(expr_structural_external_loans(
+                program, body, inner, env, is_outside,
+            ));
+        }
+        _ => {}
+    }
+    dedup_loan_pairs(&mut out);
+    out
+}
+
+impl<'a> BodyChecker<'a> {
+    fn check_loans(&mut self) -> Result<(), Error> {
+        let mut checker = LoanChecker::new(self);
+        checker.collect_body_mentions(0, false);
+        let empty = HashMap::new();
+        checker.compute_body_liveness(0, &empty, &[], &[]);
+        let _ = checker.check_body_loans(0, false)?;
+        Ok(())
+    }
 }

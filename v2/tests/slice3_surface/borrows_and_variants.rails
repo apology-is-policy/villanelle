@@ -15,7 +15,9 @@ control shorter(a: &string, b: &string) ■ auto
 │ ■ ok {b}
 ╵
 
-control bump(x: &~u32, step: u32) ■ done
+control bump(x: &~u32, step: u32)
+    ⊢ x + step ≤ 4294967295
+    ■ done ⇐ x = old(x) + step
 │ x ← x + step
 │ ■ done
 ╵
@@ -37,9 +39,9 @@ pub control variant_borrows() ■ ok {before: string, after: string, owned: stri
 │ before: string := clone(t1)
 │ Δ ~cell: filled {t2} │ empty → ⊥
 │ t2 ← "beta"
-│ Δ cell: filled {t3} │ empty → ⊥
+│ Δ cell: filled {t3} │ empty → ■ ok {"", "", ""}
 │ after: string := clone(t3)
-│ Δ ▾cell: filled {owned} │ empty → ⊥
+│ Δ ▾cell: filled {owned} │ empty → ■ ok {"", "", ""}
 │ ■ ok {before, after, owned}
 ╵
 
@@ -57,6 +59,7 @@ pub control map_borrows(table: &string ⇀ string, key: &string)
 │ ■ found {v}
 ╵
 
+//! check
 //! run borrow_basics() => done ok {"alder", "elm", 17}
 //! run variant_borrows() => done ok {"alpha", "beta", "beta"}
 //! run first_long(["elm", "birch", "oak"]) => done found {"birch"}
