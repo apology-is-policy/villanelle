@@ -527,12 +527,6 @@ fn c_header_value_ty(program: &Program, ty: &Type, usize_bits: u32) -> String {
         Type::Vector(_) => "struct vn2_vec".to_string(),
         Type::Map(_, _) => "struct vn2_map".to_string(),
         Type::Struct(sid, _) => format!("struct vn2_struct_{}", program.structs[*sid].name),
-        Type::Ref(_, _) | Type::Named(_) | Type::OutcomeNamed(_) => "void *".to_string(),
-    }
-}
-
-fn c_header_param_ty(program: &Program, ty: &Type, usize_bits: u32) -> String {
-    match ty {
         Type::Ref(BorrowMode::Shared, inner) => {
             if **inner == Type::Bool {
                 "const uint8_t *".to_string()
@@ -541,15 +535,30 @@ fn c_header_param_ty(program: &Program, ty: &Type, usize_bits: u32) -> String {
             }
         }
         Type::Ref(BorrowMode::Exclusive, inner) => {
-            format!("{} *", c_header_value_ty(program, inner, usize_bits))
+            if **inner == Type::Bool {
+                "uint8_t *".to_string()
+            } else {
+                format!("{} *", c_header_value_ty(program, inner, usize_bits))
+            }
         }
+        Type::Named(_) | Type::OutcomeNamed(_) => "void *".to_string(),
+    }
+}
+
+fn c_header_param_ty(program: &Program, ty: &Type, usize_bits: u32) -> String {
+    match ty {
+        Type::Ref(_, _) => c_header_value_ty(program, ty, usize_bits),
         other if is_c_scalar_by_val(program, other) => c_header_scalar_ty(other, usize_bits).into(),
         other => format!("const {} *", c_header_value_ty(program, other, usize_bits)),
     }
 }
 
 fn c_header_out_ty(program: &Program, ty: &Type, usize_bits: u32) -> String {
-    format!("{} *", c_header_value_ty(program, ty, usize_bits))
+    if matches!(ty, Type::Ref(_, _)) {
+        format!("{}*", c_header_value_ty(program, ty, usize_bits))
+    } else {
+        format!("{} *", c_header_value_ty(program, ty, usize_bits))
+    }
 }
 
 fn align_up(offset: usize, align: usize) -> usize {
@@ -756,6 +765,8 @@ pub fn emit_c_header(program: &Program, usize_bits: u32) -> String {
         });
 
     if uses_slice2_data {
+        let _ = writeln!(out, "#ifndef VN2_RUNTIME_TYPES_DEFINED");
+        let _ = writeln!(out, "#define VN2_RUNTIME_TYPES_DEFINED");
         let _ = writeln!(out, "#define VN2_FAULT (-1)");
         let _ = writeln!(out, "#define VN2_TERMINATED (-2)");
         let _ = writeln!(
@@ -770,18 +781,45 @@ pub fn emit_c_header(program: &Program, usize_bits: u32) -> String {
             out,
             "typedef struct vn2_map {{ void *data; {usize_c} len; {usize_c} cap; }} vn2_map;"
         );
-        for (sid, s) in program.structs.iter().enumerate() {
+        let _ = writeln!(out, "#endif");
+        let mut visited = vec![false; program.structs.len()];
+        let mut struct_order = Vec::with_capacity(program.structs.len());
+        fn visit_struct(
+            program: &Program,
+            sid: usize,
+            visited: &mut [bool],
+            order: &mut Vec<usize>,
+        ) {
+            if visited[sid] {
+                return;
+            }
+            visited[sid] = true;
+            for f in &program.structs[sid].fields {
+                if let Type::Struct(dep, _) = f.ty.deref_type() {
+                    visit_struct(program, *dep, visited, order);
+                }
+            }
+            order.push(sid);
+        }
+        for sid in 0..program.structs.len() {
+            visit_struct(program, sid, &mut visited, &mut struct_order);
+        }
+        for sid in struct_order {
+            let s = &program.structs[sid];
             let _ = write!(out, "typedef struct vn2_struct_{} {{ ", s.name);
             if s.fields.is_empty() {
                 let _ = write!(out, "uint8_t _empty; ");
             } else {
                 for f in &s.fields {
                     let fty = c_header_value_ty(program, &f.ty, usize_bits);
-                    let _ = write!(out, "{fty} {}; ", f.name);
+                    if matches!(f.ty, Type::Ref(_, _)) {
+                        let _ = write!(out, "{fty}{}; ", f.name);
+                    } else {
+                        let _ = write!(out, "{fty} {}; ", f.name);
+                    }
                 }
             }
             let _ = writeln!(out, "}} vn2_struct_{};", s.name);
-            let _ = sid;
         }
         for (vid, v) in program.variants.iter().enumerate() {
             if !is_unit_variant(program, vid) {
@@ -2866,8 +2904,14 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
                         self.code,
                         "  {gep} = getelementptr {s_ll}, ptr {cur_ptr}, i32 0, i32 {fidx}"
                     );
-                    cur_ptr = gep;
-                    cur_ty = fty.clone();
+                    if matches!(fty, Type::Ref(_, _)) {
+                        let deref = self.fresh_reg();
+                        let _ = writeln!(self.code, "  {deref} = load ptr, ptr {gep}");
+                        cur_ptr = deref;
+                    } else {
+                        cur_ptr = gep;
+                    }
+                    cur_ty = fty.deref_type().clone();
                 }
                 PlaceStep::Index(idx_expr, elem_ty) => {
                     let idx_val = self.emit_expr(idx_expr, access);
@@ -2921,14 +2965,34 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
             Expr::Move(inner, _) => self.emit_expr_ptr_if_place(inner, access),
             Expr::Borrow(_, place, _) => Some(self.emit_place_ptr(place, access)),
             Expr::Field(base, sid, fidx, _) => {
-                let base_ptr = self.emit_expr_ptr_if_place(base, access)?;
+                let decl_fty = self.program.structs[*sid].fields[*fidx].ty.clone();
                 let s_ll = self.llvm_ty(&Type::Struct(*sid, String::new()));
-                let gep = self.fresh_reg();
-                let _ = writeln!(
-                    self.code,
-                    "  {gep} = getelementptr {s_ll}, ptr {base_ptr}, i32 0, i32 {fidx}"
-                );
-                Some(gep)
+                if matches!(decl_fty, Type::Ref(_, _)) {
+                    if let Some(base_ptr) = self.emit_expr_ptr_if_place(base, access) {
+                        let gep = self.fresh_reg();
+                        let _ = writeln!(
+                            self.code,
+                            "  {gep} = getelementptr {s_ll}, ptr {base_ptr}, i32 0, i32 {fidx}"
+                        );
+                        let deref = self.fresh_reg();
+                        let _ = writeln!(self.code, "  {deref} = load ptr, ptr {gep}");
+                        Some(deref)
+                    } else {
+                        let b_val = self.emit_expr(base, access);
+                        let deref = self.fresh_reg();
+                        let _ =
+                            writeln!(self.code, "  {deref} = extractvalue {s_ll} {b_val}, {fidx}");
+                        Some(deref)
+                    }
+                } else {
+                    let base_ptr = self.emit_expr_ptr_if_place(base, access)?;
+                    let gep = self.fresh_reg();
+                    let _ = writeln!(
+                        self.code,
+                        "  {gep} = getelementptr {s_ll}, ptr {base_ptr}, i32 0, i32 {fidx}"
+                    );
+                    Some(gep)
+                }
             }
             Expr::Index(base, idx_expr, elem_ty) => {
                 let base_ptr = self.emit_expr_ptr_if_place(base, access)?;
@@ -2957,12 +3021,30 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
         if let Some(p) = self.emit_expr_ptr_if_place(expr, access) {
             return ReadOperand::PlacePtr(p);
         }
+        if matches!(expr.ty(), Type::Ref(_, _)) {
+            return ReadOperand::PlacePtr(self.emit_expr(expr, access));
+        }
         let val = self.emit_expr(expr, access);
         let ty = expr.ty().deref_type().clone();
         let ll = self.llvm_ty(&ty);
         let tmp = self.alloc_temp(&ll);
         let _ = writeln!(self.code, "  store {ll} {val}, ptr {tmp}");
         ReadOperand::OwnedTemp { ptr: tmp, ty }
+    }
+
+    fn emit_exprs_ordered(&mut self, exprs: &[Expr], access: &VarAccess<'_>) -> Vec<String> {
+        let mut results: Vec<Option<String>> = vec![None; exprs.len()];
+        for (i, expr) in exprs.iter().enumerate() {
+            if !expr.lends() {
+                results[i] = Some(self.emit_expr(expr, access));
+            }
+        }
+        for (i, expr) in exprs.iter().enumerate() {
+            if expr.lends() {
+                results[i] = Some(self.emit_expr(expr, access));
+            }
+        }
+        results.into_iter().map(|r| r.unwrap()).collect()
     }
 
     fn emit_expr(&mut self, expr: &Expr, access: &VarAccess<'_>) -> String {
@@ -3015,7 +3097,9 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
             Expr::EmptyMap(_) => "zeroinitializer".to_string(),
             Expr::Var(var_ref, var_ty) => match (var_ref, access) {
                 (VarRef::Parameter(idx), VarAccess::DirectParams(func)) => {
-                    if matches!(func.parameters[*idx].ty, Type::Ref(_, _)) {
+                    if matches!(func.parameters[*idx].ty, Type::Ref(_, _))
+                        && !matches!(var_ty, Type::Ref(_, _))
+                    {
                         let ll = self.llvm_ty(var_ty);
                         let reg = self.fresh_reg();
                         let _ = writeln!(self.code, "  {reg} = load {ll}, ptr %p{idx}");
@@ -3048,23 +3132,31 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
             Expr::Move(inner, _) => self.emit_expr(inner, access),
             Expr::Borrow(_, place, _) => self.emit_place_ptr(place, access),
             Expr::Field(base, sid, fidx, fty) => {
-                if let Some(p) = self.emit_expr_ptr_if_place(base, access) {
-                    let s_ll = self.llvm_ty(&Type::Struct(*sid, String::new()));
+                let decl_fty = self.program.structs[*sid].fields[*fidx].ty.clone();
+                let s_ll = self.llvm_ty(&Type::Struct(*sid, String::new()));
+                let raw_val = if let Some(p) = self.emit_expr_ptr_if_place(base, access) {
                     let gep = self.fresh_reg();
                     let _ = writeln!(
                         self.code,
                         "  {gep} = getelementptr {s_ll}, ptr {p}, i32 0, i32 {fidx}"
                     );
-                    let f_ll = self.llvm_ty(fty);
+                    let f_ll = self.llvm_ty(&decl_fty);
                     let r = self.fresh_reg();
                     let _ = writeln!(self.code, "  {r} = load {f_ll}, ptr {gep}");
                     r
                 } else {
                     let b_val = self.emit_expr(base, access);
                     let r = self.fresh_reg();
-                    let s_ll = self.llvm_ty(&Type::Struct(*sid, String::new()));
                     let _ = writeln!(self.code, "  {r} = extractvalue {s_ll} {b_val}, {fidx}");
                     r
+                };
+                if matches!(decl_fty, Type::Ref(_, _)) && !matches!(fty, Type::Ref(_, _)) {
+                    let v_ll = self.llvm_ty(fty);
+                    let deref = self.fresh_reg();
+                    let _ = writeln!(self.code, "  {deref} = load {v_ll}, ptr {raw_val}");
+                    deref
+                } else {
+                    raw_val
                 }
             }
             Expr::Index(base, idx_expr, elem_ty) => {
@@ -3095,10 +3187,16 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
                 if fields.is_empty() {
                     return "zeroinitializer".to_string();
                 }
-                let mut f_vals = Vec::with_capacity(fields.len());
-                for f in fields {
-                    f_vals.push((self.emit_expr(f, access), f.ty()));
-                }
+                let raw_vals = if self.program.structs[*sid].is_view {
+                    self.emit_exprs_ordered(fields, access)
+                } else {
+                    fields.iter().map(|f| self.emit_expr(f, access)).collect()
+                };
+                let f_vals: Vec<(String, Type)> = raw_vals
+                    .into_iter()
+                    .zip(fields)
+                    .map(|(val, f)| (val, f.ty()))
+                    .collect();
                 let tmp = self.alloc_temp(&s_ll);
                 for (fi, (val, fty)) in f_vals.into_iter().enumerate() {
                     let f_ll = self.llvm_ty(&fty);
@@ -3649,9 +3747,16 @@ fn emit_body_unit<'a>(
     let (roles, recover_targets) = classify_body_roles(body);
     let mut emitter = IrEmitter::new(program, reg);
 
+    let is_control = matches!(unit, UnitKind::Control { .. });
     let mut sig_parts: Vec<String> = params_sig
         .iter()
-        .map(|(n, ty)| format!("{} {n}", emitter.llvm_ty(ty)))
+        .map(|(n, ty)| {
+            if is_control && matches!(ty, Type::Ref(BorrowMode::Exclusive, _)) {
+                format!("ptr noalias {n}")
+            } else {
+                format!("{} {n}", emitter.llvm_ty(ty))
+            }
+        })
         .collect();
     if let UnitKind::Control { id, .. } = unit {
         for (alt_idx, alt) in program.controls[id].contract.iter().enumerate() {
@@ -4126,10 +4231,8 @@ fn emit_body_unit<'a>(
                     ..
                 } => {
                     let head = body.bodies[*inner].head.as_ref().expect("a loop head");
-                    let mut init_vals = Vec::new();
-                    for expr in initial {
-                        init_vals.push(emitter.emit_expr(expr, &VarAccess::ControlSlots(body)));
-                    }
+                    let init_vals =
+                        emitter.emit_exprs_ordered(initial, &VarAccess::ControlSlots(body));
                     let save_recover = recover_targets.contains(inner);
                     for (&param_var, val) in head.parameters.iter().zip(init_vals) {
                         let pty = body.vars[param_var].ty.clone();
@@ -4230,10 +4333,8 @@ fn emit_body_unit<'a>(
                     arguments,
                 } => {
                     let head = body.bodies[*target].head.as_ref().expect("a loop head");
-                    let mut arg_vals = Vec::new();
-                    for expr in arguments {
-                        arg_vals.push(emitter.emit_expr(expr, &VarAccess::ControlSlots(body)));
-                    }
+                    let arg_vals =
+                        emitter.emit_exprs_ordered(arguments, &VarAccess::ControlSlots(body));
                     // Drop remaining live locals of active loop bodies up to `*target`.
                     let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
                     for (fb, fpc) in chain {
@@ -4254,10 +4355,8 @@ fn emit_body_unit<'a>(
                     alternative,
                     payload,
                 } => {
-                    let mut pay_vals = Vec::new();
-                    for expr in payload {
-                        pay_vals.push(emitter.emit_expr(expr, &VarAccess::ControlSlots(body)));
-                    }
+                    let pay_vals =
+                        emitter.emit_exprs_ordered(payload, &VarAccess::ControlSlots(body));
                     // Unwind frames from `b_id` up through the enclosing loop body.
                     let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
                     let mut enclosing_loop = None;
@@ -4304,10 +4403,8 @@ fn emit_body_unit<'a>(
                     let UnitKind::Control { id: cid, .. } = unit else {
                         unreachable!("boundary cannot exit as control");
                     };
-                    let mut pay_vals = Vec::new();
-                    for expr in payload {
-                        pay_vals.push(emitter.emit_expr(expr, &VarAccess::ControlSlots(body)));
-                    }
+                    let pay_vals =
+                        emitter.emit_exprs_ordered(payload, &VarAccess::ControlSlots(body));
                     let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
                     for (fb, fpc) in chain {
                         let (lb, lpc) = if fb == b_id { (b_id, s_idx) } else { (fb, fpc) };
@@ -4537,10 +4634,18 @@ fn emit_operation_call(
             }
             for (i, arg) in arguments.iter().enumerate() {
                 if is_lending(i, arg) {
-                    let op = em.emit_read_operand(arg, &VarAccess::ControlSlots(body));
-                    let ptr = em.read_operand_ptr(&op).to_string();
-                    results[i] = Some(ptr);
-                    temp_drops.push(op);
+                    if callee
+                        .parameters
+                        .get(i)
+                        .is_some_and(|p| matches!(p.ty, Type::Ref(_, _)))
+                    {
+                        let op = em.emit_read_operand(arg, &VarAccess::ControlSlots(body));
+                        let ptr = em.read_operand_ptr(&op).to_string();
+                        results[i] = Some(ptr);
+                        temp_drops.push(op);
+                    } else {
+                        results[i] = Some(em.emit_expr(arg, &VarAccess::ControlSlots(body)));
+                    }
                 }
             }
 
@@ -5028,10 +5133,6 @@ fn emit_builtin_call(
                 unreachable!();
             };
             let mid = em.reg.intern_map(&k_ty, &v_ty);
-            if needs_drop(em.program, &v_ty) {
-                let vtid = em.reg.intern_type(&v_ty);
-                em.reg.require_clone(vtid);
-            }
             let out_p = &out_slots[0][0];
             let tag_reg = em.fresh_reg();
             let _ = writeln!(
@@ -5415,12 +5516,23 @@ fn emit_control_c_wrapper(
     let mut internal_args = Vec::new();
     let mut bool_outs = Vec::new();
     let mut bool_ref_writebacks = Vec::new();
+    let mut origin_params: HashSet<usize> = HashSet::new();
+    for alt in &control.contract {
+        for field in &alt.fields {
+            for &op in &field.origins {
+                origin_params.insert(op);
+            }
+        }
+    }
 
     for (idx, param) in control.parameters.iter().enumerate() {
         match &param.ty {
             Type::Bool => {
                 let _ = writeln!(out, "  %b_in_{idx} = icmp ne i8 %p{idx}, 0");
                 internal_args.push(format!("i1 %b_in_{idx}"));
+            }
+            Type::Ref(_, inner) if **inner == Type::Bool && origin_params.contains(&idx) => {
+                internal_args.push(format!("ptr %p{idx}"));
             }
             Type::Ref(mode, inner) if **inner == Type::Bool => {
                 let _ = writeln!(out, "  %br_raw_{idx} = load i8, ptr %p{idx}");
@@ -5511,6 +5623,7 @@ fn next_tmp(tmp_id: &mut usize) -> usize {
     id
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_harness_value_into(
     ir: &mut String,
     program: &Program,
@@ -5519,8 +5632,34 @@ fn emit_harness_value_into(
     ty: &Type,
     dst_ptr: &str,
     tmp_id: &mut usize,
+    heap_refs: bool,
 ) {
     let u = reg.usize_ty;
+    if let Type::Ref(_, inner) = ty {
+        let inner_ll = llvm_ty(program, inner, reg.usize_bits);
+        let id = next_tmp(tmp_id);
+        let backing = format!("%href_{id}");
+        if heap_refs {
+            reg.needed_libc = true;
+            let _ = writeln!(
+                ir,
+                "  %hrsp_{id} = getelementptr {inner_ll}, ptr null, i32 1"
+            );
+            let _ = writeln!(ir, "  %hrsz_{id} = ptrtoint ptr %hrsp_{id} to i64");
+            let _ = writeln!(ir, "  {backing} = call ptr @malloc(i64 %hrsz_{id})");
+        } else {
+            let _ = writeln!(ir, "  {backing} = alloca {inner_ll}");
+        }
+        let zero = if **inner == Type::Bool {
+            "false"
+        } else {
+            "zeroinitializer"
+        };
+        let _ = writeln!(ir, "  store {inner_ll} {zero}, ptr {backing}");
+        emit_harness_value_into(ir, program, reg, val, inner, &backing, tmp_id, heap_refs);
+        let _ = writeln!(ir, "  store ptr {backing}, ptr {dst_ptr}");
+        return;
+    }
     match (val, ty.deref_type()) {
         (Value::Bool(b), Type::Bool) => {
             let _ = writeln!(
@@ -5589,6 +5728,7 @@ fn emit_harness_value_into(
                     &fparam.ty,
                     &format!("%hsf_{id}"),
                     tmp_id,
+                    heap_refs,
                 );
             }
         }
@@ -5635,6 +5775,7 @@ fn emit_harness_value_into(
                             &fparam.ty,
                             &format!("%hvf_{fid}"),
                             tmp_id,
+                            heap_refs,
                         );
                     }
                 }
@@ -5666,6 +5807,7 @@ fn emit_harness_value_into(
                         elem_ty,
                         &format!("%he_{eid}"),
                         tmp_id,
+                        heap_refs,
                     );
                 }
                 let _ = writeln!(
@@ -5723,6 +5865,7 @@ fn emit_harness_value_into(
                         k_ty,
                         &format!("%mk_{eid}"),
                         tmp_id,
+                        heap_refs,
                     );
                     emit_harness_value_into(
                         ir,
@@ -5732,6 +5875,7 @@ fn emit_harness_value_into(
                         v_ty,
                         &format!("%mv_{eid}"),
                         tmp_id,
+                        heap_refs,
                     );
                 }
                 let _ = writeln!(
@@ -5923,7 +6067,12 @@ fn emit_printers(
                         out,
                         "  %fp_{fi} = getelementptr {ll}, ptr %p, i32 0, i32 {fi}"
                     );
-                    let _ = writeln!(out, "  call void @vn2_print_val_{ftid}(ptr %fp_{fi})");
+                    if matches!(f.ty, Type::Ref(_, _)) {
+                        let _ = writeln!(out, "  %fpd_{fi} = load ptr, ptr %fp_{fi}");
+                        let _ = writeln!(out, "  call void @vn2_print_val_{ftid}(ptr %fpd_{fi})");
+                    } else {
+                        let _ = writeln!(out, "  call void @vn2_print_val_{ftid}(ptr %fp_{fi})");
+                    }
                 }
                 let _ = writeln!(out, "  call i32 @putchar(i32 125)");
             }
@@ -6369,6 +6518,13 @@ pub fn emit_native_harness_llvm(
                         "  store i8 {}, ptr %out_{alt_idx}_{fi}",
                         i32::from(b)
                     );
+                } else if matches!(&field.ty, Type::Ref(_, inner) if **inner == Type::Bool) {
+                    reg.needed_libc = true;
+                    let b = matches!(val, Value::Bool(true));
+                    let id = next_tmp(&mut h_tmp);
+                    let _ = writeln!(ext_code, "  %hbp_{id} = call ptr @malloc(i64 1)");
+                    let _ = writeln!(ext_code, "  store i8 {}, ptr %hbp_{id}", i32::from(b));
+                    let _ = writeln!(ext_code, "  store ptr %hbp_{id}, ptr %out_{alt_idx}_{fi}");
                 } else {
                     emit_harness_value_into(
                         &mut ext_code,
@@ -6378,6 +6534,7 @@ pub fn emit_native_harness_llvm(
                         &field.ty,
                         &format!("%out_{alt_idx}_{fi}"),
                         &mut h_tmp,
+                        true,
                     );
                 }
             }
@@ -6440,7 +6597,25 @@ pub fn emit_native_harness_llvm(
                     }
                     let ftid = reg.type_ids[field.ty.deref_type()];
                     let out_p = format!("%out_{alt_idx}_{fi}");
-                    if field.ty == Type::Bool {
+                    if matches!(field.ty, Type::Ref(_, _)) {
+                        let id = next_tmp(&mut h_tmp);
+                        let _ = writeln!(ext_code, "  %fvp_{id} = load ptr, ptr {out_p}");
+                        if *field.ty.deref_type() == Type::Bool {
+                            let _ = writeln!(ext_code, "  %fb8_{id} = load i8, ptr %fvp_{id}");
+                            let _ = writeln!(ext_code, "  %fb_{id} = icmp ne i8 %fb8_{id}, 0");
+                            let _ = writeln!(ext_code, "  %fbt_{id} = alloca i1");
+                            let _ = writeln!(ext_code, "  store i1 %fb_{id}, ptr %fbt_{id}");
+                            let _ = writeln!(
+                                ext_code,
+                                "  call void @vn2_print_val_{ftid}(ptr %fbt_{id})"
+                            );
+                        } else {
+                            let _ = writeln!(
+                                ext_code,
+                                "  call void @vn2_print_val_{ftid}(ptr %fvp_{id})"
+                            );
+                        }
+                    } else if field.ty == Type::Bool {
                         let id = h_tmp;
                         h_tmp += 1;
                         let _ = writeln!(ext_code, "  %fb8_{id} = load i8, ptr {out_p}");
@@ -6500,6 +6675,7 @@ pub fn emit_native_harness_llvm(
                     param.ty.deref_type(),
                     &islot,
                     &mut h_tmp,
+                    false,
                 );
                 call_args.push(format!("ptr {islot}"));
             } else {
@@ -6523,6 +6699,7 @@ pub fn emit_native_harness_llvm(
                     &param.ty,
                     &slot,
                     &mut h_tmp,
+                    false,
                 );
                 let lr = format!("%r{run_idx}_iv_{pi}");
                 let _ = writeln!(main_out, "  {lr} = load {ll}, ptr {slot}");
@@ -6604,7 +6781,13 @@ pub fn emit_native_harness_llvm(
                 }
                 let ftid = reg.type_ids[field.ty.deref_type()];
                 let slot = format!("%r{run_idx}_out_{alt_idx}_{fi}");
-                let _ = writeln!(main_out, "  call void @vn2_print_val_{ftid}(ptr {slot})");
+                if matches!(field.ty, Type::Ref(_, _)) {
+                    let dp = format!("%r{run_idx}_dp_{alt_idx}_{fi}");
+                    let _ = writeln!(main_out, "  {dp} = load ptr, ptr {slot}");
+                    let _ = writeln!(main_out, "  call void @vn2_print_val_{ftid}(ptr {dp})");
+                } else {
+                    let _ = writeln!(main_out, "  call void @vn2_print_val_{ftid}(ptr {slot})");
+                }
                 if needs_drop(program, &field.ty) {
                     reg.require_drop(ftid);
                     let _ = writeln!(main_out, "  call fastcc void @vn2_drop_{ftid}(ptr {slot})");

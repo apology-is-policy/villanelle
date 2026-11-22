@@ -375,9 +375,20 @@ fn collect_consumed_vars(
     out: &mut Vec<VarId>,
 ) {
     match expr {
-        Expr::Var(VarRef::Local(id), _) => {
-            if consumed && program.kind(&body.vars[*id].ty) != Kind::Copy {
-                out.push(*id);
+        Expr::Var(VarRef::Local(id), expr_ty) => {
+            if consumed {
+                match &body.vars[*id].ty {
+                    Type::Ref(BorrowMode::Exclusive, _) => {
+                        if matches!(expr_ty, Type::Ref(BorrowMode::Exclusive, _)) {
+                            out.push(*id);
+                        }
+                    }
+                    Type::Ref(BorrowMode::Shared, _) => {}
+                    other if program.kind(other) != Kind::Copy => {
+                        out.push(*id);
+                    }
+                    _ => {}
+                }
             }
         }
         Expr::Move(inner, _) => collect_consumed_vars(program, body, inner, true, out),

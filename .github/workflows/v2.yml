@@ -48,3 +48,8 @@ jobs:
             cargo run --locked --bin vn2 -- emit-llvm "$f" > /dev/null
             cargo run --locked --bin vn2 -- emit-c "$f" > /dev/null
           done
+          for f in tests/slice3_surface/*.rails; do
+            cargo run --locked --bin vn2 -- expand "$f" > /dev/null
+            cargo run --locked --bin vn2 -- emit-llvm "$f" > /dev/null
+            cargo run --locked --bin vn2 -- emit-c "$f" > /dev/null
+          done

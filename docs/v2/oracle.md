@@ -688,12 +688,65 @@ fact propagation/invalidation, and Pass 2 static ROBDD loan checking to
   programs under `vn2 check --certificates`, and all 9 stuck controls plus
   `[RM7]` `disjoint_elements` from `tests/slice3/*.core`.
 
-## 17. What this checkpoint leaves open
+## 17. Slice 3 Phase 4: Theorem 4 Expansion and Typed LLVM IR / C ABI Backend for Borrows and Views
 
-- **Later phases and slices.** Slice 3 Phase 4 (Theorem 4 call expansion and
-  typed LLVM IR and C ABI backend for borrows and views), followed by Slice 4
-  (tasks), which will allow the oracle, the checker and the typed backend to run,
-  verify and compile the full paper corpus.
+Slice 3 Phase 4 completes Theorem 4 call expansion (`expand.rs`), erased borrow
+consumption (`erased.rs`), and direct typed LLVM IR and C ABI code generation
+(`codegen.rs`, `[R1]`–`[R5]`) for borrows (`&τ`, `&~τ`) and `view struct` values:
+
+- **Erased consumption fix (`v2/src/erased.rs`).** Updates
+  `collect_consumed_vars` on `Expr::Var(VarRef::Local(id), expr_ty)` so
+  reading or mutating through an exclusive borrow `&~r` does not mark `r` moved,
+  while moving `&~r` itself (`Type::Ref(BorrowMode::Exclusive, _)`) or any
+  non-`copy` owned value still consumes it.
+- **Theorem 4 call expansion (`v2/src/expand.rs`).** Adds `expr_lends_syntax`,
+  updates `inline_callee` to rename and bind all parameters (`&τ`, `&~τ`, and
+  `view struct`) as `_exp{call_id}_{name}` locals in `[E-Operands]` order
+  (non-lending before lending) with `old(...)` snapshots reading through renamed
+  `&~` locals, updates `subst_and_rename_expr`, `rename_place`, and
+  `rename_command`, and preserves `[E-Operands]` evaluation order for
+  `Command::Exit` payload bindings in `lift_exits_in_body`.
+- **Typed LLVM IR and C ABI backend (`v2/src/codegen.rs`, `[R1]`–`[R5]`).**
+  - Lowers `&τ` and `&~τ` with zero runtime borrow tags (`ptr`, with
+    `ptr noalias` on `&~` control parameters in `emit_body_unit`), emits
+    `unreachable` for `⊥` and zero bounds-check traps (`[R2]`), and removes
+    dead `require_clone` in `BuiltinOp::Get` so `@vn2_map_get_` stores `ptr`
+    directly with no `@vn2_clone_` call.
+  - Dereferences borrow-typed fields in `emit_place_ptr` (`PlaceStep::Field`),
+    `emit_expr_ptr_if_place` (`Expr::Field`, including `extractvalue` for
+    by-value `view struct` parameters in pure functions), `emit_read_operand`
+    (`Type::Ref` guard), `emit_expr`, and `emit_printers`, while preserving
+    `[E-Operands]` order in `emit_exprs_ordered` (lending `view struct`
+    constructors, `Loop`, `Again`, `Leave`, `Exit`) and Pass 2
+    `emit_operation_call`.
+  - Orders `struct` declarations topologically in `emit_c_header`, formats
+    pointer fields cleanly (`const struct vn2_vec *items;` /
+    `struct vn2_vec *items;`), guards shared `vn2_string` / `vn2_vec` / `vn2_map`
+    typedefs under `#ifndef VN2_RUNTIME_TYPES_DEFINED` so generated headers
+    compose cleanly in a single C translation unit, forwards `&bool` origin
+    pointers without dangling stack temporaries in `emit_control_c_wrapper`, and
+    extends `emit_harness_value_into` (`heap_refs` + `Type::Ref`) and
+    `emit_native_harness_llvm` for borrowed payloads and trace printing.
+- **Conformance and paired benchmark (`v2/tests/backend_slice3.rs`).** Verifies
+  Theorem 4 expansion + kernel-validated certificates + directive parity on both
+  `tests/slice3_surface/*.rails` programs and a multi-control Slice 3 suite
+  (`widest`, `pick_mut`, `halves`, `longest`, chained views, `clear`, and loop
+  exit lifting); verifies zero-tag / zero-`oob` / zero-clone `@vn2_map_get_` IR
+  plus composable dual-header `clang -fsyntax-only`; checks `-O0`/`-O2` 32/64-bit
+  differential parity across orig/expanded `.rails`, `.core`, and `extern`
+  borrowed `&string`/`&bool` payloads; and benchmarks `borrow_view_bench` (`4096`
+  `u64` elements × `200` passes × `10` reps, checksum `4790574320`, Apple M2
+  `arm64`, `Apple clang 21.0.0 -O3` vs. `rustc 1.97.1 -O3`): **24.440 ms** (v2)
+  vs. **23.932 ms** (Rust) = **1.021×** (0.508 ms / 2.1% remaining gap from
+  loop induction and `urem`/modulo lowering across `scale_tail` and
+  `sum_window`; next experiment: inspect generated arm64 assembly and align
+  unsigned `mod` constant strength-reduction).
+
+## 18. What this checkpoint leaves open
+
+- **Later slices.** Slices 1, 2, and 3 are complete across Phases 2, 3, and 4;
+  Slice 4 (tasks) is next, allowing the oracle, the checker, and the typed
+  backend to run, verify, and compile the full paper corpus.
 - **Operators that the surface does not have yet.** The wrapping and
   saturating operators and the numeric conversions are named in the core and
   the fact logic and have no spelling. They belong to phase 5.

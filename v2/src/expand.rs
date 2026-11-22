@@ -439,17 +439,6 @@ fn expr_to_place(expr: &Expr) -> Option<Place> {
     }
 }
 
-fn place_to_expr(place: &Place) -> Expr {
-    let mut cur = Expr::Name(place.root.clone());
-    for step in &place.steps {
-        cur = match step {
-            PlaceStep::Field(f) => Expr::Field(Box::new(cur), f.clone()),
-            PlaceStep::Index(idx) => Expr::Index(Box::new(cur), Box::new(idx.clone())),
-        };
-    }
-    cur
-}
-
 fn collect_old_uses(expr: &Expr, len_old: &mut HashSet<String>, val_old: &mut HashSet<String>) {
     match expr {
         Expr::Len(inner) => {
@@ -495,6 +484,20 @@ fn is_copy_type_syntax(ty: &Type, decls: &[Declaration]) -> bool {
     }
 }
 
+fn expr_lends_syntax(expr: &Expr, decls: &[Declaration]) -> bool {
+    match expr {
+        Expr::Borrow(_, _) => true,
+        Expr::Move(inner) => expr_lends_syntax(inner, decls),
+        Expr::Struct(name, fields) => {
+            let is_view = decls
+                .iter()
+                .any(|d| matches!(d, Declaration::Struct(s) if s.name == *name && s.is_view));
+            is_view && fields.iter().any(|f| expr_lends_syntax(f, decls))
+        }
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn inline_callee(
     callee: &Control,
@@ -512,19 +515,19 @@ fn inline_callee(
 ) {
     // 1. Lift any `Command::Exit` inside loops of `callee` to the top level of
     //    `callee.body`.
-    let lifted_body = lift_exits_in_body(&callee.body, &callee.contract, next_id);
+    let lifted_body = lift_exits_in_body(&callee.body, &callee.contract, decls, next_id);
 
-    // 2. Build injective renamings for all non-borrow variables, sites and loop
-    //    names in `lifted_body` and `callee.parameters`.
+    // 2. Build injective renamings for all variables (including borrow and view
+    //    parameters), sites, and loop names in `lifted_body` and
+    //    `callee.parameters`.
     let mut var_names = HashSet::new();
     let mut site_names = HashSet::new();
     let mut loop_names = HashSet::new();
-    let mut borrow_param_names = HashSet::new();
+    let mut exc_params = HashSet::new();
     for param in &callee.parameters {
-        if matches!(param.ty, Type::Ref(_, _)) {
-            borrow_param_names.insert(param.name.clone());
-        } else {
-            var_names.insert(param.name.clone());
+        var_names.insert(param.name.clone());
+        if matches!(param.ty, Type::Ref(BorrowMode::Exclusive, _)) {
+            exc_params.insert(param.name.clone());
         }
     }
     collect_callee_names(
@@ -533,9 +536,6 @@ fn inline_callee(
         &mut site_names,
         &mut loop_names,
     );
-    for bp in &borrow_param_names {
-        var_names.remove(bp);
-    }
 
     let prefix = format!("_exp{call_id}_");
     let var_map: HashMap<String, String> = var_names
@@ -552,10 +552,6 @@ fn inline_callee(
         .collect();
 
     let mut out = Vec::new();
-    let mut expr_substs: HashMap<String, Expr> = HashMap::new();
-    let mut mut_places: HashMap<String, Place> = HashMap::new();
-    let mut rvalue_shared_binds: Vec<Statement> = Vec::new();
-    let mut old_binds: Vec<Statement> = Vec::new();
 
     // Detect `old(param)` and `len(old(param))` in `callee.contract`.
     let mut len_old_params = HashSet::new();
@@ -566,88 +562,108 @@ fn inline_callee(
         }
     }
 
-    // 3. Evaluate & bind parameters in `[E-Operands]` order: non-lending first,
-    //    then borrow substitutions & `old(...)` snapshots.
+    // 3. Evaluate & bind parameters in `[E-Operands]` order: non-lending first
+    //    (including owned temp materialization for non-place `&τ` rvalues),
+    //    then lending operands (and `&` borrows of those temps), then
+    //    `old(...)` snapshots through the local exclusive borrow parameters.
+    let mut rvalue_temps: HashMap<String, String> = HashMap::new();
     for (param, arg_expr) in callee.parameters.iter().zip(arguments) {
-        match &param.ty {
-            Type::Ref(BorrowMode::Exclusive, inner_ty) => {
-                let place =
-                    expr_to_place(arg_expr).expect("exclusive borrow argument must be a place");
-                let p_expr = place_to_expr(&place);
-                if len_old_params.contains(&param.name) {
-                    let old_len_name = format!("{prefix}old_len_{}", param.name);
-                    old_binds.push(Statement {
-                        selector: call_guard.clone(),
-                        command: Command::Bind {
-                            mutable: false,
-                            name: old_len_name,
-                            ty: Some(Type::Int(IntType::Usize)),
-                            value: Expr::Len(Box::new(p_expr.clone())),
-                        },
-                        line: call_line,
-                    });
-                }
-                if val_old_params.contains(&param.name) {
-                    let old_val_name = format!("{prefix}old_{}", param.name);
-                    let snap_val = if is_copy_type_syntax(inner_ty, decls) {
-                        p_expr.clone()
-                    } else {
-                        Expr::Clone(Box::new(p_expr.clone()))
-                    };
-                    old_binds.push(Statement {
-                        selector: call_guard.clone(),
-                        command: Command::Bind {
-                            mutable: false,
-                            name: old_val_name,
-                            ty: Some((**inner_ty).clone()),
-                            value: snap_val,
-                        },
-                        line: call_line,
-                    });
-                }
-                expr_substs.insert(param.name.clone(), p_expr);
-                mut_places.insert(param.name.clone(), place);
-            }
-            Type::Ref(BorrowMode::Shared, inner_ty) => {
-                if let Some(place) = expr_to_place(arg_expr) {
-                    expr_substs.insert(param.name.clone(), place_to_expr(&place));
-                } else {
-                    let tmp_name = format!("{prefix}{}", param.name);
-                    rvalue_shared_binds.push(Statement {
-                        selector: call_guard.clone(),
-                        command: Command::Bind {
-                            mutable: false,
-                            name: tmp_name.clone(),
-                            ty: Some((**inner_ty).clone()),
-                            value: arg_expr.clone(),
-                        },
-                        line: call_line,
-                    });
-                    expr_substs.insert(param.name.clone(), Expr::Name(tmp_name));
-                }
-            }
-            val_ty => {
+        if expr_lends_syntax(arg_expr, decls) {
+            continue;
+        }
+        if let Type::Ref(BorrowMode::Shared, inner_ty) = &param.ty
+            && expr_to_place(arg_expr).is_none()
+        {
+            let tmp_name = format!("{prefix}tmp_{}", param.name);
+            out.push(Statement {
+                selector: call_guard.clone(),
+                command: Command::Bind {
+                    mutable: false,
+                    name: tmp_name.clone(),
+                    ty: Some((**inner_ty).clone()),
+                    value: arg_expr.clone(),
+                },
+                line: call_line,
+            });
+            rvalue_temps.insert(param.name.clone(), tmp_name);
+        } else {
+            out.push(Statement {
+                selector: call_guard.clone(),
+                command: Command::Bind {
+                    mutable: false,
+                    name: var_map[&param.name].clone(),
+                    ty: Some(param.ty.clone()),
+                    value: arg_expr.clone(),
+                },
+                line: call_line,
+            });
+        }
+    }
+    for (param, arg_expr) in callee.parameters.iter().zip(arguments) {
+        if expr_lends_syntax(arg_expr, decls) {
+            out.push(Statement {
+                selector: call_guard.clone(),
+                command: Command::Bind {
+                    mutable: false,
+                    name: var_map[&param.name].clone(),
+                    ty: Some(param.ty.clone()),
+                    value: arg_expr.clone(),
+                },
+                line: call_line,
+            });
+        } else if let Some(tmp_name) = rvalue_temps.get(&param.name) {
+            out.push(Statement {
+                selector: call_guard.clone(),
+                command: Command::Bind {
+                    mutable: false,
+                    name: var_map[&param.name].clone(),
+                    ty: Some(param.ty.clone()),
+                    value: Expr::Borrow(BorrowMode::Shared, Box::new(Expr::Name(tmp_name.clone()))),
+                },
+                line: call_line,
+            });
+        }
+    }
+    for param in &callee.parameters {
+        if let Type::Ref(BorrowMode::Exclusive, inner_ty) = &param.ty {
+            let p_var = &var_map[&param.name];
+            if len_old_params.contains(&param.name) {
                 out.push(Statement {
                     selector: call_guard.clone(),
                     command: Command::Bind {
                         mutable: false,
-                        name: var_map[&param.name].clone(),
-                        ty: Some(val_ty.clone()),
-                        value: arg_expr.clone(),
+                        name: format!("{prefix}old_len_{}", param.name),
+                        ty: Some(Type::Int(IntType::Usize)),
+                        value: Expr::Len(Box::new(Expr::Name(p_var.clone()))),
+                    },
+                    line: call_line,
+                });
+            }
+            if val_old_params.contains(&param.name) {
+                let snap_val = if is_copy_type_syntax(inner_ty, decls) {
+                    Expr::Name(p_var.clone())
+                } else {
+                    Expr::Clone(Box::new(Expr::Name(p_var.clone())))
+                };
+                out.push(Statement {
+                    selector: call_guard.clone(),
+                    command: Command::Bind {
+                        mutable: false,
+                        name: format!("{prefix}old_{}", param.name),
+                        ty: Some((**inner_ty).clone()),
+                        value: snap_val,
                     },
                     line: call_line,
                 });
             }
         }
     }
-    out.extend(rvalue_shared_binds);
-    out.extend(old_binds);
 
     // 4. If `callee` has a precondition `⊢ φ`, emit it as an obligation on
     //    `call_guard` so `[P3]` is preserved as `[P1]`.
     if let Some(pre) = &callee.precondition {
         let mut renamed_pre = pre.clone();
-        subst_and_rename_expr(&mut renamed_pre, &var_map, &expr_substs, None);
+        subst_and_rename_expr(&mut renamed_pre, &var_map, None);
         out.push(Statement {
             selector: call_guard.clone(),
             command: Command::Oblige(renamed_pre),
@@ -687,21 +703,20 @@ fn inline_callee(
                     .iter()
                     .map(|e| {
                         let mut c = e.clone();
-                        subst_and_rename_expr(&mut c, &var_map, &expr_substs, None);
+                        subst_and_rename_expr(&mut c, &var_map, None);
                         c
                     })
                     .collect();
 
-                // Bind the caller's arm variables `[~]y_i : field.ty := val_i` on `active`.
-                for ((y_raw, field_param), val_expr) in caller_arm
-                    .names
-                    .iter()
-                    .zip(&contract_alt.fields)
-                    .zip(&renamed_payload)
-                {
+                // Bind the caller's arm variables `[~]y_i : field.ty := val_i`
+                // on `active` in `[E-Operands]` order (non-lending before lending).
+                let emit_arm_bind = |out: &mut Vec<Statement>,
+                                     y_raw: &str,
+                                     field_param: &crate::syntax::Parameter,
+                                     val_expr: &Expr| {
                     let (y_mut, y_clean) = match y_raw.strip_prefix('~') {
                         Some(s) => (true, s.to_string()),
-                        None => (false, y_raw.clone()),
+                        None => (false, y_raw.to_string()),
                     };
                     out.push(Statement {
                         selector: active.clone(),
@@ -713,6 +728,26 @@ fn inline_callee(
                         },
                         line: call_line,
                     });
+                };
+                for ((y_raw, field_param), val_expr) in caller_arm
+                    .names
+                    .iter()
+                    .zip(&contract_alt.fields)
+                    .zip(&renamed_payload)
+                {
+                    if !expr_lends_syntax(val_expr, decls) {
+                        emit_arm_bind(&mut out, y_raw, field_param, val_expr);
+                    }
+                }
+                for ((y_raw, field_param), val_expr) in caller_arm
+                    .names
+                    .iter()
+                    .zip(&contract_alt.fields)
+                    .zip(&renamed_payload)
+                {
+                    if expr_lends_syntax(val_expr, decls) {
+                        emit_arm_bind(&mut out, y_raw, field_param, val_expr);
+                    }
                 }
 
                 // If the contract alternative has `⇐ cond`, check it as an
@@ -727,8 +762,7 @@ fn inline_callee(
                     subst_and_rename_expr(
                         &mut renamed_cond,
                         &cond_map,
-                        &expr_substs,
-                        Some(&prefix),
+                        Some((&exc_params, &prefix)),
                     );
                     out.push(Statement {
                         selector: active.clone(),
@@ -755,14 +789,7 @@ fn inline_callee(
             | Command::Terminate(_)
             | Command::Escalate
             | Command::Recover { .. } => {
-                let renamed_cmd = rename_command(
-                    &stmt.command,
-                    &var_map,
-                    &expr_substs,
-                    &mut_places,
-                    &site_map,
-                    &loop_map,
-                );
+                let renamed_cmd = rename_command(&stmt.command, &var_map, &site_map, &loop_map);
                 out.push(Statement {
                     selector: active,
                     command: renamed_cmd,
@@ -771,14 +798,7 @@ fn inline_callee(
                 terminated.push(rel_sel);
             }
             other => {
-                let renamed_cmd = rename_command(
-                    other,
-                    &var_map,
-                    &expr_substs,
-                    &mut_places,
-                    &site_map,
-                    &loop_map,
-                );
+                let renamed_cmd = rename_command(other, &var_map, &site_map, &loop_map);
                 if let Command::Loop { arms, .. } = &renamed_cmd
                     && arms.is_empty()
                 {
@@ -945,6 +965,7 @@ fn is_var_used_in_stmts(stmts: &[Statement], name: &str) -> bool {
 fn lift_exits_in_body(
     statements: &[Statement],
     contract: &[Alternative],
+    decls: &[Declaration],
     next_id: &mut usize,
 ) -> Vec<Statement> {
     let mut out = Vec::new();
@@ -959,7 +980,7 @@ fn lift_exits_in_body(
                 arms,
             } => {
                 // First lift exits inside any nested loops of `body`.
-                let inner_lifted = lift_exits_in_body(body, contract, next_id);
+                let inner_lifted = lift_exits_in_body(body, contract, decls, next_id);
                 let mut new_loop_body = Vec::new();
                 let mut new_arms = arms.clone();
                 let mut post_exits: Vec<(String, String, Vec<String>)> = Vec::new();
@@ -978,25 +999,47 @@ fn lift_exits_in_body(
                         *next_id += 1;
                         let lift_alt = format!("_lift_exit_{lift_id}");
 
-                        let mut leave_payload = Vec::new();
-                        let mut arm_vars = Vec::new();
-                        for (field_idx, (expr, field_param)) in
-                            payload.into_iter().zip(&contract_alt.fields).enumerate()
-                        {
-                            let val_name = format!("_lift_val_{lift_id}_{field_idx}");
-                            let out_name = format!("_lift_out_{lift_id}_{field_idx}");
-                            new_loop_body.push(Statement {
-                                selector: inner_stmt.selector.clone(),
-                                command: Command::Bind {
-                                    mutable: false,
-                                    name: val_name.clone(),
-                                    ty: Some(field_param.ty.clone()),
-                                    value: expr,
-                                },
-                                line: inner_stmt.line,
-                            });
-                            leave_payload.push(Expr::Name(val_name));
-                            arm_vars.push(out_name);
+                        let items: Vec<(usize, Expr, &crate::syntax::Parameter)> = payload
+                            .into_iter()
+                            .zip(&contract_alt.fields)
+                            .enumerate()
+                            .map(|(field_idx, (expr, field_param))| (field_idx, expr, field_param))
+                            .collect();
+                        let mut leave_payload = Vec::with_capacity(items.len());
+                        let mut arm_vars = Vec::with_capacity(items.len());
+                        for (field_idx, _, _) in &items {
+                            leave_payload
+                                .push(Expr::Name(format!("_lift_val_{lift_id}_{field_idx}")));
+                            arm_vars.push(format!("_lift_out_{lift_id}_{field_idx}"));
+                        }
+                        // Bind `_lift_val_*` in `[E-Operands]` order (non-lending before lending).
+                        for &(field_idx, ref expr, field_param) in &items {
+                            if !expr_lends_syntax(expr, decls) {
+                                new_loop_body.push(Statement {
+                                    selector: inner_stmt.selector.clone(),
+                                    command: Command::Bind {
+                                        mutable: false,
+                                        name: format!("_lift_val_{lift_id}_{field_idx}"),
+                                        ty: Some(field_param.ty.clone()),
+                                        value: expr.clone(),
+                                    },
+                                    line: inner_stmt.line,
+                                });
+                            }
+                        }
+                        for (field_idx, expr, field_param) in items {
+                            if expr_lends_syntax(&expr, decls) {
+                                new_loop_body.push(Statement {
+                                    selector: inner_stmt.selector.clone(),
+                                    command: Command::Bind {
+                                        mutable: false,
+                                        name: format!("_lift_val_{lift_id}_{field_idx}"),
+                                        ty: Some(field_param.ty.clone()),
+                                        value: expr,
+                                    },
+                                    line: inner_stmt.line,
+                                });
+                            }
                         }
                         new_loop_body.push(Statement {
                             selector: inner_stmt.selector,
@@ -1051,10 +1094,10 @@ fn lift_exits_in_body(
                     selector: stmt.selector.clone(),
                     command: Command::Boundary {
                         site: site.clone(),
-                        body: lift_exits_in_body(body, contract, next_id),
+                        body: lift_exits_in_body(body, contract, decls, next_id),
                         captures: captures.clone(),
                         message: message.clone(),
-                        contingency: lift_exits_in_body(contingency, contract, next_id),
+                        contingency: lift_exits_in_body(contingency, contract, decls, next_id),
                     },
                     line: stmt.line,
                 });
@@ -1180,24 +1223,23 @@ fn rename_selector(selector: &mut Selector, site_map: &HashMap<String, String>) 
 fn subst_and_rename_expr(
     expr: &mut Expr,
     var_map: &HashMap<String, String>,
-    expr_substs: &HashMap<String, Expr>,
-    old_prefix: Option<&str>,
+    old_exc: Option<(&HashSet<String>, &str)>,
 ) {
     match expr {
         Expr::Integer(_) | Expr::Boolean(_) | Expr::String(_) | Expr::EmptyMap => {}
         Expr::Len(inner) => {
             if let Expr::Old(name) = &**inner
-                && let Some(prefix) = old_prefix
-                && expr_substs.contains_key(name)
+                && let Some((exc_params, prefix)) = old_exc
+                && exc_params.contains(name)
             {
                 *expr = Expr::Name(format!("{prefix}old_len_{name}"));
                 return;
             }
-            subst_and_rename_expr(inner, var_map, expr_substs, old_prefix);
+            subst_and_rename_expr(inner, var_map, old_exc);
         }
         Expr::Old(name) => {
-            if let Some(prefix) = old_prefix
-                && expr_substs.contains_key(name)
+            if let Some((exc_params, prefix)) = old_exc
+                && exc_params.contains(name)
             {
                 *expr = Expr::Name(format!("{prefix}old_{name}"));
                 return;
@@ -1207,9 +1249,7 @@ fn subst_and_rename_expr(
             }
         }
         Expr::Name(name) => {
-            if let Some(replacement) = expr_substs.get(name) {
-                *expr = replacement.clone();
-            } else if let Some(new_name) = var_map.get(name) {
+            if let Some(new_name) = var_map.get(name) {
                 *name = new_name.clone();
             }
         }
@@ -1217,46 +1257,34 @@ fn subst_and_rename_expr(
         | Expr::Move(inner)
         | Expr::Borrow(_, inner)
         | Expr::Field(inner, _)
-        | Expr::Clone(inner) => subst_and_rename_expr(inner, var_map, expr_substs, old_prefix),
+        | Expr::Clone(inner) => subst_and_rename_expr(inner, var_map, old_exc),
         Expr::Binary(_, l, r) | Expr::Index(l, r) => {
-            subst_and_rename_expr(l, var_map, expr_substs, old_prefix);
-            subst_and_rename_expr(r, var_map, expr_substs, old_prefix);
+            subst_and_rename_expr(l, var_map, old_exc);
+            subst_and_rename_expr(r, var_map, old_exc);
         }
         Expr::Call(_, args)
         | Expr::Struct(_, args)
         | Expr::Variant(_, _, args)
         | Expr::Vector(args) => {
             for arg in args {
-                subst_and_rename_expr(arg, var_map, expr_substs, old_prefix);
+                subst_and_rename_expr(arg, var_map, old_exc);
             }
         }
     }
 }
 
-fn rename_place(
-    place: &Place,
-    var_map: &HashMap<String, String>,
-    expr_substs: &HashMap<String, Expr>,
-    mut_places: &HashMap<String, Place>,
-) -> Place {
-    let mut new_steps: Vec<PlaceStep> = Vec::new();
-    let root = if let Some(base) = mut_places.get(&place.root) {
-        for s in &base.steps {
-            new_steps.push(s.clone());
-        }
-        base.root.clone()
-    } else {
-        var_map
-            .get(&place.root)
-            .cloned()
-            .unwrap_or_else(|| place.root.clone())
-    };
+fn rename_place(place: &Place, var_map: &HashMap<String, String>) -> Place {
+    let root = var_map
+        .get(&place.root)
+        .cloned()
+        .unwrap_or_else(|| place.root.clone());
+    let mut new_steps = Vec::with_capacity(place.steps.len());
     for step in &place.steps {
         match step {
             PlaceStep::Field(f) => new_steps.push(PlaceStep::Field(f.clone())),
             PlaceStep::Index(idx) => {
                 let mut e = idx.clone();
-                subst_and_rename_expr(&mut e, var_map, expr_substs, None);
+                subst_and_rename_expr(&mut e, var_map, None);
                 new_steps.push(PlaceStep::Index(e));
             }
         }
@@ -1282,8 +1310,6 @@ fn rename_arm_name(raw: &str, var_map: &HashMap<String, String>) -> String {
 fn rename_command(
     command: &Command,
     var_map: &HashMap<String, String>,
-    expr_substs: &HashMap<String, Expr>,
-    mut_places: &HashMap<String, Place>,
     site_map: &HashMap<String, String>,
     loop_map: &HashMap<String, String>,
 ) -> Command {
@@ -1295,7 +1321,7 @@ fn rename_command(
             value,
         } => {
             let mut v = value.clone();
-            subst_and_rename_expr(&mut v, var_map, expr_substs, None);
+            subst_and_rename_expr(&mut v, var_map, None);
             Command::Bind {
                 mutable: *mutable,
                 name: var_map.get(name).cloned().unwrap_or_else(|| name.clone()),
@@ -1309,7 +1335,7 @@ fn rename_command(
             value,
         } => {
             let mut v = value.clone();
-            subst_and_rename_expr(&mut v, var_map, expr_substs, None);
+            subst_and_rename_expr(&mut v, var_map, None);
             Command::Unpack {
                 struct_name: struct_name.clone(),
                 names: names
@@ -1334,49 +1360,35 @@ fn rename_command(
                 .iter()
                 .map(|a| {
                     let mut c = a.clone();
-                    subst_and_rename_expr(&mut c, var_map, expr_substs, None);
+                    subst_and_rename_expr(&mut c, var_map, None);
                     c
                 })
                 .collect(),
         },
         Command::Assign { name, value } => {
             let mut v = value.clone();
-            subst_and_rename_expr(&mut v, var_map, expr_substs, None);
-            if let Some(target_place) = mut_places.get(name) {
-                if target_place.steps.is_empty() {
-                    Command::Assign {
-                        name: target_place.root.clone(),
-                        value: v,
-                    }
-                } else {
-                    Command::AssignPlace {
-                        target: target_place.clone(),
-                        value: v,
-                    }
-                }
-            } else {
-                Command::Assign {
-                    name: var_map.get(name).cloned().unwrap_or_else(|| name.clone()),
-                    value: v,
-                }
+            subst_and_rename_expr(&mut v, var_map, None);
+            Command::Assign {
+                name: var_map.get(name).cloned().unwrap_or_else(|| name.clone()),
+                value: v,
             }
         }
         Command::AssignPlace { target, value } => {
             let mut v = value.clone();
-            subst_and_rename_expr(&mut v, var_map, expr_substs, None);
+            subst_and_rename_expr(&mut v, var_map, None);
             Command::AssignPlace {
-                target: rename_place(target, var_map, expr_substs, mut_places),
+                target: rename_place(target, var_map),
                 value: v,
             }
         }
         Command::Oblige(formula) => {
             let mut f = formula.clone();
-            subst_and_rename_expr(&mut f, var_map, expr_substs, None);
+            subst_and_rename_expr(&mut f, var_map, None);
             Command::Oblige(f)
         }
         Command::Test { site, condition } => {
             let mut c = condition.clone();
-            subst_and_rename_expr(&mut c, var_map, expr_substs, None);
+            subst_and_rename_expr(&mut c, var_map, None);
             Command::Test {
                 site: site_map.get(site).cloned().unwrap_or_else(|| site.clone()),
                 condition: c,
@@ -1392,7 +1404,7 @@ fn rename_command(
                 .iter()
                 .map(|a| {
                     let mut c = a.clone();
-                    subst_and_rename_expr(&mut c, var_map, expr_substs, None);
+                    subst_and_rename_expr(&mut c, var_map, None);
                     c
                 })
                 .collect();
@@ -1426,7 +1438,7 @@ fn rename_command(
                 .iter()
                 .map(|p| {
                     let mut init = p.initial.clone();
-                    subst_and_rename_expr(&mut init, var_map, expr_substs, None);
+                    subst_and_rename_expr(&mut init, var_map, None);
                     LoopParameter {
                         mutable: p.mutable,
                         name: var_map
@@ -1440,7 +1452,7 @@ fn rename_command(
                 .collect();
             let new_inv = invariant.as_ref().map(|inv| {
                 let mut c = inv.clone();
-                subst_and_rename_expr(&mut c, var_map, expr_substs, None);
+                subst_and_rename_expr(&mut c, var_map, None);
                 c
             });
             let new_body = body
@@ -1450,14 +1462,7 @@ fn rename_command(
                     rename_selector(&mut sel, site_map);
                     Statement {
                         selector: sel,
-                        command: rename_command(
-                            &s.command,
-                            var_map,
-                            expr_substs,
-                            mut_places,
-                            site_map,
-                            loop_map,
-                        ),
+                        command: rename_command(&s.command, var_map, site_map, loop_map),
                         line: s.line,
                     }
                 })
@@ -1496,14 +1501,7 @@ fn rename_command(
                     rename_selector(&mut sel, site_map);
                     Statement {
                         selector: sel,
-                        command: rename_command(
-                            &s.command,
-                            var_map,
-                            expr_substs,
-                            mut_places,
-                            site_map,
-                            loop_map,
-                        ),
+                        command: rename_command(&s.command, var_map, site_map, loop_map),
                         line: s.line,
                     }
                 })
@@ -1515,14 +1513,7 @@ fn rename_command(
                     rename_selector(&mut sel, site_map);
                     Statement {
                         selector: sel,
-                        command: rename_command(
-                            &s.command,
-                            var_map,
-                            expr_substs,
-                            mut_places,
-                            site_map,
-                            loop_map,
-                        ),
+                        command: rename_command(&s.command, var_map, site_map, loop_map),
                         line: s.line,
                     }
                 })
@@ -1549,7 +1540,7 @@ fn rename_command(
                 .iter()
                 .map(|a| {
                     let mut c = a.clone();
-                    subst_and_rename_expr(&mut c, var_map, expr_substs, None);
+                    subst_and_rename_expr(&mut c, var_map, None);
                     c
                 })
                 .collect(),
@@ -1560,7 +1551,7 @@ fn rename_command(
                 .iter()
                 .map(|a| {
                     let mut c = a.clone();
-                    subst_and_rename_expr(&mut c, var_map, expr_substs, None);
+                    subst_and_rename_expr(&mut c, var_map, None);
                     c
                 })
                 .collect(),
@@ -1574,7 +1565,7 @@ fn rename_command(
                 .iter()
                 .map(|a| {
                     let mut c = a.clone();
-                    subst_and_rename_expr(&mut c, var_map, expr_substs, None);
+                    subst_and_rename_expr(&mut c, var_map, None);
                     c
                 })
                 .collect(),
@@ -1588,14 +1579,14 @@ fn rename_command(
                 .iter()
                 .map(|a| {
                     let mut c = a.clone();
-                    subst_and_rename_expr(&mut c, var_map, expr_substs, None);
+                    subst_and_rename_expr(&mut c, var_map, None);
                     c
                 })
                 .collect(),
         },
         Command::Fault { message, assumed } => {
             let mut m = message.clone();
-            subst_and_rename_expr(&mut m, var_map, expr_substs, None);
+            subst_and_rename_expr(&mut m, var_map, None);
             Command::Fault {
                 message: m,
                 assumed: *assumed,
@@ -1603,7 +1594,7 @@ fn rename_command(
         }
         Command::Terminate(status) => Command::Terminate(status.as_ref().map(|e| {
             let mut c = e.clone();
-            subst_and_rename_expr(&mut c, var_map, expr_substs, None);
+            subst_and_rename_expr(&mut c, var_map, None);
             c
         })),
         Command::Escalate => Command::Escalate,
