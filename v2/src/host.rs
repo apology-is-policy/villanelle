@@ -357,6 +357,11 @@ fn push_value(words: &mut Vec<u64>, value: &Value) {
                 push_value(words, p);
             }
         }
+        Value::Ref { mode, tag, .. } => {
+            words.push(10);
+            words.push(u64::from(*mode == crate::typed::BorrowMode::Exclusive));
+            words.push(*tag);
+        }
     }
 }
 

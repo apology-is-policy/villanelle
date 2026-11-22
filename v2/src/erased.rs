@@ -18,7 +18,7 @@
 
 use crate::host::Host;
 use crate::int::Int;
-use crate::oracle::{Config, Event, Value, list};
+use crate::oracle::{Config, Event, RuntimePlace, RuntimeStep, ScopeId, Value, list};
 use crate::syntax::escape_string;
 use crate::typed::{
     Arithmetic, BodyId, BorrowMode, BoundaryId, BuiltinOp, Command, Comparison, ControlBody,
@@ -101,7 +101,6 @@ struct Arith<'a> {
 }
 
 enum Names<'a> {
-    Slots(&'a [Value]),
     Arguments(&'a [Value]),
 }
 
@@ -156,7 +155,6 @@ impl Arith<'_> {
             }
             Expr::String(s) => Value::String(s.clone()),
             Expr::Var(var, _) => match (var, names) {
-                (VarRef::Local(id), Names::Slots(slots)) => slots[*id].clone(),
                 (VarRef::Parameter(index), Names::Arguments(arguments)) => {
                     arguments[*index].clone()
                 }
@@ -164,34 +162,7 @@ impl Arith<'_> {
             },
             Expr::Old(_, _) => return Err("`old` evaluated in erased code".to_string()),
             Expr::Move(inner, _) => self.eval(inner, names)?,
-            Expr::Borrow(_, place, _) => {
-                let Names::Slots(slots) = names else {
-                    return Err("borrow in function".to_string());
-                };
-                let mut current = slots[place.root].clone();
-                for step in &place.steps {
-                    match step {
-                        PlaceStep::Field(_, fidx, _) => {
-                            let Value::Struct { mut fields, .. } = current else {
-                                return Err("field access on non-struct".to_string());
-                            };
-                            current = fields.swap_remove(*fidx);
-                        }
-                        PlaceStep::Index(idx_expr, _) => {
-                            let Value::Vector(mut items) = current else {
-                                return Err("index on non-vector".to_string());
-                            };
-                            let idx =
-                                self.word(&self.eval(idx_expr, names)?, IntType::Usize) as usize;
-                            if idx >= items.len() {
-                                return Err("out-of-bounds index".to_string());
-                            }
-                            current = items.swap_remove(idx);
-                        }
-                    }
-                }
-                current
-            }
+            Expr::Borrow(_, _, _) => return Err("borrow in function".to_string()),
             Expr::Field(base, _, fidx, _) => {
                 let Value::Struct { mut fields, .. } = self.eval(base, names)? else {
                     return Err("field access on non-struct".to_string());
@@ -536,9 +507,10 @@ fn compute_body_availability(
                         collect_consumed_vars(program, body, arg, true, &mut consumed);
                     }
                 }
-                Operation::Variant { by_value, .. } => {
+                Operation::Variant { borrow, .. } => {
+                    let is_val = borrow.is_none();
                     for arg in arguments {
-                        collect_consumed_vars(program, body, arg, *by_value, &mut consumed);
+                        collect_consumed_vars(program, body, arg, is_val, &mut consumed);
                     }
                 }
             },
@@ -772,18 +744,6 @@ fn selects(selector: &Selector, plan: &Plan, bits: &[bool]) -> bool {
 }
 
 #[derive(Clone, Debug)]
-enum EvalStep {
-    Field(usize),
-    Index(usize),
-}
-
-#[derive(Clone, Debug)]
-struct EvalPlace {
-    root: VarId,
-    steps: Vec<EvalStep>,
-}
-
-#[derive(Clone, Debug)]
 enum FrameKind {
     Normal,
     Loop {
@@ -822,12 +782,12 @@ enum ActKind {
 
 /// One call of a control or named boundary.
 struct Activation {
+    id: ScopeId,
     kind: ActKind,
     slots: Vec<Value>,
     bits: Vec<bool>,
     positions: Vec<usize>,
     frames: Vec<BodyFrame>,
-    writebacks: Vec<(VarId, EvalPlace)>,
 }
 
 struct Machine<'a> {
@@ -837,6 +797,9 @@ struct Machine<'a> {
     control_plans: &'a [Option<Plan>],
     boundary_plans: &'a [(Plan, Plan)],
     host: &'a mut dyn Host,
+    /// Synthetic entry slots (`ScopeId = 0`) for entry arguments passed by borrow or view.
+    entry_slots: Vec<Value>,
+    next_act_id: ScopeId,
     stack: Vec<Activation>,
     trace: Vec<Event>,
 }
@@ -844,6 +807,12 @@ struct Machine<'a> {
 impl<'a> Machine<'a> {
     fn top(&mut self) -> &mut Activation {
         self.stack.last_mut().expect("an activation")
+    }
+
+    fn alloc_act_id(&mut self) -> ScopeId {
+        let id = self.next_act_id;
+        self.next_act_id += 1;
+        id
     }
 
     fn current_body(&self) -> BodyId {
@@ -882,12 +851,7 @@ impl<'a> Machine<'a> {
         }
     }
 
-    fn push_control(
-        &mut self,
-        control: ControlId,
-        arguments: &[Value],
-        writebacks: Vec<(VarId, EvalPlace)>,
-    ) {
+    fn push_control(&mut self, control: ControlId, arguments: &[Value]) {
         let body = self.program.controls[control]
             .body
             .as_ref()
@@ -895,7 +859,9 @@ impl<'a> Machine<'a> {
         let plan = self.control_plans[control].as_ref().expect("a plan");
         let mut slots = vec![Value::Int(Int::zero()); body.vars.len()];
         slots[..arguments.len()].clone_from_slice(arguments);
+        let id = self.alloc_act_id();
         self.stack.push(Activation {
+            id,
             kind: ActKind::Control(control),
             slots,
             bits: vec![false; plan.bits],
@@ -904,105 +870,450 @@ impl<'a> Machine<'a> {
                 body: 0,
                 kind: FrameKind::Normal,
             }],
-            writebacks,
         });
     }
 
-    fn eval_expr(&self, expr: &Expr) -> Result<Value, String> {
-        let names = Names::Slots(&self.stack.last().expect("an activation").slots);
-        self.arith.eval(expr, &names)
-    }
-
-    fn eval_place(&self, place: &Place) -> Result<EvalPlace, String> {
-        let mut steps = Vec::with_capacity(place.steps.len());
-        for step in &place.steps {
-            match step {
-                PlaceStep::Field(_, fidx, _) => steps.push(EvalStep::Field(*fidx)),
-                PlaceStep::Index(idx_expr, _) => {
-                    let v = self.eval_expr(idx_expr)?;
-                    let idx = self.arith.word(&v, IntType::Usize) as usize;
-                    steps.push(EvalStep::Index(idx));
+    fn wrap_entry_arg(&mut self, value: Value, ty: &Type) -> Value {
+        match ty {
+            Type::Ref(mode, _) => {
+                let idx = self.entry_slots.len();
+                self.entry_slots.push(value);
+                Value::Ref {
+                    mode: *mode,
+                    place: RuntimePlace::root(0, idx),
+                    tag: 0,
                 }
             }
+            Type::Struct(sid, _) if self.program.structs[*sid].is_view => {
+                let Value::Struct { ty, name, fields } = value else {
+                    return value;
+                };
+                let fdefs: Vec<Type> = self.program.structs[*sid]
+                    .fields
+                    .iter()
+                    .map(|f| f.ty.clone())
+                    .collect();
+                let wrapped = fields
+                    .into_iter()
+                    .zip(&fdefs)
+                    .map(|(fv, ft)| self.wrap_entry_arg(fv, ft))
+                    .collect();
+                Value::Struct {
+                    ty,
+                    name,
+                    fields: wrapped,
+                }
+            }
+            _ => value,
         }
-        Ok(EvalPlace {
-            root: place.root,
-            steps,
-        })
     }
 
-    fn read_eval_place(&self, place: &EvalPlace) -> Result<Value, String> {
-        let slots = &self.stack.last().expect("an activation").slots;
-        let mut current = &slots[place.root];
+    fn slot_ref(&self, scope: ScopeId, var: VarId) -> Result<&Value, String> {
+        if scope == 0 {
+            return self
+                .entry_slots
+                .get(var)
+                .ok_or_else(|| "dangling entry slot".to_string());
+        }
+        for act in self.stack.iter().rev() {
+            if act.id == scope {
+                return act
+                    .slots
+                    .get(var)
+                    .ok_or_else(|| "invalid slot index".to_string());
+            }
+        }
+        Err("dangling borrow to ended scope".to_string())
+    }
+
+    fn slot_mut(&mut self, scope: ScopeId, var: VarId) -> Result<&mut Value, String> {
+        if scope == 0 {
+            return self
+                .entry_slots
+                .get_mut(var)
+                .ok_or_else(|| "dangling entry slot".to_string());
+        }
+        for act in self.stack.iter_mut().rev() {
+            if act.id == scope {
+                return act
+                    .slots
+                    .get_mut(var)
+                    .ok_or_else(|| "invalid slot index".to_string());
+            }
+        }
+        Err("dangling borrow to ended scope".to_string())
+    }
+
+    fn read_place(&self, place: &RuntimePlace) -> Result<Value, String> {
+        let mut current = self.slot_ref(place.scope, place.var)?.clone();
         for step in &place.steps {
             match step {
-                EvalStep::Field(fidx) => {
-                    let Value::Struct { fields, .. } = current else {
+                RuntimeStep::Field(fidx) => {
+                    let Value::Struct { mut fields, .. } = current else {
                         return Err("field access on non-struct".to_string());
                     };
-                    current = &fields[*fidx];
+                    current = fields.swap_remove(*fidx);
                 }
-                EvalStep::Index(idx) => {
-                    let Value::Vector(items) = current else {
+                RuntimeStep::Index(idx) => {
+                    let Value::Vector(mut items) = current else {
                         return Err("index on non-vector".to_string());
                     };
-                    let Some(elem) = items.get(*idx) else {
+                    if *idx >= items.len() {
                         return Err("out-of-bounds index".to_string());
+                    }
+                    current = items.swap_remove(*idx);
+                }
+                RuntimeStep::VariantField(cidx, fidx) => {
+                    let Value::Variant {
+                        constructor,
+                        mut fields,
+                        ..
+                    } = current
+                    else {
+                        return Err("variant field access on non-variant".to_string());
                     };
-                    current = elem;
+                    if constructor != *cidx || *fidx >= fields.len() {
+                        return Err("variant constructor mismatch".to_string());
+                    }
+                    current = fields.swap_remove(*fidx);
+                }
+                RuntimeStep::MapValue(key) => {
+                    let Value::Map(mut entries) = current else {
+                        return Err("map lookup on non-map".to_string());
+                    };
+                    let Some(v) = entries.remove(key) else {
+                        return Err("dangling map value borrow".to_string());
+                    };
+                    current = v;
+                }
+                RuntimeStep::MapKey(key) => {
+                    let Value::Map(entries) = current else {
+                        return Err("map key access on non-map".to_string());
+                    };
+                    if !entries.contains_key(key) {
+                        return Err("dangling map key borrow".to_string());
+                    }
+                    current = key.clone();
                 }
             }
         }
-        Ok(current.clone())
+        Ok(current)
     }
 
-    fn write_eval_place(&mut self, place: &EvalPlace, new_val: Value) -> Result<(), String> {
-        let top = self.top();
+    fn write_place(&mut self, place: &RuntimePlace, new_val: Value) -> Result<(), String> {
         if place.steps.is_empty() {
-            top.slots[place.root] = new_val;
+            *self.slot_mut(place.scope, place.var)? = new_val;
             return Ok(());
         }
-        let mut root_val = top.slots[place.root].clone();
+        let mut root_val = self.slot_ref(place.scope, place.var)?.clone();
         update_nested_erased(&mut root_val, &place.steps, new_val)?;
-        top.slots[place.root] = root_val;
+        *self.slot_mut(place.scope, place.var)? = root_val;
         Ok(())
     }
 
-    #[allow(clippy::type_complexity)]
-    fn eval_operands(
-        &self,
-        exprs: &[Expr],
-        param_types: Option<&[Type]>,
-    ) -> Result<(Vec<Value>, Vec<(VarId, EvalPlace)>), String> {
-        let mut results: Vec<Option<Value>> = vec![None; exprs.len()];
-        let mut writebacks = Vec::new();
-        let is_lending = |i: usize, e: &Expr| -> bool {
-            e.lends()
-                || param_types
-                    .and_then(|tys| tys.get(i))
-                    .is_some_and(|ty| matches!(ty, Type::Ref(_, _)))
+    fn deref_value(&self, value: &Value) -> Result<Value, String> {
+        match value {
+            Value::Ref { place, .. } => {
+                let inner = self.read_place(place)?;
+                self.deref_value(&inner)
+            }
+            Value::Struct { ty, name, fields } => {
+                let mut out = Vec::with_capacity(fields.len());
+                for f in fields {
+                    out.push(self.deref_value(f)?);
+                }
+                Ok(Value::Struct {
+                    ty: *ty,
+                    name: name.clone(),
+                    fields: out,
+                })
+            }
+            Value::Variant {
+                ty,
+                name,
+                constructor,
+                constructor_name,
+                fields,
+            } => {
+                let mut out = Vec::with_capacity(fields.len());
+                for f in fields {
+                    out.push(self.deref_value(f)?);
+                }
+                Ok(Value::Variant {
+                    ty: *ty,
+                    name: name.clone(),
+                    constructor: *constructor,
+                    constructor_name: constructor_name.clone(),
+                    fields: out,
+                })
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    fn resolve_place(&self, place: &Place) -> Result<RuntimePlace, String> {
+        let act = self.stack.last().expect("an activation");
+        let mut cur = match &act.slots[place.root] {
+            Value::Ref { place, .. } => place.clone(),
+            _ => RuntimePlace::root(act.id, place.root),
         };
+        for step in &place.steps {
+            match step {
+                PlaceStep::Field(_, fidx, _) => {
+                    let current_val = self.read_place(&cur)?;
+                    let Value::Struct { fields, .. } = current_val else {
+                        return Err("field access on non-struct".to_string());
+                    };
+                    if let Value::Ref { place: fplace, .. } = &fields[*fidx] {
+                        cur = fplace.clone();
+                    } else {
+                        cur.steps.push(RuntimeStep::Field(*fidx));
+                    }
+                }
+                PlaceStep::Index(idx_expr, _) => {
+                    let v = self.eval_expr(idx_expr)?;
+                    let idx = self.arith.word(&v, IntType::Usize) as usize;
+                    cur.steps.push(RuntimeStep::Index(idx));
+                }
+            }
+        }
+        Ok(cur)
+    }
+
+    fn eval_expr(&self, expr: &Expr) -> Result<Value, String> {
+        Ok(match expr {
+            Expr::Boolean(value) => Value::Bool(*value),
+            Expr::Integer(value, ty) => self
+                .arith
+                .int_value(self.arith.word(&Value::Int(value.clone()), *ty), *ty),
+            Expr::String(s) => Value::String(s.clone()),
+            Expr::Var(VarRef::Local(id), expr_ty) => {
+                let raw = self.stack.last().expect("an activation").slots[*id].clone();
+                if !matches!(expr_ty, Type::Ref(_, _))
+                    && let Value::Ref { place, .. } = &raw
+                {
+                    self.read_place(place)?
+                } else {
+                    raw
+                }
+            }
+            Expr::Var(_, _) => return Err("a name of a signature stands in a body".to_string()),
+            Expr::Old(_, _) => return Err("`old` evaluated in erased code".to_string()),
+            Expr::Move(inner, _) => self.eval_expr(inner)?,
+            Expr::Borrow(mode, place, _) => {
+                let rplace = self.resolve_place(place)?;
+                Value::Ref {
+                    mode: *mode,
+                    place: rplace,
+                    tag: 0,
+                }
+            }
+            Expr::Field(base, _, fidx, fty) => {
+                let base_val = self.eval_expr(base)?;
+                let base_val = match base_val {
+                    Value::Ref { place, .. } => self.read_place(&place)?,
+                    other => other,
+                };
+                let Value::Struct { mut fields, .. } = base_val else {
+                    return Err("field access on non-struct".to_string());
+                };
+                let raw = fields.swap_remove(*fidx);
+                if !matches!(fty, Type::Ref(_, _))
+                    && let Value::Ref { place, .. } = &raw
+                {
+                    self.read_place(place)?
+                } else {
+                    raw
+                }
+            }
+            Expr::Index(base, idx_expr, _) => {
+                let base_val = self.eval_expr(base)?;
+                let base_val = match base_val {
+                    Value::Ref { place, .. } => self.read_place(&place)?,
+                    other => other,
+                };
+                let Value::Vector(mut items) = base_val else {
+                    return Err("index on non-vector".to_string());
+                };
+                let idx = self.arith.word(&self.eval_expr(idx_expr)?, IntType::Usize) as usize;
+                if idx >= items.len() {
+                    return Err("out-of-bounds index".to_string());
+                }
+                items.swap_remove(idx)
+            }
+            Expr::Struct(sid, fields, _) => {
+                let vals = if self.program.structs[*sid].is_view {
+                    self.eval_operands(fields)?
+                } else {
+                    let mut out = Vec::with_capacity(fields.len());
+                    for f in fields {
+                        out.push(self.eval_expr(f)?);
+                    }
+                    out
+                };
+                Value::Struct {
+                    ty: *sid,
+                    name: self.program.structs[*sid].name.clone(),
+                    fields: vals,
+                }
+            }
+            Expr::Variant(vid, cidx, fields, _) => {
+                let mut vals = Vec::with_capacity(fields.len());
+                for f in fields {
+                    vals.push(self.eval_expr(f)?);
+                }
+                let vdef = &self.program.variants[*vid];
+                Value::Variant {
+                    ty: *vid,
+                    name: vdef.name.clone(),
+                    constructor: *cidx,
+                    constructor_name: vdef.constructors[*cidx].name.clone(),
+                    fields: vals,
+                }
+            }
+            Expr::Vector(items, _) => {
+                let mut vals = Vec::with_capacity(items.len());
+                for item in items {
+                    vals.push(self.eval_expr(item)?);
+                }
+                Value::Vector(vals)
+            }
+            Expr::EmptyMap(_) => Value::Map(BTreeMap::new()),
+            Expr::Len(place) => {
+                let v = self.eval_expr(place)?;
+                let v = self.deref_value(&v)?;
+                let len = match v {
+                    Value::Vector(v) => v.len() as u64,
+                    Value::String(s) => s.len() as u64,
+                    Value::Map(m) => m.len() as u64,
+                    _ => 0,
+                };
+                self.arith.int_value(len, IntType::Usize)
+            }
+            Expr::Clone(place, _) => {
+                let v = self.eval_expr(place)?;
+                self.deref_value(&v)?
+            }
+            Expr::Trim(arg) => {
+                let v = self.eval_expr(arg)?;
+                let Value::String(s) = self.deref_value(&v)? else {
+                    return Err("`trim` on non-string".to_string());
+                };
+                Value::String(s.trim().to_string())
+            }
+            Expr::Not(operand) => match self.eval_expr(operand)? {
+                Value::Bool(b) => Value::Bool(!b),
+                _ => Value::Bool(false),
+            },
+            Expr::Negate(operand, ty) => {
+                let w = self.arith.word(&self.eval_expr(operand)?, *ty);
+                self.arith
+                    .int_value(self.arith.shape(*ty).wrap(w.wrapping_neg()), *ty)
+            }
+            Expr::Arithmetic(operator, left, right, ty) => {
+                let shape = self.arith.shape(*ty);
+                let left = self.arith.word(&self.eval_expr(left)?, *ty);
+                let right = self.arith.word(&self.eval_expr(right)?, *ty);
+                let result = match operator {
+                    Arithmetic::Add => left.wrapping_add(right),
+                    Arithmetic::Subtract => left.wrapping_sub(right),
+                    Arithmetic::Multiply => left.wrapping_mul(right),
+                    Arithmetic::Divide | Arithmetic::Remainder => {
+                        if right == 0 {
+                            return Err("a division by zero".to_string());
+                        }
+                        let divide = *operator == Arithmetic::Divide;
+                        if shape.signed {
+                            let (left, right) = (shape.number(left), shape.number(right));
+                            (if divide {
+                                left.wrapping_div(right)
+                            } else {
+                                left.wrapping_rem(right)
+                            }) as u64
+                        } else if divide {
+                            left / right
+                        } else {
+                            left % right
+                        }
+                    }
+                };
+                self.arith.int_value(shape.wrap(result), *ty)
+            }
+            Expr::Compare(comparison, left, right) => {
+                let l_ty = left.ty();
+                let l_val = self.eval_expr(left)?;
+                let r_val = self.eval_expr(right)?;
+                let res = if let Type::Int(int_ty) = l_ty.deref_type() {
+                    let shape = self.arith.shape(*int_ty);
+                    let lw = self.arith.word(&l_val, *int_ty);
+                    let rw = self.arith.word(&r_val, *int_ty);
+                    let ord = if shape.signed {
+                        shape.number(lw).cmp(&shape.number(rw))
+                    } else {
+                        lw.cmp(&rw)
+                    };
+                    match comparison {
+                        Comparison::Equal => ord.is_eq(),
+                        Comparison::NotEqual => ord.is_ne(),
+                        Comparison::Less => ord.is_lt(),
+                        Comparison::LessEqual => ord.is_le(),
+                        Comparison::Greater => ord.is_gt(),
+                        Comparison::GreaterEqual => ord.is_ge(),
+                    }
+                } else {
+                    match comparison {
+                        Comparison::Equal => l_val == r_val,
+                        Comparison::NotEqual => l_val != r_val,
+                        _ => false,
+                    }
+                };
+                Value::Bool(res)
+            }
+            Expr::And(left, right) => {
+                let Value::Bool(l) = self.eval_expr(left)? else {
+                    return Ok(Value::Bool(false));
+                };
+                if !l {
+                    Value::Bool(false)
+                } else {
+                    self.eval_expr(right)?
+                }
+            }
+            Expr::Or(left, right) => {
+                let Value::Bool(l) = self.eval_expr(left)? else {
+                    return Ok(Value::Bool(false));
+                };
+                if l {
+                    Value::Bool(true)
+                } else {
+                    self.eval_expr(right)?
+                }
+            }
+            Expr::Call(id, arguments, _) => {
+                let mut vals = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    let v = self.eval_expr(argument)?;
+                    vals.push(self.deref_value(&v)?);
+                }
+                self.arith
+                    .eval(&self.program.functions[*id].body, &Names::Arguments(&vals))?
+            }
+        })
+    }
+
+    fn eval_operands(&self, exprs: &[Expr]) -> Result<Vec<Value>, String> {
+        let mut results: Vec<Option<Value>> = vec![None; exprs.len()];
         for (i, expr) in exprs.iter().enumerate() {
-            if !is_lending(i, expr) {
+            if !expr.lends() {
                 results[i] = Some(self.eval_expr(expr)?);
             }
         }
         for (i, expr) in exprs.iter().enumerate() {
-            if is_lending(i, expr) {
-                if let Expr::Borrow(BorrowMode::Exclusive, place, _) = expr {
-                    let eval_place = self.eval_place(place)?;
-                    let val = self.read_eval_place(&eval_place)?;
-                    writebacks.push((i, eval_place));
-                    results[i] = Some(val);
-                } else {
-                    results[i] = Some(self.eval_expr(expr)?);
-                }
+            if expr.lends() {
+                results[i] = Some(self.eval_expr(expr)?);
             }
         }
-        Ok((
-            results.into_iter().map(|v| v.expect("evaluated")).collect(),
-            writebacks,
-        ))
+        Ok(results.into_iter().map(|v| v.expect("evaluated")).collect())
     }
 
     /// A new run of the body of a loop.
@@ -1097,7 +1408,7 @@ impl<'a> Machine<'a> {
                     self.release_value_resources(v);
                 }
             }
-            Value::Bool(_) | Value::Int(_) | Value::String(_) => {}
+            Value::Bool(_) | Value::Int(_) | Value::String(_) | Value::Ref { .. } => {}
         }
     }
 
@@ -1238,12 +1549,9 @@ impl<'a> Machine<'a> {
                 continue;
             }
 
-            let popped = self.stack.pop().expect("an activation");
+            let _popped = self.stack.pop().expect("an activation");
             if self.stack.is_empty() {
                 return Ok(Some(End::Faulted(message)));
-            }
-            for (param_var, caller_place) in &popped.writebacks {
-                let _ = self.write_eval_place(caller_place, popped.slots[*param_var].clone());
             }
         }
     }
@@ -1251,28 +1559,32 @@ impl<'a> Machine<'a> {
     fn execute_builtin(
         &mut self,
         op: BuiltinOp,
-        target: Option<&Place>,
+        _target: Option<&Place>,
         arguments: &[Expr],
     ) -> Result<(usize, Vec<Value>), String> {
-        let (mut vals, _) = self.eval_operands(arguments, None)?;
+        let mut vals = self.eval_operands(arguments)?;
         match op {
             BuiltinOp::Push => {
-                let place = self.eval_place(target.expect("push target"))?;
                 let elem = vals.remove(1);
-                let Value::Vector(mut items) = vals.remove(0) else {
+                let Value::Ref { place, .. } = vals.remove(0) else {
+                    return Err("`push` requires an exclusive borrow".to_string());
+                };
+                let Value::Vector(mut items) = self.read_place(&place)? else {
                     return Err("`push` on non-vector".to_string());
                 };
                 items.push(elem);
-                self.write_eval_place(&place, Value::Vector(items))?;
+                self.write_place(&place, Value::Vector(items))?;
                 Ok((0, Vec::new()))
             }
             BuiltinOp::Pop => {
-                let place = self.eval_place(target.expect("pop target"))?;
-                let Value::Vector(mut items) = vals.remove(0) else {
+                let Value::Ref { place, .. } = vals.remove(0) else {
+                    return Err("`pop` requires an exclusive borrow".to_string());
+                };
+                let Value::Vector(mut items) = self.read_place(&place)? else {
                     return Err("`pop` on non-vector".to_string());
                 };
                 if let Some(last) = items.pop() {
-                    self.write_eval_place(&place, Value::Vector(items))?;
+                    self.write_place(&place, Value::Vector(items))?;
                     Ok((0, vec![last]))
                 } else {
                     Ok((1, Vec::new()))
@@ -1290,37 +1602,54 @@ impl<'a> Machine<'a> {
                 }
             }
             BuiltinOp::Get => {
-                let key = vals.remove(1);
-                let Value::Map(entries) = vals.remove(0) else {
+                let raw_key = vals.remove(1);
+                let key = self.deref_value(&raw_key)?;
+                let Value::Ref { place, .. } = vals.remove(0) else {
+                    return Err("`get` requires a map borrow".to_string());
+                };
+                let Value::Map(entries) = self.read_place(&place)? else {
                     return Err("`get` on non-map".to_string());
                 };
-                match entries.get(&key) {
-                    Some(v) => Ok((0, vec![v.clone()])),
-                    None => Ok((1, Vec::new())),
+                if entries.contains_key(&key) {
+                    Ok((
+                        0,
+                        vec![Value::Ref {
+                            mode: BorrowMode::Shared,
+                            place: place.with_step(RuntimeStep::MapValue(key)),
+                            tag: 0,
+                        }],
+                    ))
+                } else {
+                    Ok((1, Vec::new()))
                 }
             }
             BuiltinOp::Insert => {
-                let place = self.eval_place(target.expect("insert target"))?;
                 let value = vals.remove(2);
                 let key = vals.remove(1);
-                let Value::Map(mut entries) = vals.remove(0) else {
+                let Value::Ref { place, .. } = vals.remove(0) else {
+                    return Err("`insert` requires an exclusive borrow".to_string());
+                };
+                let Value::Map(mut entries) = self.read_place(&place)? else {
                     return Err("`insert` on non-map".to_string());
                 };
                 let prev = entries.insert(key, value);
-                self.write_eval_place(&place, Value::Map(entries))?;
+                self.write_place(&place, Value::Map(entries))?;
                 match prev {
                     None => Ok((0, Vec::new())),
                     Some(old) => Ok((1, vec![old])),
                 }
             }
             BuiltinOp::Remove => {
-                let place = self.eval_place(target.expect("remove target"))?;
-                let key = vals.remove(1);
-                let Value::Map(mut entries) = vals.remove(0) else {
+                let raw_key = vals.remove(1);
+                let key = self.deref_value(&raw_key)?;
+                let Value::Ref { place, .. } = vals.remove(0) else {
+                    return Err("`remove` requires an exclusive borrow".to_string());
+                };
+                let Value::Map(mut entries) = self.read_place(&place)? else {
                     return Err("`remove` on non-map".to_string());
                 };
                 let prev = entries.remove(&key);
-                self.write_eval_place(&place, Value::Map(entries))?;
+                self.write_place(&place, Value::Map(entries))?;
                 match prev {
                     Some(old) => Ok((0, vec![old])),
                     None => Ok((1, Vec::new())),
@@ -1328,18 +1657,38 @@ impl<'a> Machine<'a> {
             }
             BuiltinOp::EntryAt => {
                 let pos = self.arith.word(&vals.remove(1), IntType::Usize) as usize;
-                let Value::Map(entries) = vals.remove(0) else {
+                let Value::Ref { place, .. } = vals.remove(0) else {
+                    return Err("`entry_at` requires a map borrow".to_string());
+                };
+                let Value::Map(entries) = self.read_place(&place)? else {
                     return Err("`entry_at` on non-map".to_string());
                 };
                 if pos >= entries.len() {
                     return Ok((1, Vec::new()));
                 }
-                let (k, v) = entries.iter().nth(pos).unwrap();
+                let (k, _) = entries.iter().nth(pos).unwrap();
+                let key_val = k.clone();
                 let next = self.arith.int_value((pos + 1) as u64, IntType::Usize);
-                Ok((0, vec![k.clone(), v.clone(), next]))
+                Ok((
+                    0,
+                    vec![
+                        Value::Ref {
+                            mode: BorrowMode::Shared,
+                            place: place.with_step(RuntimeStep::MapKey(key_val.clone())),
+                            tag: 0,
+                        },
+                        Value::Ref {
+                            mode: BorrowMode::Shared,
+                            place: place.with_step(RuntimeStep::MapValue(key_val)),
+                            tag: 0,
+                        },
+                        next,
+                    ],
+                ))
             }
             BuiltinOp::Emit => {
-                let text = vals.remove(0);
+                let raw_text = vals.remove(0);
+                let text = self.deref_value(&raw_text)?;
                 self.trace.push(Event {
                     control: "emit".to_string(),
                     arguments: vec![text],
@@ -1361,15 +1710,17 @@ impl<'a> Machine<'a> {
         let arith = self.arith;
         match op_kind {
             Operation::Control(callee_id) => {
+                let values = self.eval_operands(arguments)?;
                 let callee = &program.controls[*callee_id];
-                let param_types: Vec<Type> =
-                    callee.parameters.iter().map(|p| p.ty.clone()).collect();
-                let (values, writebacks) = self.eval_operands(arguments, Some(&param_types))?;
                 if callee.body.is_some() {
-                    self.push_control(*callee_id, &values, writebacks);
+                    self.push_control(*callee_id, &values);
                     return Ok(None);
                 }
-                let answer = match self.host.call(callee, &values, self.config) {
+                let mut concrete_args = Vec::with_capacity(values.len());
+                for v in &values {
+                    concrete_args.push(self.deref_value(v)?);
+                }
+                let answer = match self.host.call(callee, &concrete_args, self.config) {
                     Ok(answer) => answer,
                     Err(detail) => return Ok(Some(Err(End::HostFailed(detail)))),
                 };
@@ -1397,11 +1748,15 @@ impl<'a> Machine<'a> {
                     .map(|(value, field)| arith.normalize(value, &field.ty))
                     .collect();
                 if !callee.is_pure() {
+                    let mut concrete_payload = Vec::with_capacity(payload.len());
+                    for v in &payload {
+                        concrete_payload.push(self.deref_value(v)?);
+                    }
                     self.trace.push(Event {
                         control: callee.name.clone(),
-                        arguments: values,
+                        arguments: concrete_args,
                         alternative: answer.alternative,
-                        payload: payload.clone(),
+                        payload: concrete_payload,
                     });
                 }
                 Ok(Some(Ok((index, payload))))
@@ -1422,18 +1777,42 @@ impl<'a> Machine<'a> {
                 };
                 Ok(Some(Ok((alternative, payload))))
             }
-            Operation::Variant { .. } => {
-                let val = self.eval_expr(&arguments[0])?;
-                let Value::Variant {
-                    constructor,
-                    fields,
-                    ..
-                } = val
-                else {
-                    return Err("variant decision on non-variant value".to_string());
-                };
-                Ok(Some(Ok((constructor, fields))))
-            }
+            Operation::Variant { borrow, .. } => match borrow {
+                None => {
+                    let val = self.eval_expr(&arguments[0])?;
+                    let Value::Variant {
+                        constructor,
+                        fields,
+                        ..
+                    } = val
+                    else {
+                        return Err("variant decision on non-variant value".to_string());
+                    };
+                    Ok(Some(Ok((constructor, fields))))
+                }
+                Some(mode) => {
+                    let val = self.eval_expr(&arguments[0])?;
+                    let Value::Ref { place, .. } = val else {
+                        return Err("borrowed variant decision requires a borrow".to_string());
+                    };
+                    let Value::Variant {
+                        constructor,
+                        fields,
+                        ..
+                    } = self.read_place(&place)?
+                    else {
+                        return Err("variant decision on non-variant value".to_string());
+                    };
+                    let refs = (0..fields.len())
+                        .map(|fidx| Value::Ref {
+                            mode: *mode,
+                            place: place.with_step(RuntimeStep::VariantField(constructor, fidx)),
+                            tag: 0,
+                        })
+                        .collect();
+                    Ok(Some(Ok((constructor, refs))))
+                }
+            },
         }
     }
 
@@ -1479,11 +1858,21 @@ impl<'a> Machine<'a> {
         }
         let command = statement.command.clone();
         match &command {
-            Command::Bind { var, value } | Command::Assign { var, value } => {
+            Command::Bind { var, value } => {
                 let val = self.eval_expr(value)?;
                 let top = self.top();
                 top.slots[*var] = val;
                 top.positions[current] += 1;
+            }
+            Command::Assign { var, value } => {
+                let val = self.eval_expr(value)?;
+                let existing = self.stack.last().expect("an activation").slots[*var].clone();
+                if let Value::Ref { place, .. } = existing {
+                    self.write_place(&place, val)?;
+                } else {
+                    self.top().slots[*var] = val;
+                }
+                self.top().positions[current] += 1;
             }
             Command::Unpack { vars, value, .. } => {
                 let Value::Struct { fields, .. } = self.eval_expr(value)? else {
@@ -1509,8 +1898,8 @@ impl<'a> Machine<'a> {
             }
             Command::AssignPlace { target, value } => {
                 let val = self.eval_expr(value)?;
-                let eval_place = self.eval_place(target)?;
-                self.write_eval_place(&eval_place, val)?;
+                let rplace = self.resolve_place(target)?;
+                self.write_place(&rplace, val)?;
                 self.top().positions[current] += 1;
             }
             // [R2]: not evaluated.
@@ -1543,7 +1932,7 @@ impl<'a> Machine<'a> {
                 initial,
                 ..
             } => {
-                let (values, _) = self.eval_operands(initial, None)?;
+                let values = self.eval_operands(initial)?;
                 self.enter(*inner, &values);
             }
             Command::Boundary {
@@ -1581,12 +1970,14 @@ impl<'a> Machine<'a> {
                 boundary,
                 arguments,
             } => {
-                let (values, _) = self.eval_operands(arguments, None)?;
+                let values = self.eval_operands(arguments)?;
                 let b1_body = &program.boundaries[*boundary].body;
                 let b1_plan = &self.boundary_plans[*boundary].0;
                 let mut slots = vec![Value::Int(Int::zero()); b1_body.vars.len()];
                 slots[..values.len()].clone_from_slice(&values);
+                let id = self.alloc_act_id();
                 self.stack.push(Activation {
+                    id,
                     kind: ActKind::Boundary {
                         id: *boundary,
                         in_contingency: None,
@@ -1598,14 +1989,13 @@ impl<'a> Machine<'a> {
                         body: 0,
                         kind: FrameKind::Normal,
                     }],
-                    writebacks: Vec::new(),
                 });
             }
             Command::Again {
                 body: target,
                 arguments,
             } => {
-                let (values, _) = self.eval_operands(arguments, None)?;
+                let values = self.eval_operands(arguments)?;
                 while let Some(frame) = self.top().frames.pop() {
                     if frame.body == *target {
                         break;
@@ -1617,7 +2007,7 @@ impl<'a> Machine<'a> {
                 alternative,
                 payload,
             } => {
-                let (values, _) = self.eval_operands(payload, None)?;
+                let values = self.eval_operands(payload)?;
                 while let Some(frame) = self.top().frames.pop() {
                     if matches!(frame.kind, FrameKind::Loop { .. }) {
                         break;
@@ -1641,20 +2031,21 @@ impl<'a> Machine<'a> {
                 alternative,
                 payload,
             } => {
-                let (values, _) = self.eval_operands(payload, None)?;
+                let values = self.eval_operands(payload)?;
                 let popped = self.stack.pop().expect("an activation");
                 if self.stack.is_empty() {
                     let ActKind::Control(control_id) = popped.kind else {
                         return Err("boundary exited as control".to_string());
                     };
+                    let mut observable = Vec::with_capacity(values.len());
+                    for v in &values {
+                        observable.push(self.deref_value(v)?);
+                    }
                     let entry = &program.controls[control_id].contract[*alternative];
                     return Ok(Some(End::Done {
                         alternative: entry.name.clone(),
-                        payload: values,
+                        payload: observable,
                     }));
-                }
-                for (param_var, caller_place) in &popped.writebacks {
-                    self.write_eval_place(caller_place, popped.slots[*param_var].clone())?;
                 }
                 self.complete(*alternative, &values)?;
             }
@@ -1783,12 +2174,12 @@ impl<'a> Machine<'a> {
 
 fn update_nested_erased(
     current: &mut Value,
-    steps: &[EvalStep],
+    steps: &[RuntimeStep],
     new_val: Value,
 ) -> Result<(), String> {
     let (first, rest) = steps.split_first().expect("non-empty steps");
     match first {
-        EvalStep::Field(fidx) => {
+        RuntimeStep::Field(fidx) => {
             let Value::Struct { fields, .. } = current else {
                 return Err("field assignment on non-struct".to_string());
             };
@@ -1799,7 +2190,7 @@ fn update_nested_erased(
                 update_nested_erased(&mut fields[*fidx], rest, new_val)
             }
         }
-        EvalStep::Index(idx) => {
+        RuntimeStep::Index(idx) => {
             let Value::Vector(items) = current else {
                 return Err("index assignment on non-vector".to_string());
             };
@@ -1813,6 +2204,40 @@ fn update_nested_erased(
                 update_nested_erased(elem, rest, new_val)
             }
         }
+        RuntimeStep::VariantField(cidx, fidx) => {
+            let Value::Variant {
+                constructor,
+                fields,
+                ..
+            } = current
+            else {
+                return Err("variant field assignment on non-variant".to_string());
+            };
+            if *constructor != *cidx || *fidx >= fields.len() {
+                return Err("variant constructor mismatch".to_string());
+            }
+            if rest.is_empty() {
+                fields[*fidx] = new_val;
+                Ok(())
+            } else {
+                update_nested_erased(&mut fields[*fidx], rest, new_val)
+            }
+        }
+        RuntimeStep::MapValue(key) => {
+            let Value::Map(entries) = current else {
+                return Err("map value assignment on non-map".to_string());
+            };
+            let Some(val) = entries.get_mut(key) else {
+                return Err("dangling map value borrow".to_string());
+            };
+            if rest.is_empty() {
+                *val = new_val;
+                Ok(())
+            } else {
+                update_nested_erased(val, rest, new_val)
+            }
+        }
+        RuntimeStep::MapKey(_) => Err("cannot assign through a map key borrow".to_string()),
     }
 }
 
@@ -1882,10 +2307,17 @@ pub fn run(
         control_plans: &control_plans,
         boundary_plans: &boundary_plans,
         host,
+        entry_slots: Vec::new(),
+        next_act_id: 1,
         stack: Vec::new(),
         trace: Vec::new(),
     };
-    machine.push_control(id, &normalized_args, Vec::new());
+    let wrapped_args: Vec<Value> = normalized_args
+        .into_iter()
+        .zip(&control.parameters)
+        .map(|(v, p)| machine.wrap_entry_arg(v, &p.ty))
+        .collect();
+    machine.push_control(id, &wrapped_args);
     let mut steps = 0;
     let end = loop {
         if steps >= config.fuel {

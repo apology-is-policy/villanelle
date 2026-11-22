@@ -1,0 +1,48 @@
+┄ Slice 3 Rails: `view struct` (`window`, `tail`), `[U11]` in view constructors
+┄ and loop parameters, `[E-Operands]` evaluation order (Q17), and borrow-preserving `□`.
+
+pub view struct window {items: &[u32], start: usize, stop: usize}
+
+pub view struct tail {items: &~[u32], from: usize}
+
+function window_ends(w: window) ⊢ w.start < w.stop ∧ w.stop ≤ len(w.items): u32 := w.items[w.start] + w.items[w.stop - 1]
+
+pub control make_window(items: &[u32], start: usize, stop: usize) ■ ok {w: window ∈ items}
+│ ■ ok {window {items, start, stop}}
+╵
+
+pub control clear(t: tail) ■ done
+│ ↻ zero(i: usize := t.from)
+│ ║ ⊢ i ≤ len(t.items)
+│ ║ ? i = len(t.items) → □
+│ ║ t.items[i] ← 0
+│ ║ ↑ zero(i + 1)
+│ ■ done
+╵
+
+pub control exercise_views() ■ ok {ends: u32, cleared_sum: u32, pushed_last: usize}
+│ ~numbers: [u32] := [10, 20, 30, 40]
+│ Δ make_window(numbers, 1, 4): ok {w}
+│ ends: u32 := window_ends(w)
+│ clear(tail {~numbers, 2})
+│ cleared_sum: u32 := numbers[0] + numbers[1] + numbers[2] + numbers[3]
+│ ~sizes: [usize] := [10, 20]
+│ sizes.push(len(sizes))
+│ ■ ok {ends, cleared_sum, sizes[2]}
+╵
+
+pub control find_ge(items: &[u32], limit: u32) ■ found {elem: &u32 ∈ items} │ missing
+│ ? len(items) = 0 → ■ missing
+│ ↻ scan(i: usize := 0, cur: &u32 := items[0])
+│ ║ ⊢ i < len(items)
+│ ║ ? cur ≥ limit → □ found {elem: cur}
+│ ║ ? i + 1 = len(items) → □ missing
+│ ║ ↑ scan(i + 1, items[i + 1])
+╞═ found:   ■ found {elem}
+╞═ missing: ■ missing
+╵
+
+//! run exercise_views() => done ok {60, 30, 2}
+//! run find_ge([3, 7, 12], 8) => done found {12}
+//! run find_ge([3, 7, 12], 20) => done missing
+//! run find_ge([], 1) => done missing

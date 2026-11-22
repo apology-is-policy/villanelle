@@ -597,11 +597,67 @@ paired native-performance suite (`v2/tests/backend_slice2.rs`):
     loads and stores) and evaluate pre-sized vector growth in Phase 7 to close
     the remaining `2.5%` gap.
 
-## 15. What this checkpoint leaves open
+## 15. Slice 3 Phase 2: Second-Class Borrows, Views, and Borrow Tag Semantics
 
-- **Later slices in phases 2, 3 and 4.** Slice 3 (borrows and views) and
-  slice 4 (tasks), which will allow the oracle, the checker and the typed
-  backend to run, verify and compile the full paper corpus.
+Slice 3 Phase 2 implements the executable core oracle, zero-tag erased
+semantics, well-formedness and typing rules, Rails surface reader/elaborator/
+formatter, and conformance suite for second-class borrows and views
+([`references.md`](references.md)):
+
+- **Core syntax, typed AST, and well-formedness (`syntax.rs`, `text.rs`,
+  `typed.rs`, `resolve.rs`).** Adds `view struct` declarations, payload origins
+  `∈`, local borrows (`&p`, `&~p`), borrowed variant decisions (`[E-Outcome]`,
+  `Operation::Variant { borrow }`), recursive `Expr::lends()` across view
+  constructors (`[E-Operands]`), and normative borrowed-payload contracts for
+  `get` (`&v ∈ 0`) and `entry_at` (`&k ∈ 0, &v ∈ 0, next : usize`). Enforces
+  `[W5a]` (no borrow or view inside an owning container), `[W6]` (no reference
+  to a reference or to a view, no borrow or view inside a regular `struct` or
+  `variant`, and at least one borrow/view field in a `view struct`), `[W8]`
+  (no borrows/views in function parameters or outputs), `[W9]` (valid payload
+  origins on every borrow/view outcome payload, exclusive origin matching for
+  `&~` and `&~`-containing views, and no origin on owned payloads), `[T1]`
+  (view kinds: `copy` if all fields are `&`/copy, `drop` if any field is `&~`),
+  `[T4]` (immutable `&` places; mutable `&~` and view-projected `&~` places),
+  `[T6]` (no move out of a borrowed place), `[F5]` (no `&~` across a fault
+  boundary), and `[F6]` (no borrow/view outcome payload escaping a boundary),
+  plus borrow-preserving `□` (`LeaveKind`).
+- **Instrumented borrow tag oracle and erased semantics (`oracle.rs`,
+  `erased.rs`, `host.rs`).** Replaces call-end writebacks with live
+  `RuntimePlace` references (`Value::Ref { mode, place, tag }`) across struct
+  fields, vector elements, variant payload fields, and map keys/values, and
+  adds `TagTable` implementing `[B1]`–`[B5]` (`X4 B1` stuck states on tag
+  invalidation, element-granular place overlap, child reborrow chains,
+  collection shape write invalidation, and scope-end tag kills `[B4]`).
+  Enforces `[E-Formula]` read-only dereferencing without tag mutation,
+  `[E-Outcome]` variant field reborrows, and `[E-Host]` borrow/origin/overlap
+  checks on host extern calls. `erased.rs` runs zero-tag `[R1]` live
+  `RuntimePlace` references and matches `oracle::run` differentially.
+- **Rails surface, elaboration, and formatter (`surface.rs`).** Supports
+  `[pub] view struct`, `∈`/`in`/`from` payload origins (keeping `from` usable
+  as a field name, e.g. `tail {items: &~[u32], from: usize}`), brace literals
+  in call arguments, `[U11]` + Q16 (`~r` required for `&~τ` and automatic
+  temporary binding for non-place rvalues passed to `&τ`) across all typed
+  slots (bindings, calls, loop initial values, `↑`, `■`, view constructors),
+  `[U6]` borrowed variant decisions (`Δ p`, `Δ ~p`, `Δ ▾p`), `[U9]`
+  borrow-preserving `□`, `[U10]` `∀ x ∈ p` with origin propagation, `[G3]`
+  `■ auto` origin inference, and `[G10]` canonical formatting (printing
+  exclusive borrows as `~p`).
+- **Conformance (`v2/tests/slice3.rs`, `tests/slice3/*.core`,
+  `tests/slice3_surface/*.rails`).** Exercises 22 core runs (valid borrows,
+  views, variant borrows, `get`, loops, and 9 `X4 B1` tag-invalidation stuck
+  cases including the [`references.md`](references.md) §10 trace), 10 Rails
+  surface runs with differential erased checking and `[G10]` format
+  idempotence, `[G3]` `■ auto` origin inference, 25 core well-formedness
+  refusals, ASCII `in`/`from` and `[U11]`/Q16 surface refusals, and `[E-Host]`
+  host borrow violation checks.
+
+## 16. What this checkpoint leaves open
+
+- **Later phases and slices.** Slice 3 Phase 3 (static loan checking
+  `[L1]`–`[L5]`/`[L2a]`) and Slice 3 Phase 4 (Theorem 4 call expansion and
+  typed LLVM IR backend for borrows and views), followed by Slice 4 (tasks),
+  which will allow the oracle, the checker and the typed backend to run, verify
+  and compile the full paper corpus.
 - **Operators that the surface does not have yet.** The wrapping and
   saturating operators and the numeric conversions are named in the core and
   the fact logic and have no spelling. They belong to phase 5.

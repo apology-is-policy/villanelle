@@ -1,0 +1,113 @@
+// Slice 3 core conformance: view structs, variant borrows [E-Outcome],
+// map borrowed lookups, loop borrows [W9], and view/variant X4 stuck states.
+
+view struct window {items : &[u32], start : usize, stop : usize}
+
+view struct tail {items : &~[u32], from : usize}
+
+view struct twin_windows {left : window, right : window}
+
+variant entry {value {text : string} │ empty {}}
+
+variant pair_var {both {first : u32, second : u32} │ none {}}
+
+function window_span(w : window) : usize := w.stop - w.start
+
+function window_ends(w : window) ⊢ w.start < w.stop ∧ w.stop ≤ len(w.items) : u32 := w.items[w.start] + w.items[w.stop - 1]
+
+control make_window(items : &[u32], start : usize, stop : usize)
+    ■ { ok {w : window ∈ items} }
+    1  ⊤ ▷ ■ ok {window {items, start, stop}}
+
+control use_views()
+    ■ { ok {total : u32, span : usize} }
+    1  ⊤ ▷ xs : [u32] := [5, 10, 15, 20]
+    2  ⊤ ▷ m : Δ make_window(&xs, 1, 4) ▸ ok {w}
+    3  ⊤ ▷ w2 : window := w
+    4  ⊤ ▷ tw : twin_windows := twin_windows {w, w2}
+    5  ⊤ ▷ ■ ok {window_ends(tw.left) + window_ends(tw.right), window_span(tw.left)}
+
+control clear_tail(t : tail)
+    ■ { done {} }
+    1  ⊤ ▷ lp : ↻ lp(i : usize := t.from) {
+        ⊢ i ≤ len(t.items)
+        1  ⊤ ▷ done_chk : ? i = len(t.items)
+        2  done_chk.true ▷ □ done {}
+        3  ⊤ ▷ t.items[i] ← 0
+        4  ⊤ ▷ ↑ lp(i + 1)
+    } ▸ done {}
+    2  ⊤ ▷ ■ done {}
+
+control test_tail_and_operands()
+    ■ { ok {sum : u32, last : u32} }
+    1  ⊤ ▷ ~numbers : [u32] := [10, 20, 30, 40]
+    2  ⊤ ▷ c1 : Δ clear_tail(tail {&~numbers, 2}) ▸ done {}
+    3  ⊤ ▷ ~other : [u32] := [1, 2, 3]
+    4  ⊤ ▷ c2 : Δ clear_tail(tail {&~other, len(other) - 1}) ▸ done {}
+    5  ⊤ ▷ ■ ok {numbers[0] + numbers[1] + numbers[2] + numbers[3], other[2]}
+
+control variant_shared_and_mut()
+    ■ { ok {before : string, after : string, pair_sum : u32} }
+    1  ⊤ ▷ ~e : entry := entry.value {"alpha"}
+    2  ⊤ ▷ d1 : Δ entry(&e) ▸ value {t1} │ empty {}
+    3  d1.empty ▷ ⊥
+    4  d1.value ▷ before : string := clone(t1)
+    5  ⊤ ▷ d2 : Δ entry(&~e) ▸ value {t2} │ empty {}
+    6  d2.empty ▷ ⊥
+    7  d2.value ▷ t2 ← "beta"
+    8  ⊤ ▷ d3 : Δ entry(&e) ▸ value {t3} │ empty {}
+    9  d3.empty ▷ ⊥
+    10 d3.value ▷ after : string := clone(t3)
+    11 ⊤ ▷ ~pv : pair_var := pair_var.both {3, 4}
+    12 ⊤ ▷ d4 : Δ pair_var(&~pv) ▸ both {fa, fb} │ none {}
+    13 d4.none ▷ ⊥
+    14 d4.both ▷ fa ← fa + 10
+    15 d4.both ▷ fb ← fb + 20
+    16 ⊤ ▷ d5 : Δ pair_var(&pv) ▸ both {ga, gb} │ none {}
+    17 d5.none ▷ ⊥
+    18 d5.both ▷ ■ ok {before, after, ga + gb}
+
+control lookup_map(m : &string ⇀ string, key : &string)
+    ■ { found {val : &string ∈ m} │ missing {} }
+    1  ⊤ ▷ g : Δ get(m, key) ▸ found {v} │ missing {}
+    2  g.found   ▷ ■ found {v}
+    3  g.missing ▷ ■ missing {}
+
+control loop_borrow_search(xs : &[string])
+    ■ { found {item : &string ∈ xs} │ missing {} }
+    1  ⊤ ▷ lp : ↻ lp(i : usize := 0) {
+        ⊢ i ≤ len(xs)
+        1  ⊤ ▷ end : ? i = len(xs)
+        2  end.true ▷ □ missing {}
+        3  ⊤ ▷ cur : &string := &xs[i]
+        4  ⊤ ▷ hit : ? len(cur) > 4
+        5  hit.true ▷ □ found {cur}
+        6  ⊤ ▷ ↑ lp(i + 1)
+    } ▸ found {item} │ missing {}
+    2  lp.found   ▷ ■ found {item}
+    3  lp.missing ▷ ■ missing {}
+
+// [B2]/[B1]: overwriting a variant kills an active borrowed variant field.
+control stuck_overwrite_variant()
+    ■ { ok {n : usize} }
+    1  ⊤ ▷ ~e : entry := entry.value {"alpha"}
+    2  ⊤ ▷ d : Δ entry(&~e) ▸ value {t} │ empty {}
+    3  d.empty ▷ ⊥
+    4  d.value ▷ e ← entry.empty {}
+    5  d.value ▷ ■ ok {len(t)}
+
+// [B4]/[B1]: returning a view struct borrowing a local triggers X4 B1.
+control stuck_dangling_view(dummy : &[u32])
+    ■ { ok {w : window ∈ dummy} }
+    1  ⊤ ▷ local : [u32] := [1, 2, 3]
+    2  ⊤ ▷ ■ ok {window {&local, 0, 2}}
+
+//! run use_views() => done ok {60, 3}
+//! run test_tail_and_operands() => done ok {30, 0}
+//! run variant_shared_and_mut() => done ok {"alpha", "beta", 37}
+//! run lookup_map({"k" ↦ "val"}, "k") => done found {"val"}
+//! run lookup_map({"k" ↦ "val"}, "z") => done missing
+//! run loop_borrow_search(["a", "birch", "oak"]) => done found {"birch"}
+//! run loop_borrow_search(["a", "oak"]) => done missing
+//! run stuck_overwrite_variant() => stuck X4 B1
+//! run stuck_dangling_view([1]) => stuck X4 B1

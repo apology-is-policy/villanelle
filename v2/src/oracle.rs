@@ -16,6 +16,56 @@ use crate::typed::{
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
+pub type ScopeId = u64;
+pub type TagId = u64;
+
+/// One concrete step inside a runtime place (`docs/v2/core.md` section 6.1).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum RuntimeStep {
+    Field(usize),
+    Index(usize),
+    VariantField(usize, usize),
+    MapValue(Value),
+    MapKey(Value),
+}
+
+/// A live runtime location `(scope, var, steps)` referred to by a borrow.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct RuntimePlace {
+    pub scope: ScopeId,
+    pub var: VarId,
+    pub steps: Vec<RuntimeStep>,
+}
+
+impl RuntimePlace {
+    pub fn root(scope: ScopeId, var: VarId) -> RuntimePlace {
+        RuntimePlace {
+            scope,
+            var,
+            steps: Vec::new(),
+        }
+    }
+
+    pub fn with_step(&self, step: RuntimeStep) -> RuntimePlace {
+        let mut out = self.clone();
+        out.steps.push(step);
+        out
+    }
+
+    /// Whether `self` contains `other` (`self` is a prefix of `other`, §6.3).
+    pub fn contains(&self, other: &RuntimePlace) -> bool {
+        self.scope == other.scope
+            && self.var == other.var
+            && other.steps.len() >= self.steps.len()
+            && other.steps[..self.steps.len()] == self.steps[..]
+    }
+
+    /// Whether `self` and `other` overlap (one contains the other, §6.3).
+    pub fn overlaps(&self, other: &RuntimePlace) -> bool {
+        self.contains(other) || other.contains(self)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Value {
     Bool(bool),
@@ -45,6 +95,11 @@ pub enum Value {
         alternative: usize,
         alternative_name: String,
         payload: Vec<Value>,
+    },
+    Ref {
+        mode: BorrowMode,
+        place: RuntimePlace,
+        tag: TagId,
     },
 }
 
@@ -85,6 +140,10 @@ impl fmt::Display for Value {
                 "outcome.{alternative_name} {{{}}}",
                 list(payload)
             ),
+            Value::Ref { mode, tag, .. } => match mode {
+                BorrowMode::Shared => write!(formatter, "&ref#{tag}"),
+                BorrowMode::Exclusive => write!(formatter, "&~ref#{tag}"),
+            },
         }
     }
 }
@@ -125,6 +184,9 @@ impl Config {
     }
 
     pub fn fits(&self, value: &Value, ty: &Type) -> bool {
+        if let (Value::Ref { mode, .. }, Type::Ref(exp_mode, _)) = (value, ty) {
+            return mode == exp_mode;
+        }
         match (value, ty.deref_type()) {
             (Value::Bool(_), Type::Bool) => true,
             (Value::Int(value), Type::Int(ty)) => {
@@ -147,6 +209,9 @@ impl Config {
     }
 
     pub fn fits_in_program(&self, program: &Program, value: &Value, ty: &Type) -> bool {
+        if let (Value::Ref { mode, .. }, Type::Ref(exp_mode, _)) = (value, ty) {
+            return mode == exp_mode;
+        }
         match (value, ty.deref_type()) {
             (Value::Bool(_), Type::Bool) => true,
             (Value::Int(value), Type::Int(ty)) => {
@@ -368,17 +433,149 @@ enum Slot {
     Moved,
 }
 
-/// Concrete evaluated path steps for writing back to a place.
-#[derive(Clone, Debug)]
-enum EvalStep {
-    Field(usize),
-    Index(usize),
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TagMode {
+    Owner,
+    Shared,
+    Exclusive,
 }
 
 #[derive(Clone, Debug)]
-struct EvalPlace {
-    root: VarId,
-    steps: Vec<EvalStep>,
+struct Tag {
+    mode: TagMode,
+    place: RuntimePlace,
+    parent: Option<TagId>,
+    alive: bool,
+}
+
+/// The borrow tag table (`docs/v2/core.md` section 6.3, `[B1]`–`[B5]`).
+/// Tag IDs are 1-based indices into `tags` (index 0 is a dummy sentinel).
+struct TagTable {
+    tags: Vec<Tag>,
+}
+
+impl TagTable {
+    fn new() -> TagTable {
+        TagTable {
+            tags: vec![Tag {
+                mode: TagMode::Owner,
+                place: RuntimePlace::root(0, 0),
+                parent: None,
+                alive: false,
+            }],
+        }
+    }
+
+    fn new_owner(&mut self, scope: ScopeId, var: VarId) -> TagId {
+        let id = self.tags.len() as TagId;
+        self.tags.push(Tag {
+            mode: TagMode::Owner,
+            place: RuntimePlace::root(scope, var),
+            parent: None,
+            alive: true,
+        });
+        id
+    }
+
+    fn is_alive(&self, id: TagId) -> bool {
+        self.tags.get(id as usize).is_some_and(|t| t.alive)
+    }
+
+    fn ancestors(&self, mut id: TagId) -> Vec<TagId> {
+        let mut out = Vec::new();
+        while id != 0 {
+            out.push(id);
+            match self.tags.get(id as usize).and_then(|t| t.parent) {
+                Some(p) => id = p,
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Kills `root_id` and every descendant tag derived from it (`[B2]`, `[B4]`).
+    fn kill_with_descendants(&mut self, root_id: TagId) {
+        let start = root_id as usize;
+        if start == 0 || start >= self.tags.len() {
+            return;
+        }
+        self.tags[start].alive = false;
+        // Because every child tag has id > parent id, one forward sweep kills all descendants.
+        for i in (start + 1)..self.tags.len() {
+            if self.tags[i].alive
+                && let Some(p) = self.tags[i].parent
+                && !self.tags[p as usize].alive
+            {
+                self.tags[i].alive = false;
+            }
+        }
+    }
+
+    /// `[B1]` + `[B2]`: checks `tag_id` for a read or write access to `place`,
+    /// then invalidates conflicting non-ancestor live tags and their descendants.
+    fn access(&mut self, tag_id: TagId, place: &RuntimePlace, is_write: bool) -> Result<(), Fail> {
+        let Some(tag) = self.tags.get(tag_id as usize).cloned() else {
+            return fail(4, "B1", "access through unknown borrow tag");
+        };
+        if !tag.alive {
+            return fail(
+                4,
+                "B1",
+                "borrow tag is no longer alive (use after invalidation or scope end)",
+            );
+        }
+        if !tag.place.contains(place) {
+            return fail(
+                4,
+                "B1",
+                "access through a borrow outside its borrowed place",
+            );
+        }
+        if is_write && tag.mode == TagMode::Shared {
+            return fail(4, "B1", "write access through a shared borrow");
+        }
+        let anc = self.ancestors(tag_id);
+        let mut to_kill = Vec::new();
+        for u in 1..self.tags.len() {
+            let u_id = u as TagId;
+            let entry = &self.tags[u];
+            if !entry.alive || anc.contains(&u_id) {
+                continue;
+            }
+            if !entry.place.overlaps(place) {
+                continue;
+            }
+            if is_write || entry.mode == TagMode::Exclusive {
+                to_kill.push(u_id);
+            }
+        }
+        for u_id in to_kill {
+            self.kill_with_descendants(u_id);
+        }
+        Ok(())
+    }
+
+    /// `[B3]`: creates a child borrow of `place` derived from `parent_tag`.
+    fn create_borrow(
+        &mut self,
+        parent_tag: TagId,
+        place: RuntimePlace,
+        mode: BorrowMode,
+    ) -> Result<TagId, Fail> {
+        let is_write = mode == BorrowMode::Exclusive;
+        self.access(parent_tag, &place, is_write)?;
+        let id = self.tags.len() as TagId;
+        self.tags.push(Tag {
+            mode: match mode {
+                BorrowMode::Shared => TagMode::Shared,
+                BorrowMode::Exclusive => TagMode::Exclusive,
+            },
+            place,
+            parent: Some(parent_tag),
+            alive: true,
+        });
+        Ok(id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -403,9 +600,10 @@ enum ScopeKind {
 
 /// One run of one body ([6.2]).
 struct Scope {
+    id: ScopeId,
     body: BodyId,
     pc: usize,
-    slots: Vec<(VarId, Slot)>,
+    slots: Vec<(VarId, Slot, TagId)>,
     history: Vec<(SiteId, usize)>,
     kind: ScopeKind,
 }
@@ -422,29 +620,169 @@ enum ActivationKind {
 /// One call of a control or named boundary.
 struct Activation {
     kind: ActivationKind,
-    /// Arguments as they were at entry (`old(y)` in contract conditions, [E-Formula]).
+    /// Concrete entry argument snapshots (`old(y)` in contract conditions, [E-Formula]).
     arguments: Vec<Value>,
-    /// Writeback mappings `(param_var_id, caller_place)` for `&~` parameters.
-    writebacks: Vec<(VarId, EvalPlace)>,
     scopes: Vec<Scope>,
+}
+
+fn find_slot_ref<'a>(
+    entry_slots: &'a [(VarId, Slot, TagId)],
+    stack: &'a [Activation],
+    place: &RuntimePlace,
+) -> Option<&'a Slot> {
+    if place.scope == 0 {
+        return entry_slots
+            .iter()
+            .find(|(v, _, _)| *v == place.var)
+            .map(|(_, s, _)| s);
+    }
+    for act in stack.iter().rev() {
+        for scope in act.scopes.iter().rev() {
+            if scope.id == place.scope {
+                return scope
+                    .slots
+                    .iter()
+                    .find(|(v, _, _)| *v == place.var)
+                    .map(|(_, s, _)| s);
+            }
+        }
+    }
+    None
+}
+
+fn read_place_from_state(
+    entry_slots: &[(VarId, Slot, TagId)],
+    stack: &[Activation],
+    place: &RuntimePlace,
+) -> Result<Value, Fail> {
+    let Some(slot) = find_slot_ref(entry_slots, stack, place) else {
+        return fail(4, "B1", "borrow refers to a scope that has ended");
+    };
+    let Slot::Available(mut current) = slot.clone() else {
+        return fail(2, "E-Var", "borrowed slot has been moved");
+    };
+    for step in &place.steps {
+        match step {
+            RuntimeStep::Field(fidx) => {
+                let Value::Struct { mut fields, .. } = current else {
+                    return fail(10, "E-Field", "field access on non-struct");
+                };
+                current = fields.swap_remove(*fidx);
+            }
+            RuntimeStep::Index(idx) => {
+                let Value::Vector(mut items) = current else {
+                    return fail(10, "E-Index", "index on non-vector");
+                };
+                if *idx >= items.len() {
+                    return fail(
+                        7,
+                        "E-Index",
+                        format!("index {idx} is out of bounds for length {}", items.len()),
+                    );
+                }
+                current = items.swap_remove(*idx);
+            }
+            RuntimeStep::VariantField(cidx, fidx) => {
+                let Value::Variant {
+                    constructor,
+                    mut fields,
+                    ..
+                } = current
+                else {
+                    return fail(10, "E-Outcome", "variant field access on non-variant");
+                };
+                if constructor != *cidx || *fidx >= fields.len() {
+                    return fail(4, "B1", "variant constructor changed under borrow");
+                }
+                current = fields.swap_remove(*fidx);
+            }
+            RuntimeStep::MapValue(key) => {
+                let Value::Map(mut entries) = current else {
+                    return fail(10, "E-Extern", "map lookup on non-map");
+                };
+                let Some(val) = entries.remove(key) else {
+                    return fail(4, "B1", "map key removed under borrow");
+                };
+                current = val;
+            }
+            RuntimeStep::MapKey(key) => {
+                let Value::Map(entries) = current else {
+                    return fail(10, "E-Extern", "map key access on non-map");
+                };
+                if !entries.contains_key(key) {
+                    return fail(4, "B1", "map key removed under borrow");
+                }
+                current = key.clone();
+            }
+        }
+    }
+    Ok(current)
+}
+
+/// Recursively dereferences `Value::Ref` without touching tags (`[E-Formula]`).
+fn deref_value_formula(
+    entry_slots: &[(VarId, Slot, TagId)],
+    stack: &[Activation],
+    value: &Value,
+) -> Result<Value, Fail> {
+    match value {
+        Value::Ref { place, .. } => {
+            let inner = read_place_from_state(entry_slots, stack, place)?;
+            deref_value_formula(entry_slots, stack, &inner)
+        }
+        Value::Struct { ty, name, fields } => {
+            let mut out = Vec::with_capacity(fields.len());
+            for f in fields {
+                out.push(deref_value_formula(entry_slots, stack, f)?);
+            }
+            Ok(Value::Struct {
+                ty: *ty,
+                name: name.clone(),
+                fields: out,
+            })
+        }
+        Value::Variant {
+            ty,
+            name,
+            constructor,
+            constructor_name,
+            fields,
+        } => {
+            let mut out = Vec::with_capacity(fields.len());
+            for f in fields {
+                out.push(deref_value_formula(entry_slots, stack, f)?);
+            }
+            Ok(Value::Variant {
+                ty: *ty,
+                name: name.clone(),
+                constructor: *constructor,
+                constructor_name: constructor_name.clone(),
+                fields: out,
+            })
+        }
+        other => Ok(other.clone()),
+    }
 }
 
 struct ActivationEnv<'a> {
     body: &'a ControlBody,
-    activation: &'a Activation,
+    entry_slots: &'a [(VarId, Slot, TagId)],
+    stack: &'a [Activation],
 }
 
 impl Env for ActivationEnv<'_> {
-    /// [E-Var]: a name is looked up from the innermost scope outward, and a
-    /// name without a slot or with a moved slot `◌` is stuck.
+    /// [E-Formula]: reads current values through borrows and changes no tag.
     fn get(&self, var: VarRef) -> Result<Value, Fail> {
         let VarRef::Local(id) = var else {
             return fail(10, "E-Var", "a body refers to a name of a signature");
         };
-        for scope in self.activation.scopes.iter().rev() {
-            if let Some((_, slot)) = scope.slots.iter().find(|(slot, _)| *slot == id) {
+        let activation = self.stack.last().expect("an activation");
+        for scope in activation.scopes.iter().rev() {
+            if let Some((_, slot, _)) = scope.slots.iter().find(|(slot, _, _)| *slot == id) {
                 return match slot {
-                    Slot::Available(value) => Ok(value.clone()),
+                    Slot::Available(value) => {
+                        deref_value_formula(self.entry_slots, self.stack, value)
+                    }
                     Slot::Moved => fail(
                         2,
                         "E-Var",
@@ -464,7 +802,8 @@ impl Env for ActivationEnv<'_> {
     }
 
     fn get_old(&self, index: usize) -> Result<Value, Fail> {
-        match self.activation.arguments.get(index) {
+        let activation = self.stack.last().expect("an activation");
+        match activation.arguments.get(index) {
             Some(v) => Ok(v.clone()),
             None => fail(10, "E-Formula", "no entry argument for `old`"),
         }
@@ -943,6 +1282,11 @@ struct Machine<'a> {
     program: &'a Program,
     config: &'a Config,
     host: &'a mut dyn Host,
+    /// Synthetic owner slots (`ScopeId = 0`) for entry arguments passed by borrow or view.
+    entry_slots: Vec<(VarId, Slot, TagId)>,
+    /// Borrow tag table (`[B1]`–`[B5]`).
+    tags: TagTable,
+    next_scope_id: ScopeId,
     stack: Vec<Activation>,
     trace: Vec<Event>,
     steps: u64,
@@ -980,7 +1324,7 @@ fn collect_resources(value: &Value, out: &mut Vec<(ResourceId, u64)>) {
                 collect_resources(v, out);
             }
         }
-        Value::Bool(_) | Value::Int(_) | Value::String(_) => {}
+        Value::Bool(_) | Value::Int(_) | Value::String(_) | Value::Ref { .. } => {}
     }
 }
 
@@ -1043,98 +1387,264 @@ impl<'a> Machine<'a> {
             Value::Map(entries) => entries
                 .iter()
                 .any(|(k, v)| self.contains_obligation(k) || self.contains_obligation(v)),
-            Value::Bool(_) | Value::Int(_) | Value::String(_) => false,
+            Value::Bool(_) | Value::Int(_) | Value::String(_) | Value::Ref { .. } => false,
         }
     }
 
-    /// Evaluates an expression `expr` in the current activation, moving slots
-    /// when `consumed` is true and the variable's type does not have kind
-    /// `copy` ([E-Var], [O3]), and checking temporary obligations when
-    /// `consumed` is false ([E-Temp]).
-    fn eval_expr(&mut self, expr: &Expr, consumed: bool) -> Result<Value, Fail> {
-        let is_temp = matches!(
-            expr,
-            Expr::Struct(_, _, _)
-                | Expr::Variant(_, _, _, _)
-                | Expr::Vector(_, _)
-                | Expr::EmptyMap(_)
-                | Expr::Clone(_, _)
-                | Expr::Call(_, _, _)
-        );
-        let value = match expr {
-            Expr::Boolean(v) => Value::Bool(*v),
-            Expr::Integer(v, _) => Value::Int(v.clone()),
-            Expr::String(v) => Value::String(v.clone()),
-            Expr::Var(VarRef::Local(id), ty) => {
-                let var_name = self.body().vars[*id].name.clone();
-                let is_copy = self.program.kind(ty) == Kind::Copy;
-                let activation = self.stack.last_mut().expect("an activation");
-                let mut found: Option<&mut Slot> = None;
-                for scope in activation.scopes.iter_mut().rev() {
-                    if let Some((_, slot)) = scope.slots.iter_mut().find(|(s, _)| *s == *id) {
-                        found = Some(slot);
-                        break;
+    fn alloc_scope_id(&mut self) -> ScopeId {
+        let id = self.next_scope_id;
+        self.next_scope_id += 1;
+        id
+    }
+
+    fn access_tag(
+        &mut self,
+        tag_id: TagId,
+        place: &RuntimePlace,
+        is_write: bool,
+    ) -> Result<(), Fail> {
+        self.tags.access(tag_id, place, is_write)?;
+        self.count("B1");
+        Ok(())
+    }
+
+    fn create_borrow_tag(
+        &mut self,
+        parent_tag: TagId,
+        place: RuntimePlace,
+        mode: BorrowMode,
+    ) -> Result<TagId, Fail> {
+        let tag = self.tags.create_borrow(parent_tag, place, mode)?;
+        self.count("B3");
+        Ok(tag)
+    }
+
+    fn read_place(&self, place: &RuntimePlace) -> Result<Value, Fail> {
+        read_place_from_state(&self.entry_slots, &self.stack, place)
+    }
+
+    fn deref_formula(&self, value: &Value) -> Result<Value, Fail> {
+        deref_value_formula(&self.entry_slots, &self.stack, value)
+    }
+
+    /// Recursively materializes any `Value::Ref` by performing a `[B1]` read
+    /// access through its tag (used for pure function calls, host calls,
+    /// traces, and final entry `Done` payloads).
+    fn deref_checked(&mut self, value: &Value) -> Result<Value, Fail> {
+        match value {
+            Value::Ref { place, tag, .. } => {
+                self.access_tag(*tag, place, false)?;
+                let inner = self.read_place(place)?;
+                self.deref_checked(&inner)
+            }
+            Value::Struct { ty, name, fields } => {
+                let mut out = Vec::with_capacity(fields.len());
+                for f in fields {
+                    out.push(self.deref_checked(f)?);
+                }
+                Ok(Value::Struct {
+                    ty: *ty,
+                    name: name.clone(),
+                    fields: out,
+                })
+            }
+            Value::Variant {
+                ty,
+                name,
+                constructor,
+                constructor_name,
+                fields,
+            } => {
+                let mut out = Vec::with_capacity(fields.len());
+                for f in fields {
+                    out.push(self.deref_checked(f)?);
+                }
+                Ok(Value::Variant {
+                    ty: *ty,
+                    name: name.clone(),
+                    constructor: *constructor,
+                    constructor_name: constructor_name.clone(),
+                    fields: out,
+                })
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    fn find_local_slot(&self, var: VarId) -> Result<(ScopeId, Slot, TagId), Fail> {
+        let var_name = &self.body().vars[var].name;
+        let activation = self.stack.last().expect("an activation");
+        for scope in activation.scopes.iter().rev() {
+            if let Some((_, slot, owner_tag)) = scope.slots.iter().find(|(s, _, _)| *s == var) {
+                return Ok((scope.id, slot.clone(), *owner_tag));
+            }
+        }
+        fail(
+            2,
+            "E-Var",
+            format!("`{var_name}` has no value on this history"),
+        )
+    }
+
+    fn slot_mut(&mut self, scope_id: ScopeId, var: VarId) -> Option<&mut Slot> {
+        if scope_id == 0 {
+            return self
+                .entry_slots
+                .iter_mut()
+                .find(|(v, _, _)| *v == var)
+                .map(|(_, s, _)| s);
+        }
+        for act in self.stack.iter_mut().rev() {
+            for scope in act.scopes.iter_mut().rev() {
+                if scope.id == scope_id {
+                    return scope
+                        .slots
+                        .iter_mut()
+                        .find(|(v, _, _)| *v == var)
+                        .map(|(_, s, _)| s);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolves a syntactic `Place` into `(RuntimePlace, TagId)` through any
+    /// borrow root or borrow-typed view field.
+    fn resolve_place(&mut self, place: &Place) -> Result<(RuntimePlace, TagId), Fail> {
+        let var_name = self.body().vars[place.root].name.clone();
+        let (scope_id, slot, owner_tag) = self.find_local_slot(place.root)?;
+        let Slot::Available(root_val) = slot else {
+            return fail(
+                2,
+                "E-Var",
+                format!("`{var_name}` has been moved on this history"),
+            );
+        };
+        let (mut cur_place, mut cur_tag) = match root_val {
+            Value::Ref { place, tag, .. } => (place, tag),
+            _ => (RuntimePlace::root(scope_id, place.root), owner_tag),
+        };
+        for step in &place.steps {
+            match step {
+                PlaceStep::Field(_, fidx, _) => {
+                    if !self.tags.is_alive(cur_tag) {
+                        return fail(
+                            4,
+                            "B1",
+                            "borrow tag is no longer alive (use after invalidation or scope end)",
+                        );
+                    }
+                    let current_val = self.read_place(&cur_place)?;
+                    let Value::Struct { fields, .. } = current_val else {
+                        return fail(10, "E-Field", "field access on non-struct");
+                    };
+                    if let Value::Ref {
+                        place: fplace,
+                        tag: ftag,
+                        ..
+                    } = &fields[*fidx]
+                    {
+                        cur_place = fplace.clone();
+                        cur_tag = *ftag;
+                    } else {
+                        cur_place.steps.push(RuntimeStep::Field(*fidx));
                     }
                 }
-                let Some(slot) = found else {
+                PlaceStep::Index(idx_expr, _) => {
+                    let idx_val = integer(self.eval_expr(idx_expr, false)?)?;
+                    if !self.tags.is_alive(cur_tag) {
+                        return fail(
+                            4,
+                            "B1",
+                            "borrow tag is no longer alive (use after invalidation or scope end)",
+                        );
+                    }
+                    let current_val = self.read_place(&cur_place)?;
+                    let Value::Vector(items) = current_val else {
+                        return fail(10, "E-Index", "index on non-vector");
+                    };
+                    let Some(i) = idx_val
+                        .to_i128()
+                        .filter(|&i| i >= 0 && (i as usize) < items.len())
+                    else {
+                        return fail(
+                            7,
+                            "E-Index",
+                            format!(
+                                "index {idx_val} is out of bounds for length {}",
+                                items.len()
+                            ),
+                        );
+                    };
+                    cur_place.steps.push(RuntimeStep::Index(i as usize));
+                }
+            }
+        }
+        Ok((cur_place, cur_tag))
+    }
+
+    /// If `expr` is a place chain (`Var` followed by `Field`/`Index`), resolves
+    /// it to `(RuntimePlace, TagId)` so reads access only the leaf component (`[B5]`).
+    fn resolve_expr_place(&mut self, expr: &Expr) -> Result<Option<(RuntimePlace, TagId)>, Fail> {
+        match expr {
+            Expr::Var(VarRef::Local(id), _) => {
+                let var_name = self.body().vars[*id].name.clone();
+                let (scope_id, slot, owner_tag) = self.find_local_slot(*id)?;
+                let Slot::Available(root_val) = slot else {
                     return fail(
                         2,
                         "E-Var",
-                        format!("`{var_name}` has no value on this history"),
+                        format!("`{var_name}` has been moved on this history"),
                     );
                 };
-                match slot {
-                    Slot::Moved => {
-                        return fail(
-                            2,
-                            "E-Var",
-                            format!("`{var_name}` has been moved on this history"),
-                        );
-                    }
-                    Slot::Available(val) => {
-                        let out = val.clone();
-                        if consumed && !is_copy {
-                            *slot = Slot::Moved;
-                        }
-                        self.count("E-Var");
-                        out
-                    }
+                match root_val {
+                    Value::Ref { place, tag, .. } => Ok(Some((place, tag))),
+                    _ => Ok(Some((RuntimePlace::root(scope_id, *id), owner_tag))),
                 }
             }
-            Expr::Var(_, _) | Expr::Old(_, _) => {
-                return fail(10, "E-Var", "a body refers to a name of a signature");
-            }
-            Expr::Move(inner, _) => self.eval_expr(inner, true)?,
-            Expr::Borrow(_, place, _) => {
-                let eval_place = self.eval_place(place)?;
-                self.read_eval_place(&eval_place)?
-            }
-            Expr::Field(base, _, fidx, fty) => {
-                if consumed && self.program.kind(fty) != Kind::Copy {
+            Expr::Field(base, _, fidx, expr_ty) => {
+                let Some((mut cur_place, mut cur_tag)) = self.resolve_expr_place(base)? else {
+                    return Ok(None);
+                };
+                if !self.tags.is_alive(cur_tag) {
                     return fail(
-                        2,
-                        "E-Field",
-                        "cannot partially move a non-copy field out of a struct",
+                        4,
+                        "B1",
+                        "borrow tag is no longer alive (use after invalidation or scope end)",
                     );
                 }
-                let base_val = self.eval_expr(base, false)?;
-                let Value::Struct { mut fields, .. } = base_val else {
+                let current_val = self.read_place(&cur_place)?;
+                let Value::Struct { fields, .. } = current_val else {
                     return fail(10, "E-Field", "field access on non-struct");
                 };
-                self.count("E-Field");
-                fields.swap_remove(*fidx)
+                if !matches!(expr_ty, Type::Ref(_, _))
+                    && let Value::Ref {
+                        place: fplace,
+                        tag: ftag,
+                        ..
+                    } = &fields[*fidx]
+                {
+                    cur_place = fplace.clone();
+                    cur_tag = *ftag;
+                } else {
+                    cur_place.steps.push(RuntimeStep::Field(*fidx));
+                }
+                Ok(Some((cur_place, cur_tag)))
             }
-            Expr::Index(base, idx_expr, ety) => {
-                if consumed && self.program.kind(ety) != Kind::Copy {
+            Expr::Index(base, idx_expr, _) => {
+                let Some((mut cur_place, cur_tag)) = self.resolve_expr_place(base)? else {
+                    return Ok(None);
+                };
+                let idx_val = integer(self.eval_expr(idx_expr, false)?)?;
+                if !self.tags.is_alive(cur_tag) {
                     return fail(
-                        2,
-                        "E-Index",
-                        "cannot partially move a non-copy element out of a vector",
+                        4,
+                        "B1",
+                        "borrow tag is no longer alive (use after invalidation or scope end)",
                     );
                 }
-                let base_val = self.eval_expr(base, false)?;
-                let idx_val = integer(self.eval_expr(idx_expr, false)?)?;
-                let Value::Vector(mut items) = base_val else {
+                let current_val = self.read_place(&cur_place)?;
+                let Value::Vector(items) = current_val else {
                     return fail(10, "E-Index", "index on non-vector");
                 };
                 let Some(i) = idx_val
@@ -1150,14 +1660,231 @@ impl<'a> Machine<'a> {
                         ),
                     );
                 };
-                self.count("E-Index");
-                items.swap_remove(i as usize)
+                cur_place.steps.push(RuntimeStep::Index(i as usize));
+                Ok(Some((cur_place, cur_tag)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Writes `new_val` at `place` through `tag` (`[B1]`, `[B2]`, `[E-Assign]`).
+    fn write_runtime_place(
+        &mut self,
+        place: &RuntimePlace,
+        tag: TagId,
+        new_val: Value,
+        check_replaced_obligation: bool,
+    ) -> Result<(), Fail> {
+        self.access_tag(tag, place, true)?;
+        let Some(slot_clone) = find_slot_ref(&self.entry_slots, &self.stack, place).cloned() else {
+            return fail(4, "B1", "assignment target scope has ended");
+        };
+        if place.steps.is_empty() {
+            if check_replaced_obligation
+                && let Slot::Available(old_val) = &slot_clone
+                && self.contains_obligation(old_val)
+            {
+                return fail(
+                    5,
+                    "E-Assign",
+                    "overwriting slot destroys an uncompleted obligation",
+                );
+            }
+            let slot = self.slot_mut(place.scope, place.var).expect("slot exists");
+            *slot = Slot::Available(new_val);
+            return Ok(());
+        }
+        let Slot::Available(mut root_val) = slot_clone else {
+            return fail(2, "E-Assign", "assignment target slot has been moved");
+        };
+        let replaced = update_nested(&mut root_val, &place.steps, new_val)?;
+        if check_replaced_obligation && self.contains_obligation(&replaced) {
+            return fail(
+                5,
+                "E-Assign",
+                "overwriting component destroys an uncompleted obligation",
+            );
+        }
+        let slot = self.slot_mut(place.scope, place.var).expect("slot exists");
+        *slot = Slot::Available(root_val);
+        Ok(())
+    }
+
+    /// Evaluates an expression `expr` in the current activation, checking
+    /// borrow tags (`[B1]`–`[B4]`), moving slots when `consumed` is true and
+    /// the variable's type does not have kind `copy` (`[E-Var]`, `[O3]`), and
+    /// checking temporary obligations when `consumed` is false (`[E-Temp]`).
+    fn eval_expr(&mut self, expr: &Expr, consumed: bool) -> Result<Value, Fail> {
+        let is_temp = matches!(
+            expr,
+            Expr::Struct(_, _, _)
+                | Expr::Variant(_, _, _, _)
+                | Expr::Vector(_, _)
+                | Expr::EmptyMap(_)
+                | Expr::Clone(_, _)
+                | Expr::Call(_, _, _)
+        );
+        let value = match expr {
+            Expr::Boolean(v) => Value::Bool(*v),
+            Expr::Integer(v, _) => Value::Int(v.clone()),
+            Expr::String(v) => Value::String(v.clone()),
+            Expr::Var(VarRef::Local(id), expr_ty) => {
+                let var_name = self.body().vars[*id].name.clone();
+                let var_ty = self.body().vars[*id].ty.clone();
+                let (scope_id, slot, owner_tag) = self.find_local_slot(*id)?;
+                let Slot::Available(val) = slot else {
+                    return fail(
+                        2,
+                        "E-Var",
+                        format!("`{var_name}` has been moved on this history"),
+                    );
+                };
+                if matches!(var_ty, Type::Ref(_, _)) {
+                    if matches!(expr_ty, Type::Ref(_, _)) {
+                        // [W8]: passing the borrow itself (copying `&τ` or moving `&~τ`).
+                        // Copying a shared borrow copies its tag; moving an exclusive
+                        // borrow moves its tag. Neither is an access to the referent.
+                        if consumed && self.program.kind(&var_ty) != Kind::Copy {
+                            let own_place = RuntimePlace::root(scope_id, *id);
+                            self.access_tag(owner_tag, &own_place, true)?;
+                            *self.slot_mut(scope_id, *id).expect("slot") = Slot::Moved;
+                        }
+                        self.count("E-Var");
+                        val
+                    } else {
+                        // [W8]: dereferencing a borrow name to read its referent value.
+                        if consumed && self.program.kind(expr_ty) != Kind::Copy {
+                            return fail(
+                                2,
+                                "E-Var",
+                                format!("cannot move non-copy value out of borrow `{var_name}`"),
+                            );
+                        }
+                        let Value::Ref { place, tag, .. } = val else {
+                            return fail(10, "E-Var", "borrow slot does not hold a reference");
+                        };
+                        self.access_tag(tag, &place, false)?;
+                        let derefed = self.read_place(&place)?;
+                        self.count("E-Var");
+                        derefed
+                    }
+                } else {
+                    let is_copy = self.program.kind(&var_ty) == Kind::Copy;
+                    let own_place = RuntimePlace::root(scope_id, *id);
+                    if consumed && !is_copy {
+                        // [B4]: moving a value out of a slot is a write access through owner tag.
+                        self.access_tag(owner_tag, &own_place, true)?;
+                        *self.slot_mut(scope_id, *id).expect("slot") = Slot::Moved;
+                        self.count("B4");
+                    } else {
+                        self.access_tag(owner_tag, &own_place, false)?;
+                    }
+                    self.count("E-Var");
+                    val
+                }
+            }
+            Expr::Var(_, _) | Expr::Old(_, _) => {
+                return fail(10, "E-Var", "a body refers to a name of a signature");
+            }
+            Expr::Move(inner, _) => self.eval_expr(inner, true)?,
+            Expr::Borrow(mode, place, _) => {
+                let (rplace, parent_tag) = self.resolve_place(place)?;
+                let tag = self.create_borrow_tag(parent_tag, rplace.clone(), *mode)?;
+                self.count("E-Borrow");
+                Value::Ref {
+                    mode: *mode,
+                    place: rplace,
+                    tag,
+                }
+            }
+            Expr::Field(base, _, fidx, fty) => {
+                if consumed && self.program.kind(fty) != Kind::Copy {
+                    return fail(
+                        2,
+                        "E-Field",
+                        "cannot partially move a non-copy field out of a struct",
+                    );
+                }
+                if let Some((rplace, tag)) = self.resolve_expr_place(expr)? {
+                    if matches!(fty, Type::Ref(_, _)) {
+                        // Copying a `&τ` borrow field out of a view without touching referent.
+                        if !self.tags.is_alive(tag) {
+                            return fail(4, "B1", "borrow tag is no longer alive");
+                        }
+                        let val = self.read_place(&rplace)?;
+                        self.count("E-Field");
+                        val
+                    } else {
+                        self.access_tag(tag, &rplace, false)?;
+                        let val = self.read_place(&rplace)?;
+                        self.count("E-Field");
+                        val
+                    }
+                } else {
+                    let base_val = self.eval_expr(base, false)?;
+                    let Value::Struct { mut fields, .. } = base_val else {
+                        return fail(10, "E-Field", "field access on non-struct");
+                    };
+                    let raw = fields.swap_remove(*fidx);
+                    let val = if !matches!(fty, Type::Ref(_, _))
+                        && let Value::Ref { place, tag, .. } = &raw
+                    {
+                        self.access_tag(*tag, place, false)?;
+                        self.read_place(place)?
+                    } else {
+                        raw
+                    };
+                    self.count("E-Field");
+                    val
+                }
+            }
+            Expr::Index(base, idx_expr, ety) => {
+                if consumed && self.program.kind(ety) != Kind::Copy {
+                    return fail(
+                        2,
+                        "E-Index",
+                        "cannot partially move a non-copy element out of a vector",
+                    );
+                }
+                if let Some((rplace, tag)) = self.resolve_expr_place(expr)? {
+                    self.access_tag(tag, &rplace, false)?;
+                    let val = self.read_place(&rplace)?;
+                    self.count("E-Index");
+                    val
+                } else {
+                    let base_val = self.eval_expr(base, false)?;
+                    let idx_val = integer(self.eval_expr(idx_expr, false)?)?;
+                    let Value::Vector(mut items) = base_val else {
+                        return fail(10, "E-Index", "index on non-vector");
+                    };
+                    let Some(i) = idx_val
+                        .to_i128()
+                        .filter(|&i| i >= 0 && (i as usize) < items.len())
+                    else {
+                        return fail(
+                            7,
+                            "E-Index",
+                            format!(
+                                "index {idx_val} is out of bounds for length {}",
+                                items.len()
+                            ),
+                        );
+                    };
+                    self.count("E-Index");
+                    items.swap_remove(i as usize)
+                }
             }
             Expr::Struct(sid, fields, _) => {
-                let mut vals = Vec::with_capacity(fields.len());
-                for f in fields {
-                    vals.push(self.eval_expr(f, true)?);
-                }
+                let vals = if self.program.structs[*sid].is_view {
+                    // [E-Operands]: a view constructor evaluates non-lending fields first.
+                    self.eval_operands(fields)?
+                } else {
+                    let mut out = Vec::with_capacity(fields.len());
+                    for f in fields {
+                        out.push(self.eval_expr(f, true)?);
+                    }
+                    out
+                };
                 self.count("E-Build");
                 Value::Struct {
                     ty: *sid,
@@ -1194,15 +1921,18 @@ impl<'a> Machine<'a> {
             }
             Expr::Len(place) => {
                 let v = self.eval_expr(place, false)?;
+                let v = self.deref_checked(&v)?;
                 Value::Int(value_len(&v)?)
             }
             Expr::Clone(place, _) => {
                 let v = self.eval_expr(place, false)?;
+                let v = self.deref_checked(&v)?;
                 self.count("E-Build");
                 v
             }
             Expr::Trim(arg) => {
-                let Value::String(s) = self.eval_expr(arg, false)? else {
+                let v = self.eval_expr(arg, false)?;
+                let Value::String(s) = self.deref_checked(&v)? else {
                     return fail(10, "E-Fn", "`trim` expects a string");
                 };
                 Value::String(s.trim().to_string())
@@ -1276,7 +2006,9 @@ impl<'a> Machine<'a> {
                 let function = &self.program.functions[*id];
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
-                    values.push(self.eval_expr(argument, false)?);
+                    let v = self.eval_expr(argument, false)?;
+                    // [E-Fn]: read borrowed/view arguments where they are, checking [B1].
+                    values.push(self.deref_checked(&v)?);
                 }
                 let inner = SignatureEnv {
                     parameters: &values,
@@ -1311,227 +2043,61 @@ impl<'a> Machine<'a> {
         Ok(value)
     }
 
-    fn eval_place(&mut self, place: &Place) -> Result<EvalPlace, Fail> {
-        let mut steps = Vec::with_capacity(place.steps.len());
-        for step in &place.steps {
-            match step {
-                PlaceStep::Field(_, fidx, _) => steps.push(EvalStep::Field(*fidx)),
-                PlaceStep::Index(idx_expr, _) => {
-                    let idx_val = integer(self.eval_expr(idx_expr, false)?)?;
-                    let Some(i) = idx_val.to_i128().filter(|&i| i >= 0) else {
-                        return fail(7, "E-Index", format!("index {idx_val} is negative"));
-                    };
-                    steps.push(EvalStep::Index(i as usize));
-                }
-            }
-        }
-        Ok(EvalPlace {
-            root: place.root,
-            steps,
-        })
-    }
-
-    fn read_eval_place(&self, place: &EvalPlace) -> Result<Value, Fail> {
-        let var_name = &self.body().vars[place.root].name;
-        let activation = self.stack.last().expect("an activation");
-        let mut root_val: Option<&Value> = None;
-        for scope in activation.scopes.iter().rev() {
-            if let Some((_, slot)) = scope.slots.iter().find(|(s, _)| *s == place.root) {
-                match slot {
-                    Slot::Available(v) => {
-                        root_val = Some(v);
-                        break;
-                    }
-                    Slot::Moved => {
-                        return fail(
-                            2,
-                            "E-Var",
-                            format!("`{var_name}` has been moved on this history"),
-                        );
-                    }
-                }
-            }
-        }
-        let Some(mut current) = root_val else {
-            return fail(
-                2,
-                "E-Var",
-                format!("`{var_name}` has no value on this history"),
-            );
-        };
-        for step in &place.steps {
-            match step {
-                EvalStep::Field(fidx) => {
-                    let Value::Struct { fields, .. } = current else {
-                        return fail(10, "E-Field", "field access on non-struct");
-                    };
-                    current = &fields[*fidx];
-                }
-                EvalStep::Index(idx) => {
-                    let Value::Vector(items) = current else {
-                        return fail(10, "E-Index", "index on non-vector");
-                    };
-                    let Some(elem) = items.get(*idx) else {
-                        return fail(
-                            7,
-                            "E-Index",
-                            format!("index {idx} is out of bounds for length {}", items.len()),
-                        );
-                    };
-                    current = elem;
-                }
-            }
-        }
-        Ok(current.clone())
-    }
-
-    /// Writes `new_val` at `place` in the top activation ([E-Assign]).
-    /// If `check_replaced_obligation` is true, checks that the overwritten
-    /// value does not contain an obligation (X5 E-Assign).
-    fn write_eval_place(
-        &mut self,
-        place: &EvalPlace,
-        new_val: Value,
-        check_replaced_obligation: bool,
-    ) -> Result<(), Fail> {
-        let var_name = self.body().vars[place.root].name.clone();
-        let activation = self.stack.last_mut().expect("an activation");
-        let slot = activation
-            .scopes
-            .iter_mut()
-            .rev()
-            .find_map(|scope| scope.slots.iter_mut().find(|(s, _)| *s == place.root));
-        let Some((_, slot)) = slot else {
-            return fail(
-                2,
-                "E-Assign",
-                format!("`{var_name}` has no slot on this history"),
-            );
-        };
-        if place.steps.is_empty() {
-            if check_replaced_obligation && let Slot::Available(old_val) = slot {
-                let old_clone = old_val.clone();
-                if self.contains_obligation(&old_clone) {
-                    return fail(
-                        5,
-                        "E-Assign",
-                        format!("overwriting `{var_name}` destroys an uncompleted obligation"),
-                    );
-                }
-            }
-            let activation = self.stack.last_mut().expect("an activation");
-            let (_, slot) = activation
-                .scopes
-                .iter_mut()
-                .rev()
-                .find_map(|scope| scope.slots.iter_mut().find(|(s, _)| *s == place.root))
-                .unwrap();
-            *slot = Slot::Available(new_val);
-            return Ok(());
-        }
-
-        // Component assignment: root must be available.
-        let mut root_val = match slot {
-            Slot::Available(v) => v.clone(),
-            Slot::Moved => {
-                return fail(
-                    2,
-                    "E-Assign",
-                    format!("`{var_name}` has been moved on this history"),
-                );
-            }
-        };
-        let replaced = update_nested(&mut root_val, &place.steps, new_val)?;
-        if check_replaced_obligation && self.contains_obligation(&replaced) {
-            return fail(
-                5,
-                "E-Assign",
-                format!("overwriting part of `{var_name}` destroys an uncompleted obligation"),
-            );
-        }
-        let activation = self.stack.last_mut().expect("an activation");
-        let (_, slot) = activation
-            .scopes
-            .iter_mut()
-            .rev()
-            .find_map(|scope| scope.slots.iter_mut().find(|(s, _)| *s == place.root))
-            .unwrap();
-        *slot = Slot::Available(root_val);
-        Ok(())
-    }
-
     /// Evaluates operands according to `[E-Operands]`: operands that do not
-    /// lend are evaluated first, left to right, and operands that lend (`&p` or
-    /// `&~p`) afterwards, left to right.
-    #[allow(clippy::type_complexity)]
-    fn eval_operands(
-        &mut self,
-        exprs: &[Expr],
-        param_types: Option<&[Type]>,
-    ) -> Result<(Vec<Value>, Vec<(VarId, EvalPlace)>), Fail> {
+    /// lend are evaluated first, left to right, and operands that lend (`&p`,
+    /// `&~p`, or view constructors with a lending field) afterwards, left to right.
+    fn eval_operands(&mut self, exprs: &[Expr]) -> Result<Vec<Value>, Fail> {
         let mut results: Vec<Option<Value>> = vec![None; exprs.len()];
-        let mut writebacks = Vec::new();
-        let is_lending = |i: usize, e: &Expr| -> bool {
-            e.lends()
-                || param_types
-                    .and_then(|tys| tys.get(i))
-                    .is_some_and(|ty| matches!(ty, Type::Ref(_, _)))
-        };
-        // Pass 1: non-lending operands (consumed by value).
         for (i, expr) in exprs.iter().enumerate() {
-            if !is_lending(i, expr) {
+            if !expr.lends() {
                 results[i] = Some(self.eval_expr(expr, true)?);
             }
         }
-        // Pass 2: lending operands (read or exclusively borrowed).
         for (i, expr) in exprs.iter().enumerate() {
-            if is_lending(i, expr) {
-                if let Expr::Borrow(BorrowMode::Exclusive, place, _) = expr {
-                    let eval_place = self.eval_place(place)?;
-                    let val = self.read_eval_place(&eval_place)?;
-                    writebacks.push((i, eval_place));
-                    results[i] = Some(val);
-                } else {
-                    results[i] = Some(self.eval_expr(expr, false)?);
-                }
-                self.count("E-Borrow");
+            if expr.lends() {
+                results[i] = Some(self.eval_expr(expr, true)?);
             }
         }
-        if exprs.len() > 1 && exprs.iter().enumerate().any(|(i, e)| is_lending(i, e)) {
+        if exprs.len() > 1 && exprs.iter().any(Expr::lends) {
             self.count("E-Operands");
         }
-        let values = results.into_iter().map(|v| v.expect("evaluated")).collect();
-        Ok((values, writebacks))
+        Ok(results.into_iter().map(|v| v.expect("evaluated")).collect())
     }
 
     fn formula(&self, formula: &Expr) -> Result<bool, Fail> {
-        let activation = self.stack.last().expect("an activation");
         let env = ActivationEnv {
             body: self.body(),
-            activation,
+            entry_slots: &self.entry_slots,
+            stack: &self.stack,
         };
         self.evaluator().holds(formula, &env)
     }
 
-    /// [E-Bind]: a name gets its slot once in a run of its body.
+    /// [E-Bind]: a name gets its slot and owner tag once in a run of its body.
     fn bind(&mut self, var: VarId, value: Value) -> Result<(), Fail> {
         let name = self.body().vars[var].name.clone();
-        let scope = self.scope();
-        if scope.slots.iter().any(|(slot, _)| *slot == var) {
-            return fail(
-                3,
-                "E-Bind",
-                format!("`{name}` is bound twice in one run of its body"),
-            );
-        }
-        scope.slots.push((var, Slot::Available(value)));
+        let scope_id = {
+            let scope = self.scope();
+            if scope.slots.iter().any(|(slot, _, _)| *slot == var) {
+                return fail(
+                    3,
+                    "E-Bind",
+                    format!("`{name}` is bound twice in one run of its body"),
+                );
+            }
+            scope.id
+        };
+        let owner_tag = self.tags.new_owner(scope_id, var);
+        self.scope()
+            .slots
+            .push((var, Slot::Available(value), owner_tag));
         Ok(())
     }
 
-    /// [E-Scope]: ends a scope normally; stuck with X5 if any available slot
-    /// contains an uncompleted obligation.
+    /// [E-Scope], [B4]: ends a scope normally; stuck with X5 if any available
+    /// slot contains an uncompleted obligation, and kills all owner tags of the scope.
     fn end_scope(&mut self, scope: &Scope) -> Result<(), Fail> {
-        for (var_id, slot) in &scope.slots {
+        for (var_id, slot, owner_tag) in scope.slots.iter().rev() {
             if let Slot::Available(val) = slot
                 && self.contains_obligation(val)
             {
@@ -1544,6 +2110,7 @@ impl<'a> Machine<'a> {
                     ),
                 );
             }
+            self.tags.kill_with_descendants(*owner_tag);
         }
         if let ScopeKind::LexicalBoundary { captures, .. } = &scope.kind {
             for val in captures {
@@ -1558,6 +2125,7 @@ impl<'a> Machine<'a> {
                 }
             }
         }
+        self.count("B4");
         self.count("E-Scope");
         Ok(())
     }
@@ -1608,15 +2176,16 @@ impl<'a> Machine<'a> {
                 }
                 Ok(())
             }
-            Value::Bool(_) | Value::Int(_) | Value::String(_) => Ok(()),
+            Value::Bool(_) | Value::Int(_) | Value::String(_) | Value::Ref { .. } => Ok(()),
         }
     }
 
     fn unwind_scope(&mut self, scope: &Scope) -> Result<(), Fail> {
-        for (_, slot) in scope.slots.iter().rev() {
+        for (_, slot, owner_tag) in scope.slots.iter().rev() {
             if let Slot::Available(val) = slot {
                 self.unwind_value(val)?;
             }
+            self.tags.kill_with_descendants(*owner_tag);
         }
         self.count("E-Unwind");
         Ok(())
@@ -1662,18 +2231,22 @@ impl<'a> Machine<'a> {
                 } = top_scope.kind
                 {
                     // [E-Contingency]: enter lexical contingency `B₂`.
+                    let scope_id = self.alloc_scope_id();
                     let mut slots = Vec::with_capacity(contingency_vars.len() + 1);
                     for (var, val) in contingency_vars.into_iter().zip(captures) {
-                        slots.push((var, Slot::Available(val)));
+                        let tag = self.tags.new_owner(scope_id, var);
+                        slots.push((var, Slot::Available(val), tag));
                     }
                     if let Some(mvar) = message_var {
-                        slots.push((mvar, Slot::Available(Value::String(message.clone()))));
+                        let tag = self.tags.new_owner(scope_id, mvar);
+                        slots.push((mvar, Slot::Available(Value::String(message.clone())), tag));
                     }
                     self.stack
                         .last_mut()
                         .expect("an activation")
                         .scopes
                         .push(Scope {
+                            id: scope_id,
                             body: contingency_body,
                             pc: 0,
                             slots,
@@ -1688,19 +2261,11 @@ impl<'a> Machine<'a> {
                 }
             }
 
-            // Pop activation (and apply `&~` writebacks if any).
-            let popped = self.stack.pop().expect("an activation");
+            // Pop activation.
+            let _popped = self.stack.pop().expect("an activation");
             if self.stack.is_empty() {
                 self.count("E-Root");
                 return Ok(Some(End::Faulted(message)));
-            }
-            for (param_var, caller_place) in &popped.writebacks {
-                if let Some(root_scope) = popped.scopes.first()
-                    && let Some((_, Slot::Available(val))) =
-                        root_scope.slots.iter().find(|(s, _)| *s == *param_var)
-                {
-                    let _ = self.write_eval_place(caller_place, val.clone(), false);
-                }
             }
             self.locate();
 
@@ -1774,18 +2339,22 @@ impl<'a> Machine<'a> {
                     ..
                 } = top_scope.kind
                 {
+                    let scope_id = self.alloc_scope_id();
                     let mut slots = Vec::with_capacity(contingency_vars.len() + 1);
                     for (var, val) in contingency_vars.into_iter().zip(captures) {
-                        slots.push((var, Slot::Available(val)));
+                        let tag = self.tags.new_owner(scope_id, var);
+                        slots.push((var, Slot::Available(val), tag));
                     }
                     if let Some(mvar) = message_var {
-                        slots.push((mvar, Slot::Available(Value::String(message.clone()))));
+                        let tag = self.tags.new_owner(scope_id, mvar);
+                        slots.push((mvar, Slot::Available(Value::String(message.clone())), tag));
                     }
                     self.stack
                         .last_mut()
                         .expect("an activation")
                         .scopes
                         .push(Scope {
+                            id: scope_id,
                             body: contingency_body,
                             pc: 0,
                             slots,
@@ -1836,9 +2405,12 @@ impl<'a> Machine<'a> {
             let param_name = self.program.boundaries[id].parameters[param_var]
                 .name
                 .clone();
-            let slot = root_scope.slots.iter_mut().find(|(s, _)| *s == param_var);
+            let slot = root_scope
+                .slots
+                .iter_mut()
+                .find(|(s, _, _)| *s == param_var);
             match slot {
-                Some((_, s @ Slot::Available(_))) => {
+                Some((_, s @ Slot::Available(_), _)) => {
                     let Slot::Available(val) = std::mem::replace(s, Slot::Moved) else {
                         unreachable!();
                     };
@@ -1859,18 +2431,26 @@ impl<'a> Machine<'a> {
         // Unwind all remaining non-retained slots of `B₁`.
         self.unwind_scope(&root_scope)?;
 
+        let scope_id = self.alloc_scope_id();
         let mut b2_slots = Vec::with_capacity(retained_values.len() + 1);
         for (idx, val) in retained_values.into_iter().enumerate() {
-            b2_slots.push((idx, Slot::Available(val)));
+            let tag = self.tags.new_owner(scope_id, idx);
+            b2_slots.push((idx, Slot::Available(val), tag));
         }
         let msg_var = retains.len();
-        b2_slots.push((msg_var, Slot::Available(Value::String(message.clone()))));
+        let msg_tag = self.tags.new_owner(scope_id, msg_var);
+        b2_slots.push((
+            msg_var,
+            Slot::Available(Value::String(message.clone())),
+            msg_tag,
+        ));
         let act = self.stack.last_mut().expect("an activation");
         act.kind = ActivationKind::Boundary {
             id,
             in_contingency: Some(message),
         };
         act.scopes.push(Scope {
+            id: scope_id,
             body: 0,
             pc: 0,
             slots: b2_slots,
@@ -1916,15 +2496,21 @@ impl<'a> Machine<'a> {
         values: Vec<Value>,
         clause: &'static str,
     ) -> Result<(), Fail> {
-        let head = self.body().bodies[body].head.as_ref().expect("a loop body");
-        let slots = head
+        let params = self.body().bodies[body]
+            .head
+            .as_ref()
+            .expect("a loop body")
             .parameters
-            .iter()
-            .copied()
-            .zip(values.iter().cloned().map(Slot::Available))
-            .collect();
+            .clone();
+        let scope_id = self.alloc_scope_id();
+        let mut slots = Vec::with_capacity(params.len());
+        for (&var, val) in params.iter().zip(&values) {
+            let tag = self.tags.new_owner(scope_id, var);
+            slots.push((var, Slot::Available(val.clone()), tag));
+        }
         let activation = self.stack.last_mut().expect("an activation");
         activation.scopes.push(Scope {
+            id: scope_id,
             body,
             pc: 0,
             slots,
@@ -1933,6 +2519,7 @@ impl<'a> Machine<'a> {
                 entry_parameters: values,
             },
         });
+        let head = self.body().bodies[body].head.as_ref().expect("a loop body");
         if let Some(invariant) = &head.invariant
             && !self.formula(invariant)?
         {
@@ -2032,11 +2619,15 @@ impl<'a> Machine<'a> {
 
     /// [E-Extern], [E-Effect], [E-Host], [E-Resource]: one step of the host.
     fn external(&mut self, id: ControlId, arguments: Vec<Value>) -> Result<Answered, Fail> {
+        let mut concrete_args = Vec::with_capacity(arguments.len());
+        for arg in &arguments {
+            concrete_args.push(self.deref_checked(arg)?);
+        }
         let callee: &Control = &self.program.controls[id];
         if let Some(precondition) = &callee.precondition {
             let env = SignatureEnv {
-                parameters: &arguments,
-                old_parameters: &arguments,
+                parameters: &concrete_args,
+                old_parameters: &concrete_args,
                 fields: &[],
             };
             if !self.evaluator().holds(precondition, &env)? {
@@ -2046,7 +2637,7 @@ impl<'a> Machine<'a> {
                     format!(
                         "the precondition of `{}` is false for ({})",
                         callee.name,
-                        list(&arguments)
+                        list(&concrete_args)
                     ),
                 );
             }
@@ -2055,7 +2646,7 @@ impl<'a> Machine<'a> {
 
         // [E-Resource]: track resources passed by value vs by borrow.
         let mut consumed_resources = Vec::new();
-        for (arg, param) in arguments.iter().zip(&callee.parameters) {
+        for (arg, param) in concrete_args.iter().zip(&callee.parameters) {
             let mut arg_res = Vec::new();
             collect_resources(arg, &mut arg_res);
             for &(rid, handle_id) in &arg_res {
@@ -2080,7 +2671,7 @@ impl<'a> Machine<'a> {
             }
         }
 
-        let answer = match self.host.call(callee, &arguments, self.config) {
+        let answer = match self.host.call(callee, &concrete_args, self.config) {
             Ok(answer) => answer,
             Err(detail) => return Ok(Answered::Ended(End::HostFailed(detail))),
         };
@@ -2111,6 +2702,68 @@ impl<'a> Machine<'a> {
             ));
         }
 
+        // [E-Host]: validate any returned borrow/view payload against declared origins `∈ ȳ`.
+        fn collect_refs(v: &Value, out: &mut Vec<(BorrowMode, RuntimePlace, TagId)>) {
+            match v {
+                Value::Ref { mode, place, tag } => out.push((*mode, place.clone(), *tag)),
+                Value::Struct { fields, .. } => {
+                    for f in fields {
+                        collect_refs(f, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut all_payload_refs: Vec<(BorrowMode, RuntimePlace, TagId)> = Vec::new();
+        for (val, field) in answer.payload.iter().zip(&alternative.fields) {
+            if self.program.contains_borrow_or_view(&field.ty) {
+                let mut frefs = Vec::new();
+                collect_refs(val, &mut frefs);
+                if frefs.is_empty() && matches!(field.ty, Type::Ref(_, _)) {
+                    return violation(format!(
+                        "`{}` answered a non-borrow value for borrowed payload `{}`",
+                        callee.name, field.name
+                    ));
+                }
+                let mut allowed_sources = Vec::new();
+                for &oidx in &field.origins {
+                    collect_refs(&arguments[oidx], &mut allowed_sources);
+                }
+                for (rmode, rplace, rtag) in &frefs {
+                    if !self.tags.is_alive(*rtag) {
+                        return violation(format!(
+                            "`{}` returned a dead borrow in `{}`",
+                            callee.name, field.name
+                        ));
+                    }
+                    let anc = self.tags.ancestors(*rtag);
+                    let valid_origin = allowed_sources
+                        .iter()
+                        .any(|(_, aplace, atag)| anc.contains(atag) && aplace.contains(rplace));
+                    if !valid_origin {
+                        return violation(format!(
+                            "`{}` returned a borrow in `{}` not derived from its declared origins",
+                            callee.name, field.name
+                        ));
+                    }
+                    all_payload_refs.push((*rmode, rplace.clone(), *rtag));
+                }
+            }
+        }
+        for i in 0..all_payload_refs.len() {
+            for j in (i + 1)..all_payload_refs.len() {
+                let (m1, p1, _) = &all_payload_refs[i];
+                let (m2, p2, _) = &all_payload_refs[j];
+                if (*m1 == BorrowMode::Exclusive || *m2 == BorrowMode::Exclusive) && p1.overlaps(p2)
+                {
+                    return violation(format!(
+                        "`{}` returned overlapping exclusive borrows in its payload",
+                        callee.name
+                    ));
+                }
+            }
+        }
+
         // [E-Resource]: resources taken by value are closed unless returned in
         // the payload; new resources in the payload are recorded as open.
         for &(rid, handle_id) in &consumed_resources {
@@ -2138,31 +2791,35 @@ impl<'a> Machine<'a> {
             self.count("E-Resource");
         }
 
+        let mut concrete_payload = Vec::with_capacity(answer.payload.len());
+        for val in &answer.payload {
+            concrete_payload.push(self.deref_formula(val)?);
+        }
         if let Some(condition) = &alternative.condition {
             let env = SignatureEnv {
-                parameters: &arguments,
-                old_parameters: &arguments,
-                fields: &answer.payload,
+                parameters: &concrete_args,
+                old_parameters: &concrete_args,
+                fields: &concrete_payload,
             };
             if !self.evaluator().holds(condition, &env)? {
                 return violation(format!(
                     "`{}` answered `{} {{{}}}` for ({}), and the condition of the alternative is false",
                     callee.name,
                     answer.alternative,
-                    list(&answer.payload),
-                    list(&arguments)
+                    list(&concrete_payload),
+                    list(&concrete_args)
                 ));
             }
         }
         if callee.is_pure() {
-            let key = (id, arguments.clone());
-            let given = (index, answer.payload.clone());
+            let key = (id, concrete_args.clone());
+            let given = (index, concrete_payload.clone());
             match self.answers.get(&key) {
                 Some(earlier) if *earlier != given => {
                     return violation(format!(
                         "`{}` has no effect and answered ({}) in two ways",
                         callee.name,
-                        list(&arguments)
+                        list(&concrete_args)
                     ));
                 }
                 Some(_) => {}
@@ -2173,9 +2830,9 @@ impl<'a> Machine<'a> {
         } else {
             self.trace.push(Event {
                 control: callee.name.clone(),
-                arguments,
+                arguments: concrete_args,
                 alternative: answer.alternative.clone(),
-                payload: answer.payload.clone(),
+                payload: concrete_payload,
             });
         }
         self.count("E-Extern");
@@ -2185,28 +2842,38 @@ impl<'a> Machine<'a> {
     fn execute_builtin(
         &mut self,
         op: BuiltinOp,
-        target: Option<&Place>,
+        _target: Option<&Place>,
         arguments: &[Expr],
     ) -> Result<(usize, Vec<Value>), Fail> {
-        let (mut vals, _) = self.eval_operands(arguments, None)?;
+        let mut vals = self.eval_operands(arguments)?;
         match op {
             BuiltinOp::Push => {
-                let place = self.eval_place(target.expect("push target"))?;
+                // [B5]: push is a write access to the whole vector.
                 let elem = vals.remove(1);
-                let Value::Vector(mut items) = vals.remove(0) else {
+                let Value::Ref { place, tag, .. } = vals.remove(0) else {
+                    return fail(10, "E-Extern", "`push` requires an exclusive borrow");
+                };
+                self.access_tag(tag, &place, true)?;
+                let Value::Vector(mut items) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`push` on non-vector");
                 };
                 items.push(elem);
-                self.write_eval_place(&place, Value::Vector(items), false)?;
+                self.write_runtime_place(&place, tag, Value::Vector(items), false)?;
+                self.count("B5");
                 Ok((0, Vec::new()))
             }
             BuiltinOp::Pop => {
-                let place = self.eval_place(target.expect("pop target"))?;
-                let Value::Vector(mut items) = vals.remove(0) else {
+                // [B5]: pop is a write access to the whole vector.
+                let Value::Ref { place, tag, .. } = vals.remove(0) else {
+                    return fail(10, "E-Extern", "`pop` requires an exclusive borrow");
+                };
+                self.access_tag(tag, &place, true)?;
+                let Value::Vector(mut items) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`pop` on non-vector");
                 };
+                self.count("B5");
                 if let Some(last) = items.pop() {
-                    self.write_eval_place(&place, Value::Vector(items), false)?;
+                    self.write_runtime_place(&place, tag, Value::Vector(items), false)?;
                     Ok((0, vec![last]))
                 } else {
                     Ok((1, Vec::new()))
@@ -2224,45 +2891,78 @@ impl<'a> Machine<'a> {
                 }
             }
             BuiltinOp::Get => {
-                let key = vals.remove(1);
-                let Value::Map(entries) = vals.remove(0) else {
+                // `get(map: &k ⇀ v, key: &k) ■ found {value: &v ∈ map} │ missing`
+                let raw_key = vals.remove(1);
+                let key = self.deref_checked(&raw_key)?;
+                let Value::Ref { place, tag, .. } = vals.remove(0) else {
+                    return fail(10, "E-Extern", "`get` requires a map borrow");
+                };
+                self.access_tag(tag, &place, false)?;
+                let Value::Map(entries) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`get` on non-map");
                 };
-                match entries.get(&key) {
-                    Some(v) => Ok((0, vec![v.clone()])),
-                    None => Ok((1, Vec::new())),
+                if entries.contains_key(&key) {
+                    let val_place = place.with_step(RuntimeStep::MapValue(key));
+                    let val_tag =
+                        self.create_borrow_tag(tag, val_place.clone(), BorrowMode::Shared)?;
+                    Ok((
+                        0,
+                        vec![Value::Ref {
+                            mode: BorrowMode::Shared,
+                            place: val_place,
+                            tag: val_tag,
+                        }],
+                    ))
+                } else {
+                    Ok((1, Vec::new()))
                 }
             }
             BuiltinOp::Insert => {
-                let place = self.eval_place(target.expect("insert target"))?;
+                // [B5]: insert is a write access to the whole map.
                 let value = vals.remove(2);
                 let key = vals.remove(1);
-                let Value::Map(mut entries) = vals.remove(0) else {
+                let Value::Ref { place, tag, .. } = vals.remove(0) else {
+                    return fail(10, "E-Extern", "`insert` requires an exclusive borrow");
+                };
+                self.access_tag(tag, &place, true)?;
+                let Value::Map(mut entries) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`insert` on non-map");
                 };
                 let prev = entries.insert(key, value);
-                self.write_eval_place(&place, Value::Map(entries), false)?;
+                self.write_runtime_place(&place, tag, Value::Map(entries), false)?;
+                self.count("B5");
                 match prev {
                     None => Ok((0, Vec::new())),
                     Some(old) => Ok((1, vec![old])),
                 }
             }
             BuiltinOp::Remove => {
-                let place = self.eval_place(target.expect("remove target"))?;
-                let key = vals.remove(1);
-                let Value::Map(mut entries) = vals.remove(0) else {
+                // [B5]: remove is a write access to the whole map.
+                let raw_key = vals.remove(1);
+                let key = self.deref_checked(&raw_key)?;
+                let Value::Ref { place, tag, .. } = vals.remove(0) else {
+                    return fail(10, "E-Extern", "`remove` requires an exclusive borrow");
+                };
+                self.access_tag(tag, &place, true)?;
+                let Value::Map(mut entries) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`remove` on non-map");
                 };
                 let prev = entries.remove(&key);
-                self.write_eval_place(&place, Value::Map(entries), false)?;
+                self.write_runtime_place(&place, tag, Value::Map(entries), false)?;
+                self.count("B5");
                 match prev {
                     Some(old) => Ok((0, vec![old])),
                     None => Ok((1, Vec::new())),
                 }
             }
             BuiltinOp::EntryAt => {
+                // `entry_at(map: &k ⇀ v, position: usize) ■ item {key: &k ∈ map, value: &v ∈ map, next: usize} │ finished`
                 let pos = integer(vals.remove(1))?;
-                let Value::Map(entries) = vals.remove(0) else {
+                let Value::Ref { place, tag, .. } = vals.remove(0) else {
+                    return fail(10, "E-Extern", "`entry_at` requires a map borrow");
+                };
+                self.access_tag(tag, &place, false)?;
+                let Value::Map(entries) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`entry_at` on non-map");
                 };
                 let Some(idx) = pos
@@ -2271,13 +2971,34 @@ impl<'a> Machine<'a> {
                 else {
                     return Ok((1, Vec::new()));
                 };
-                let (k, v) = entries.iter().nth(idx as usize).unwrap();
+                let (k, _) = entries.iter().nth(idx as usize).unwrap();
+                let key_val = k.clone();
+                let key_place = place.with_step(RuntimeStep::MapKey(key_val.clone()));
+                let val_place = place.with_step(RuntimeStep::MapValue(key_val));
+                let key_tag = self.create_borrow_tag(tag, key_place.clone(), BorrowMode::Shared)?;
+                let val_tag = self.create_borrow_tag(tag, val_place.clone(), BorrowMode::Shared)?;
                 let next = pos.plus(&Int::from_u64(1));
-                Ok((0, vec![k.clone(), v.clone(), Value::Int(next)]))
+                Ok((
+                    0,
+                    vec![
+                        Value::Ref {
+                            mode: BorrowMode::Shared,
+                            place: key_place,
+                            tag: key_tag,
+                        },
+                        Value::Ref {
+                            mode: BorrowMode::Shared,
+                            place: val_place,
+                            tag: val_tag,
+                        },
+                        Value::Int(next),
+                    ],
+                ))
             }
             BuiltinOp::Emit => {
                 self.check_effects(&["console.write".to_string()], "emit")?;
-                let text = vals.remove(0);
+                let raw_text = vals.remove(0);
+                let text = self.deref_checked(&raw_text)?;
                 self.trace.push(Event {
                     control: "emit".to_string(),
                     arguments: vec![text],
@@ -2297,19 +3018,20 @@ impl<'a> Machine<'a> {
     ) -> Result<Option<Answered>, Fail> {
         match op_kind {
             Operation::Control(callee_id) => {
-                let callee = &self.program.controls[*callee_id];
-                let param_types: Vec<Type> =
-                    callee.parameters.iter().map(|p| p.ty.clone()).collect();
-                let (arg_values, writebacks) = self.eval_operands(arguments, Some(&param_types))?;
+                let arg_values = self.eval_operands(arguments)?;
                 let callee = &self.program.controls[*callee_id];
                 if callee.body.is_none() {
                     return Ok(Some(self.external(*callee_id, arg_values)?));
                 }
                 // [E-Call]
+                let mut entry_snapshots = Vec::with_capacity(arg_values.len());
+                for v in &arg_values {
+                    entry_snapshots.push(self.deref_formula(v)?);
+                }
                 if let Some(precondition) = &callee.precondition {
                     let env = SignatureEnv {
-                        parameters: &arg_values,
-                        old_parameters: &arg_values,
+                        parameters: &entry_snapshots,
+                        old_parameters: &entry_snapshots,
                         fields: &[],
                     };
                     if !self.evaluator().holds(precondition, &env)? {
@@ -2319,12 +3041,12 @@ impl<'a> Machine<'a> {
                             format!(
                                 "the precondition of `{}` is false for ({})",
                                 callee.name,
-                                list(&arg_values)
+                                list(&entry_snapshots)
                             ),
                         );
                     }
                 }
-                self.push_control(*callee_id, arg_values, writebacks);
+                self.push_control(*callee_id, arg_values, entry_snapshots);
                 self.count("E-Call");
                 Ok(None)
             }
@@ -2345,19 +3067,53 @@ impl<'a> Machine<'a> {
                 self.count("E-Outcome");
                 Ok(Some(Answered::Completed(alternative, payload)))
             }
-            Operation::Variant { by_value, .. } => {
-                let val = self.eval_expr(&arguments[0], *by_value)?;
-                let Value::Variant {
-                    constructor,
-                    fields,
-                    ..
-                } = val
-                else {
-                    return fail(10, "E-Outcome", "variant decision on non-variant value");
-                };
-                self.count("E-Outcome");
-                Ok(Some(Answered::Completed(constructor, fields)))
-            }
+            Operation::Variant { borrow, .. } => match borrow {
+                None => {
+                    let val = self.eval_expr(&arguments[0], true)?;
+                    let Value::Variant {
+                        constructor,
+                        fields,
+                        ..
+                    } = val
+                    else {
+                        return fail(10, "E-Outcome", "variant decision on non-variant value");
+                    };
+                    self.count("E-Outcome");
+                    Ok(Some(Answered::Completed(constructor, fields)))
+                }
+                Some(mode) => {
+                    // [E-Outcome]: deciding a borrowed variant reborrows each field through it.
+                    let val = self.eval_expr(&arguments[0], true)?;
+                    let Value::Ref { place, tag, .. } = val else {
+                        return fail(
+                            10,
+                            "E-Outcome",
+                            "borrowed variant decision requires a borrow value",
+                        );
+                    };
+                    self.access_tag(tag, &place, false)?;
+                    let Value::Variant {
+                        constructor,
+                        fields,
+                        ..
+                    } = self.read_place(&place)?
+                    else {
+                        return fail(10, "E-Outcome", "variant decision on non-variant value");
+                    };
+                    let mut field_refs = Vec::with_capacity(fields.len());
+                    for fidx in 0..fields.len() {
+                        let fplace = place.with_step(RuntimeStep::VariantField(constructor, fidx));
+                        let ftag = self.create_borrow_tag(tag, fplace.clone(), *mode)?;
+                        field_refs.push(Value::Ref {
+                            mode: *mode,
+                            place: fplace,
+                            tag: ftag,
+                        });
+                    }
+                    self.count("E-Outcome");
+                    Ok(Some(Answered::Completed(constructor, field_refs)))
+                }
+            },
         }
     }
 
@@ -2440,18 +3196,33 @@ impl<'a> Machine<'a> {
             }
             Command::Assign { var, value } => {
                 let value = self.eval_expr(value, true)?;
-                let place = EvalPlace {
-                    root: *var,
-                    steps: Vec::new(),
-                };
-                self.write_eval_place(&place, value, true)?;
+                let var_name = self.body().vars[*var].name.clone();
+                let var_ty = self.body().vars[*var].ty.clone();
+                let (scope_id, slot, owner_tag) = self.find_local_slot(*var).map_err(|_| Fail {
+                    state: 2,
+                    clause: "E-Assign",
+                    detail: format!("`{var_name}` has no slot on this history"),
+                })?;
+                if matches!(var_ty, Type::Ref(_, _)) {
+                    let Slot::Available(Value::Ref { place, tag, .. }) = slot else {
+                        return fail(
+                            2,
+                            "E-Assign",
+                            format!("`{var_name}` has been moved on this history"),
+                        );
+                    };
+                    self.write_runtime_place(&place, tag, value, true)?;
+                } else {
+                    let own_place = RuntimePlace::root(scope_id, *var);
+                    self.write_runtime_place(&own_place, owner_tag, value, true)?;
+                }
                 self.scope().pc += 1;
                 self.count("E-Assign");
             }
             Command::AssignPlace { target, value } => {
                 let value = self.eval_expr(value, true)?;
-                let eval_place = self.eval_place(target)?;
-                self.write_eval_place(&eval_place, value, true)?;
+                let (rplace, tag) = self.resolve_place(target)?;
+                self.write_runtime_place(&rplace, tag, value, true)?;
                 self.scope().pc += 1;
                 self.count("E-Assign");
             }
@@ -2487,9 +3258,14 @@ impl<'a> Machine<'a> {
                 initial,
                 ..
             } => {
-                let (values, _) = self.eval_operands(initial, None)?;
+                let values = self.eval_operands(initial)?;
                 if let Err(stuck) = self.enter(*inner, values, "E-Loop") {
-                    self.stack.last_mut().expect("an activation").scopes.pop();
+                    if let Some(popped) = self.stack.last_mut().expect("an activation").scopes.pop()
+                    {
+                        for (_, _, tag) in &popped.slots {
+                            self.tags.kill_with_descendants(*tag);
+                        }
+                    }
                     return Err(stuck);
                 }
                 self.count("E-Loop");
@@ -2509,11 +3285,13 @@ impl<'a> Machine<'a> {
                     cap_values.push(val);
                 }
                 let parent_pc = self.scope().pc;
+                let scope_id = self.alloc_scope_id();
                 self.stack
                     .last_mut()
                     .expect("an activation")
                     .scopes
                     .push(Scope {
+                        id: scope_id,
                         body: *b1,
                         pc: 0,
                         slots: Vec::new(),
@@ -2533,20 +3311,21 @@ impl<'a> Machine<'a> {
                 boundary,
                 arguments,
             } => {
-                let (values, _) = self.eval_operands(arguments, None)?;
-                let slots = values
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| (i, Slot::Available(v)))
-                    .collect();
+                let values = self.eval_operands(arguments)?;
+                let scope_id = self.alloc_scope_id();
+                let mut slots = Vec::with_capacity(values.len());
+                for (i, v) in values.into_iter().enumerate() {
+                    let tag = self.tags.new_owner(scope_id, i);
+                    slots.push((i, Slot::Available(v), tag));
+                }
                 self.stack.push(Activation {
                     kind: ActivationKind::Boundary {
                         id: *boundary,
                         in_contingency: None,
                     },
                     arguments: Vec::new(),
-                    writebacks: Vec::new(),
                     scopes: vec![Scope {
+                        id: scope_id,
                         body: 0,
                         pc: 0,
                         slots,
@@ -2560,7 +3339,7 @@ impl<'a> Machine<'a> {
                 body: target,
                 arguments,
             } => {
-                let (values, _) = self.eval_operands(arguments, None)?;
+                let values = self.eval_operands(arguments)?;
                 while let Some(scope) = self.stack.last_mut().expect("an activation").scopes.pop() {
                     let done = scope.body == *target;
                     self.end_scope(&scope)?;
@@ -2575,7 +3354,7 @@ impl<'a> Machine<'a> {
                 alternative,
                 payload,
             } => {
-                let (values, _) = self.eval_operands(payload, None)?;
+                let values = self.eval_operands(payload)?;
                 loop {
                     let scope = self
                         .stack
@@ -2614,7 +3393,7 @@ impl<'a> Machine<'a> {
                 alternative,
                 payload,
             } => {
-                let (values, _) = self.eval_operands(payload, None)?;
+                let values = self.eval_operands(payload)?;
                 let act = self.stack.last().expect("an activation");
                 let ActivationKind::Control(control_id) = act.kind else {
                     return fail(10, "E-Exit", "`■` inside a named boundary");
@@ -2622,22 +3401,26 @@ impl<'a> Machine<'a> {
                 let control = &self.program.controls[control_id];
                 let entry = &control.contract[*alternative];
                 if let Some(condition) = &entry.condition {
-                    // Completion parameter values (reading updated slots for `&~` parameters).
+                    // Completion parameter values (reading current targets for `&~`/view parameters).
                     let mut final_params = act.arguments.clone();
                     if let Some(root_scope) = act.scopes.first() {
                         for (idx, param) in control.parameters.iter().enumerate() {
-                            if matches!(param.ty, Type::Ref(BorrowMode::Exclusive, _))
-                                && let Some((_, Slot::Available(v))) =
-                                    root_scope.slots.iter().find(|(s, _)| *s == idx)
+                            if self.program.contains_borrow_or_view(&param.ty)
+                                && let Some((_, Slot::Available(v), _)) =
+                                    root_scope.slots.iter().find(|(s, _, _)| *s == idx)
                             {
-                                final_params[idx] = v.clone();
+                                final_params[idx] = self.deref_formula(v)?;
                             }
                         }
+                    }
+                    let mut concrete_fields = Vec::with_capacity(values.len());
+                    for v in &values {
+                        concrete_fields.push(self.deref_formula(v)?);
                     }
                     let env = SignatureEnv {
                         parameters: &final_params,
                         old_parameters: &act.arguments,
-                        fields: &values,
+                        fields: &concrete_fields,
                     };
                     if !self.evaluator().holds(condition, &env)? {
                         return fail(
@@ -2646,36 +3429,33 @@ impl<'a> Machine<'a> {
                             format!(
                                 "the condition of `{}` is false for the payload {{{}}}",
                                 entry.name,
-                                list(&values)
+                                list(&concrete_fields)
                             ),
                         );
                     }
                 }
-                // [E-Scope] for every scope of the activation, innermost first.
+                // [E-Scope], [B4] for every scope of the activation, innermost first.
                 let mut scopes =
                     std::mem::take(&mut self.stack.last_mut().expect("an activation").scopes);
-                let root_slots = scopes.first().map(|s| s.slots.clone()).unwrap_or_default();
                 while let Some(scope) = scopes.pop() {
                     self.end_scope(&scope)?;
                 }
-                let popped = self.stack.pop().expect("an activation");
+                let _popped = self.stack.pop().expect("an activation");
                 self.count("E-Exit");
                 if self.stack.is_empty() {
+                    // Materialize final observable payload after scope-end tag kills
+                    // so returning a dangling borrow of a local triggers X4 B1.
+                    let mut observable = Vec::with_capacity(values.len());
+                    for v in &values {
+                        observable.push(self.deref_checked(v)?);
+                    }
                     let alt_name = self.program.controls[control_id].contract[*alternative]
                         .name
                         .clone();
                     return Ok(Some(End::Done {
                         alternative: alt_name,
-                        payload: values,
+                        payload: observable,
                     }));
-                }
-                // Write back any `&~` parameters to the caller's places.
-                for (param_var, caller_place) in &popped.writebacks {
-                    if let Some((_, Slot::Available(val))) =
-                        root_slots.iter().find(|(s, _)| *s == *param_var)
-                    {
-                        self.write_eval_place(caller_place, val.clone(), false)?;
-                    }
                 }
                 self.locate();
                 self.complete(*alternative, values)?;
@@ -2854,15 +3634,16 @@ impl<'a> Machine<'a> {
         &mut self,
         control: ControlId,
         arguments: Vec<Value>,
-        writebacks: Vec<(VarId, EvalPlace)>,
+        entry_snapshots: Vec<Value>,
     ) {
-        let slots = arguments
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(i, v)| (i, Slot::Available(v)))
-            .collect();
+        let scope_id = self.alloc_scope_id();
+        let mut slots = Vec::with_capacity(arguments.len());
+        for (i, v) in arguments.into_iter().enumerate() {
+            let tag = self.tags.new_owner(scope_id, i);
+            slots.push((i, Slot::Available(v), tag));
+        }
         let scope = Scope {
+            id: scope_id,
             body: 0,
             pc: 0,
             slots,
@@ -2871,17 +3652,60 @@ impl<'a> Machine<'a> {
         };
         self.stack.push(Activation {
             kind: ActivationKind::Control(control),
-            arguments,
-            writebacks,
+            arguments: entry_snapshots,
             scopes: vec![scope],
         });
     }
+
+    /// Wraps top-level entry arguments that have borrow or view types in
+    /// synthetic `ScopeId = 0` owner slots + live `Value::Ref` borrows.
+    fn wrap_entry_arg(&mut self, value: Value, ty: &Type) -> Result<Value, Fail> {
+        match ty {
+            Type::Ref(mode, _) => {
+                let slot_idx = self.entry_slots.len();
+                let owner_tag = self.tags.new_owner(0, slot_idx);
+                self.entry_slots
+                    .push((slot_idx, Slot::Available(value), owner_tag));
+                let place = RuntimePlace::root(0, slot_idx);
+                let tag = self.create_borrow_tag(owner_tag, place.clone(), *mode)?;
+                Ok(Value::Ref {
+                    mode: *mode,
+                    place,
+                    tag,
+                })
+            }
+            Type::Struct(sid, _) if self.program.structs[*sid].is_view => {
+                let Value::Struct { ty, name, fields } = value else {
+                    return Ok(value);
+                };
+                let fdefs: Vec<Type> = self.program.structs[*sid]
+                    .fields
+                    .iter()
+                    .map(|f| f.ty.clone())
+                    .collect();
+                let mut wrapped = Vec::with_capacity(fields.len());
+                for (fval, fty) in fields.into_iter().zip(&fdefs) {
+                    wrapped.push(self.wrap_entry_arg(fval, fty)?);
+                }
+                Ok(Value::Struct {
+                    ty,
+                    name,
+                    fields: wrapped,
+                })
+            }
+            _ => Ok(value),
+        }
+    }
 }
 
-fn update_nested(current: &mut Value, steps: &[EvalStep], new_val: Value) -> Result<Value, Fail> {
+fn update_nested(
+    current: &mut Value,
+    steps: &[RuntimeStep],
+    new_val: Value,
+) -> Result<Value, Fail> {
     let (first, rest) = steps.split_first().expect("non-empty steps");
     match first {
-        EvalStep::Field(fidx) => {
+        RuntimeStep::Field(fidx) => {
             let Value::Struct { fields, .. } = current else {
                 return fail(10, "E-Assign", "field assignment on non-struct");
             };
@@ -2891,7 +3715,7 @@ fn update_nested(current: &mut Value, steps: &[EvalStep], new_val: Value) -> Res
                 update_nested(&mut fields[*fidx], rest, new_val)
             }
         }
-        EvalStep::Index(idx) => {
+        RuntimeStep::Index(idx) => {
             let Value::Vector(items) = current else {
                 return fail(10, "E-Assign", "index assignment on non-vector");
             };
@@ -2909,6 +3733,38 @@ fn update_nested(current: &mut Value, steps: &[EvalStep], new_val: Value) -> Res
                 update_nested(elem, rest, new_val)
             }
         }
+        RuntimeStep::VariantField(cidx, fidx) => {
+            let Value::Variant {
+                constructor,
+                fields,
+                ..
+            } = current
+            else {
+                return fail(10, "E-Assign", "variant field assignment on non-variant");
+            };
+            if *constructor != *cidx || *fidx >= fields.len() {
+                return fail(4, "B1", "variant constructor changed under borrow");
+            }
+            if rest.is_empty() {
+                Ok(std::mem::replace(&mut fields[*fidx], new_val))
+            } else {
+                update_nested(&mut fields[*fidx], rest, new_val)
+            }
+        }
+        RuntimeStep::MapValue(key) => {
+            let Value::Map(entries) = current else {
+                return fail(10, "E-Assign", "map value assignment on non-map");
+            };
+            let Some(val) = entries.get_mut(key) else {
+                return fail(4, "B1", "map key removed under borrow");
+            };
+            if rest.is_empty() {
+                Ok(std::mem::replace(val, new_val))
+            } else {
+                update_nested(val, rest, new_val)
+            }
+        }
+        RuntimeStep::MapKey(_) => fail(4, "B1", "cannot assign through a map key borrow"),
     }
 }
 
@@ -2943,6 +3799,9 @@ pub fn run(
         program,
         config,
         host,
+        entry_slots: Vec::new(),
+        tags: TagTable::new(),
+        next_scope_id: 1,
         stack: Vec::new(),
         trace: Vec::new(),
         steps: 0,
@@ -2994,7 +3853,28 @@ pub fn run(
             machine.resources.insert((rid, handle_id), true);
         }
     }
-    machine.push_control(id, arguments, Vec::new());
+    let entry_snapshots = arguments.clone();
+    let mut wrapped_args = Vec::with_capacity(arguments.len());
+    for (arg, param) in arguments.into_iter().zip(&control.parameters) {
+        match machine.wrap_entry_arg(arg, &param.ty) {
+            Ok(v) => wrapped_args.push(v),
+            Err(stuck) => {
+                return Run {
+                    end: End::Stuck(Stuck {
+                        state: stuck.state,
+                        clause: stuck.clause,
+                        control: entry.to_string(),
+                        line: 0,
+                        detail: stuck.detail,
+                    }),
+                    trace: machine.trace,
+                    steps: machine.steps,
+                    rules: machine.rules,
+                };
+            }
+        }
+    }
+    machine.push_control(id, wrapped_args, entry_snapshots);
     let end = loop {
         if machine.steps >= config.fuel {
             break End::OutOfFuel;

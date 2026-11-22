@@ -29,6 +29,9 @@ pub enum Declaration {
 pub struct Parameter {
     pub name: String,
     pub ty: Type,
+    /// Borrow origin parameter names (`∈ y₁, y₂`, `[T4]`, `[W9]`), non-empty only
+    /// on borrowed/view payload fields of control contracts.
+    pub origins: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +39,7 @@ pub struct StructDecl {
     pub name: String,
     pub public: bool,
     pub is_copy: bool,
+    pub is_view: bool,
     pub fields: Vec<Parameter>,
     pub line: u32,
 }
@@ -540,6 +544,9 @@ fn print_parameters(out: &mut String, parameters: &[Parameter]) {
             out.push_str(", ");
         }
         let _ = write!(out, "{} : {}", parameter.name, parameter.ty);
+        if !parameter.origins.is_empty() {
+            let _ = write!(out, " ∈ {}", parameter.origins.join(", "));
+        }
     }
 }
 
@@ -779,6 +786,9 @@ impl Program {
                     }
                     if st.is_copy {
                         out.push_str("copy ");
+                    }
+                    if st.is_view {
+                        out.push_str("view ");
                     }
                     let _ = write!(out, "struct {} {{", st.name);
                     print_parameters(&mut out, &st.fields);

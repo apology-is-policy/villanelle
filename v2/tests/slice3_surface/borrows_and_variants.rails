@@ -1,0 +1,65 @@
+┄ Slice 3 Rails: borrows, `∈` origins, `■ auto` origin inference ([G3]),
+┄ variant borrows ([U6]), `∀` borrowing elements ([U10]), and borrow-preserving `□` ([U9]).
+
+variant slot
+├ filled {text: string}
+└ empty
+
+pub control widest(a: &string, b: &string) ■ ok {out: &string ∈ a, b}
+│ ? len(a) ≥ len(b) → ■ ok {a}
+│ ■ ok {b}
+╵
+
+control shorter(a: &string, b: &string) ■ auto
+│ ? len(a) ≤ len(b) → ■ ok {a}
+│ ■ ok {b}
+╵
+
+control bump(x: &~u32, step: u32) ■ done
+│ x ← x + step
+│ ■ done
+╵
+
+pub control borrow_basics() ■ ok {wide: string, short: string, count: u32}
+│ Δ widest("alder", "birch"): ok {w}
+│ Δ shorter("elm", "birch"): ok {s}
+│ ~n: u32 := 10
+│ m: &~u32 := ~n
+│ bump(~m, 5)
+│ m ← m + 2
+│ r: &u32 := n
+│ ■ ok {clone(w), clone(s), r}
+╵
+
+pub control variant_borrows() ■ ok {before: string, after: string, owned: string}
+│ ~cell: slot := slot.filled {"alpha"}
+│ Δ cell: filled {t1} │ empty → ⊥
+│ before: string := clone(t1)
+│ Δ ~cell: filled {t2} │ empty → ⊥
+│ t2 ← "beta"
+│ Δ cell: filled {t3} │ empty → ⊥
+│ after: string := clone(t3)
+│ Δ ▾cell: filled {owned} │ empty → ⊥
+│ ■ ok {before, after, owned}
+╵
+
+pub control first_long(names: &[string]) ■ found {item: &string ∈ names} │ missing
+│ ∀ name ∈ names
+│ ║ ? len(name) > 4 → □ found {item: name}
+╞═ found: ■ found {item}
+│ ■ missing
+╵
+
+pub control map_borrows(table: &string ⇀ string, key: &string)
+    ■ found {value: &string ∈ table}
+    ■ missing
+│ Δ table.get(key): found {v} │ missing → ■ missing
+│ ■ found {v}
+╵
+
+//! run borrow_basics() => done ok {"alder", "elm", 17}
+//! run variant_borrows() => done ok {"alpha", "beta", "beta"}
+//! run first_long(["elm", "birch", "oak"]) => done found {"birch"}
+//! run first_long(["elm", "oak"]) => done missing
+//! run map_borrows({"a" ↦ "alder"}, "a") => done found {"alder"}
+//! run map_borrows({"a" ↦ "alder"}, "b") => done missing

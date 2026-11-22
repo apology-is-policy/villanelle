@@ -62,6 +62,9 @@ trait Scope {
     fn find_parameter(&self, _name: &str) -> Option<(usize, Type)> {
         None
     }
+    fn is_mutable(&self, _var: VarId) -> bool {
+        false
+    }
 }
 
 struct SignatureScope<'a> {
@@ -106,9 +109,33 @@ struct Globals<'a> {
 }
 
 impl Globals<'_> {
+    fn is_view(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Struct(id, _) if self.structs[*id].is_view)
+    }
+
+    fn contains_borrow_or_view(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Ref(_, _) => true,
+            Type::Struct(id, _) => self.structs[*id].is_view,
+            Type::Vector(elem) => self.contains_borrow_or_view(elem),
+            Type::Map(k, v) => self.contains_borrow_or_view(k) || self.contains_borrow_or_view(v),
+            _ => false,
+        }
+    }
+
+    fn has_exclusive_borrow(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Ref(BorrowMode::Exclusive, _) => true,
+            Type::Struct(id, _) => {
+                self.structs[*id].is_view && self.structs[*id].kind != Kind::Copy
+            }
+            _ => false,
+        }
+    }
+
     /// Resolves a syntactic `Type` into a canonical `typed::Type`.
-    /// `allow_ref` is true at top-level parameter, local, loop-parameter and
-    /// payload-field positions ([W6]).
+    /// `allow_ref` is true at top-level parameter, local, loop-parameter,
+    /// view-field and payload-field positions ([W6]).
     fn resolve_type(
         &self,
         ty: &Type,
@@ -165,6 +192,24 @@ impl Globals<'_> {
                     return Ok(t);
                 }
                 if let Some(&id) = self.struct_ids.get(name.as_str()) {
+                    if self.structs[id].is_view {
+                        if in_outcome {
+                            return fail(
+                                line,
+                                "T6",
+                                "`outcome⟨K⟩` is not allowed when a payload contains a view",
+                            );
+                        }
+                        if !allow_ref {
+                            return fail(
+                                line,
+                                "W6",
+                                format!(
+                                    "view type `{name}` may not occur inside another type or borrow"
+                                ),
+                            );
+                        }
+                    }
                     return Ok(Type::Struct(id, name.clone()));
                 }
                 if let Some(&id) = self.variant_ids.get(name.as_str()) {
@@ -178,7 +223,27 @@ impl Globals<'_> {
                 }
                 fail(line, "C1", format!("`{name}` is not a declared type"))
             }
-            Type::Struct(id, name) => Ok(Type::Struct(*id, name.clone())),
+            Type::Struct(id, name) => {
+                if self.structs[*id].is_view {
+                    if in_outcome {
+                        return fail(
+                            line,
+                            "T6",
+                            "`outcome⟨K⟩` is not allowed when a payload contains a view",
+                        );
+                    }
+                    if !allow_ref {
+                        return fail(
+                            line,
+                            "W6",
+                            format!(
+                                "view type `{name}` may not occur inside another type or borrow"
+                            ),
+                        );
+                    }
+                }
+                Ok(Type::Struct(*id, name.clone()))
+            }
             Type::Variant(id, name) => Ok(Type::Variant(*id, name.clone())),
             Type::Resource(id, name) => Ok(Type::Resource(*id, name.clone())),
             Type::Outcome(id, name) => Ok(Type::Outcome(*id, name.clone())),
@@ -328,7 +393,7 @@ impl Typer<'_> {
                 else {
                     return self.error(format!("struct `{sname}` has no field `{field}`"));
                 };
-                Some(f.ty.clone())
+                Some(f.ty.deref_type().clone())
             }
             syntax::Expr::Index(base, _) => {
                 let Some(base_ty) = self.kind(base)? else {
@@ -393,6 +458,39 @@ impl Typer<'_> {
                 Some(self.globals.function_types[self.function(name)?].1.clone())
             }
         })
+    }
+
+    /// Like `kind`, but preserves borrow types on names and view fields for `□` ([W8], [W9]).
+    fn leave_kind(&self, expr: &syntax::Expr) -> Result<Option<Type>, Error> {
+        match expr {
+            syntax::Expr::Name(name) => match self.scope.find(name) {
+                Some((_, ty)) => Ok(Some(ty)),
+                None => self.error(format!("`{name}` is not a name here")),
+            },
+            syntax::Expr::Field(base, field) => {
+                if let syntax::Expr::Name(vname) = &**base
+                    && self.scope.find(vname).is_none()
+                    && let Some(&vid) = self.globals.variant_ids.get(vname.as_str())
+                {
+                    return Ok(Some(Type::Variant(vid, vname.clone())));
+                }
+                let Some(base_ty) = self.kind(base)? else {
+                    return Ok(None);
+                };
+                let Type::Struct(sid, sname) = base_ty.deref_type() else {
+                    return self.error(format!("cannot read field `{field}` on `{base_ty}`"));
+                };
+                let Some(f) = self.globals.structs[*sid]
+                    .fields
+                    .iter()
+                    .find(|f| f.name == *field)
+                else {
+                    return self.error(format!("struct `{sname}` has no field `{field}`"));
+                };
+                Ok(Some(f.ty.clone()))
+            }
+            _ => self.kind(expr),
+        }
     }
 
     fn infer(&self, expr: &syntax::Expr) -> Result<Expr, Error> {
@@ -473,9 +571,15 @@ impl Typer<'_> {
                     return self.error(format!("struct `{sname}` has no field `{field_name}`"));
                 };
                 let fty = field.ty.clone();
-                place.steps.push(PlaceStep::Field(sid, fidx, fty.clone()));
-                place.ty = fty;
-                Ok((place, through_exc))
+                let next_exc = match &fty {
+                    Type::Ref(BorrowMode::Exclusive, _) => true,
+                    Type::Ref(BorrowMode::Shared, _) => false,
+                    _ => through_exc,
+                };
+                let val_ty = fty.deref_type().clone();
+                place.steps.push(PlaceStep::Field(sid, fidx, fty));
+                place.ty = val_ty;
+                Ok((place, next_exc))
             }
             syntax::Expr::Index(base, idx_expr) => {
                 let (mut place, through_exc) = self.resolve_place(base)?;
@@ -506,7 +610,13 @@ impl Typer<'_> {
                             }
                         ));
                     }
-                    let (place, _) = self.resolve_place(inner)?;
+                    let (place, through_exc) = self.resolve_place(inner)?;
+                    if *mode == BorrowMode::Exclusive
+                        && !self.scope.is_mutable(place.root)
+                        && !through_exc
+                    {
+                        return self.error("cannot take an exclusive borrow of an immutable place");
+                    }
                     if place.ty != **exp_inner {
                         return self.error(format!(
                             "borrowed place has type {}, and {} is expected",
@@ -524,8 +634,57 @@ impl Typer<'_> {
                             && (var_ty == Type::Ref(BorrowMode::Exclusive, exp_inner.clone())
                                 || var_ty == **exp_inner)
                         {
-                            return Ok(Expr::Var(var, (**exp_inner).clone()));
+                            return match var {
+                                VarRef::Local(id) => Ok(Expr::Borrow(
+                                    BorrowMode::Shared,
+                                    Place {
+                                        root: id,
+                                        root_ty: var_ty,
+                                        steps: Vec::new(),
+                                        ty: (**exp_inner).clone(),
+                                    },
+                                    expected.clone(),
+                                )),
+                                _ => Ok(Expr::Var(var, (**exp_inner).clone())),
+                            };
                         }
+                    }
+                }
+                syntax::Expr::Field(base, field) => {
+                    if let Ok(base_expr) = self.infer(base)
+                        && let Type::Struct(sid, _) = base_expr.ty().deref_type().clone()
+                        && let Some((fidx, fdef)) = self.globals.structs[sid]
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .find(|(_, f)| f.name == *field)
+                    {
+                        if fdef.ty == *expected {
+                            return Ok(Expr::Field(
+                                Box::new(base_expr),
+                                sid,
+                                fidx,
+                                expected.clone(),
+                            ));
+                        }
+                        if *exp_mode == BorrowMode::Shared && fdef.ty.deref_type() == &**exp_inner {
+                            if let Ok((place, _)) = self.resolve_place(expr) {
+                                return Ok(Expr::Borrow(
+                                    BorrowMode::Shared,
+                                    place,
+                                    expected.clone(),
+                                ));
+                            }
+                            return Ok(Expr::Field(
+                                Box::new(base_expr),
+                                sid,
+                                fidx,
+                                (**exp_inner).clone(),
+                            ));
+                        }
+                    }
+                    if *exp_mode == BorrowMode::Shared {
+                        return self.build(expr, exp_inner);
                     }
                 }
                 _ if *exp_mode == BorrowMode::Shared => {
@@ -627,7 +786,7 @@ impl Typer<'_> {
                 else {
                     return self.error(format!("struct `{sname}` has no field `{field}`"));
                 };
-                if fdef.ty != *expected {
+                if fdef.ty.deref_type() != expected {
                     return self.error(format!(
                         "`{sname}.{field}` has type {}, and {expected} is expected",
                         fdef.ty
@@ -939,6 +1098,10 @@ impl Scope for Builder<'_, '_> {
             .find_map(|frame| frame.names.get(name))?;
         Some((VarRef::Local(*id), self.vars[*id].ty.clone()))
     }
+
+    fn is_mutable(&self, var: VarId) -> bool {
+        self.vars[var].mutable
+    }
 }
 
 impl<'g, 'a> Builder<'g, 'a> {
@@ -967,6 +1130,13 @@ impl<'g, 'a> Builder<'g, 'a> {
             None => (false, raw_name),
         };
         let mutable = mutable || has_prefix;
+        if mutable && self.globals.contains_borrow_or_view(&ty) {
+            return fail(
+                line,
+                "W8",
+                format!("`{name}` has borrow or view type `{ty}` and cannot be declared mutable"),
+            );
+        }
         let current = self.frames.len() - 1;
         if let Some(id) = self.frames[current].names.get(name).copied() {
             let var = &self.vars[id];
@@ -1112,6 +1282,21 @@ impl<'g, 'a> Builder<'g, 'a> {
         let mut built = Vec::with_capacity(arguments.len());
         for (argument, ty) in arguments.iter().zip(types) {
             if let Type::Ref(BorrowMode::Exclusive, inner) = ty {
+                // [W8]: A name or view field of type `&~τ` passes the borrow itself.
+                if let syntax::Expr::Name(name) = argument
+                    && let Some((var, var_ty)) = self.find(name)
+                    && var_ty == *ty
+                {
+                    built.push(Expr::Var(var, var_ty));
+                    continue;
+                }
+                if matches!(argument, syntax::Expr::Field(_, _))
+                    && let Ok(expr) = typer.build(argument, ty)
+                    && expr.ty() == *ty
+                {
+                    built.push(expr);
+                    continue;
+                }
                 let place_expr = match argument {
                     syntax::Expr::Borrow(BorrowMode::Exclusive, p) => &**p,
                     other => other,
@@ -1204,34 +1389,68 @@ impl<'g, 'a> Builder<'g, 'a> {
                 );
             }
             let raw = &arguments[0];
-            let by_value = matches!(raw, syntax::Expr::Move(_))
-                || !matches!(
-                    raw,
-                    syntax::Expr::Name(_)
-                        | syntax::Expr::Field(_, _)
-                        | syntax::Expr::Index(_, _)
-                        | syntax::Expr::Borrow(_, _)
-                );
-            let inner_raw = match raw {
-                syntax::Expr::Borrow(_, inner) => &**inner,
-                other => other,
-            };
             let expected = Type::Variant(vid, operation.to_string());
-            let arg = self
-                .typer(Mode::Expression, line)
-                .build(inner_raw, &expected)?;
+            let typer = self.typer(Mode::Expression, line);
+            let (borrow, arg) = match raw {
+                syntax::Expr::Borrow(mode, inner) => {
+                    let (place, through_exc) = typer.resolve_place(inner)?;
+                    if *mode == BorrowMode::Exclusive && !self.is_mutable_place(&place, through_exc)
+                    {
+                        return fail(
+                            line,
+                            "C1",
+                            format!("`{}` is not a mutable place", self.vars[place.root].name),
+                        );
+                    }
+                    if place.ty != expected {
+                        return fail(
+                            line,
+                            "C1",
+                            format!(
+                                "borrowed place has type {}, and {expected} is expected",
+                                place.ty
+                            ),
+                        );
+                    }
+                    let bty = Type::Ref(*mode, Box::new(expected));
+                    (Some(*mode), Expr::Borrow(*mode, place, bty))
+                }
+                syntax::Expr::Name(name)
+                    if self.find(name).is_some_and(
+                        |(_, ty)| matches!(&ty, Type::Ref(_, inner) if **inner == expected),
+                    ) =>
+                {
+                    let (var, var_ty) = self.find(name).unwrap();
+                    let Type::Ref(mode, _) = var_ty else {
+                        unreachable!();
+                    };
+                    (Some(mode), Expr::Var(var, var_ty))
+                }
+                _ => (None, typer.build(raw, &expected)?),
+            };
             let contract: Vec<Alternative> = self.globals.variants[vid]
                 .constructors
                 .iter()
                 .map(|c| Alternative {
                     name: c.name.clone(),
-                    fields: c.fields.clone(),
+                    fields: c
+                        .fields
+                        .iter()
+                        .map(|f| match borrow {
+                            None => f.clone(),
+                            Some(mode) => Parameter {
+                                name: f.name.clone(),
+                                ty: Type::Ref(mode, Box::new(f.ty.clone())),
+                                origins: vec![0],
+                            },
+                        })
+                        .collect(),
                     condition: None,
                 })
                 .collect();
             return Ok((
                 0,
-                Operation::Variant { id: vid, by_value },
+                Operation::Variant { id: vid, borrow },
                 vec![arg],
                 contract,
             ));
@@ -1314,6 +1533,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                         fields: vec![Parameter {
                             name: "value".to_string(),
                             ty: elem_ty,
+                            origins: Vec::new(),
                         }],
                         condition: None,
                     },
@@ -1350,10 +1570,12 @@ impl<'g, 'a> Builder<'g, 'a> {
                             Parameter {
                                 name: "head".to_string(),
                                 ty: *elem_ty,
+                                origins: Vec::new(),
                             },
                             Parameter {
                                 name: "tail".to_string(),
                                 ty: vec_ty,
+                                origins: Vec::new(),
                             },
                         ],
                         condition: None,
@@ -1403,7 +1625,8 @@ impl<'g, 'a> Builder<'g, 'a> {
                         name: "found".to_string(),
                         fields: vec![Parameter {
                             name: "value".to_string(),
-                            ty: *v_ty,
+                            ty: Type::Ref(BorrowMode::Shared, v_ty),
+                            origins: vec![0],
                         }],
                         condition: None,
                     },
@@ -1454,6 +1677,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                         fields: vec![Parameter {
                             name: "previous".to_string(),
                             ty: v_ty,
+                            origins: Vec::new(),
                         }],
                         condition: None,
                     },
@@ -1505,6 +1729,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                         fields: vec![Parameter {
                             name: "previous".to_string(),
                             ty: v_ty,
+                            origins: Vec::new(),
                         }],
                         condition: None,
                     },
@@ -1549,15 +1774,18 @@ impl<'g, 'a> Builder<'g, 'a> {
                         fields: vec![
                             Parameter {
                                 name: "key".to_string(),
-                                ty: *k_ty,
+                                ty: Type::Ref(BorrowMode::Shared, k_ty),
+                                origins: vec![0],
                             },
                             Parameter {
                                 name: "value".to_string(),
-                                ty: *v_ty,
+                                ty: Type::Ref(BorrowMode::Shared, v_ty),
+                                origins: vec![0],
                             },
                             Parameter {
                                 name: "next".to_string(),
                                 ty: Type::Int(IntType::Usize),
+                                origins: Vec::new(),
                             },
                         ],
                         condition: None,
@@ -1722,14 +1950,14 @@ impl<'g, 'a> Builder<'g, 'a> {
             } => {
                 let (_, op_kind, built_args, contract) =
                     self.resolve_operation(operation, arguments, line)?;
-                // [T6]: outcome<K> is allowed only when no payload of K contains a borrow.
+                // [T6]: outcome<K> is allowed only when no payload of K contains a borrow or view.
                 for alt in &contract {
                     for f in &alt.fields {
-                        if matches!(f.ty, Type::Ref(_, _)) {
+                        if self.globals.contains_borrow_or_view(&f.ty) {
                             return fail(
                                 line,
                                 "T6",
-                                "`outcome⟨K⟩` is not allowed when a payload contains a borrow",
+                                "`outcome⟨K⟩` is not allowed when a payload contains a borrow or view",
                             );
                         }
                     }
@@ -1772,6 +2000,9 @@ impl<'g, 'a> Builder<'g, 'a> {
                         format!("shared borrow `{name}` cannot be assigned"),
                     );
                 }
+                if self.globals.is_view(&ty) {
+                    return fail(line, "W8", format!("view `{name}` cannot be assigned"));
+                }
                 let through_exc = matches!(ty, Type::Ref(BorrowMode::Exclusive, _));
                 if !self.vars[var].mutable && !through_exc {
                     return fail(line, "C1", format!("`{name}` is not a mutable place"));
@@ -1780,6 +2011,9 @@ impl<'g, 'a> Builder<'g, 'a> {
                 let value = self
                     .typer(Mode::Expression, line)
                     .build(value, &target_ty)?;
+                if self.globals.contains_borrow_or_view(&value.ty()) {
+                    return fail(line, "W8", "an assignment never takes a borrow or view");
+                }
                 Ok(Command::Assign { var, value })
             }
             syntax::Command::AssignPlace { target, value } => {
@@ -1807,6 +2041,9 @@ impl<'g, 'a> Builder<'g, 'a> {
                     );
                 }
                 let value = typer.build(value, &place.ty)?;
+                if self.globals.contains_borrow_or_view(&value.ty()) {
+                    return fail(line, "W8", "an assignment never takes a borrow or view");
+                }
                 Ok(Command::AssignPlace {
                     target: place,
                     value,
@@ -1903,7 +2140,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                 let typer = self.typer(Mode::Expression, line);
                 let mut kinds = Vec::new();
                 for operand in payload {
-                    kinds.push(typer.kind(operand)?);
+                    kinds.push(typer.leave_kind(operand)?);
                 }
                 let statement = self.bodies[self.frames.last().expect("a frame").body]
                     .statements
@@ -2129,7 +2366,7 @@ impl<'g, 'a> Builder<'g, 'a> {
             let Some((VarRef::Local(var), ty)) = self.find(cap) else {
                 return fail(line, "C1", format!("`{cap}` is not a name here"));
             };
-            if matches!(ty, Type::Ref(_, _)) {
+            if self.globals.contains_borrow_or_view(&ty) {
                 return fail(
                     line,
                     "F5",
@@ -2406,6 +2643,7 @@ fn resolve_parameters(
         out.push(Parameter {
             name: parameter.name.clone(),
             ty,
+            origins: Vec::new(),
         });
     }
     Ok(out)
@@ -2534,11 +2772,16 @@ fn compute_type_properties(
     for _ in 0..rounds {
         for sid in 0..globals.structs.len() {
             let is_copy = globals.structs[sid].is_copy;
-            let mut max_kind = if is_copy { Kind::Copy } else { Kind::Drop };
+            let is_view = globals.structs[sid].is_view;
+            let mut max_kind = if is_copy || is_view {
+                Kind::Copy
+            } else {
+                Kind::Drop
+            };
             let mut fault_rel = true;
             let mut holds_ob = false;
-            let mut clonable = true;
-            let mut comparable = true;
+            let mut clonable = !is_view;
+            let mut comparable = !is_view;
             for i in 0..globals.structs[sid].fields.len() {
                 let fty = globals.structs[sid].fields[i].ty.clone();
                 max_kind = max_kind.max(globals.kind(&fty));
@@ -2591,6 +2834,7 @@ fn compute_type_properties(
     }
 
     // [T1], [G4b]: a `copy` struct or variant must have only `copy` components.
+    // [W6]: a `view struct` may contain only borrows, other views, or `copy` types.
     for (sid, st) in globals.structs.iter().enumerate() {
         if st.is_copy && st.kind != Kind::Copy {
             return fail(
@@ -2601,6 +2845,23 @@ fn compute_type_properties(
                     st.name
                 ),
             );
+        }
+        if st.is_view {
+            for f in &st.fields {
+                let allowed = matches!(f.ty, Type::Ref(_, _))
+                    || globals.is_view(&f.ty)
+                    || globals.kind(&f.ty) == Kind::Copy;
+                if !allowed {
+                    return fail(
+                        source_structs[sid].line,
+                        "W6",
+                        format!(
+                            "`view struct {}` field `{}` has owned non-copy type `{}`",
+                            st.name, f.name, f.ty
+                        ),
+                    );
+                }
+            }
         }
     }
     for (vid, var) in globals.variants.iter().enumerate() {
@@ -2666,11 +2927,16 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
             name: s.name.clone(),
             public: s.public,
             is_copy: s.is_copy,
-            kind: if s.is_copy { Kind::Copy } else { Kind::Drop },
+            is_view: s.is_view,
+            kind: if s.is_copy || s.is_view {
+                Kind::Copy
+            } else {
+                Kind::Drop
+            },
             fault_releasable: true,
             holds_obligation: false,
-            clonable: true,
-            comparable: true,
+            clonable: !s.is_view,
+            comparable: !s.is_view,
             fields: Vec::new(),
         });
     }
@@ -2724,7 +2990,7 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
     // Resolve fields of structs, variants and outcomes.
     for (id, s) in source_structs.iter().enumerate() {
         globals.structs[id].fields =
-            resolve_parameters(&globals, &s.fields, false, false, s.line, "the field")?;
+            resolve_parameters(&globals, &s.fields, s.is_view, false, s.line, "the field")?;
     }
     for (id, v) in source_variants.iter().enumerate() {
         let mut ctors: Vec<VariantConstructor> = Vec::new();
@@ -2811,11 +3077,11 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
             }
         }
         let result = globals.resolve_type(&function.result, true, false, function.line)?;
-        if matches!(result, Type::Ref(_, _)) {
+        if globals.contains_borrow_or_view(&result) {
             return fail(
                 function.line,
                 "W5a",
-                "the result of a function may not be a borrow",
+                "the result of a function may not be a borrow or a view",
             );
         }
         globals.function_types.push((
@@ -2865,7 +3131,7 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
                     format!("the contract lists `{}` twice", alternative.name),
                 );
             }
-            let fields = resolve_parameters(
+            let mut fields = resolve_parameters(
                 &globals,
                 &alternative.fields,
                 true,
@@ -2886,6 +3152,66 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
                     ),
                 );
             }
+            // [T4], [W9]: borrowed/view payload fields must declare valid parameter origins `∈ ȳ`.
+            for (field, syn_field) in fields.iter_mut().zip(&alternative.fields) {
+                let is_bv = globals.contains_borrow_or_view(&field.ty);
+                if !is_bv && !syn_field.origins.is_empty() {
+                    return fail(
+                        line,
+                        "T4",
+                        format!(
+                            "owned payload field `{}` may not declare borrow origins `∈`",
+                            field.name
+                        ),
+                    );
+                }
+                if is_bv && syn_field.origins.is_empty() {
+                    return fail(
+                        line,
+                        "W9",
+                        format!(
+                            "payload field `{}` of type `{}` must declare its origin with `∈`",
+                            field.name, field.ty
+                        ),
+                    );
+                }
+                let field_exc = globals.has_exclusive_borrow(&field.ty);
+                for origin_name in &syn_field.origins {
+                    let Some(pidx) = parameters.iter().position(|p| p.name == *origin_name) else {
+                        return fail(
+                            line,
+                            "T4",
+                            format!(
+                                "origin `{origin_name}` on payload `{}` is not a parameter of `{}`",
+                                field.name, control.name
+                            ),
+                        );
+                    };
+                    if !globals.contains_borrow_or_view(&parameters[pidx].ty) {
+                        return fail(
+                            line,
+                            "T4",
+                            format!(
+                                "origin `{origin_name}` on payload `{}` must be a borrow or view parameter",
+                                field.name
+                            ),
+                        );
+                    }
+                    if field_exc && !globals.has_exclusive_borrow(&parameters[pidx].ty) {
+                        return fail(
+                            line,
+                            "T4",
+                            format!(
+                                "exclusive payload `{}` cannot originate from shared parameter `{origin_name}`",
+                                field.name
+                            ),
+                        );
+                    }
+                    if !field.origins.contains(&pidx) {
+                        field.origins.push(pidx);
+                    }
+                }
+            }
             contract.push(Alternative {
                 name: alternative.name.clone(),
                 fields,
@@ -2893,11 +3219,13 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
             });
         }
         // Register the control's contract in `outcomes` if not already registered
-        // so `outcome⟨control_name⟩` works as a type.
+        // so `outcome⟨control_name⟩` works as a type ([T6]).
         if !globals.outcome_ids.contains_key(&control.name)
-            && contract
-                .iter()
-                .all(|a| a.fields.iter().all(|f| !matches!(f.ty, Type::Ref(_, _))))
+            && contract.iter().all(|a| {
+                a.fields
+                    .iter()
+                    .all(|f| !globals.contains_borrow_or_view(&f.ty))
+            })
         {
             let fault_rel = contract
                 .iter()
@@ -2939,15 +3267,27 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
                 format!("boundary `{}` is declared twice", b.name),
             );
         }
-        // [F6]: No parameter of a named boundary is or contains a borrow.
+        // [F6]: No parameter of a named boundary is or contains a borrow or view.
         let parameters = resolve_parameters(
             &globals,
             &b.parameters,
-            false,
+            true,
             false,
             b.line,
             "the parameter",
         )?;
+        for param in &parameters {
+            if globals.contains_borrow_or_view(&param.ty) {
+                return fail(
+                    b.line,
+                    "F6",
+                    format!(
+                        "boundary parameter `{}` has type `{}`, which contains a borrow or view",
+                        param.name, param.ty
+                    ),
+                );
+            }
+        }
         let mut retains_idx = Vec::with_capacity(b.retains.len());
         for ret_name in &b.retains {
             let Some(idx) = parameters.iter().position(|p| p.name == *ret_name) else {

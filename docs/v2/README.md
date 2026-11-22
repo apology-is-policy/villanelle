@@ -15,7 +15,7 @@ v1, the language and compiler at 0.306, is described by the
 | [Reference model](references.md) | Second-class borrows and views: the model, 36 worked examples in Rails and core form with verdicts, the tag semantics on an example | Draft 1, accepted; one review folded in, which found the 36 verdicts to agree with their clauses. Records the decisions on Q16 and Q17. |
 | [Surface](surface.md) | The Rails grammar, layout, and the elaboration into the core, including the acknowledgement rule and outcome groups | Draft 1, accepted, with the task forms of the core's draft 2 and the forms the corpus needed (traits, named boundaries, `copy` types); one review folded in. Records the decisions on Q11 to Q15 and Q19. |
 | [Corpus on paper](corpus.md) | The settings application, the eight collection modules and three new programs, rewritten by hand, with counts and findings | Draft 1, accepted; checked by hand and read by one review, which found no error in the programs. Library 476 to 231 lines, application 635 to 304, no filler arm; thirteen gaps repaired in the other documents, thirteen limits left open. |
-| [Oracle](oracle.md) | Phases 2, 3 and 4: the instrumented semantics, the Rails surface reader, elaborator and formatter, the certificate-producing checker, call expansion (Theorem 4) and the typed LLVM IR and C ABI backend (the crate `v2/`), with the conformance suite | **Slices 1 & 2 complete across phases 2, 3 and 4** (Slice 2 phase 2 oracle/erased/Rails surface, phase 3 ROBDD ownership `[O0]`–`[O6]`, faults & boundaries `[F1]`–`[F6]`, data axioms `[A3]`–`[A6]` & kernel validation, and phase 4 Theorem 4 expansion + typed LLVM IR & C ABI backend under `[R1]`–`[R5]`, `1.025×` Rust `-O3` on paired Slice 2 data kernel). **Slice 3** (borrows and views) is next. |
+| [Oracle](oracle.md) | Phases 2, 3 and 4: the instrumented semantics, the Rails surface reader, elaborator and formatter, the certificate-producing checker, call expansion (Theorem 4) and the typed LLVM IR and C ABI backend (the crate `v2/`), with the conformance suite | **Slices 1 & 2 complete across phases 2, 3 and 4; Slice 3 phase 2 complete** (`view struct`, payload origins `∈`, `[W5a]`/`[W6]`/`[W8]`/`[W9]`/`[T1]`/`[T4]`/`[T6]`/`[F5]`/`[F6]`, borrow tag oracle `[B1]`–`[B5]` & `X4`, zero-tag erased references `[R1]`, `[E-Host]` borrow checks, Rails `[U6]`/`[U9]`–`[U11]`/Q16/`[G3]`/`[G10]`). **Slice 3 phase 3** (loan checking `[L1]`–`[L5]`/`[L2a]`) is next. |
 | [Reading and repair test](reading-test.md) | v1 and v2 versions of the same programs, given to people and to agents | First run with agents done: 24 runs, 23 fully correct, so no difference between the versions is shown on reading. The repair needs 8 edits in v2 against 14. People have not taken it. |
 
 ## Acceptance
@@ -90,5 +90,13 @@ Three things were open at acceptance, and the author accepted with them named:
     `[I11]`, `[I12]`, `[M7]`) with kernel certificate validation, and Phase 4
     Theorem 4 call expansion + typed LLVM IR and C ABI backend (`[R1]`–`[R5]`)
     verified natively at `-O0`/`-O2` across 32/64-bit `usize` and measured at
-    `1.025×` optimized Rust on Apple M2 (done); slice 3 (borrows and views) is
-    next.
+    `1.025×` optimized Rust on Apple M2 (done).
+13. Phase 2 for slice 3: second-class borrows `&τ`/`&~τ`, `view struct`,
+    payload origins `∈`, well-formedness (`[W5a]`, `[W6]`, `[W8]`, `[W9]`,
+    `[T1]`, `[T4]`, `[T6]`, `[F5]`, `[F6]`), instrumented borrow tag semantics
+    (`[B1]`–`[B5]`, `X4`) and zero-tag erased live references (`[R1]`),
+    borrowed variant decisions (`[E-Outcome]`), `[E-Host]` borrow/origin
+    checks, normative `get`/`entry_at` borrowed payloads, and Rails surface
+    support (`[U6]`, `[U9]`–`[U11]`, Q16, `[G3]` `■ auto` origins, `[G10]`
+    formatter) (done); slice 3 phase 3 (static loan checking `[L1]`–`[L5]`/
+    `[L2a]`) is next.

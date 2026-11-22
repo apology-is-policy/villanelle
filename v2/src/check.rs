@@ -3253,7 +3253,7 @@ impl<'a> BodyChecker<'a> {
                                 in_loop,
                             )?;
                         }
-                        Operation::Variant { by_value, .. } => {
+                        Operation::Variant { borrow, .. } => {
                             if let Some(arg) = arguments.first() {
                                 check_expr_obligations(
                                     self.program,
@@ -3267,7 +3267,7 @@ impl<'a> BodyChecker<'a> {
                                     in_loop,
                                     self.certificates,
                                 )?;
-                                if *by_value {
+                                if borrow.is_none() {
                                     self.check_consume_expr(
                                         arg,
                                         r_i,

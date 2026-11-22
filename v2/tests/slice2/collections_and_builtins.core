@@ -27,13 +27,14 @@ control map_ops()
     5  i3.inserted ▷ ⊥
     6  ⊤ ▷ g1 : Δ get(&m, "a") ▸ found {va} │ missing {}
     7  g1.missing ▷ ⊥
-    8  ⊤ ▷ r1 : Δ remove(&~m, "b") ▸ removed {vb} │ missing {}
-    9  r1.missing ▷ ⊥
-    10 ⊤ ▷ e1 : Δ entry_at(&m, 0) ▸ item {k0, v0, next0} │ finished {}
-    11 e1.finished ▷ ⊥
-    12 ⊤ ▷ e2 : Δ entry_at(&m, next0) ▸ item {k1, v1, next1} │ finished {}
-    13 e2.item ▷ ⊥
-    14 ⊤ ▷ ■ ok {va, prev, vb, len(m), k0}
+    8  ⊤ ▷ va_val : u32 := va
+    9  ⊤ ▷ r1 : Δ remove(&~m, "b") ▸ removed {vb} │ missing {}
+    10 r1.missing ▷ ⊥
+    11 ⊤ ▷ e1 : Δ entry_at(&m, 0) ▸ item {k0, v0, next0} │ finished {}
+    12 e1.finished ▷ ⊥
+    13 ⊤ ▷ e2 : Δ entry_at(&m, next0) ▸ item {k1, v1, next1} │ finished {}
+    14 e2.item ▷ ⊥
+    15 ⊤ ▷ ■ ok {va_val, prev, vb, len(m), clone(k0)}
 
 control say_hello(msg : string)
     ■ { done {} }

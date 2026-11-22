@@ -54,6 +54,7 @@ enum Tok {
     Move,
     EmptyMap,
     MapArrow,
+    In,
     LeftParen,
     RightParen,
     LeftBrace,
@@ -278,6 +279,7 @@ fn lex(source: &str) -> Result<Vec<Token>, ParseError> {
                 '▾' => (Tok::Move, 1),
                 '∅' => (Tok::EmptyMap, 1),
                 '⇀' => (Tok::MapArrow, 1),
+                '∈' => (Tok::In, 1),
                 '⟨' => (Tok::LeftAngle, 1),
                 '⟩' => (Tok::RightAngle, 1),
                 ',' => (Tok::Comma, 1),
@@ -442,6 +444,18 @@ impl Parser {
     }
 
     fn ty(&mut self) -> Parsed<Type> {
+        if self.eat(&Tok::And) {
+            let mode = if self.eat(&Tok::Tilde) {
+                BorrowMode::Exclusive
+            } else {
+                BorrowMode::Shared
+            };
+            let inner = self.ty()?;
+            return Ok(Type::Ref(
+                BorrowMode::Shared,
+                Box::new(Type::Ref(mode, Box::new(inner))),
+            ));
+        }
         if self.eat(&Tok::Amp) {
             let mode = if self.eat(&Tok::Tilde) {
                 BorrowMode::Exclusive
@@ -490,6 +504,26 @@ impl Parser {
     }
 
     fn field_list(&mut self, open: Tok, close: Tok) -> Parsed<Vec<Parameter>> {
+        self.field_list_impl(open, close, false)
+    }
+
+    fn eat_origin_keyword(&mut self) -> bool {
+        if self.eat(&Tok::In) {
+            return true;
+        }
+        if matches!(self.peek(), Tok::Name(w) if w == "in" || w == "from") {
+            self.advance();
+            return true;
+        }
+        false
+    }
+
+    fn field_list_impl(
+        &mut self,
+        open: Tok,
+        close: Tok,
+        allow_origins: bool,
+    ) -> Parsed<Vec<Parameter>> {
         let mut out = Vec::new();
         self.expect(open, "an opening delimiter")?;
         while !self.eat(&close) {
@@ -498,10 +532,19 @@ impl Parser {
             }
             let name = self.name("a field or parameter name")?;
             self.expect(Tok::Colon, "`:`")?;
-            out.push(Parameter {
-                name,
-                ty: self.ty()?,
-            });
+            let ty = self.ty()?;
+            let mut origins = Vec::new();
+            if allow_origins && self.eat_origin_keyword() {
+                origins.push(self.name("an origin parameter name")?);
+                while self.peek() == &Tok::Comma
+                    && matches!(self.peek_at(1), Tok::Name(_))
+                    && self.peek_at(2) != &Tok::Colon
+                {
+                    self.advance();
+                    origins.push(self.name("an origin parameter name")?);
+                }
+            }
+            out.push(Parameter { name, ty, origins });
         }
         Ok(out)
     }
@@ -510,13 +553,13 @@ impl Parser {
         self.field_list(Tok::LeftParen, Tok::RightParen)
     }
 
-    fn contract_alternatives(&mut self) -> Parsed<Vec<Alternative>> {
+    fn contract_alternatives(&mut self, allow_origins: bool) -> Parsed<Vec<Alternative>> {
         self.expect(Tok::LeftBrace, "`{` to open the contract")?;
         let mut contract = Vec::new();
         loop {
             let name = self.name("an alternative")?;
             let fields = if self.peek() == &Tok::LeftBrace {
-                self.field_list(Tok::LeftBrace, Tok::RightBrace)?
+                self.field_list_impl(Tok::LeftBrace, Tok::RightBrace, allow_origins)?
             } else {
                 Vec::new()
             };
@@ -538,6 +581,10 @@ impl Parser {
         Ok(contract)
     }
 
+    fn is_view_struct_start(&self) -> bool {
+        matches!(self.peek(), Tok::Name(w) if w == "view") && self.peek_at(1) == &Tok::Struct
+    }
+
     fn is_declaration_start(&self) -> bool {
         matches!(
             self.peek(),
@@ -552,13 +599,21 @@ impl Parser {
                 | Tok::Variant
                 | Tok::Outcome
                 | Tok::Boundary
-        )
+        ) || self.is_view_struct_start()
     }
 
     fn program(&mut self) -> Parsed<Program> {
         let mut declarations = Vec::new();
         loop {
             let line = self.line();
+            if self.is_view_struct_start() {
+                self.advance();
+                self.advance();
+                declarations.push(Declaration::Struct(
+                    self.struct_decl(false, false, true, line)?,
+                ));
+                continue;
+            }
             match self.peek() {
                 Tok::End => return Ok(Program { declarations }),
                 Tok::Function => {
@@ -586,10 +641,18 @@ impl Parser {
                         declarations.push(Declaration::Outcome(self.outcome_decl(public, line)?));
                         continue;
                     }
+                    if self.is_view_struct_start() {
+                        self.advance();
+                        self.advance();
+                        declarations.push(Declaration::Struct(
+                            self.struct_decl(public, false, true, line)?,
+                        ));
+                        continue;
+                    }
                     let is_copy = self.eat(&Tok::Copy);
                     if self.eat(&Tok::Struct) {
                         declarations.push(Declaration::Struct(
-                            self.struct_decl(public, is_copy, line)?,
+                            self.struct_decl(public, is_copy, false, line)?,
                         ));
                         continue;
                     }
@@ -623,13 +686,20 @@ impl Parser {
         }
     }
 
-    fn struct_decl(&mut self, public: bool, is_copy: bool, line: u32) -> Parsed<StructDecl> {
+    fn struct_decl(
+        &mut self,
+        public: bool,
+        is_copy: bool,
+        is_view: bool,
+        line: u32,
+    ) -> Parsed<StructDecl> {
         let name = self.name("a struct name")?;
         let fields = self.field_list(Tok::LeftBrace, Tok::RightBrace)?;
         Ok(StructDecl {
             name,
             public,
             is_copy,
+            is_view,
             fields,
             line,
         })
@@ -665,7 +735,7 @@ impl Parser {
 
     fn outcome_decl(&mut self, public: bool, line: u32) -> Parsed<OutcomeDecl> {
         let name = self.name("an outcome name")?;
-        let alternatives = self.contract_alternatives()?;
+        let alternatives = self.contract_alternatives(false)?;
         Ok(OutcomeDecl {
             name,
             public,
@@ -771,7 +841,7 @@ impl Parser {
             None
         };
         self.expect(Tok::Exit, "`■` and the contract")?;
-        let contract = self.contract_alternatives()?;
+        let contract = self.contract_alternatives(true)?;
         let faults = self.eat(&Tok::Faults);
         let mut uses = Vec::new();
         if self.eat(&Tok::Uses) {

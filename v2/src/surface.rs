@@ -1072,7 +1072,7 @@ fn word_token(word: &str) -> Tok {
         "loop" => Tok::Loop,
         "again" => Tok::Again,
         "for" => Tok::ForAll,
-        "in" | "from" => Tok::In,
+        "in" => Tok::In,
         "move" => Tok::Move,
         "ref" => Tok::Ref,
         "if" => Tok::Test,
@@ -1720,7 +1720,11 @@ impl Parser {
             let name = self.name(clause, "a parameter name")?;
             self.expect(Tok::Colon, clause, "`:`")?;
             let ty = self.ty(clause)?;
-            out.push(Parameter { name, ty });
+            out.push(Parameter {
+                name,
+                ty,
+                origins: Vec::new(),
+            });
         }
         Ok(out)
     }
@@ -1736,7 +1740,26 @@ impl Parser {
         matches!(get(1), Tok::Name(_)) && get(2) == &Tok::Colon
     }
 
+    fn eat_origin_keyword(&mut self) -> bool {
+        if self.eat(&Tok::In) {
+            return true;
+        }
+        if matches!(self.peek(), Tok::Name(w) if w == "from") {
+            self.advance();
+            return true;
+        }
+        false
+    }
+
     fn fields(&mut self, clause: &'static str) -> Result<Vec<Parameter>, Error> {
+        self.fields_with_origins(clause, false)
+    }
+
+    fn fields_with_origins(
+        &mut self,
+        clause: &'static str,
+        allow_origins: bool,
+    ) -> Result<Vec<Parameter>, Error> {
         let mut out = Vec::new();
         if self.is_field_list_ahead() && self.eat(&Tok::LeftBrace) {
             while !self.eat(&Tok::RightBrace) {
@@ -1746,7 +1769,21 @@ impl Parser {
                 let name = self.name(clause, "a field name")?;
                 self.expect(Tok::Colon, clause, "`:`")?;
                 let ty = self.ty(clause)?;
-                out.push(Parameter { name, ty });
+                let mut origins = Vec::new();
+                if allow_origins && self.eat_origin_keyword() {
+                    origins.push(self.name(clause, "an origin parameter name")?);
+                    while self.peek() == &Tok::Comma {
+                        let next1 = &self.tokens[(self.pos + 1).min(self.tokens.len() - 1)].tok;
+                        let next2 = &self.tokens[(self.pos + 2).min(self.tokens.len() - 1)].tok;
+                        if matches!(next1, Tok::Name(_)) && next2 != &Tok::Colon {
+                            self.advance();
+                            origins.push(self.name(clause, "an origin parameter name")?);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                out.push(Parameter { name, ty, origins });
             }
         }
         Ok(out)
@@ -1791,7 +1828,7 @@ impl Parser {
                 into.push(SurfaceContractEntry::Group(group, line));
             } else {
                 let name = self.name("G1", "an alternative")?;
-                let fields = self.fields("G1")?;
+                let fields = self.fields_with_origins("G1", true)?;
                 if self.eat(&Tok::MapsTo) {
                     return fail(
                         self.line(),
@@ -2185,13 +2222,19 @@ impl Parser {
     fn arguments(&mut self) -> Result<Vec<Expr>, Error> {
         let mut out = Vec::new();
         self.expect(Tok::LeftParen, "G8", "`(`")?;
-        while !self.eat(&Tok::RightParen) {
-            if !out.is_empty() {
-                self.expect(Tok::Comma, "G8", "`,`")?;
+        let prev = self.allow_brace_literal;
+        self.allow_brace_literal = true;
+        let res = (|| {
+            while !self.eat(&Tok::RightParen) {
+                if !out.is_empty() {
+                    self.expect(Tok::Comma, "G8", "`,`")?;
+                }
+                out.push(self.expr()?);
             }
-            out.push(self.expr()?);
-        }
-        Ok(out)
+            Ok(out)
+        })();
+        self.allow_brace_literal = prev;
+        res
     }
 
     fn payload(&mut self) -> Result<Vec<Expr>, Error> {
@@ -3078,6 +3121,7 @@ fn starts_top_decl(trimmed: &str) -> bool {
     [
         "pub ",
         "copy ",
+        "view ",
         "struct ",
         "variant ",
         "outcome ",
@@ -3247,8 +3291,18 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
         let mut parser = Parser::new(lex_fragment(&header, line_no)?);
         let public = parser.eat(&Tok::Pub);
 
-        // `[pub] [copy] struct name { Field,* }` ([G4b])
-        let is_copy = if let Tok::Name(word) = parser.peek()
+        // `[pub] [copy | view] struct name { Field,* }` ([G4b])
+        let is_view = if let Tok::Name(word) = parser.peek()
+            && word == "view"
+            && parser.peek_next() == &Tok::Struct
+        {
+            parser.advance();
+            true
+        } else {
+            false
+        };
+        let is_copy = if !is_view
+            && let Tok::Name(word) = parser.peek()
             && word == "copy"
             && matches!(parser.peek_next(), Tok::Struct | Tok::Variant)
         {
@@ -3275,6 +3329,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                 fields.push(Parameter {
                     name: fname,
                     ty: fty,
+                    origins: Vec::new(),
                 });
             }
             if parser.peek() != &Tok::End {
@@ -3284,6 +3339,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                 name,
                 public,
                 is_copy,
+                is_view,
                 fields,
                 line: line_no,
             }));
@@ -3869,6 +3925,10 @@ struct BodyScope {
     vars: HashMap<String, Type>,
     /// Captured outcome contracts keyed by variable name (`[U6]`, `[U14]`).
     captured_contracts: HashMap<String, ResolvedContract>,
+    /// Borrow origin parameter names for each local variable (`[G3]` `■ auto`).
+    var_origins: HashMap<String, Vec<String>>,
+    /// Declared parameter types of enclosing loops keyed by loop name (`[U11]` on `↑`).
+    loop_params: HashMap<String, Vec<Type>>,
 }
 
 #[derive(Clone, Debug)]
@@ -3877,6 +3937,7 @@ struct AutoExit {
     alternative: String,
     field_names: Vec<String>,
     field_types: Vec<Option<Type>>,
+    field_origins: Vec<Vec<String>>,
 }
 
 struct Elaborator {
@@ -4029,12 +4090,53 @@ impl Elaborator {
         }
     }
 
+    fn is_borrow_or_view(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Ref(_, _) => true,
+            Type::Named(name) => self.structs.get(name).is_some_and(|s| s.is_view),
+            _ => false,
+        }
+    }
+
+    fn expr_origins(&self, expr: &Expr, scopes: &[BodyScope]) -> Vec<String> {
+        let mut out = Vec::new();
+        fn collect(elab: &Elaborator, expr: &Expr, scopes: &[BodyScope], out: &mut Vec<String>) {
+            match expr {
+                Expr::Name(n) => {
+                    if let Some(origins) = scopes.iter().rev().find_map(|s| s.var_origins.get(n)) {
+                        for o in origins {
+                            if !out.contains(o) {
+                                out.push(o.clone());
+                            }
+                        }
+                    }
+                }
+                Expr::Borrow(_, inner)
+                | Expr::Move(inner)
+                | Expr::Field(inner, _)
+                | Expr::Index(inner, _) => collect(elab, inner, scopes, out),
+                Expr::Struct(sname, fields)
+                    if elab.structs.get(sname).is_some_and(|s| s.is_view) =>
+                {
+                    for f in fields {
+                        collect(elab, f, scopes, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        collect(self, expr, scopes, &mut out);
+        out
+    }
+
     #[allow(clippy::only_used_in_recursion)]
-    fn check_arg(
+    fn check_arg_into(
         &self,
         expr: &Expr,
         expected: &Type,
-        scopes: &[BodyScope],
+        selection: &Selector,
+        ctx: &mut ControlElab,
+        out: &mut Vec<Statement>,
         line: u32,
     ) -> Result<Expr, Error> {
         match expected {
@@ -4042,18 +4144,73 @@ impl Elaborator {
                 Expr::Borrow(BorrowMode::Exclusive, inner) => {
                     Ok(Expr::Borrow(BorrowMode::Exclusive, inner.clone()))
                 }
+                Expr::Name(n)
+                    if matches!(
+                        self.expr_type(expr, &ctx.scopes),
+                        Some(Type::Ref(BorrowMode::Exclusive, _))
+                    ) =>
+                {
+                    fail(
+                        line,
+                        "U11",
+                        format!(
+                            "an `&~` borrow argument must be marked with `~` (write `~{n}` to reborrow)"
+                        ),
+                    )
+                }
                 _ => fail(
                     line,
                     "U11",
                     "an `&~` borrow argument must be marked with `~`",
                 ),
             },
-            Type::Ref(BorrowMode::Shared, _) => match expr {
+            Type::Ref(BorrowMode::Shared, inner_ty) => match expr {
                 Expr::Move(_) => fail(line, "U11", "`▾` cannot be used for a `&` borrow argument"),
                 Expr::Borrow(BorrowMode::Exclusive, _) => {
                     fail(line, "U11", "`~` cannot be used for a `&` borrow argument")
                 }
-                other => Ok(other.clone()),
+                Expr::Borrow(BorrowMode::Shared, inner) => {
+                    Ok(Expr::Borrow(BorrowMode::Shared, inner.clone()))
+                }
+                Expr::Name(n)
+                    if matches!(
+                        self.expr_type(expr, &ctx.scopes),
+                        Some(Type::Ref(BorrowMode::Shared, _))
+                    ) =>
+                {
+                    Ok(Expr::Name(n.clone()))
+                }
+                Expr::Field(_, _)
+                    if matches!(
+                        self.expr_type(expr, &ctx.scopes),
+                        Some(Type::Ref(BorrowMode::Shared, _))
+                    ) =>
+                {
+                    Ok(expr.clone())
+                }
+                other if Self::is_place_expr(other) => {
+                    Ok(Expr::Borrow(BorrowMode::Shared, Box::new(other.clone())))
+                }
+                other => {
+                    // [U11]: a non-place expression passed to `&τ` is first bound to a hidden name.
+                    let checked =
+                        self.check_arg_into(other, inner_ty, selection, ctx, out, line)?;
+                    let tmp = ctx.fresh_hidden_var();
+                    ctx.current_scope_mut()
+                        .vars
+                        .insert(tmp.clone(), (**inner_ty).clone());
+                    out.push(Statement {
+                        selector: selection.clone(),
+                        command: Command::Bind {
+                            mutable: false,
+                            name: tmp.clone(),
+                            ty: Some((**inner_ty).clone()),
+                            value: checked,
+                        },
+                        line,
+                    });
+                    Ok(Expr::Borrow(BorrowMode::Shared, Box::new(Expr::Name(tmp))))
+                }
             },
             _ => {
                 let ob = self.holds_obligation(expected);
@@ -4075,7 +4232,9 @@ impl Elaborator {
                         if let Some(st) = self.structs.get(sname) {
                             let mut checked = Vec::with_capacity(args.len());
                             for (arg, field) in args.iter().zip(&st.fields) {
-                                checked.push(self.check_arg(arg, &field.ty, scopes, line)?);
+                                checked.push(
+                                    self.check_arg_into(arg, &field.ty, selection, ctx, out, line)?,
+                                );
                             }
                             for arg in args.iter().skip(st.fields.len()) {
                                 checked.push(arg.clone());
@@ -4090,7 +4249,9 @@ impl Elaborator {
                         {
                             let mut checked = Vec::with_capacity(args.len());
                             for (arg, field) in args.iter().zip(&ctor.fields) {
-                                checked.push(self.check_arg(arg, &field.ty, scopes, line)?);
+                                checked.push(
+                                    self.check_arg_into(arg, &field.ty, selection, ctx, out, line)?,
+                                );
                             }
                             for arg in args.iter().skip(ctor.fields.len()) {
                                 checked.push(arg.clone());
@@ -4103,7 +4264,9 @@ impl Elaborator {
                         if let Type::Vector(elem_ty) = expected {
                             let mut checked = Vec::with_capacity(items.len());
                             for item in items {
-                                checked.push(self.check_arg(item, elem_ty, scopes, line)?);
+                                checked.push(
+                                    self.check_arg_into(item, elem_ty, selection, ctx, out, line)?,
+                                );
                             }
                             return Ok(Expr::Vector(checked));
                         }
@@ -4124,15 +4287,17 @@ impl Elaborator {
         }
     }
 
-    fn check_untyped_value(
+    fn check_untyped_value_into(
         &self,
         expr: &Expr,
-        scopes: &[BodyScope],
+        selection: &Selector,
+        ctx: &mut ControlElab,
+        out: &mut Vec<Statement>,
         line: u32,
     ) -> Result<Expr, Error> {
         match expr {
             Expr::Move(inner) => {
-                if let Some(ty) = self.expr_type(inner, scopes)
+                if let Some(ty) = self.expr_type(inner, &ctx.scopes)
                     && !self.holds_obligation(&ty)
                 {
                     return fail(
@@ -4149,30 +4314,33 @@ impl Elaborator {
                 "`~` requires an `&~` borrow type annotation on a bind",
             ),
             other => {
-                if let Some(ty) = self.expr_type(other, scopes) {
-                    return self.check_arg(other, &ty, scopes, line);
+                if let Some(ty) = self.expr_type(other, &ctx.scopes) {
+                    let target_ty = ty.deref_type().clone();
+                    return self.check_arg_into(other, &target_ty, selection, ctx, out, line);
                 }
                 Ok(other.clone())
             }
         }
     }
 
-    fn check_args_against(
+    fn check_args_against_into(
         &self,
         arguments: &[Expr],
         param_types: &[Type],
-        scopes: &[BodyScope],
+        selection: &Selector,
+        ctx: &mut ControlElab,
+        out: &mut Vec<Statement>,
         line: u32,
     ) -> Result<Vec<Expr>, Error> {
-        let mut out = Vec::with_capacity(arguments.len());
+        let mut checked = Vec::with_capacity(arguments.len());
         for (idx, arg) in arguments.iter().enumerate() {
             if let Some(expected) = param_types.get(idx) {
-                out.push(self.check_arg(arg, expected, scopes, line)?);
+                checked.push(self.check_arg_into(arg, expected, selection, ctx, out, line)?);
             } else {
-                out.push(arg.clone());
+                checked.push(arg.clone());
             }
         }
-        Ok(out)
+        Ok(checked)
     }
 
     fn lookup_captured_contract(
@@ -4217,7 +4385,13 @@ impl Elaborator {
                         return None;
                     };
                     let st = self.structs.get(&sname)?;
-                    ty = st.fields.iter().find(|f| f.name == *fname)?.ty.clone();
+                    ty = st
+                        .fields
+                        .iter()
+                        .find(|f| f.name == *fname)?
+                        .ty
+                        .deref_type()
+                        .clone();
                 }
                 PlaceStep::Index(_) => {
                     let Type::Vector(elem) = ty else {
@@ -4278,13 +4452,16 @@ impl Elaborator {
                 }
             }
             Expr::Unary(Unary::Not, _) => Some(Type::Bool),
-            Expr::Unary(Unary::Negate, inner) => self.expr_type(inner, scopes),
+            Expr::Unary(Unary::Negate, inner) => self
+                .expr_type(inner, scopes)
+                .map(|t| t.deref_type().clone()),
             Expr::Binary(op, left, right) => {
                 if op.level() <= 3 {
                     Some(Type::Bool)
                 } else {
                     self.expr_type(left, scopes)
                         .or_else(|| self.expr_type(right, scopes))
+                        .map(|t| t.deref_type().clone())
                 }
             }
             Expr::Call(func, _) => {
@@ -4300,7 +4477,9 @@ impl Elaborator {
     fn resolve_builtin_call(
         &self,
         call: &SurfaceCall,
-        scopes: &[BodyScope],
+        selection: &Selector,
+        ctx: &mut ControlElab,
+        out: &mut Vec<Statement>,
         line: u32,
     ) -> Result<Option<(String, Vec<Expr>, ResolvedContract)>, Error> {
         let single_alt = |name: &str, fields: Vec<Parameter>| ResolvedContract {
@@ -4328,6 +4507,16 @@ impl Elaborator {
             groups: Vec::new(),
             own_alternatives: vec![a.0.to_string(), b.0.to_string()],
         };
+        let p = |name: &str, ty: Type| Parameter {
+            name: name.to_string(),
+            ty,
+            origins: Vec::new(),
+        };
+        let p_orig = |name: &str, ty: Type, origin: &str| Parameter {
+            name: name.to_string(),
+            ty,
+            origins: vec![origin.to_string()],
+        };
 
         match call {
             SurfaceCall::Method {
@@ -4345,14 +4534,15 @@ impl Elaborator {
                     );
                 }
                 let rec_ty = self
-                    .expr_type(receiver, scopes)
+                    .expr_type(receiver, &ctx.scopes)
                     .map(|t| t.deref_type().clone());
                 match (method.as_str(), rec_ty) {
                     ("push", Some(Type::Vector(elem))) => {
                         if arguments.len() != 1 {
                             return fail(line, "C1", "`push` takes 1 argument");
                         }
-                        let val = self.check_arg(&arguments[0], &elem, scopes, line)?;
+                        let val =
+                            self.check_arg_into(&arguments[0], &elem, selection, ctx, out, line)?;
                         Ok(Some((
                             "push".to_string(),
                             vec![
@@ -4372,16 +4562,7 @@ impl Elaborator {
                                 BorrowMode::Exclusive,
                                 Box::new(receiver.clone()),
                             )],
-                            two_alts(
-                                (
-                                    "item",
-                                    vec![Parameter {
-                                        name: "value".to_string(),
-                                        ty: *elem,
-                                    }],
-                                ),
-                                ("empty", Vec::new()),
-                            ),
+                            two_alts(("item", vec![p("value", *elem)]), ("empty", Vec::new())),
                         )))
                     }
                     ("take", Some(Type::Vector(elem))) => {
@@ -4393,19 +4574,7 @@ impl Elaborator {
                             "take".to_string(),
                             vec![receiver.clone()],
                             two_alts(
-                                (
-                                    "item",
-                                    vec![
-                                        Parameter {
-                                            name: "head".to_string(),
-                                            ty: *elem,
-                                        },
-                                        Parameter {
-                                            name: "tail".to_string(),
-                                            ty: vec_ty,
-                                        },
-                                    ],
-                                ),
+                                ("item", vec![p("head", *elem), p("tail", vec_ty)]),
                                 ("empty", Vec::new()),
                             ),
                         )))
@@ -4415,7 +4584,8 @@ impl Elaborator {
                             return fail(line, "C1", "`get` takes 1 argument");
                         }
                         let k_ref = Type::Ref(BorrowMode::Shared, k);
-                        let key = self.check_arg(&arguments[0], &k_ref, scopes, line)?;
+                        let key =
+                            self.check_arg_into(&arguments[0], &k_ref, selection, ctx, out, line)?;
                         Ok(Some((
                             "get".to_string(),
                             vec![
@@ -4425,10 +4595,7 @@ impl Elaborator {
                             two_alts(
                                 (
                                     "found",
-                                    vec![Parameter {
-                                        name: "value".to_string(),
-                                        ty: *v,
-                                    }],
+                                    vec![p_orig("value", Type::Ref(BorrowMode::Shared, v), "map")],
                                 ),
                                 ("missing", Vec::new()),
                             ),
@@ -4438,8 +4605,10 @@ impl Elaborator {
                         if arguments.len() != 2 {
                             return fail(line, "C1", "`insert` takes 2 arguments");
                         }
-                        let key = self.check_arg(&arguments[0], &k, scopes, line)?;
-                        let val = self.check_arg(&arguments[1], &v, scopes, line)?;
+                        let key =
+                            self.check_arg_into(&arguments[0], &k, selection, ctx, out, line)?;
+                        let val =
+                            self.check_arg_into(&arguments[1], &v, selection, ctx, out, line)?;
                         Ok(Some((
                             "insert".to_string(),
                             vec![
@@ -4449,13 +4618,7 @@ impl Elaborator {
                             ],
                             two_alts(
                                 ("inserted", Vec::new()),
-                                (
-                                    "replaced",
-                                    vec![Parameter {
-                                        name: "previous".to_string(),
-                                        ty: *v,
-                                    }],
-                                ),
+                                ("replaced", vec![p("previous", *v)]),
                             ),
                         )))
                     }
@@ -4464,7 +4627,8 @@ impl Elaborator {
                             return fail(line, "C1", "`remove` takes 1 argument");
                         }
                         let k_ref = Type::Ref(BorrowMode::Shared, k);
-                        let key = self.check_arg(&arguments[0], &k_ref, scopes, line)?;
+                        let key =
+                            self.check_arg_into(&arguments[0], &k_ref, selection, ctx, out, line)?;
                         Ok(Some((
                             "remove".to_string(),
                             vec![
@@ -4472,13 +4636,7 @@ impl Elaborator {
                                 key,
                             ],
                             two_alts(
-                                (
-                                    "removed",
-                                    vec![Parameter {
-                                        name: "previous".to_string(),
-                                        ty: *v,
-                                    }],
-                                ),
+                                ("removed", vec![p("previous", *v)]),
                                 ("missing", Vec::new()),
                             ),
                         )))
@@ -4487,10 +4645,12 @@ impl Elaborator {
                         if arguments.len() != 1 {
                             return fail(line, "C1", "`entry_at` takes 1 argument");
                         }
-                        let pos = self.check_arg(
+                        let pos = self.check_arg_into(
                             &arguments[0],
                             &Type::Int(IntType::Usize),
-                            scopes,
+                            selection,
+                            ctx,
+                            out,
                             line,
                         )?;
                         Ok(Some((
@@ -4503,18 +4663,9 @@ impl Elaborator {
                                 (
                                     "item",
                                     vec![
-                                        Parameter {
-                                            name: "key".to_string(),
-                                            ty: *k,
-                                        },
-                                        Parameter {
-                                            name: "value".to_string(),
-                                            ty: *v,
-                                        },
-                                        Parameter {
-                                            name: "next".to_string(),
-                                            ty: Type::Int(IntType::Usize),
-                                        },
+                                        p_orig("key", Type::Ref(BorrowMode::Shared, k), "map"),
+                                        p_orig("value", Type::Ref(BorrowMode::Shared, v), "map"),
+                                        p("next", Type::Int(IntType::Usize)),
                                     ],
                                 ),
                                 ("finished", Vec::new()),
@@ -4546,7 +4697,8 @@ impl Elaborator {
                             return fail(line, "C1", "`emit` takes 1 argument");
                         }
                         let s_ref = Type::Ref(BorrowMode::Shared, Box::new(Type::String));
-                        let text = self.check_arg(&arguments[0], &s_ref, scopes, line)?;
+                        let text =
+                            self.check_arg_into(&arguments[0], &s_ref, selection, ctx, out, line)?;
                         Ok(Some((
                             "emit".to_string(),
                             vec![text],
@@ -4558,18 +4710,21 @@ impl Elaborator {
                             return fail(line, "C1", "`push` takes 2 arguments");
                         }
                         let Some(Type::Vector(elem)) = self
-                            .expr_type(&arguments[0], scopes)
+                            .expr_type(&arguments[0], &ctx.scopes)
                             .map(|t| t.deref_type().clone())
                         else {
                             return fail(line, "C1", "`push` requires a vector place");
                         };
-                        let rec = self.check_arg(
+                        let rec = self.check_arg_into(
                             &arguments[0],
                             &Type::Ref(BorrowMode::Exclusive, Box::new(Type::Vector(elem.clone()))),
-                            scopes,
+                            selection,
+                            ctx,
+                            out,
                             line,
                         )?;
-                        let val = self.check_arg(&arguments[1], &elem, scopes, line)?;
+                        let val =
+                            self.check_arg_into(&arguments[1], &elem, selection, ctx, out, line)?;
                         Ok(Some((
                             "push".to_string(),
                             vec![rec, val],
@@ -4581,30 +4736,23 @@ impl Elaborator {
                             return fail(line, "C1", "`pop` takes 1 argument");
                         }
                         let Some(Type::Vector(elem)) = self
-                            .expr_type(&arguments[0], scopes)
+                            .expr_type(&arguments[0], &ctx.scopes)
                             .map(|t| t.deref_type().clone())
                         else {
                             return fail(line, "C1", "`pop` requires a vector place");
                         };
-                        let rec = self.check_arg(
+                        let rec = self.check_arg_into(
                             &arguments[0],
                             &Type::Ref(BorrowMode::Exclusive, Box::new(Type::Vector(elem.clone()))),
-                            scopes,
+                            selection,
+                            ctx,
+                            out,
                             line,
                         )?;
                         Ok(Some((
                             "pop".to_string(),
                             vec![rec],
-                            two_alts(
-                                (
-                                    "item",
-                                    vec![Parameter {
-                                        name: "value".to_string(),
-                                        ty: *elem,
-                                    }],
-                                ),
-                                ("empty", Vec::new()),
-                            ),
+                            two_alts(("item", vec![p("value", *elem)]), ("empty", Vec::new())),
                         )))
                     }
                     "take" => {
@@ -4612,30 +4760,19 @@ impl Elaborator {
                             return fail(line, "C1", "`take` takes 1 argument");
                         }
                         let Some(Type::Vector(elem)) = self
-                            .expr_type(&arguments[0], scopes)
+                            .expr_type(&arguments[0], &ctx.scopes)
                             .map(|t| t.deref_type().clone())
                         else {
                             return fail(line, "C1", "`take` requires a vector");
                         };
                         let vec_ty = Type::Vector(elem.clone());
-                        let rec = self.check_arg(&arguments[0], &vec_ty, scopes, line)?;
+                        let rec =
+                            self.check_arg_into(&arguments[0], &vec_ty, selection, ctx, out, line)?;
                         Ok(Some((
                             "take".to_string(),
                             vec![rec],
                             two_alts(
-                                (
-                                    "item",
-                                    vec![
-                                        Parameter {
-                                            name: "head".to_string(),
-                                            ty: *elem,
-                                        },
-                                        Parameter {
-                                            name: "tail".to_string(),
-                                            ty: vec_ty,
-                                        },
-                                    ],
-                                ),
+                                ("item", vec![p("head", *elem), p("tail", vec_ty)]),
                                 ("empty", Vec::new()),
                             ),
                         )))
@@ -4645,7 +4782,7 @@ impl Elaborator {
                             return fail(line, "C1", "`get` takes 2 arguments");
                         }
                         let Some(Type::Map(k, v)) = self
-                            .expr_type(&arguments[0], scopes)
+                            .expr_type(&arguments[0], &ctx.scopes)
                             .map(|t| t.deref_type().clone())
                         else {
                             return fail(line, "C1", "`get` requires a map");
@@ -4655,18 +4792,23 @@ impl Elaborator {
                             Box::new(Type::Map(k.clone(), v.clone())),
                         );
                         let k_ref = Type::Ref(BorrowMode::Shared, k);
-                        let m = self.check_arg(&arguments[0], &map_ref, scopes, line)?;
-                        let key = self.check_arg(&arguments[1], &k_ref, scopes, line)?;
+                        let m = self.check_arg_into(
+                            &arguments[0],
+                            &map_ref,
+                            selection,
+                            ctx,
+                            out,
+                            line,
+                        )?;
+                        let key =
+                            self.check_arg_into(&arguments[1], &k_ref, selection, ctx, out, line)?;
                         Ok(Some((
                             "get".to_string(),
                             vec![m, key],
                             two_alts(
                                 (
                                     "found",
-                                    vec![Parameter {
-                                        name: "value".to_string(),
-                                        ty: *v,
-                                    }],
+                                    vec![p_orig("value", Type::Ref(BorrowMode::Shared, v), "map")],
                                 ),
                                 ("missing", Vec::new()),
                             ),
@@ -4677,7 +4819,7 @@ impl Elaborator {
                             return fail(line, "C1", "`insert` takes 3 arguments");
                         }
                         let Some(Type::Map(k, v)) = self
-                            .expr_type(&arguments[0], scopes)
+                            .expr_type(&arguments[0], &ctx.scopes)
                             .map(|t| t.deref_type().clone())
                         else {
                             return fail(line, "C1", "`insert` requires a map place");
@@ -4686,21 +4828,24 @@ impl Elaborator {
                             BorrowMode::Exclusive,
                             Box::new(Type::Map(k.clone(), v.clone())),
                         );
-                        let m = self.check_arg(&arguments[0], &map_ref, scopes, line)?;
-                        let key = self.check_arg(&arguments[1], &k, scopes, line)?;
-                        let val = self.check_arg(&arguments[2], &v, scopes, line)?;
+                        let m = self.check_arg_into(
+                            &arguments[0],
+                            &map_ref,
+                            selection,
+                            ctx,
+                            out,
+                            line,
+                        )?;
+                        let key =
+                            self.check_arg_into(&arguments[1], &k, selection, ctx, out, line)?;
+                        let val =
+                            self.check_arg_into(&arguments[2], &v, selection, ctx, out, line)?;
                         Ok(Some((
                             "insert".to_string(),
                             vec![m, key, val],
                             two_alts(
                                 ("inserted", Vec::new()),
-                                (
-                                    "replaced",
-                                    vec![Parameter {
-                                        name: "previous".to_string(),
-                                        ty: *v,
-                                    }],
-                                ),
+                                ("replaced", vec![p("previous", *v)]),
                             ),
                         )))
                     }
@@ -4709,7 +4854,7 @@ impl Elaborator {
                             return fail(line, "C1", "`remove` takes 2 arguments");
                         }
                         let Some(Type::Map(k, v)) = self
-                            .expr_type(&arguments[0], scopes)
+                            .expr_type(&arguments[0], &ctx.scopes)
                             .map(|t| t.deref_type().clone())
                         else {
                             return fail(line, "C1", "`remove` requires a map place");
@@ -4719,19 +4864,21 @@ impl Elaborator {
                             Box::new(Type::Map(k.clone(), v.clone())),
                         );
                         let k_ref = Type::Ref(BorrowMode::Shared, k);
-                        let m = self.check_arg(&arguments[0], &map_ref, scopes, line)?;
-                        let key = self.check_arg(&arguments[1], &k_ref, scopes, line)?;
+                        let m = self.check_arg_into(
+                            &arguments[0],
+                            &map_ref,
+                            selection,
+                            ctx,
+                            out,
+                            line,
+                        )?;
+                        let key =
+                            self.check_arg_into(&arguments[1], &k_ref, selection, ctx, out, line)?;
                         Ok(Some((
                             "remove".to_string(),
                             vec![m, key],
                             two_alts(
-                                (
-                                    "removed",
-                                    vec![Parameter {
-                                        name: "previous".to_string(),
-                                        ty: *v,
-                                    }],
-                                ),
+                                ("removed", vec![p("previous", *v)]),
                                 ("missing", Vec::new()),
                             ),
                         )))
@@ -4741,7 +4888,7 @@ impl Elaborator {
                             return fail(line, "C1", "`entry_at` takes 2 arguments");
                         }
                         let Some(Type::Map(k, v)) = self
-                            .expr_type(&arguments[0], scopes)
+                            .expr_type(&arguments[0], &ctx.scopes)
                             .map(|t| t.deref_type().clone())
                         else {
                             return fail(line, "C1", "`entry_at` requires a map");
@@ -4750,11 +4897,20 @@ impl Elaborator {
                             BorrowMode::Shared,
                             Box::new(Type::Map(k.clone(), v.clone())),
                         );
-                        let m = self.check_arg(&arguments[0], &map_ref, scopes, line)?;
-                        let pos = self.check_arg(
+                        let m = self.check_arg_into(
+                            &arguments[0],
+                            &map_ref,
+                            selection,
+                            ctx,
+                            out,
+                            line,
+                        )?;
+                        let pos = self.check_arg_into(
                             &arguments[1],
                             &Type::Int(IntType::Usize),
-                            scopes,
+                            selection,
+                            ctx,
+                            out,
                             line,
                         )?;
                         Ok(Some((
@@ -4764,18 +4920,9 @@ impl Elaborator {
                                 (
                                     "item",
                                     vec![
-                                        Parameter {
-                                            name: "key".to_string(),
-                                            ty: *k,
-                                        },
-                                        Parameter {
-                                            name: "value".to_string(),
-                                            ty: *v,
-                                        },
-                                        Parameter {
-                                            name: "next".to_string(),
-                                            ty: Type::Int(IntType::Usize),
-                                        },
+                                        p_orig("key", Type::Ref(BorrowMode::Shared, k), "map"),
+                                        p_orig("value", Type::Ref(BorrowMode::Shared, v), "map"),
+                                        p("next", Type::Int(IntType::Usize)),
                                     ],
                                 ),
                                 ("finished", Vec::new()),
@@ -4836,9 +4983,16 @@ impl Elaborator {
             suppressed_defaults: HashSet::new(),
             vars: HashMap::new(),
             captured_contracts: HashMap::new(),
+            var_origins: HashMap::new(),
+            loop_params: HashMap::new(),
         };
         for param in &control.parameters {
             root_scope.vars.insert(param.name.clone(), param.ty.clone());
+            if self.is_borrow_or_view(&param.ty) {
+                root_scope
+                    .var_origins
+                    .insert(param.name.clone(), vec![param.name.clone()]);
+            }
         }
 
         let mut ctx = ControlElab {
@@ -4913,6 +5067,8 @@ impl Elaborator {
             suppressed_defaults: HashSet::new(),
             vars: HashMap::new(),
             captured_contracts: HashMap::new(),
+            var_origins: HashMap::new(),
+            loop_params: HashMap::new(),
         };
         for param in &boundary.parameters {
             body_scope.vars.insert(param.name.clone(), param.ty.clone());
@@ -4944,6 +5100,8 @@ impl Elaborator {
             suppressed_defaults: HashSet::new(),
             vars: HashMap::new(),
             captured_contracts: HashMap::new(),
+            var_origins: HashMap::new(),
+            loop_params: HashMap::new(),
         };
         for retained in &boundary.retains {
             if let Some(param) = boundary.parameters.iter().find(|p| &p.name == retained) {
@@ -5047,7 +5205,19 @@ impl Elaborator {
                     .get(field_idx)
                     .cloned()
                     .unwrap_or_else(|| format!("v{field_idx}"));
-                fields.push(Parameter { name, ty });
+                let mut origins = Vec::new();
+                if self.is_borrow_or_view(&ty) {
+                    for item in group {
+                        if let Some(item_origins) = item.field_origins.get(field_idx) {
+                            for o in item_origins {
+                                if !origins.contains(o) {
+                                    origins.push(o.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                fields.push(Parameter { name, ty, origins });
             }
             alternatives.push(Alternative {
                 name: alt_name.clone(),
@@ -5102,11 +5272,16 @@ impl Elaborator {
         let names =
             field_names.unwrap_or_else(|| (0..types.len()).map(|idx| format!("v{idx}")).collect());
         if ctx.is_auto {
+            let field_origins: Vec<Vec<String>> = payload
+                .iter()
+                .map(|e| self.expr_origins(e, &ctx.scopes))
+                .collect();
             ctx.auto_exits.push(AutoExit {
                 line,
                 alternative: alternative.to_string(),
                 field_names: names,
                 field_types: types,
+                field_origins,
             });
             return Ok(());
         }
@@ -5341,15 +5516,29 @@ impl Elaborator {
                 value,
             } => {
                 let checked_value = if let Some(declared_ty) = ty {
-                    self.check_arg(value, declared_ty, &ctx.scopes, *line)?
+                    self.check_arg_into(value, declared_ty, selection, ctx, out, *line)?
                 } else {
-                    self.check_untyped_value(value, &ctx.scopes, *line)?
+                    self.check_untyped_value_into(value, selection, ctx, out, *line)?
                 };
                 let inferred = ty
                     .clone()
-                    .or_else(|| self.expr_type(&checked_value, &ctx.scopes))
+                    .or_else(|| {
+                        self.expr_type(&checked_value, &ctx.scopes).map(|t| {
+                            if matches!(checked_value, Expr::Borrow(_, _)) {
+                                t
+                            } else {
+                                t.deref_type().clone()
+                            }
+                        })
+                    })
                     .unwrap_or(Type::Int(IntType::U32));
+                let origins = self.expr_origins(&checked_value, &ctx.scopes);
                 ctx.current_scope_mut().vars.insert(name.clone(), inferred);
+                if !origins.is_empty() {
+                    ctx.current_scope_mut()
+                        .var_origins
+                        .insert(name.clone(), origins);
+                }
                 out.push(Statement {
                     selector: selection.clone(),
                     command: Command::Bind {
@@ -5367,13 +5556,25 @@ impl Elaborator {
                 names,
                 value,
             } => {
-                let checked_value =
-                    self.check_arg(value, &Type::Named(struct_name.clone()), &ctx.scopes, *line)?;
+                let checked_value = self.check_arg_into(
+                    value,
+                    &Type::Named(struct_name.clone()),
+                    selection,
+                    ctx,
+                    out,
+                    *line,
+                )?;
+                let val_origins = self.expr_origins(&checked_value, &ctx.scopes);
                 if let Some(st) = self.structs.get(struct_name).cloned() {
                     for (var_name, field) in names.iter().zip(&st.fields) {
                         ctx.current_scope_mut()
                             .vars
                             .insert(var_name.clone(), field.ty.clone());
+                        if !val_origins.is_empty() && self.is_borrow_or_view(&field.ty) {
+                            ctx.current_scope_mut()
+                                .var_origins
+                                .insert(var_name.clone(), val_origins.clone());
+                        }
                     }
                 }
                 out.push(Statement {
@@ -5404,12 +5605,19 @@ impl Elaborator {
                             .iter()
                             .map(|p| p.ty.clone())
                             .collect();
-                        let checked =
-                            self.check_args_against(arguments, &param_types, &ctx.scopes, *line)?;
+                        let checked = self.check_args_against_into(
+                            arguments,
+                            &param_types,
+                            selection,
+                            ctx,
+                            out,
+                            *line,
+                        )?;
                         (operation.clone(), checked, callee)
                     }
                     other => {
-                        let Some(res) = self.resolve_builtin_call(other, &ctx.scopes, *line)?
+                        let Some(res) =
+                            self.resolve_builtin_call(other, selection, ctx, out, *line)?
                         else {
                             let SurfaceCall::Direct { operation, .. } = other else {
                                 unreachable!();
@@ -5447,9 +5655,9 @@ impl Elaborator {
                     .rev()
                     .find_map(|s| s.vars.get(name).cloned())
                 {
-                    self.check_arg(value, var_ty.deref_type(), &ctx.scopes, *line)?
+                    self.check_arg_into(value, var_ty.deref_type(), selection, ctx, out, *line)?
                 } else {
-                    self.check_untyped_value(value, &ctx.scopes, *line)?
+                    self.check_untyped_value_into(value, selection, ctx, out, *line)?
                 };
                 out.push(Statement {
                     selector: selection.clone(),
@@ -5466,9 +5674,9 @@ impl Elaborator {
                 value,
             } => {
                 let checked_value = if let Some(place_ty) = self.place_type(target, &ctx.scopes) {
-                    self.check_arg(value, &place_ty, &ctx.scopes, *line)?
+                    self.check_arg_into(value, &place_ty, selection, ctx, out, *line)?
                 } else {
-                    self.check_untyped_value(value, &ctx.scopes, *line)?
+                    self.check_untyped_value_into(value, selection, ctx, out, *line)?
                 };
                 out.push(Statement {
                     selector: selection.clone(),
@@ -5538,7 +5746,14 @@ impl Elaborator {
                 let checked_args = if let Some(bdef) = self.boundaries.get(boundary) {
                     let param_types: Vec<Type> =
                         bdef.parameters.iter().map(|p| p.ty.clone()).collect();
-                    self.check_args_against(arguments, &param_types, &ctx.scopes, *line)?
+                    self.check_args_against_into(
+                        arguments,
+                        &param_types,
+                        selection,
+                        ctx,
+                        out,
+                        *line,
+                    )?
                 } else {
                     arguments.clone()
                 };
@@ -5556,11 +5771,28 @@ impl Elaborator {
                 name,
                 arguments,
             } => {
+                let checked_args = if let Some(param_types) = ctx
+                    .scopes
+                    .iter()
+                    .rev()
+                    .find_map(|s| s.loop_params.get(name).cloned())
+                {
+                    self.check_args_against_into(
+                        arguments,
+                        &param_types,
+                        selection,
+                        ctx,
+                        out,
+                        *line,
+                    )?
+                } else {
+                    arguments.clone()
+                };
                 out.push(Statement {
                     selector: selection.clone(),
                     command: Command::Again {
                         name: name.clone(),
-                        arguments: arguments.clone(),
+                        arguments: checked_args,
                     },
                     line: *line,
                 });
@@ -5570,10 +5802,31 @@ impl Elaborator {
                 alternative,
                 outputs,
             } => {
+                // [U9]: a name of borrow or view type leaves as the borrow or view it is.
                 let alt_name = alternative.clone().unwrap_or_default();
                 let mut payload = Vec::with_capacity(outputs.len());
                 for item in outputs {
-                    payload.push(self.check_untyped_value(&item.value, &ctx.scopes, *line)?);
+                    let val = match &item.value {
+                        Expr::Borrow(_, _) => item.value.clone(),
+                        Expr::Name(_)
+                            if self
+                                .expr_type(&item.value, &ctx.scopes)
+                                .is_some_and(|t| matches!(t, Type::Ref(_, _))) =>
+                        {
+                            item.value.clone()
+                        }
+                        Expr::Field(_, _)
+                            if self
+                                .expr_type(&item.value, &ctx.scopes)
+                                .is_some_and(|t| matches!(t, Type::Ref(_, _))) =>
+                        {
+                            item.value.clone()
+                        }
+                        other => {
+                            self.check_untyped_value_into(other, selection, ctx, out, *line)?
+                        }
+                    };
+                    payload.push(val);
                 }
                 out.push(Statement {
                     selector: selection.clone(),
@@ -5595,11 +5848,24 @@ impl Elaborator {
                 {
                     let field_types: Vec<Type> =
                         entry.fields.iter().map(|f| f.ty.clone()).collect();
-                    self.check_args_against(payload, &field_types, &ctx.scopes, *line)?
+                    self.check_args_against_into(payload, &field_types, selection, ctx, out, *line)?
                 } else {
                     let mut out_p = Vec::with_capacity(payload.len());
                     for item in payload {
-                        out_p.push(self.check_untyped_value(item, &ctx.scopes, *line)?);
+                        let v = match item {
+                            Expr::Borrow(_, _) => item.clone(),
+                            Expr::Name(_)
+                                if self
+                                    .expr_type(item, &ctx.scopes)
+                                    .is_some_and(|t| matches!(t, Type::Ref(_, _))) =>
+                            {
+                                item.clone()
+                            }
+                            other => {
+                                self.check_untyped_value_into(other, selection, ctx, out, *line)?
+                            }
+                        };
+                        out_p.push(v);
                     }
                     out_p
                 };
@@ -5698,7 +5964,7 @@ impl Elaborator {
                     arguments: arguments.clone(),
                 };
                 let (op_name, core_args, contract) = self
-                    .resolve_builtin_call(&call, &ctx.scopes, *line)?
+                    .resolve_builtin_call(&call, selection, ctx, out, *line)?
                     .expect("method call resolves or errors");
                 if contract.alternatives.len() != 1 {
                     return fail(
@@ -5743,15 +6009,23 @@ impl Elaborator {
                         .iter()
                         .map(|p| p.ty.clone())
                         .collect();
-                    let checked =
-                        self.check_args_against(arguments, &param_types, &ctx.scopes, *line)?;
+                    let checked = self.check_args_against_into(
+                        arguments,
+                        &param_types,
+                        selection,
+                        ctx,
+                        out,
+                        *line,
+                    )?;
                     (operation.clone(), checked, contract)
                 } else if let Some(res) = self.resolve_builtin_call(
                     &SurfaceCall::Direct {
                         operation: operation.clone(),
                         arguments: arguments.clone(),
                     },
-                    &ctx.scopes,
+                    selection,
+                    ctx,
+                    out,
                     *line,
                 )? {
                     res
@@ -5801,8 +6075,14 @@ impl Elaborator {
                     .iter()
                     .map(|p| p.ty.clone())
                     .collect();
-                let checked_args =
-                    self.check_args_against(arguments, &param_types, &ctx.scopes, *line)?;
+                let checked_args = self.check_args_against_into(
+                    arguments,
+                    &param_types,
+                    selection,
+                    ctx,
+                    out,
+                    *line,
+                )?;
                 self.check_forward_compatibility(
                     &format!("forward {operation}"),
                     &callee,
@@ -5869,8 +6149,14 @@ impl Elaborator {
                             .iter()
                             .map(|p| p.ty.clone())
                             .collect();
-                        let checked_args =
-                            self.check_args_against(arguments, &param_types, &ctx.scopes, *line)?;
+                        let checked_args = self.check_args_against_into(
+                            arguments,
+                            &param_types,
+                            selection,
+                            ctx,
+                            out,
+                            *line,
+                        )?;
                         self.elaborate_resolved_decision(
                             *line,
                             site.as_deref(),
@@ -5885,7 +6171,7 @@ impl Elaborator {
                             out,
                         )?;
                     } else if let Some((op_name, core_args, contract)) =
-                        self.resolve_builtin_call(call, &ctx.scopes, *line)?
+                        self.resolve_builtin_call(call, selection, ctx, out, *line)?
                     {
                         self.elaborate_resolved_decision(
                             *line,
@@ -5972,15 +6258,44 @@ impl Elaborator {
                         .map(|t| t.deref_type().clone())
                         && let Some(ctors) = self.variants.get(&vname).cloned()
                     {
-                        // Variant decision (`Δ p`, `Δ ~p`, `Δ ▾p` [U6]).
+                        // Variant decision (`Δ p` shared, `Δ ~p` exclusive, `Δ ▾p` by value [U6]).
                         let default_site =
                             Self::place_last_name(expr).unwrap_or_else(|| vname.clone());
+                        let (core_arg, borrow_mode) = match expr {
+                            Expr::Move(_) => (expr.clone(), None),
+                            Expr::Borrow(mode, _) => (expr.clone(), Some(*mode)),
+                            other if Self::is_place_expr(other) => {
+                                if matches!(
+                                    self.expr_type(other, &ctx.scopes),
+                                    Some(Type::Ref(BorrowMode::Shared, _))
+                                ) {
+                                    (other.clone(), Some(BorrowMode::Shared))
+                                } else {
+                                    (
+                                        Expr::Borrow(BorrowMode::Shared, Box::new(other.clone())),
+                                        Some(BorrowMode::Shared),
+                                    )
+                                }
+                            }
+                            other => (other.clone(), None),
+                        };
                         let contract = ResolvedContract {
                             alternatives: ctors
                                 .iter()
                                 .map(|c| Alternative {
                                     name: c.name.clone(),
-                                    fields: c.fields.clone(),
+                                    fields: c
+                                        .fields
+                                        .iter()
+                                        .map(|f| match borrow_mode {
+                                            None => f.clone(),
+                                            Some(mode) => Parameter {
+                                                name: f.name.clone(),
+                                                ty: Type::Ref(mode, Box::new(f.ty.clone())),
+                                                origins: vec!["_self".to_string()],
+                                            },
+                                        })
+                                        .collect(),
                                     condition: None,
                                 })
                                 .collect(),
@@ -5993,7 +6308,7 @@ impl Elaborator {
                             *adapter,
                             &default_site,
                             &vname,
-                            std::slice::from_ref(expr),
+                            &[core_arg],
                             &contract,
                             arms,
                             selection,
@@ -6414,6 +6729,35 @@ impl Elaborator {
                     ctx.current_scope_mut()
                         .vars
                         .insert(pat.name.clone(), field.ty.clone());
+                    if !field.origins.is_empty() {
+                        let mut pat_origins = Vec::new();
+                        for origin_param in &field.origins {
+                            let arg_idx = if origin_param == "_self"
+                                || ((core_operation == "get" || core_operation == "entry_at")
+                                    && origin_param == "map")
+                            {
+                                Some(0)
+                            } else {
+                                self.controls.get(core_operation).and_then(|c| {
+                                    c.parameters.iter().position(|p| p.name == *origin_param)
+                                })
+                            };
+                            if let Some(aidx) = arg_idx
+                                && let Some(arg_expr) = arguments.get(aidx)
+                            {
+                                for o in self.expr_origins(arg_expr, &ctx.scopes) {
+                                    if !pat_origins.contains(&o) {
+                                        pat_origins.push(o);
+                                    }
+                                }
+                            }
+                        }
+                        if !pat_origins.is_empty() {
+                            ctx.current_scope_mut()
+                                .var_origins
+                                .insert(pat.name.clone(), pat_origins);
+                        }
+                    }
                     if pat.mutable {
                         let raw = ctx.fresh_hidden_var();
                         arm_vars.push(raw.clone());
@@ -6686,6 +7030,24 @@ impl Elaborator {
             );
         }
 
+        // Check `[U11]` on loop initial parameter expressions.
+        let mut checked_params = Vec::with_capacity(parameters.len());
+        let mut param_origins: Vec<(String, Vec<String>)> = Vec::new();
+        for param in parameters {
+            let checked_init =
+                self.check_arg_into(&param.initial, &param.ty, selection, ctx, out, line)?;
+            let origins = self.expr_origins(&checked_init, &ctx.scopes);
+            if !origins.is_empty() {
+                param_origins.push((param.name.clone(), origins));
+            }
+            checked_params.push(LoopParameter {
+                mutable: param.mutable,
+                name: param.name.clone(),
+                ty: param.ty.clone(),
+                initial: checked_init,
+            });
+        }
+
         // Open the loop's scope.
         let mut loop_scope = BodyScope {
             sites: Vec::new(),
@@ -6693,9 +7055,18 @@ impl Elaborator {
             suppressed_defaults: HashSet::new(),
             vars: HashMap::new(),
             captured_contracts: HashMap::new(),
+            var_origins: HashMap::new(),
+            loop_params: HashMap::new(),
         };
-        for param in parameters {
+        let loop_param_types: Vec<Type> = parameters.iter().map(|p| p.ty.clone()).collect();
+        loop_scope
+            .loop_params
+            .insert(name.to_string(), loop_param_types);
+        for param in &checked_params {
             loop_scope.vars.insert(param.name.clone(), param.ty.clone());
+        }
+        for (pname, origs) in param_origins {
+            loop_scope.var_origins.insert(pname, origs);
         }
         ctx.scopes.push(loop_scope);
 
@@ -6726,13 +7097,20 @@ impl Elaborator {
             }
         }
 
-        // Infer types of exported loop fields and record them in the outer scope.
+        // Infer types and origins of exported loop fields and record them in the outer scope ([U9]).
+        let mut check_scopes = ctx.scopes.clone();
+        check_scopes.push(finished_loop_scope);
         for (_, alt, outputs) in &leaves {
-            if let Some(alt_name) = alt {
-                let _ = alt_name;
+            if alt.is_some() {
                 for output in outputs {
-                    if let Some(ty) = finished_loop_scope.vars.get(&output.name).cloned() {
+                    if let Some(ty) = self.expr_type(&output.value, &check_scopes) {
                         ctx.current_scope_mut().vars.insert(output.name.clone(), ty);
+                    }
+                    let origs = self.expr_origins(&output.value, &check_scopes);
+                    if !origs.is_empty() {
+                        ctx.current_scope_mut()
+                            .var_origins
+                            .insert(output.name.clone(), origs);
                     }
                 }
             }
@@ -6742,7 +7120,7 @@ impl Elaborator {
         // output field name bound after the loop, rename the inner one so [W4]
         // holds in the core.
         let mut inner_declared = HashSet::new();
-        for param in parameters {
+        for param in &checked_params {
             inner_declared.insert(param.name.clone());
         }
         collect_inner_declarations(&core_body, &mut inner_declared);
@@ -6754,7 +7132,7 @@ impl Elaborator {
             }
         }
 
-        let mut core_params = parameters.to_vec();
+        let mut core_params = checked_params;
         let mut core_invariant = invariant.cloned();
         if !renames.is_empty() {
             for param in &mut core_params {
@@ -6865,12 +7243,15 @@ impl Elaborator {
             }
         }
 
+        let coll_origins = self.expr_origins(collection, &ctx.scopes);
         let mut loop_scope = BodyScope {
             sites: Vec::new(),
             paths: Vec::new(),
             suppressed_defaults: HashSet::new(),
             vars: HashMap::new(),
             captured_contracts: HashMap::new(),
+            var_origins: HashMap::new(),
+            loop_params: HashMap::new(),
         };
         loop_scope
             .vars
@@ -6879,6 +7260,9 @@ impl Elaborator {
             var.to_string(),
             Type::Ref(BorrowMode::Shared, Box::new(elem_ty)),
         );
+        if !coll_origins.is_empty() {
+            loop_scope.var_origins.insert(var.to_string(), coll_origins);
+        }
         ctx.scopes.push(loop_scope);
 
         let user_stmts = self.elaborate_items(body, ctx)?;
@@ -6952,11 +7336,19 @@ impl Elaborator {
                 is_route: false,
             });
         }
+        let mut check_scopes = ctx.scopes.clone();
+        check_scopes.push(finished_loop_scope);
         for (_, alt, outputs) in &leaves {
             if alt.is_some() {
                 for output in outputs {
-                    if let Some(ty) = finished_loop_scope.vars.get(&output.name).cloned() {
+                    if let Some(ty) = self.expr_type(&output.value, &check_scopes) {
                         ctx.current_scope_mut().vars.insert(output.name.clone(), ty);
+                    }
+                    let origs = self.expr_origins(&output.value, &check_scopes);
+                    if !origs.is_empty() {
+                        ctx.current_scope_mut()
+                            .var_origins
+                            .insert(output.name.clone(), origs);
                     }
                 }
             }
@@ -7543,7 +7935,13 @@ pub fn format(source: &str) -> Result<String, Error> {
 fn format_params(parameters: &[Parameter]) -> String {
     let items: Vec<String> = parameters
         .iter()
-        .map(|p| format!("{}: {}", p.name, p.ty))
+        .map(|p| {
+            if p.origins.is_empty() {
+                format!("{}: {}", p.name, p.ty)
+            } else {
+                format!("{}: {} ∈ {}", p.name, p.ty, p.origins.join(", "))
+            }
+        })
         .collect();
     items.join(", ")
 }
@@ -7571,6 +7969,9 @@ fn format_struct(st: &StructDecl, lines: &mut Vec<String>) {
     }
     if st.is_copy {
         head.push_str("copy ");
+    }
+    if st.is_view {
+        head.push_str("view ");
     }
     head.push_str(&format!(
         "struct {} {{{}}}",
@@ -7842,8 +8243,132 @@ fn format_arm_head(arm: &SurfaceArm) -> String {
     s
 }
 
+fn surface_expr_level(expr: &Expr) -> u8 {
+    match expr {
+        Expr::Binary(op, _, _) => op.level(),
+        Expr::Unary(_, _) | Expr::Move(_) | Expr::Borrow(_, _) => 6,
+        Expr::Integer(v) if v.is_negative() => 6,
+        Expr::Field(_, _) | Expr::Index(_, _) => 7,
+        _ => 8,
+    }
+}
+
+/// Formats an expression in canonical Rails surface syntax (`~p` for exclusive
+/// borrow marks instead of core `&~p`, `[G10]`).
+fn format_surface_expr_prec(out: &mut String, expr: &Expr, minimum: u8) {
+    let level = surface_expr_level(expr);
+    if level < minimum {
+        out.push('(');
+    }
+    match expr {
+        Expr::Borrow(BorrowMode::Exclusive, inner) => {
+            out.push('~');
+            format_surface_expr_prec(out, inner, 6);
+        }
+        Expr::Borrow(BorrowMode::Shared, inner) => {
+            out.push('&');
+            format_surface_expr_prec(out, inner, 6);
+        }
+        Expr::Move(inner) => {
+            out.push('▾');
+            format_surface_expr_prec(out, inner, 6);
+        }
+        Expr::Field(base, field) => {
+            format_surface_expr_prec(out, base, 7);
+            out.push('.');
+            out.push_str(field);
+        }
+        Expr::Index(base, idx) => {
+            format_surface_expr_prec(out, base, 7);
+            out.push('[');
+            format_surface_expr_prec(out, idx, 0);
+            out.push(']');
+        }
+        Expr::Struct(name, fields) => {
+            out.push_str(name);
+            out.push_str(" {");
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                format_surface_expr_prec(out, f, 0);
+            }
+            out.push('}');
+        }
+        Expr::Variant(vname, cname, fields) => {
+            out.push_str(vname);
+            out.push('.');
+            out.push_str(cname);
+            out.push_str(" {");
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                format_surface_expr_prec(out, f, 0);
+            }
+            out.push('}');
+        }
+        Expr::Vector(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                format_surface_expr_prec(out, item, 0);
+            }
+            out.push(']');
+        }
+        Expr::Call(name, args) => {
+            out.push_str(name);
+            out.push('(');
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                format_surface_expr_prec(out, arg, 0);
+            }
+            out.push(')');
+        }
+        Expr::Len(inner) => {
+            out.push_str("len(");
+            format_surface_expr_prec(out, inner, 0);
+            out.push(')');
+        }
+        Expr::Clone(inner) => {
+            out.push_str("clone(");
+            format_surface_expr_prec(out, inner, 0);
+            out.push(')');
+        }
+        Expr::Unary(op, inner) => {
+            out.push_str(match op {
+                Unary::Negate => "-",
+                Unary::Not => "¬",
+            });
+            format_surface_expr_prec(out, inner, 6);
+        }
+        Expr::Binary(op, left, right) => {
+            let left_min = if level == 3 { level + 1 } else { level };
+            format_surface_expr_prec(out, left, left_min);
+            out.push(' ');
+            out.push_str(op.glyph());
+            out.push(' ');
+            format_surface_expr_prec(out, right, level + 1);
+        }
+        other => out.push_str(&other.to_string()),
+    }
+    if level < minimum {
+        out.push(')');
+    }
+}
+
+fn format_surface_expr(expr: &Expr) -> String {
+    let mut s = String::new();
+    format_surface_expr_prec(&mut s, expr, 0);
+    s
+}
+
 fn format_expr_list(exprs: &[Expr]) -> String {
-    let items: Vec<String> = exprs.iter().map(ToString::to_string).collect();
+    let items: Vec<String> = exprs.iter().map(format_surface_expr).collect();
     items.join(", ")
 }
 
@@ -7863,7 +8388,7 @@ fn format_leave_outputs(outputs: &[LeaveOut]) -> String {
         .iter()
         .map(|o| match &o.value {
             Expr::Name(n) if n == &o.name => o.name.clone(),
-            other => format!("{}: {other}", o.name),
+            other => format!("{}: {}", o.name, format_surface_expr(other)),
         })
         .collect();
     format!(" {{{}}}", items.join(", "))
@@ -7890,14 +8415,18 @@ fn format_surface_call(call: &SurfaceCall) -> String {
             receiver,
             method,
             arguments,
-        } => format!("{receiver}.{method}({})", format_expr_list(arguments)),
+        } => format!(
+            "{}.{method}({})",
+            format_surface_expr(receiver),
+            format_expr_list(arguments)
+        ),
     }
 }
 
 fn format_surface_operand(operand: &SurfaceOperand) -> String {
     match operand {
         SurfaceOperand::Call(call) => format_surface_call(call),
-        SurfaceOperand::Expr(expr) => expr.to_string(),
+        SurfaceOperand::Expr(expr) => format_surface_expr(expr),
     }
 }
 
@@ -7934,7 +8463,7 @@ fn format_simple_stmt_inline(stmt: &SurfaceStmt) -> String {
             if let Some(ty) = ty {
                 s.push_str(&format!(": {ty}"));
             }
-            s.push_str(&format!(" := {value}"));
+            s.push_str(&format!(" := {}", format_surface_expr(value)));
             s
         }
         SurfaceStmt::Unpack {
@@ -7942,7 +8471,11 @@ fn format_simple_stmt_inline(stmt: &SurfaceStmt) -> String {
             names,
             value,
             ..
-        } => format!("{struct_name} {{{}}} := {value}", names.join(", ")),
+        } => format!(
+            "{struct_name} {{{}}} := {}",
+            names.join(", "),
+            format_surface_expr(value)
+        ),
         SurfaceStmt::Capture {
             mutable,
             name,
@@ -8313,7 +8846,12 @@ fn format_stmt(stmt: &SurfaceStmt, prefix: &str, lines: &mut Vec<String>) {
                     .iter()
                     .map(|p| {
                         let tilde = if p.mutable { "~" } else { "" };
-                        format!("{tilde}{}: {} := {}", p.name, p.ty, p.initial)
+                        format!(
+                            "{tilde}{}: {} := {}",
+                            p.name,
+                            p.ty,
+                            format_surface_expr(&p.initial)
+                        )
                     })
                     .collect();
                 lines.push(format!("{prefix}↻ {name}({})", params.join(", ")));

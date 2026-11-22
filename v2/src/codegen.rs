@@ -2532,16 +2532,7 @@ fn emit_map_ops(
         out,
         "  %vp = getelementptr {entry_ty}, ptr %ep, i32 0, i32 1"
     );
-    if reg.needed_clone.contains(&_vtid) && needs_drop(program, v) {
-        let _ = writeln!(
-            out,
-            "  %cv = call fastcc {v_ll} @vn2_clone_{_vtid}(ptr %vp)"
-        );
-        let _ = writeln!(out, "  store {v_ll} %cv, ptr %v_out");
-    } else {
-        let _ = writeln!(out, "  %val = load {v_ll}, ptr %vp");
-        let _ = writeln!(out, "  store {v_ll} %val, ptr %v_out");
-    }
+    let _ = writeln!(out, "  store ptr %vp, ptr %v_out");
     let _ = writeln!(out, "  ret i32 0");
     let _ = writeln!(out, "miss:");
     let _ = writeln!(out, "  ret i32 1");
@@ -3035,12 +3026,16 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
                 }
                 (VarRef::Local(id), VarAccess::ControlSlots(body)) => {
                     if matches!(body.vars[*id].ty, Type::Ref(_, _)) {
-                        let ll = self.llvm_ty(var_ty);
                         let ptr_r = self.fresh_reg();
                         let _ = writeln!(self.code, "  {ptr_r} = load ptr, ptr %slot_{id}");
-                        let val_r = self.fresh_reg();
-                        let _ = writeln!(self.code, "  {val_r} = load {ll}, ptr {ptr_r}");
-                        val_r
+                        if matches!(var_ty, Type::Ref(_, _)) {
+                            ptr_r
+                        } else {
+                            let ll = self.llvm_ty(var_ty);
+                            let val_r = self.fresh_reg();
+                            let _ = writeln!(self.code, "  {val_r} = load {ll}, ptr {ptr_r}");
+                            val_r
+                        }
                     } else {
                         let ll = self.llvm_ty(var_ty);
                         let reg = self.fresh_reg();
@@ -4714,13 +4709,21 @@ fn emit_operation_call(
                 on_done(em, &tag_reg, &out_slots, Vec::new());
             }
         }
-        Operation::Variant { id: vid, by_value } => {
+        Operation::Variant { id: vid, borrow } => {
             if is_unit_variant(program, *vid) {
-                let tag_reg = em.emit_expr(&arguments[0], &VarAccess::ControlSlots(body));
+                let tag_reg = if borrow.is_some() {
+                    let op = em.emit_read_operand(&arguments[0], &VarAccess::ControlSlots(body));
+                    let p = em.read_operand_ptr(&op).to_string();
+                    let r = em.fresh_reg();
+                    let _ = writeln!(em.code, "  {r} = load i32, ptr {p}");
+                    r
+                } else {
+                    em.emit_expr(&arguments[0], &VarAccess::ControlSlots(body))
+                };
                 on_done(em, &tag_reg, &out_slots, Vec::new());
             } else {
                 let v_ll = format!("%vn2.variant.{vid}");
-                let (v_ptr, temp_drops) = if *by_value {
+                let (v_ptr, temp_drops) = if borrow.is_none() {
                     let val = em.emit_expr(&arguments[0], &VarAccess::ControlSlots(body));
                     let tmp = em.alloc_temp(&v_ll);
                     let _ = writeln!(em.code, "  store {v_ll} {val}, ptr {tmp}");
@@ -4762,23 +4765,16 @@ fn emit_operation_call(
                         "  {pp} = getelementptr {v_ll}, ptr {v_ptr}, i32 0, i32 1"
                     );
                     for (fi, f) in ctor.fields.iter().enumerate() {
-                        let f_ll = em.llvm_ty(&f.ty);
                         let gp = em.fresh_reg();
                         let _ = writeln!(
                             em.code,
                             "  {gp} = getelementptr {sub_ll}, ptr {pp}, i32 0, i32 {fi}"
                         );
                         let dst_s = &out_slots[k][fi];
-                        if !by_value && needs_drop(program, &f.ty) {
-                            let ftid = em.reg.intern_type(&f.ty);
-                            em.reg.require_clone(ftid);
-                            let cv = em.fresh_reg();
-                            let _ = writeln!(
-                                em.code,
-                                "  {cv} = call fastcc {f_ll} @vn2_clone_{ftid}(ptr {gp})"
-                            );
-                            let _ = writeln!(em.code, "  store {f_ll} {cv}, ptr {dst_s}");
+                        if borrow.is_some() {
+                            let _ = writeln!(em.code, "  store ptr {gp}, ptr {dst_s}");
                         } else {
+                            let f_ll = em.llvm_ty(&f.ty);
                             let fv = em.fresh_reg();
                             let _ = writeln!(em.code, "  {fv} = load {f_ll}, ptr {gp}");
                             let _ = writeln!(em.code, "  store {f_ll} {fv}, ptr {dst_s}");
@@ -5149,34 +5145,9 @@ fn emit_builtin_call(
                 em.code,
                 "  {vp} = getelementptr {entry_ty}, ptr {ep}, i32 0, i32 1"
             );
-            if needs_drop(em.program, &k_ty) {
-                let ktid = em.reg.intern_type(&k_ty);
-                em.reg.require_clone(ktid);
-                let ck = em.fresh_reg();
-                let _ = writeln!(
-                    em.code,
-                    "  {ck} = call fastcc {k_ll} @vn2_clone_{ktid}(ptr {kp})"
-                );
-                let _ = writeln!(em.code, "  store {k_ll} {ck}, ptr {}", out_slots[0][0]);
-            } else {
-                let kv = em.fresh_reg();
-                let _ = writeln!(em.code, "  {kv} = load {k_ll}, ptr {kp}");
-                let _ = writeln!(em.code, "  store {k_ll} {kv}, ptr {}", out_slots[0][0]);
-            }
-            if needs_drop(em.program, &v_ty) {
-                let vtid = em.reg.intern_type(&v_ty);
-                em.reg.require_clone(vtid);
-                let cv = em.fresh_reg();
-                let _ = writeln!(
-                    em.code,
-                    "  {cv} = call fastcc {v_ll} @vn2_clone_{vtid}(ptr {vp})"
-                );
-                let _ = writeln!(em.code, "  store {v_ll} {cv}, ptr {}", out_slots[0][1]);
-            } else {
-                let vv = em.fresh_reg();
-                let _ = writeln!(em.code, "  {vv} = load {v_ll}, ptr {vp}");
-                let _ = writeln!(em.code, "  store {v_ll} {vv}, ptr {}", out_slots[0][1]);
-            }
+            let _ = writeln!(em.code, "  store ptr {kp}, ptr {}", out_slots[0][0]);
+            let _ = writeln!(em.code, "  store ptr {vp}, ptr {}", out_slots[0][1]);
+            let _ = (&k_ll, &v_ll);
             let next_p = em.fresh_reg();
             let _ = writeln!(em.code, "  {next_p} = add {u} {pos}, 1");
             let _ = writeln!(em.code, "  store {u} {next_p}, ptr {}", out_slots[0][2]);

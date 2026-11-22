@@ -294,9 +294,14 @@ impl Expr {
         }
     }
 
-    /// Whether this operand lends (`&p` or `&~p`) for `[E-Operands]`.
+    /// Whether this operand lends (`&p`, `&~p`, or a view constructor with a
+    /// field that lends) for `[E-Operands]`.
     pub fn lends(&self) -> bool {
-        matches!(self, Expr::Borrow(_, _, _))
+        match self {
+            Expr::Borrow(_, _, _) => true,
+            Expr::Struct(_, fields, _) => fields.iter().any(Expr::lends),
+            _ => false,
+        }
     }
 }
 
@@ -304,6 +309,8 @@ impl Expr {
 pub struct Parameter {
     pub name: String,
     pub ty: Type,
+    /// Indices into the enclosing control's parameters for `∈ y₁, y₂` ([T4], [W9]).
+    pub origins: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -311,6 +318,7 @@ pub struct StructDef {
     pub name: String,
     pub public: bool,
     pub is_copy: bool,
+    pub is_view: bool,
     pub kind: Kind,
     pub fault_releasable: bool,
     pub holds_obligation: bool,
@@ -535,10 +543,10 @@ pub enum Operation {
     },
     /// Decides a captured outcome value (`Δ outcome(x)`).
     Outcome(OutcomeId),
-    /// Decides a variant value (`Δ V(e)`).
+    /// Decides a variant value (`Δ V(e)`), or a borrowed variant (`Δ V(&p)` / `Δ V(&~p)`).
     Variant {
         id: VariantId,
-        by_value: bool,
+        borrow: Option<BorrowMode>,
     },
 }
 
@@ -557,12 +565,23 @@ impl Operation {
             Operation::Control(id) => program.controls[*id].contract.clone(),
             Operation::Builtin { contract, .. } => contract.clone(),
             Operation::Outcome(id) => program.outcomes[*id].alternatives.clone(),
-            Operation::Variant { id, .. } => program.variants[*id]
+            Operation::Variant { id, borrow } => program.variants[*id]
                 .constructors
                 .iter()
                 .map(|c| Alternative {
                     name: c.name.clone(),
-                    fields: c.fields.clone(),
+                    fields: c
+                        .fields
+                        .iter()
+                        .map(|f| match borrow {
+                            None => f.clone(),
+                            Some(mode) => Parameter {
+                                name: f.name.clone(),
+                                ty: Type::Ref(*mode, Box::new(f.ty.clone())),
+                                origins: vec![0],
+                            },
+                        })
+                        .collect(),
                     condition: None,
                 })
                 .collect(),
@@ -687,6 +706,33 @@ impl Program {
         self.boundaries
             .iter()
             .position(|boundary| boundary.name == name)
+    }
+
+    /// Whether `ty` is a `view struct` ([W6]).
+    pub fn is_view(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Struct(id, _) if self.structs[*id].is_view)
+    }
+
+    /// Whether `ty` is or contains a borrow or a view ([W6], [T6], [W5a], [F6]).
+    pub fn contains_borrow_or_view(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Ref(_, _) => true,
+            Type::Struct(id, _) => self.structs[*id].is_view,
+            Type::Vector(elem) => self.contains_borrow_or_view(elem),
+            Type::Map(k, v) => self.contains_borrow_or_view(k) || self.contains_borrow_or_view(v),
+            _ => false,
+        }
+    }
+
+    /// Whether `ty` is `&~σ` or a view containing an exclusive borrow.
+    pub fn has_exclusive_borrow(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Ref(BorrowMode::Exclusive, _) => true,
+            Type::Struct(id, _) => {
+                self.structs[*id].is_view && self.structs[*id].kind != Kind::Copy
+            }
+            _ => false,
+        }
     }
 
     /// Usage kind of `ty` (`copy < drop < must`, [T1]).

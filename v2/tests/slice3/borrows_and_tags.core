@@ -1,0 +1,136 @@
+// Slice 3 core conformance: second-class borrows, reborrows, disjoint places,
+// borrow tag rules [B1]-[B5], and X4 stuck states.
+
+copy struct pair {x : u32, y : u32}
+
+control widest(a : &string, b : &string)
+    ■ { ok {out : &string ∈ a, b} }
+    1  ⊤ ▷ cmp : ? len(a) ≥ len(b)
+    2  cmp.true  ▷ ■ ok {a}
+    3  cmp.false ▷ ■ ok {b}
+
+control bump(x : &~u32, step : u32)
+    ■ { done {} }
+    1  ⊤ ▷ x ← x + step
+    2  ⊤ ▷ ■ done {}
+
+control pick_mut(a : &~u32, b : &~u32, left : bool)
+    ■ { ok {out : &~u32 ∈ a, b} }
+    1  ⊤ ▷ c : ? left
+    2  c.true  ▷ ■ ok {a}
+    3  c.false ▷ ■ ok {b}
+
+control valid_tag_trace()
+    ■ { ok {result : u32} }
+    1  ⊤ ▷ ~x : u32 := 1
+    2  ⊤ ▷ r1 : &~u32 := &~x
+    3  ⊤ ▷ r2 : &~u32 := &~r1
+    4  ⊤ ▷ r2 ← 2
+    5  ⊤ ▷ r1 ← 3
+    6  ⊤ ▷ s1 : &u32 := &x
+    7  ⊤ ▷ s2 : &u32 := &x
+    8  ⊤ ▷ sum : u32 := s1 + s2
+    9  ⊤ ▷ x ← 4
+    10 ⊤ ▷ ■ ok {sum + x}
+
+control disjoint_fields()
+    ■ { ok {p : pair} }
+    1  ⊤ ▷ ~p : pair := pair {1, 2}
+    2  ⊤ ▷ rx : &~u32 := &~p.x
+    3  ⊤ ▷ ry : &~u32 := &~p.y
+    4  ⊤ ▷ rx ← rx + 10
+    5  ⊤ ▷ ry ← ry + 20
+    6  ⊤ ▷ ■ ok {p}
+
+control disjoint_elements()
+    ■ { ok {sum : u32} }
+    1  ⊤ ▷ ~v : [u32] := [10, 20, 30]
+    2  ⊤ ▷ r0 : &~u32 := &~v[0]
+    3  ⊤ ▷ r1 : &~u32 := &~v[1]
+    4  ⊤ ▷ r0 ← r0 + 1
+    5  ⊤ ▷ r1 ← r1 + 2
+    6  ⊤ ▷ ■ ok {v[0] + v[1] + v[2]}
+
+control reborrow_and_pick()
+    ■ { ok {a : u32, b : u32} }
+    1  ⊤ ▷ ~a : u32 := 10
+    2  ⊤ ▷ ~b : u32 := 20
+    3  ⊤ ▷ p : Δ pick_mut(&~a, &~b, false) ▸ ok {chosen}
+    4  ⊤ ▷ b1 : Δ bump(&~chosen, 5) ▸ done {}
+    5  ⊤ ▷ chosen ← chosen + 1
+    6  ⊤ ▷ ■ ok {a, b}
+
+// [B2]/[B1]: writing through owner invalidates shared borrow.
+control stuck_write_kills_shared()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ ~x : u32 := 1
+    2  ⊤ ▷ s : &u32 := &x
+    3  ⊤ ▷ x ← 2
+    4  ⊤ ▷ ■ ok {s}
+
+// [B2]/[B1]: reading through owner invalidates exclusive borrow.
+control stuck_read_kills_exclusive()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ ~x : u32 := 1
+    2  ⊤ ▷ r : &~u32 := &~x
+    3  ⊤ ▷ y : u32 := x
+    4  ⊤ ▷ r ← y + 1
+    5  ⊤ ▷ ■ ok {x}
+
+// [B2]/[B1] (references.md §10): writing through parent r1 kills child reborrow r2.
+control stuck_parent_kills_reborrow()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ ~x : u32 := 1
+    2  ⊤ ▷ r1 : &~u32 := &~x
+    3  ⊤ ▷ r2 : &~u32 := &~r1
+    4  ⊤ ▷ r1 ← 3
+    5  ⊤ ▷ ■ ok {r2}
+
+// [B4]/[B1]: moving an owned value invalidates its shared borrow.
+control stuck_move_kills_borrow()
+    ■ { ok {n : usize} }
+    1  ⊤ ▷ s : string := "hello"
+    2  ⊤ ▷ r : &string := &s
+    3  ⊤ ▷ moved : string := s
+    4  ⊤ ▷ ■ ok {len(r) + len(moved)}
+
+// [B4]/[B1]: returning a borrow of a local kills its owner tag at scope end.
+control stuck_dangling_return(dummy : &string)
+    ■ { ok {out : &string ∈ dummy} }
+    1  ⊤ ▷ local : string := "temp"
+    2  ⊤ ▷ r : &string := &local
+    3  ⊤ ▷ ■ ok {r}
+
+// [B5]/[B1]: push writes the whole vector and invalidates element borrows.
+control stuck_push_kills_elem_borrow()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ ~xs : [u32] := [10, 20]
+    2  ⊤ ▷ r : &u32 := &xs[0]
+    3  ⊤ ▷ p : Δ push(&~xs, 30) ▸ done {}
+    4  ⊤ ▷ ■ ok {r}
+
+// [B5]/[B1]: remove writes the whole map and invalidates `get` borrows.
+control stuck_remove_kills_map_borrow()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ ~m : string ⇀ u32 := ∅
+    2  ⊤ ▷ i1 : Δ insert(&~m, "a", 1) ▸ inserted {} │ replaced {p1}
+    3  ⊤ ▷ i2 : Δ insert(&~m, "b", 2) ▸ inserted {} │ replaced {p2}
+    4  ⊤ ▷ g1 : Δ get(&m, "a") ▸ found {va} │ missing {}
+    5  g1.missing ▷ ⊥
+    6  ⊤ ▷ r1 : Δ remove(&~m, "b") ▸ removed {vb} │ missing {}
+    7  r1.missing ▷ ⊥
+    8  ⊤ ▷ ■ ok {va + vb}
+
+//! run widest("alder", "birch") => done ok {"alder"}
+//! run widest("elm", "birch") => done ok {"birch"}
+//! run valid_tag_trace() => done ok {10}
+//! run disjoint_fields() => done ok {pair {11, 22}}
+//! run disjoint_elements() => done ok {63}
+//! run reborrow_and_pick() => done ok {10, 26}
+//! run stuck_write_kills_shared() => stuck X4 B1
+//! run stuck_read_kills_exclusive() => stuck X4 B1
+//! run stuck_parent_kills_reborrow() => stuck X4 B1
+//! run stuck_move_kills_borrow() => stuck X4 B1
+//! run stuck_dangling_return("x") => stuck X4 B1
+//! run stuck_push_kills_elem_borrow() => stuck X4 B1
+//! run stuck_remove_kills_map_borrow() => stuck X4 B1

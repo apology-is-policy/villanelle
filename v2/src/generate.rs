@@ -463,10 +463,12 @@ pub fn valid(rng: &mut Rng) -> Program {
             Parameter {
                 name: "a".to_string(),
                 ty: Type::Int(int_ty),
+                origins: Vec::new(),
             },
             Parameter {
                 name: "b".to_string(),
                 ty: Type::Int(int_ty),
+                origins: Vec::new(),
             },
         ],
         precondition: None,
@@ -481,6 +483,7 @@ pub fn valid(rng: &mut Rng) -> Program {
         parameters: vec![Parameter {
             name: "a".to_string(),
             ty: Type::Int(int_ty),
+            origins: Vec::new(),
         }],
         precondition: Some(bin(Binary::Greater, name("a"), int(0))),
         result: Type::Int(int_ty),
@@ -503,10 +506,12 @@ pub fn valid(rng: &mut Rng) -> Program {
             Parameter {
                 name: "s".to_string(),
                 ty: Type::Int(signed_ty),
+                origins: Vec::new(),
             },
             Parameter {
                 name: "flag".to_string(),
                 ty: Type::Bool,
+                origins: Vec::new(),
             },
         ],
         precondition: None,
@@ -533,6 +538,7 @@ pub fn valid(rng: &mut Rng) -> Program {
         parameters: vec![Parameter {
             name: "a".to_string(),
             ty: Type::Int(int_ty),
+            origins: Vec::new(),
         }],
         precondition: Some(bin(Binary::Greater, name("a"), int(0))),
         contract: vec![
@@ -541,6 +547,7 @@ pub fn valid(rng: &mut Rng) -> Program {
                 fields: vec![Parameter {
                     name: "v".to_string(),
                     ty: Type::Int(int_ty),
+                    origins: Vec::new(),
                 }],
                 condition: Some(bin(
                     Binary::And,
@@ -569,6 +576,7 @@ pub fn valid(rng: &mut Rng) -> Program {
         parameters: vec![Parameter {
             name: "b".to_string(),
             ty: Type::Int(int_ty2),
+            origins: Vec::new(),
         }],
         precondition: None,
         contract: vec![
@@ -577,6 +585,7 @@ pub fn valid(rng: &mut Rng) -> Program {
                 fields: vec![Parameter {
                     name: "w".to_string(),
                     ty: Type::Int(int_ty2),
+                    origins: Vec::new(),
                 }],
                 condition: Some(bin(
                     Binary::And,
@@ -606,14 +615,17 @@ pub fn valid(rng: &mut Rng) -> Program {
             Parameter {
                 name: "x".to_string(),
                 ty: Type::Int(int_ty),
+                origins: Vec::new(),
             },
             Parameter {
                 name: "s".to_string(),
                 ty: Type::Int(signed_ty),
+                origins: Vec::new(),
             },
             Parameter {
                 name: "flag".to_string(),
                 ty: Type::Bool,
+                origins: Vec::new(),
             },
         ],
         precondition: Some(bin(Binary::Greater, name("x"), int(0))),
@@ -623,6 +635,7 @@ pub fn valid(rng: &mut Rng) -> Program {
                 fields: vec![Parameter {
                     name: "r".to_string(),
                     ty: Type::Int(int_ty),
+                    origins: Vec::new(),
                 }],
                 condition: Some(bin(
                     Binary::And,
@@ -1046,18 +1059,22 @@ pub fn valid(rng: &mut Rng) -> Program {
             Parameter {
                 name: "a".to_string(),
                 ty: Type::Int(int_ty),
+                origins: Vec::new(),
             },
             Parameter {
                 name: "b".to_string(),
                 ty: Type::Int(int_ty2),
+                origins: Vec::new(),
             },
             Parameter {
                 name: "s".to_string(),
                 ty: Type::Int(signed_ty),
+                origins: Vec::new(),
             },
             Parameter {
                 name: "flag".to_string(),
                 ty: Type::Bool,
+                origins: Vec::new(),
             },
         ],
         precondition: None,
@@ -1067,6 +1084,7 @@ pub fn valid(rng: &mut Rng) -> Program {
                 fields: vec![Parameter {
                     name: "res".to_string(),
                     ty: Type::Int(int_ty),
+                    origins: Vec::new(),
                 }],
                 condition: Some(bin(
                     Binary::And,
@@ -1079,6 +1097,7 @@ pub fn valid(rng: &mut Rng) -> Program {
                 fields: vec![Parameter {
                     name: "code".to_string(),
                     ty: Type::Int(int_ty2),
+                    origins: Vec::new(),
                 }],
                 condition: None,
             },
@@ -1361,6 +1380,7 @@ pub fn free(rng: &mut Rng) -> Program {
             parameters: vec![Parameter {
                 name: param_name,
                 ty: param_ty,
+                origins: Vec::new(),
             }],
             precondition,
             result: result_ty,
@@ -1394,6 +1414,7 @@ pub fn free(rng: &mut Rng) -> Program {
         parameters: vec![Parameter {
             name: "ep".to_string(),
             ty: ext_param_ty.clone(),
+            origins: Vec::new(),
         }],
         precondition: if rng.chance(1, 2) {
             Some(free_expr(
@@ -1413,6 +1434,7 @@ pub fn free(rng: &mut Rng) -> Program {
                 fields: vec![Parameter {
                     name: "ef".to_string(),
                     ty: ext_field_ty.clone(),
+                    origins: Vec::new(),
                 }],
                 condition: if rng.chance(1, 2) {
                     Some(free_expr(rng, &Type::Bool, &ext_vars, &functions, 1, false))
@@ -1716,10 +1738,12 @@ pub fn free(rng: &mut Rng) -> Program {
             Parameter {
                 name: "a0".to_string(),
                 ty: p0_ty,
+                origins: Vec::new(),
             },
             Parameter {
                 name: "a1".to_string(),
                 ty: p1_ty,
+                origins: Vec::new(),
             },
         ],
         precondition: if rng.chance(1, 3) {
@@ -1740,6 +1764,7 @@ pub fn free(rng: &mut Rng) -> Program {
                 fields: vec![Parameter {
                     name: "res".to_string(),
                     ty: out_ty,
+                    origins: Vec::new(),
                 }],
                 condition: if rng.chance(1, 2) {
                     Some(free_expr(rng, &Type::Bool, &sig_vars, &functions, 1, false))
