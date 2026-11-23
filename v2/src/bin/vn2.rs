@@ -33,6 +33,7 @@ Options of `run`:
 Options of `fuzz`:
   --seed N       the first seed (default: 1); a program is a function of its seed
   --count N      the number of seeds (default: 100)
+  --slice N      1 for scalars and decisions (default), 2 for programs with data
   --mutants      try the mutants of each program too
   --native       compile each accepted program and run it too (needs clang)
   --show         print the programs and try nothing
@@ -275,7 +276,7 @@ fn parse_emit_args(arguments: &[String]) -> Result<(&str, u32), String> {
     }
 }
 
-/// `vn2 fuzz [--seed N] [--count N] [--mutants] [--show] [--out DIR]`.
+/// `vn2 fuzz [--seed N] [--count N] [--slice N] [--mutants] [--show] [--out DIR]`.
 fn fuzz_command(arguments: &[String]) -> Result<bool, String> {
     let mut first = 1u64;
     let mut count = 100u64;
@@ -297,6 +298,7 @@ fn fuzz_command(arguments: &[String]) -> Result<bool, String> {
             "--seconds" => options.seconds = number("--seconds")?,
             "--mutants" => options.mutants = true,
             "--native" => options.native = true,
+            "--slice" => options.slice = number("--slice")? as u8,
             "--show" => show = true,
             "--out" => out = Some(rest.next().ok_or("`--out` takes a directory")?.clone()),
             _ => return Err(USAGE.to_string()),
@@ -304,7 +306,10 @@ fn fuzz_command(arguments: &[String]) -> Result<bool, String> {
     }
     if show {
         for seed in first..first + count {
-            println!("┄ seed {seed}\n{}", fuzz::program_of(seed).print());
+            println!(
+                "┄ seed {seed}\n{}",
+                fuzz::program_in(seed, options.slice).print()
+            );
         }
         return Ok(true);
     }

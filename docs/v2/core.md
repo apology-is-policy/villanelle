@@ -1157,6 +1157,13 @@ Each of these is an entailment by [N2], on the histories that run the statement.
   boundary's `B₁` that may fault, with the same availability of the names
   around it.
 
+  The histories that run `B₂` are those of the statements of `B₁` that may
+  fault: what holds at every one of them holds in `B₂`, and where no
+  statement of `B₁` may fault no history runs `B₂`, so that `⊥` is a body
+  for it ([P6]). The same holds of the `B₂` of a named boundary ([F6]),
+  which no history runs when no statement of its `B₁` outside every lexical
+  boundary may fault on a history that can happen.
+
   The requirements of form, which a reader of programs refuses:
   (a) In `B₂`, at any depth, there is no `■`, no boundary, no `supervise`
   and no `terminate` without a status; `↑` and `□` there are those of a
@@ -1508,3 +1515,4 @@ and what asked for it:
 | 23 November 2026 | [E-Extern] says that the host names the place a returned borrow refers to and the step makes the reborrow. | The oracle (RO6): a host sees values and no slots, so no host could answer a borrowed payload. The directive form is `&x…` or `&~x…`, with `x` a parameter ([oracle document](oracle.md)). Not answered here: whether a host may write through an `&~` argument. The host relation has no part of the store, so by this document it does not, although [W7] reads such a parameter at completion in the contract of an extern control too (review finding RO11). |
 | 23 November 2026 | Section 6.6 names the built-in operations and gives them the contracts of the corpus prelude; an operand of one follows the rule of any operand. The row X2 of section 6.10 lists the clauses under which the oracle reports that state. | The oracle (RO9, RO10): `take`, `entry_at` and `trim` were in the prelude and not in this document; the written mode of a collection operand was ignored, so `push(&v, x)` was read as `push(&~v, x)`; and the labels `X2 E-Field`, `X2 E-Index` and `X2 E-Supervise` had no row. `X5 E-Resource` is a check of the oracle on its own table of resources, which no run of a program reaches. |
 | 23 November 2026 | [F5] says in which state the names around a lexical boundary are when its contingency ends: as they were at the statement of `B₁` that faulted, for every such statement; and that a statement of `B₂` that may fault is one of the `B₁` of a boundary around it. | The checker (RC4): it took the availability at the entry of the boundary, so it accepted a program whose `B₁` fills an outer name before it faults (stuck, `X5`) and refused one whose `B₁` consumes it. |
+| 23 November 2026 | [F5] says on which histories a contingency runs: those of the statements of `B₁` that may fault, and none where there is no such statement. | The generator of slice 2 (review finding RC21): the checker gave a contingency every history of its boundary and refused `⊥` in the contingency of work that cannot fault, which the oracle never runs. |

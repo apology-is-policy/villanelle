@@ -60,6 +60,83 @@ fn generated_valid_programs_run_to_an_end_and_reach_every_construct() {
     assert!(report.runs >= 2_000, "runs = {}", report.runs);
 }
 
+/// The constructs of slice 2 that the generator does not write yet:
+/// resources, captured outcomes, faults and boundaries
+/// (`docs/v2/review.md`, section 3).
+const DATA_NOT_WRITTEN: [&str; 17] = [
+    "resource",
+    "resource-on-fault-release",
+    "named-boundary",
+    "retains",
+    "contingent-control",
+    "faults",
+    "type-resource",
+    "capture",
+    "decide-outcome",
+    "boundary",
+    "boundary-care",
+    "supervise",
+    "fault",
+    "escalate",
+    "recover",
+    "terminate-status",
+    "terminate",
+];
+
+/// The generator with the data of slice 2
+/// ([`villanelle_v2::generate::valid_data`]): as for slice 1, what it writes
+/// reads back, resolves, runs to an end and gives the same observation under
+/// the erased semantics. It reaches every construct of slice 1 and the
+/// constructs of slice 2 that are data and operations on data.
+#[test]
+fn generated_programs_with_data_run_to_an_end_and_reach_the_data_constructs() {
+    let options = fuzz::Options {
+        slice: 2,
+        ..fuzz::Options::default()
+    };
+    let report = fuzz::campaign_without_checker(1, 160, &options);
+    let failures: Vec<String> = report
+        .findings
+        .iter()
+        .map(|finding| format!("seed {} {}: {}", finding.seed, finding.kind, finding.detail))
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        report.coverage.missing().is_empty(),
+        "constructs not reached: {:?}",
+        report.coverage.missing()
+    );
+    assert_eq!(report.coverage.missing_data(), DATA_NOT_WRITTEN);
+    assert!(report.runs >= 4_000, "runs = {}", report.runs);
+    assert_eq!(
+        fuzz::program_in(7, 2).print(),
+        fuzz::program_in(7, 2).print()
+    );
+    assert_ne!(fuzz::program_in(7, 2).print(), fuzz::program_of(7).print());
+}
+
+/// The checker accepts the programs with data that the generator calls
+/// valid. `vn2 fuzz --slice 2` tries more seeds; `docs/v2/review.md` has
+/// the one of the first 300 that the checker does not answer in time.
+#[test]
+fn the_checker_accepts_generated_programs_with_data() {
+    let options = fuzz::Options {
+        slice: 2,
+        entries: 1,
+        hosts: 1,
+        seconds: 60,
+        ..fuzz::Options::default()
+    };
+    let report = fuzz::campaign(1, 30, &options);
+    let findings: Vec<String> = report
+        .findings
+        .iter()
+        .map(|finding| format!("seed {} {}: {}", finding.seed, finding.kind, finding.detail))
+        .collect();
+    assert!(findings.is_empty(), "{}", findings.join("\n"));
+    assert_eq!(report.accepted, 30);
+}
+
 /// A program is a function of its seed, and seeds give different programs.
 #[test]
 fn a_generated_program_is_a_function_of_its_seed() {

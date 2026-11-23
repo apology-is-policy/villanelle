@@ -60,11 +60,11 @@ for every clause implemented.
 | Requirement | 1. Scalars and decisions | 2. Data | 3. Borrows | 4. Tasks |
 | --- | --- | --- | --- | --- |
 | Oracle: accepting and rejecting test for each clause | Met: 41 files, 126 runs, 12 rules, 15 stuck states, 9 refusals | Partly: 42 files, 68 runs, 12 stuck labels. Requalified since 23 November: the fault-boundary rules (RO1, RO3, RO4), pure operations (RO8) and the operands and contracts of the built-in operations (RO9, RO10). Open: a test for each clause of the data rules, as the fault boundaries have | No: 5 files, 55 runs. Three of the files are of 23 November, with the findings they close (RO2, RO6, RO10); the two before them reach one stuck label, `X4 B1`, which the oracle raises in 17 places, and the test asserts counts of runs. A host cannot write through an `&~` argument (RO11) | No: 2 files; the test asserts no stuck state; one run varies the order of turns |
-| Checker: accepting and rejecting test for each clause | Met | Partly. The findings of the review in this slice are closed since 23 November (RC2 to RC8, RC20), with tests that run each program in the oracle as well; the clauses of the data rules have the tests of before, which the review found thin | Partly: the worked examples of the reference model; unsound (RC1); the loan checker was tested from outside only | No checker |
-| Generator reaches every construct of the slice (phase 2 exit) | Met since 23 November (section 9, RG1) | No generator | No generator | No generator |
-| Oracle against erased semantics | 62 runs of the suite and 11,728 runs of 300 generated programs | The erased interpreter is a transcription of the oracle (RO7) and wrong under faults (RO5) | As slice 2 | As slice 2 |
+| Checker: accepting and rejecting test for each clause | Met | Partly. The findings of the review in this slice are closed since 23 November (RC2 to RC8, RC20, RC21), with tests that run each program in the oracle as well; the clauses of the data rules have the tests of before, which the review found thin | Partly: the worked examples of the reference model; unsound (RC1); the loan checker was tested from outside only | No checker |
+| Generator reaches every construct of the slice (phase 2 exit) | Met since 23 November (section 9, RG1) | Partly since 23 November: `generate::valid_data` (`vn2 fuzz --slice 2`) writes the data of the slice and the operations on it, valid by construction as slice 1 is, and reaches 35 of the 52 constructs that `generate::DATA_CONSTRUCTS` lists, beside the 61 of slice 1. Not written yet: resources, captured outcomes, faults and boundaries (17 constructs) | No generator | No generator |
+| Oracle against erased semantics | 62 runs of the suite and 11,728 runs of 300 generated programs | The erased interpreter is a transcription of the oracle (RO7) and wrong under faults (RO5). 11,836 runs of 300 generated programs with data give the same observation | As slice 2 | As slice 2 |
 | Mutations rejected at the rate the author sets (phase 3 exit) | Seven kinds on generated programs since 23 November. Every mutant for which a stuck run was found is rejected: 761 of 5,403 mutants of 25 programs, and 72 in the suite. The checker accepts 4,066 for which none was found. The rate is not set | None | None | None |
-| No generated checked program is stuck over a long campaign (phase 3 exit) | No long campaign yet. The checker accepts all of 300 generated programs, none of which is stuck in 11,728 runs, and 5,403 mutants of 25 of them gave none that was accepted and stuck | None | None | None |
+| No generated checked program is stuck over a long campaign (phase 3 exit) | No long campaign yet. The checker accepts all of 300 generated programs, none of which is stuck in 11,728 runs, and 5,403 mutants of 25 of them gave none that was accepted and stuck | The checker accepts 299 of 300 generated programs with data, none of which is stuck in 11,836 runs. It gives no answer on the other one (RC22). No mutants yet | None | None |
 | Compiled code agrees with the oracle on generated programs (phase 4 exit) | Since 23 November: 300 generated programs at both widths of `usize`, at `-O0` and `-O2`, 23,456 runs with no difference (`vn2 fuzz --native`); six of them with their expansions in the suite. No longer campaign yet | None; double free (RB1) | None | No backend; `emit-llvm` panics (RB9) |
 | Every kernel under `experiments/` within 1.2× of optimized Rust (phase 4 exit) | None measured (RB6) | None measured | None measured | |
 
@@ -89,7 +89,9 @@ Everything built on it has one program shape: "reaches all 61 constructs",
 in the first statements.
 
 **RG3.** The generator, the differential fuzzing and the mutations cover
-slice 1 only.
+slice 1 only. Since 23 November the generator writes the data of slice 2 as
+well (`generate::valid_data`, `v2/src/generate/valid/data.rs`); section 3 says
+what of the slice it does not write yet. The mutations are those of slice 1.
 
 The review's own run over 200 seeds, 9,800 mutants and 200 free programs at
 both `usize` widths found no program that the checker accepts and the oracle
@@ -242,6 +244,23 @@ stuck with X4 were all rejected.
 were requalified: the checker refuses by [F3] a named boundary that
 supervises another whose body has an effect. A boundary declares no effects;
 those of both bodies count toward the control that supervises.
+
+**RC21.** Found on 23 November by the first programs of the generator of
+slice 2. The checker gave the statements of a contingency every history of
+the boundary. So it refused `⊥` in the contingency of work that cannot
+fault, which no execution runs (`falls_off` of
+`v2/tests/slice2/lexical_boundaries.core` is such a control; the suite ran
+that file in the oracle only), and it knew in a contingency nothing of the
+histories on which the work faults.
+
+**RC22.** Found on 23 November by `vn2 fuzz --slice 2`: one of the first 300
+programs (`v2/tests/open/rc22_structs_in_loops.core`, 80 lines, no run of it
+stuck) gets no answer from the checker in two minutes. Its control `c1`
+takes structs apart in two nested loops and then decides on an extern
+control with structs for arguments. A sample of the running check shows the
+time in the conjunction of the premises into one diagram (`Solver::decide`,
+`Bdd::apply`). Without the loops the control is checked in 36 theory checks.
+It is not understood further.
 
 ## 6. Oracle and erased interpreter, slices 2 to 4
 
@@ -494,6 +513,8 @@ A finding is closed here with the date and the test that holds it.
 | RC7 | Closed 23 November 2026. The move mark of the core text stands only on an expression that is consumed, which its position decides ([E-Var]); on an operand of an operator, an argument of a function, the base of a field or an index or the place of `len` or `clone` it is refused when the text is resolved, by [O3]: a read moves nothing. `a_move_mark_stands_on_what_is_consumed_o3` (`v2/tests/checker_slice2.rs`) refuses three such forms and accepts and runs the mark on a bind, a field of a constructor and an element of a vector |
 | RC8 | Closed 23 November 2026. A component has the declared interval of its type only as a component of a value term, as [A9] of the [fact logic](facts.md) has it; read out of a constructor at any depth it is the term written there and has none. `a_component_read_out_of_a_constructor_has_no_declared_interval_a9`: a formula that holds for every `u32` and fails for `a + 1` at the end of the range is stuck in the oracle and refused, and the same formula of a component of a name is accepted |
 | RC20 | Closed 23 November 2026. The effects of a named boundary include those of the boundaries its `B₁` supervises (`resolve.rs`), as [F6] says of what supervises. `the_effects_of_a_supervised_boundary_count_toward_what_supervises_f3_f6`: a boundary that supervises one that writes is accepted, and the control that supervises it must allow the effect |
+| RC21 | Closed 23 November 2026. The statements of `B₂` have the histories of the statements of `B₁` that may fault: for a lexical boundary the disjunction of their reach, and for a named boundary, whose `B₂` is checked in a diagram of its own, all or none by whether one of them can happen. [F5] of the [core](core.md) says so now (section 12). `a_contingency_runs_on_the_histories_that_fault_f5_f6_p6` (`v2/tests/checker_slice2.rs`): five programs, each run in the oracle as well. |
+| RC22 | Open. The program is `v2/tests/open/rc22_structs_in_loops.core`; no test reads it. |
 | RS2 | Closed 23 November 2026. The renaming of [U9] reaches the name of a capture, the names of an unpacking, the root and the indexes of an assigned place, the parameters of an inner loop, the set of `await next`, and what a boundary captures. `u9_renames_inner_binders_and_the_places_that_use_them` (`v2/tests/surface.rs`) runs the three files of `v2/tests/loop_names/` in both semantics and refuses a free name that is spelled like a renamed one |
 | RS4 | Closed 23 November 2026. The formatter prints from a tree that holds no comment at the end of a line, so it now notes the source line of each thing it prints and puts the comments of the source back between those lines (`FormatLines` in `surface.rs`); a comment between the two bodies of a named boundary in the plain form goes to the end of the first, since [Y12] makes the bodies touch. `g10_keeps_comments_in_order_through_layout_changes` (the 24 comments of `v2/tests/format/comments.rails` and the 9 of `plain_comments.rails`, which changes from braces to rails), `g10_keeps_comments_on_folded_lines_and_delimiters`, `g10_keeps_plain_boundary_comments_next_to_the_work_body`, and `g10_keeps_a_comment_in_every_position`, which puts a comment after every line and before every line of every Rails file of the suite, one at a time, and requires that the text is refused or every comment is kept in order by a formatter that is the identity on its output |
 | RS7, RS8 | Closed 23 November 2026. `forward` takes any call that a decision takes (a control, the method form, a built-in), and the entries of a contract that is one outcome name are those of the declaration ([G2]), for `forward` and for `■ ▾x`. `u14_forwards_named_contracts_and_builtin_calls` (`v2/tests/surface.rs`) runs both; a payload of another type is refused by [U14] and a built-in with the wrong number of operands by [C1] |

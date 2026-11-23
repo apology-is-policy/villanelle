@@ -25,7 +25,7 @@ use crate::codegen::{NativeRunSpec, run_native_batch};
 use crate::counts::{self, Counts};
 use crate::differential::{Verdict, compare};
 use crate::erased;
-use crate::generate::{Coverage, entry_runs, valid};
+use crate::generate::{Coverage, entry_runs, valid, valid_data};
 use crate::host::{Arithmetic, Seeded};
 use crate::mutate::{Kind, mutate};
 use crate::oracle::{self, Config, End};
@@ -53,6 +53,8 @@ pub struct Options {
     pub seconds: u64,
     /// Whether an accepted program is compiled and run too. Needs `clang`.
     pub native: bool,
+    /// The slice whose constructs the programs have: 1, or 2 for data.
+    pub slice: u8,
 }
 
 impl Default for Options {
@@ -66,6 +68,7 @@ impl Default for Options {
             hosts: 2,
             seconds: 20,
             native: false,
+            slice: 1,
         }
     }
 }
@@ -97,6 +100,8 @@ pub struct Report {
     pub survived: u64,
     pub survivors: BTreeMap<Kind, u64>,
     pub coverage: Coverage,
+    /// The slice whose constructs the campaign is to reach.
+    pub slice: u8,
     pub rules: BTreeSet<&'static str>,
     /// The work of the search in every check that gave an answer in time.
     pub search: Counts,
@@ -176,15 +181,24 @@ fn configs(fuel: u64) -> [(u32, Config); 2] {
     ]
 }
 
-/// The program of `seed`.
+/// The program of `seed`, with the constructs of slice 1.
 pub fn program_of(seed: u64) -> crate::syntax::Program {
-    valid(&mut Rng::new(mix(&[seed, 0x76616c6964])))
+    program_in(seed, 1)
+}
+
+/// The program of `seed` with the constructs of `slice`.
+pub fn program_in(seed: u64, slice: u8) -> crate::syntax::Program {
+    if slice >= 2 {
+        valid_data(&mut Rng::new(mix(&[seed, 0x64617461])))
+    } else {
+        valid(&mut Rng::new(mix(&[seed, 0x76616c6964])))
+    }
 }
 
 /// Tries the program of `seed`, and its mutants if asked, and adds what it
 /// sees to `report`.
 pub fn one(seed: u64, options: &Options, report: &mut Report) {
-    let tree = program_of(seed);
+    let tree = program_in(seed, options.slice);
     let printed = tree.print();
     report.programs += 1;
     report.coverage.observe(&tree);
@@ -433,7 +447,10 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
 
 /// Tries the programs of `count` seeds from `first`.
 pub fn campaign(first: u64, count: u64, options: &Options) -> Report {
-    let mut report = Report::default();
+    let mut report = Report {
+        slice: options.slice,
+        ..Report::default()
+    };
     for seed in first..first + count {
         one(seed, options, &mut report);
     }
@@ -476,7 +493,10 @@ impl Report {
                 out.push_str(&format!("  accepted {kind:?}: {count}\n"));
             }
         }
-        let missing = self.coverage.missing();
+        let mut missing = self.coverage.missing();
+        if self.slice >= 2 {
+            missing.extend(self.coverage.missing_data());
+        }
         out.push_str(&format!(
             "constructs not reached: {}\n",
             if missing.is_empty() {

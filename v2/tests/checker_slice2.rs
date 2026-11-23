@@ -1784,3 +1784,99 @@ fn a_move_mark_stands_on_what_is_consumed_o3() {
         done_and_accepted("O3", &program(consumed));
     }
 }
+
+#[test]
+fn a_contingency_runs_on_the_histories_that_fault_f5_f6_p6() {
+    // `B₂` runs after a fault at a statement of `B₁` ([F5]), so the
+    // histories of its statements are those of the statements of `B₁` that
+    // may fault. The checker gave them every history of the boundary, and
+    // refused `⊥` in the contingency of work that cannot fault.
+    done_and_accepted(
+        "P6",
+        r#"
+control quiet(n : u32)
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ inside : u32 := n
+       } contingency (m : string) {
+           1  ⊤ ▷ ⊥
+       }
+    2  ⊤ ▷ ■ ok {n}
+
+//! run quiet(4) => done ok {4}
+"#,
+    );
+    // What holds where the work faults holds in the contingency.
+    done_and_accepted(
+        "P1",
+        r#"
+control guarded(n : u32)
+    ■ { ok {v : u32} }
+    faults
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ t : ? n > 5
+           2  t.true ▷ fault "big"
+       } contingency [n] (m : string) {
+           1  ⊤ ▷ ⊢ n > 5
+           2  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ■ ok {n}
+
+//! run guarded(4) => done ok {4}
+//! run guarded(9) => faulted "big"
+"#,
+    );
+    // Work that may fault has a contingency that runs.
+    stuck_and_rejected(
+        "P6",
+        r#"
+control loud(n : u32)
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ t : ? n > 5
+           2  t.true ▷ fault "big"
+       } contingency (m : string) {
+           1  ⊤ ▷ ⊥
+       }
+    2  ⊤ ▷ ■ ok {n}
+
+//! run loud(9) => stuck X6 E-Impossible
+//! run loud(1) => done ok {1}
+"#,
+    );
+    // The same of a named boundary ([F6]).
+    done_and_accepted(
+        "P6",
+        r#"
+boundary calm(tag : string) retains tag {
+    1  ⊤ ▷ terminate
+} contingency (m : string) {
+    1  ⊤ ▷ ⊥
+}
+
+control uses_calm()
+    ■ { done {} }
+    1  ⊤ ▷ supervise calm("x")
+    2  ⊤ ▷ ■ done {}
+
+//! run uses_calm() => done done
+"#,
+    );
+    stuck_and_rejected(
+        "P6",
+        r#"
+boundary rough(tag : string) retains tag {
+    1  ⊤ ▷ fault "x"
+} contingency (m : string) {
+    1  ⊤ ▷ ⊥
+}
+
+control uses_rough()
+    ■ { done {} }
+    1  ⊤ ▷ supervise rough("x")
+    2  ⊤ ▷ ■ done {}
+
+//! run uses_rough() => stuck X6 E-Impossible
+"#,
+    );
+}

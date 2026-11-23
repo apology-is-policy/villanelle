@@ -38,8 +38,12 @@ use crate::syntax::{
     Alternative, Arm, Binary, CallMode, Command, Control, Declaration, Expr, Function,
     LoopParameter, Parameter, Program, Selector, Statement, Unary,
 };
-use crate::typed::{IntType, Type};
+use crate::typed::{BorrowMode, IntType, Type};
 use std::collections::{BTreeMap, BTreeSet};
+
+mod data;
+
+use data::Types;
 
 const ALTERNATIVES: [&str; 12] = [
     "done", "ok", "low", "high", "none", "some", "left", "right", "stop", "more", "hit", "miss",
@@ -169,6 +173,15 @@ impl Val {
 enum Know {
     Int(Val),
     Bool(Tri),
+    /// A struct, field by field ([A4]).
+    Struct(Vec<Know>),
+    /// A variant: for each constructor what is known of its fields, or
+    /// `None` where the value is known not to be made by it ([A5]).
+    Variant(Vec<Option<Vec<Know>>>),
+    /// A vector, a map or a string: the interval of its length ([A3]).
+    Sized(Range),
+    /// A resource or a captured outcome, of which nothing is known.
+    Opaque,
 }
 
 impl Know {
@@ -191,6 +204,22 @@ impl Know {
                 },
             }),
             (Know::Bool(a), Know::Bool(b)) => Know::Bool(a.hull(*b)),
+            (Know::Struct(a), Know::Struct(b)) => {
+                Know::Struct(a.iter().zip(b).map(|(x, y)| x.hull(y)).collect())
+            }
+            (Know::Variant(a), Know::Variant(b)) => Know::Variant(
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| match (x, y) {
+                        (Some(x), Some(y)) => {
+                            Some(x.iter().zip(y).map(|(x, y)| x.hull(y)).collect())
+                        }
+                        (Some(seen), None) | (None, Some(seen)) => Some(seen.clone()),
+                        (None, None) => None,
+                    })
+                    .collect(),
+            ),
+            (Know::Sized(a), Know::Sized(b)) => Know::Sized(a.hull(*b)),
             (seen, _) => seen.clone(),
         }
     }
@@ -205,6 +234,11 @@ struct Slot {
     /// For a `bool` bound once to an expression over names that never
     /// change: that expression ([I13]).
     definition: Option<Expr>,
+    /// Whether the value has moved out of the name on this history ([O3]).
+    gone: bool,
+    /// The body that binds the name, as an index into the bodies being
+    /// written.
+    home: usize,
 }
 
 type Env = BTreeMap<String, Slot>;
@@ -335,6 +369,7 @@ fn literal_of(expr: &Expr) -> Option<i128> {
 /// its obligations hold there, and what a condition adds.
 struct Lib<'a> {
     functions: &'a [FnSig],
+    types: &'a Types,
 }
 
 impl Lib<'_> {
@@ -358,6 +393,67 @@ impl Lib<'_> {
             Expr::Unary(Unary::Negate, inner) => self.anchor(inner, env),
             Expr::Binary(operator, left, right) if operator.level() >= 4 => {
                 self.anchor(left, env).or_else(|| self.anchor(right, env))
+            }
+            Expr::Field(_, _) | Expr::Index(_, _) => match self.place(expr, env, false)?.0 {
+                Type::Int(ty) => Some(ty),
+                _ => None,
+            },
+            Expr::Len(_) => Some(IntType::Usize),
+            _ => None,
+        }
+    }
+
+    /// The type of a place and what is known of the value there: a name
+    /// that is available, a field of a struct, an element of a vector. With
+    /// `evaluated`, an index has to be known less than the length ([P5]).
+    fn place(&self, expr: &Expr, env: &Env, evaluated: bool) -> Option<(Type, Know)> {
+        match expr {
+            Expr::Name(name) => {
+                let slot = env.get(name)?;
+                (!slot.gone).then(|| (slot.ty.clone(), slot.know.clone()))
+            }
+            Expr::Field(base, field) => {
+                let (ty, know) = self.place(base, env, evaluated)?;
+                let Type::Named(name) = &ty else {
+                    return None;
+                };
+                let info = self.types.structure(name)?;
+                let index = info.fields.iter().position(|(seen, _)| seen == field)?;
+                let field_ty = info.fields[index].1.clone();
+                let know = match know {
+                    Know::Struct(mut fields) => fields.swap_remove(index),
+                    _ => self.types.top(&field_ty),
+                };
+                Some((field_ty, know))
+            }
+            Expr::Index(base, index) => {
+                let (ty, know) = self.place(base, env, evaluated)?;
+                let (Type::Vector(item), Know::Sized(length)) = (ty, know) else {
+                    return None;
+                };
+                let position = self.int(index, env, evaluated.then_some(IntType::Usize))?;
+                if evaluated && !(position.flow.lo >= 0 && position.flow.hi < length.lo) {
+                    return None;
+                }
+                let know = self.types.top(&item);
+                Some((*item, know))
+            }
+            _ => None,
+        }
+    }
+
+    /// The name and the fields that lead to a place without an index.
+    fn path(&self, expr: &Expr, env: &Env) -> Option<(String, Vec<usize>)> {
+        match expr {
+            Expr::Name(name) => Some((name.clone(), Vec::new())),
+            Expr::Field(base, field) => {
+                let (root, mut steps) = self.path(base, env)?;
+                let Type::Named(name) = self.place(base, env, false)?.0 else {
+                    return None;
+                };
+                let info = self.types.structure(&name)?;
+                steps.push(info.fields.iter().position(|(seen, _)| seen == field)?);
+                Some((root, steps))
             }
             _ => None,
         }
@@ -387,7 +483,20 @@ impl Lib<'_> {
             }
             Expr::Name(name) => match &env.get(name)?.know {
                 Know::Int(val) => Some(*val),
-                Know::Bool(_) => None,
+                _ => None,
+            },
+            Expr::Field(_, _) | Expr::Index(_, _) => match self.place(expr, env, fit.is_some())? {
+                (_, Know::Int(val)) => Some(val),
+                _ => None,
+            },
+            // [A3]: a length is a value of `usize`.
+            Expr::Len(inner) => match self.place(inner, env, fit.is_some())? {
+                (_, Know::Sized(length)) => Some(Val {
+                    flow: length.meet(value_range(IntType::Usize)),
+                    declared: declared_range(IntType::Usize),
+                    constant: None,
+                }),
+                _ => None,
             },
             Expr::Binary(operator, left, right) => {
                 let a = self.int(left, env, fit)?;
@@ -526,6 +635,8 @@ impl Lib<'_> {
                     mutable: false,
                     know,
                     definition: None,
+                    gone: false,
+                    home: 0,
                 },
             );
         }
@@ -538,7 +649,7 @@ impl Lib<'_> {
             Expr::Boolean(value) => Some(Tri::of(*value)),
             Expr::Name(name) => match &env.get(name)?.know {
                 Know::Bool(tri) => Some(*tri),
-                Know::Int(_) => None,
+                _ => None,
             },
             Expr::Unary(Unary::Not, inner) => Some(self.boolean(inner, env, evaluated)?.not()),
             Expr::Binary(Binary::And, left, right) => {
@@ -669,15 +780,35 @@ impl Lib<'_> {
         if new_a.is_empty() || new_b.is_empty() {
             return false;
         }
-        Self::narrow(left, new_a, env);
-        Self::narrow(right, new_b, env);
+        self.narrow(left, new_a, env);
+        self.narrow(right, new_b, env);
         true
     }
 
     /// `expr` lies in `range`: narrow the name it is, or the name it is a
     /// literal away from.
-    fn narrow(expr: &Expr, range: Range, env: &mut Env) {
+    fn narrow(&self, expr: &Expr, range: Range, env: &mut Env) {
         match expr {
+            Expr::Field(_, _) => {
+                if let Some((root, steps)) = self.path(expr, env)
+                    && let Some(Know::Int(val)) = data::know_at(env, &root, &steps)
+                {
+                    let narrowed = val.flow.meet(range);
+                    if !narrowed.is_empty() {
+                        val.flow = narrowed;
+                    }
+                }
+            }
+            Expr::Len(inner) => {
+                if let Some((root, steps)) = self.path(inner, env)
+                    && let Some(Know::Sized(length)) = data::know_at(env, &root, &steps)
+                {
+                    let narrowed = length.meet(range);
+                    if !narrowed.is_empty() {
+                        *length = narrowed;
+                    }
+                }
+            }
             Expr::Name(name) => {
                 if let Some(Slot {
                     know: Know::Int(val),
@@ -692,16 +823,16 @@ impl Lib<'_> {
             }
             Expr::Binary(Binary::Add, left, right) => match (literal_of(left), literal_of(right)) {
                 (None, Some(literal)) => {
-                    Self::narrow(left, subtract(range, Range::point(literal)), env);
+                    self.narrow(left, subtract(range, Range::point(literal)), env);
                 }
                 (Some(literal), None) => {
-                    Self::narrow(right, subtract(range, Range::point(literal)), env);
+                    self.narrow(right, subtract(range, Range::point(literal)), env);
                 }
                 _ => {}
             },
             Expr::Binary(Binary::Subtract, left, right) => {
                 if let (None, Some(literal)) = (literal_of(left), literal_of(right)) {
-                    Self::narrow(left, add(range, Range::point(literal)), env);
+                    self.narrow(left, add(range, Range::point(literal)), env);
                 }
             }
             _ => {}
@@ -777,6 +908,7 @@ enum Step {
     Decide,
     Loop,
     Terminate,
+    Data,
 }
 
 struct Generator<'r> {
@@ -792,6 +924,10 @@ struct Generator<'r> {
     parameters: Vec<String>,
     exits: Vec<ExitRecord>,
     effects: BTreeSet<String>,
+    /// Whether the program has the data of slice 2, and the types it
+    /// declares.
+    data: bool,
+    types: Types,
 }
 
 fn conjunction(parts: Vec<Expr>) -> Option<Expr> {
@@ -839,6 +975,7 @@ fn merge(paths: &[&Path]) -> Env {
         env.retain(|name, slot| match other.env.get(name) {
             Some(theirs) if theirs.ty == slot.ty && theirs.mutable == slot.mutable => {
                 slot.know = slot.know.hull(&theirs.know);
+                slot.gone |= theirs.gone;
                 let same = match (&slot.definition, &theirs.definition) {
                     (Some(ours), Some(theirs)) => ours.to_string() == theirs.to_string(),
                     _ => false,
@@ -866,6 +1003,7 @@ impl Generator<'_> {
     fn lib(&self) -> Lib<'_> {
         Lib {
             functions: &self.functions,
+            types: &self.types,
         }
     }
 
@@ -985,6 +1123,12 @@ impl Generator<'_> {
     }
 
     fn atom(&mut self, env: &Env, ty: IntType) -> Expr {
+        if self.data
+            && self.rng.chance(1, 3)
+            && let Some(place) = self.int_place(env, ty)
+        {
+            return place;
+        }
         let names = Self::names_of(env, &Type::Int(ty));
         if !names.is_empty() && self.rng.chance(3, 4) {
             name(self.rng.pick(&names))
@@ -1144,7 +1288,7 @@ impl Generator<'_> {
         let names = Self::names_of(env, &Type::Int(ty));
         let flow_of = |name: &String| match &env[name].know {
             Know::Int(val) => val.flow,
-            Know::Bool(_) => Range::ALL,
+            _ => Range::ALL,
         };
         let inside: Vec<&String> = names
             .iter()
@@ -1514,6 +1658,9 @@ impl Generator<'_> {
         if running.len() < live {
             choices.push((2, Step::Terminate));
         }
+        if self.data {
+            choices.push((9, Step::Data));
+        }
         let total: u64 = choices.iter().map(|(weight, _)| weight).sum();
         let mut drawn = self.rng.below(total);
         let mut chosen = Step::Bind;
@@ -1548,6 +1695,7 @@ impl Generator<'_> {
                 self.terminate(selector, running);
                 true
             }
+            Step::Data => self.data_step(selector, running, room),
         };
         if !done {
             self.bind(selector, running);
@@ -1556,7 +1704,11 @@ impl Generator<'_> {
 
     fn bind(&mut self, selector: &Selector, running: &[usize]) {
         let env = self.running_env(running);
-        let ty = self.random_type();
+        let ty = self.value_type();
+        if !ty.is_scalar() {
+            self.bind_data(selector, running, ty);
+            return;
+        }
         let bound = self.fresh("v");
         let mutable = self.rng.chance(1, 3);
         let (value, know) = self.gen_expr(&env, &ty, 3);
@@ -1592,6 +1744,8 @@ impl Generator<'_> {
             mutable,
             know,
             definition,
+            gone: false,
+            home: self.scopes.len() - 1,
         };
         for &index in running {
             self.scope_mut().live[index]
@@ -1612,7 +1766,10 @@ impl Generator<'_> {
     fn unchanging(expr: &Expr, env: &Env) -> bool {
         match expr {
             Expr::Name(name) => env.get(name).is_some_and(|slot| !slot.mutable),
-            Expr::Unary(_, inner) => Self::unchanging(inner, env),
+            Expr::Unary(_, inner) | Expr::Field(inner, _) | Expr::Len(inner) => {
+                Self::unchanging(inner, env)
+            }
+            Expr::Index(base, index) => Self::unchanging(base, env) && Self::unchanging(index, env),
             Expr::Binary(_, left, right) => {
                 Self::unchanging(left, env) && Self::unchanging(right, env)
             }
@@ -1627,7 +1784,7 @@ impl Generator<'_> {
         let env = self.running_env(running);
         let candidates: Vec<String> = env
             .iter()
-            .filter(|(_, slot)| slot.mutable)
+            .filter(|(_, slot)| slot.mutable && slot.ty.is_scalar())
             .map(|(name, _)| name.clone())
             .collect();
         if candidates.is_empty() {
@@ -1724,7 +1881,7 @@ impl Generator<'_> {
                     if narrowed.is_empty() {
                         continue 'alternative;
                     }
-                    Lib::narrow(&arguments[position], narrowed, &mut env);
+                    self.lib().narrow(&arguments[position], narrowed, &mut env);
                 }
                 for (field, bound) in alternative.fields.iter().zip(&arms[which].names) {
                     let know = match &field.ty {
@@ -1756,7 +1913,7 @@ impl Generator<'_> {
                             }
                             Know::Int(Val::value(*int_ty, range))
                         }
-                        other => Know::top(other),
+                        other => self.types.top(other),
                     };
                     env.insert(
                         bound.clone(),
@@ -1765,6 +1922,8 @@ impl Generator<'_> {
                             mutable: false,
                             know,
                             definition: None,
+                            gone: false,
+                            home: self.scopes.len() - 1,
                         },
                     );
                 }
@@ -1791,7 +1950,8 @@ impl Generator<'_> {
     }
 
     fn decide(&mut self, selector: &Selector, running: &[usize]) -> bool {
-        let env = self.running_env(running);
+        let mut ctx = self.ctx(running);
+        let env = ctx.env.clone();
         let callee = self.rng.pick(&self.callables).clone();
         let mut arguments: Vec<Expr> = Vec::new();
         for (position, (_, ty)) in callee.params.iter().enumerate() {
@@ -1821,10 +1981,15 @@ impl Generator<'_> {
                         None => return false,
                     }
                 }
-                _ => self.gen_bool(&env, 1).0,
+                Type::Bool => self.gen_bool(&env, 1).0,
+                other => match self.operand_for(&mut ctx, other, callee.pre[position]) {
+                    Some(expr) => expr,
+                    None => return false,
+                },
             };
             arguments.push(argument);
         }
+        self.apply(running, &ctx);
         let site = self.fresh("d");
         let arms: Vec<Arm> = callee
             .alts
@@ -1870,8 +2035,9 @@ impl Generator<'_> {
             ty: Type::Int(counter_ty),
             invariant: counter_invariant,
         }];
+        let mut ctx = self.ctx(running);
         for _ in 0..self.rng.below(3) {
-            let ty = self.random_type();
+            let ty = self.value_type();
             let mutable = self.rng.chance(1, 4);
             let (initial, invariant) = match &ty {
                 Type::Int(int_ty) => {
@@ -1885,7 +2051,11 @@ impl Generator<'_> {
                     };
                     (initial, invariant)
                 }
-                _ => (self.gen_bool(&env, 1).0, None),
+                Type::Bool => (self.gen_bool(&env, 1).0, None),
+                other => match self.value(&mut ctx, other, 2) {
+                    Some((initial, _)) => (initial, None),
+                    None => continue,
+                },
             };
             let parameter = self.fresh("x");
             parameters.push(LoopParameter {
@@ -1910,12 +2080,17 @@ impl Generator<'_> {
 
         // The body sees the names around it. Those it may assign are known
         // inside by their type alone ([N5]); the others do not change.
-        let mut inner = env.clone();
+        self.apply(running, &ctx);
+        let mut inner = if self.data {
+            self.running_env(running)
+        } else {
+            env.clone()
+        };
         let mut assignable = BTreeSet::new();
         for (outer, slot) in inner.iter_mut() {
             if slot.mutable {
                 if self.rng.chance(1, 2) {
-                    slot.know = Know::top(&slot.ty);
+                    slot.know = self.types.top(&slot.ty);
                     slot.definition = None;
                     assignable.insert(outer.clone());
                 } else {
@@ -1923,12 +2098,15 @@ impl Generator<'_> {
                 }
             }
         }
+        let home = self.scopes.len();
         for (info, parameter) in params.iter().zip(&parameters) {
+            // A parameter of data is one name for every iteration: what the
+            // first one knows of it holds of the first only ([N5]).
             let know = match &info.ty {
                 Type::Int(int_ty) => {
                     Know::Int(Val::value(*int_ty, info.invariant.unwrap_or(Range::ALL)))
                 }
-                other => Know::top(other),
+                other => self.types.top(other),
             };
             inner.insert(
                 info.name.clone(),
@@ -1937,6 +2115,8 @@ impl Generator<'_> {
                     mutable: parameter.mutable,
                     know,
                     definition: None,
+                    gone: false,
+                    home,
                 },
             );
         }
@@ -1946,7 +2126,7 @@ impl Generator<'_> {
             if planned.iter().any(|(seen, _)| seen == &alternative) {
                 continue;
             }
-            let types = (0..self.rng.below(3)).map(|_| self.random_type()).collect();
+            let types = (0..self.rng.below(3)).map(|_| self.value_type()).collect();
             planned.push((alternative, types));
         }
         let mut outer_atoms = self.scope().outer_atoms.clone();
@@ -2051,6 +2231,8 @@ impl Generator<'_> {
                             mutable: false,
                             know,
                             definition: None,
+                            gone: false,
+                            home: self.scopes.len() - 1,
                         },
                     );
                 }
@@ -2074,7 +2256,7 @@ impl Generator<'_> {
                             Know::Int(Val::value(*int_ty, val.flow))
                         }
                         (_, Some(know)) => know,
-                        (ty, None) => Know::top(ty),
+                        (ty, None) => self.types.top(ty),
                     };
                     slot.definition = None;
                 }
@@ -2128,12 +2310,13 @@ impl Generator<'_> {
     }
 
     fn exit(&mut self, selector: &Selector, running: &[usize]) {
-        let env = self.running_env(running);
+        let mut ctx = self.ctx(running);
+        let env = ctx.env.clone();
         let which = self.rng.index(self.contract.len());
         let (alternative, fields) = self.contract[which].clone();
         let mut payload = Vec::new();
         for (position, (_, ty)) in fields.iter().enumerate() {
-            let (expr, know) = self.gen_expr(&env, ty, 2);
+            let (expr, know) = self.value(&mut ctx, ty, 2).expect("a payload");
             if let Know::Int(val) = know {
                 let seen = &mut self.exits[which].fields[position];
                 *seen = Some(seen.map_or(val.flow, |range| range.hull(val.flow)));
@@ -2164,14 +2347,30 @@ impl Generator<'_> {
     }
 
     fn leave(&mut self, selector: &Selector, running: &[usize]) {
-        let env = self.running_env(running);
+        let mut ctx = self.ctx(running);
+        let env = ctx.env.clone();
         let info = self.scope().looping.clone().expect("a loop to leave");
         let which = self.rng.index(info.planned.len());
         let (alternative, types) = info.planned[which].clone();
         let mut payload = Vec::new();
         let mut knows = Vec::new();
         for ty in &types {
-            let (mut expr, know) = self.gen_expr(&env, ty, 2);
+            let (mut expr, know) = self.value(&mut ctx, ty, 2).expect("a payload");
+            // The type of a payload of data is that of its operand too, and
+            // a literal of a collection does not say it.
+            if !ty.is_scalar() && !matches!(expr, Expr::Name(_) | Expr::Move(_)) {
+                let held = self.fresh("v");
+                self.push(
+                    selector,
+                    Command::Bind {
+                        mutable: false,
+                        name: held.clone(),
+                        ty: Some(ty.clone()),
+                        value: expr,
+                    },
+                );
+                expr = name(&held);
+            }
             // [W9]: a payload field of a loop has the type of its operand,
             // and literals alone are `u32` ([C1]). A name says the type.
             if let Type::Int(int_ty) = ty
@@ -2217,7 +2416,8 @@ impl Generator<'_> {
     /// `↑ ℓ` for the loop whose body is the scope `target`. It needs room
     /// for the counter to move, which a test gave or did not.
     fn again(&mut self, selector: &Selector, running: &[usize], target: usize) -> bool {
-        let env = self.running_env(running);
+        let mut ctx = self.ctx(running);
+        let env = ctx.env.clone();
         let info = self.scopes[target].looping.clone().expect("a loop");
         let Some(Slot {
             know: Know::Int(counter),
@@ -2252,7 +2452,10 @@ impl Generator<'_> {
                     Some((expr, _)) => expr,
                     None => return false,
                 },
-                (ty, _) => self.gen_expr(&env, ty, 2).0,
+                (ty, _) => match self.value(&mut ctx, ty, 2) {
+                    Some((expr, _)) => expr,
+                    None => return false,
+                },
             });
         }
         self.push(
@@ -2278,6 +2481,10 @@ impl Generator<'_> {
         for ((parameter, ty), range) in params.iter().zip(pre) {
             if let Type::Int(int_ty) = ty {
                 parts.extend(self.bounds(&name(parameter), *range, *int_ty));
+            } else if matches!(ty.deref_type(), Type::Vector(_)) && range.lo > 0 {
+                // [A3]: a precondition on the length of a vector.
+                let length = Expr::Len(Box::new(name(parameter)));
+                parts.push(bin(Binary::GreaterEqual, length, int(range.lo)));
             }
         }
         if let Some((small, large)) = order {
@@ -2295,16 +2502,24 @@ impl Generator<'_> {
         prefix: &str,
         count: usize,
         bounded: u64,
+        wide: bool,
     ) -> (Vec<(String, Type)>, Vec<Range>) {
         let mut params = Vec::new();
         let mut pre = Vec::new();
         for index in 0..count {
-            let ty = self.random_type();
+            let ty = if wide {
+                self.value_type()
+            } else {
+                self.random_type()
+            };
             pre.push(match &ty {
                 Type::Int(int_ty) if self.rng.chance(bounded, 4) => {
                     self.subrange(*int_ty).meet(value_range(*int_ty))
                 }
                 Type::Int(int_ty) => value_range(*int_ty),
+                // For a vector, the interval of its length.
+                Type::Vector(_) if self.rng.chance(1, 3) => Range::new(self.rng.range(1, 3), POS),
+                Type::Vector(_) => Range::new(0, POS),
                 _ => Range::ALL,
             });
             params.push((format!("{prefix}{index}"), ty));
@@ -2314,7 +2529,7 @@ impl Generator<'_> {
 
     fn function(&mut self, index: usize) -> Function {
         let count = 1 + self.rng.index(3);
-        let (params, pre) = self.parameters_and_precondition("a", count, 2);
+        let (params, pre) = self.parameters_and_precondition("a", count, 2, false);
         let mut env = Env::new();
         for ((parameter, ty), range) in params.iter().zip(&pre) {
             let know = match ty {
@@ -2328,6 +2543,8 @@ impl Generator<'_> {
                     mutable: false,
                     know,
                     definition: None,
+                    gone: false,
+                    home: 0,
                 },
             );
         }
@@ -2448,7 +2665,10 @@ impl Generator<'_> {
 
     fn external(&mut self, index: usize) -> Control {
         let count = self.rng.index(4);
-        let (params, pre) = self.parameters_and_precondition("p", count, 1);
+        let (mut params, pre) = self.parameters_and_precondition("p", count, 1, true);
+        if self.data {
+            self.lend_parameters(&mut params);
+        }
         let names = {
             let count = 1 + self.rng.index(3);
             self.alternative_names(count)
@@ -2457,7 +2677,7 @@ impl Generator<'_> {
         for alternative in names {
             let mut fields = Vec::new();
             for position in 0..self.rng.index(3) {
-                let ty = self.random_type();
+                let ty = self.value_type();
                 let (mut lo, mut hi) = (End::Open, End::Open);
                 if let Type::Int(int_ty) = &ty {
                     let same: Vec<usize> = (0..params.len())
@@ -2567,7 +2787,7 @@ impl Generator<'_> {
         self.loops = 0;
         self.effects.clear();
         let count = self.rng.index(5);
-        let (params, pre) = self.parameters_and_precondition("p", count, 2);
+        let (params, pre) = self.parameters_and_precondition("p", count, 2, true);
         let order = self.order(&params, &pre);
         let names = {
             let count = 1 + self.rng.index(3);
@@ -2577,7 +2797,7 @@ impl Generator<'_> {
             .into_iter()
             .map(|alternative| {
                 let fields = (0..self.rng.index(3))
-                    .map(|position| (format!("r{position}"), self.random_type()))
+                    .map(|position| (format!("r{position}"), self.value_type()))
                     .collect();
                 (alternative, fields)
             })
@@ -2596,7 +2816,8 @@ impl Generator<'_> {
         for ((parameter, ty), range) in params.iter().zip(&pre) {
             let know = match ty {
                 Type::Int(int_ty) => Know::Int(Val::value(*int_ty, *range)),
-                other => Know::top(other),
+                Type::Vector(_) => Know::Sized(*range),
+                other => self.types.top(other),
             };
             env.insert(
                 parameter.clone(),
@@ -2605,6 +2826,8 @@ impl Generator<'_> {
                     mutable: false,
                     know,
                     definition: None,
+                    gone: false,
+                    home: 0,
                 },
             );
         }
@@ -2735,8 +2958,43 @@ pub fn valid(rng: &mut Rng) -> Program {
         parameters: Vec::new(),
         exits: Vec::new(),
         effects: BTreeSet::new(),
+        data: false,
+        types: Types::default(),
     };
     let mut declarations = Vec::new();
+    for index in 0..generator.rng.index(3) {
+        declarations.push(Declaration::Function(generator.function(index)));
+    }
+    for index in 0..1 + generator.rng.index(3) {
+        declarations.push(Declaration::Control(generator.external(index)));
+    }
+    for index in 0..1 + generator.rng.index(3) {
+        declarations.push(Declaration::Control(generator.control(index)));
+    }
+    Program { declarations }
+}
+
+/// As [`valid`], with the data of slice 2: structs, variants, vectors, maps
+/// and strings, moved, taken apart and changed in place, and the built-in
+/// operations on them.
+pub fn valid_data(rng: &mut Rng) -> Program {
+    let palette = (0..3).map(|_| *rng.pick(&IntType::ALL)).collect();
+    let mut generator = Generator {
+        rng,
+        functions: Vec::new(),
+        callables: Vec::new(),
+        palette,
+        scopes: Vec::new(),
+        fresh: 0,
+        loops: 0,
+        contract: Vec::new(),
+        parameters: Vec::new(),
+        exits: Vec::new(),
+        effects: BTreeSet::new(),
+        data: true,
+        types: Types::default(),
+    };
+    let mut declarations = generator.declare_types();
     for index in 0..generator.rng.index(3) {
         declarations.push(Declaration::Function(generator.function(index)));
     }

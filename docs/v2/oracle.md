@@ -351,6 +351,36 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   draws the runs of each for its own preconditions, and requires that
   `resolve` or the checker rejects each mutant with a stuck run: 72 of them,
   of every kind but `DropInvariant`, which leaves no run stuck.
+- **Data in generated programs (`generate::valid_data`,
+  `v2/src/generate/valid/data.rs`, `vn2 fuzz --slice 2`).** The same
+  generator writes the data of slice 2 when it is asked to. It declares
+  structs and variants, and gives names, parameters, payloads and loop
+  parameters the types of data as well. Beside the interval of an integer it
+  keeps, for every name on every history, whether its value has moved ([O3])
+  and what the fact logic knows of it: a struct field by field ([A4]), a
+  variant by the constructors it can be ([A5]), a vector, a map or a string
+  by the interval of its length ([A3] and the conditions of the built-in
+  operations). One statement evaluates its operands in an order
+  ([E-Operands], [O0]): a name that an operand has consumed is gone for the
+  operands after it, and a name that one operand lends is not consumed by
+  another. A body moves no name of a body around a loop it is in ([O6]).
+  What it writes: binds of constructors, clones and moves; `S {x̄} := e`;
+  assignments to names, fields and elements; decisions on variants, with
+  `⊥` on a constructor that the value cannot be; `push`, `pop`, `take`,
+  `get`, `entry_at`, `insert`, `remove` and `emit`, with `⊥` on an
+  alternative that the length excludes; fields, elements at an index known
+  to be in range, and lengths, inside any integer expression;
+  `t : ? i < len(v)` followed by `v[i]`, where the test alone puts the
+  index in range; preconditions on the length of a vector; and `&τ` and
+  `&~τ` parameters of extern controls. A program of slice 1 is unchanged by
+  this: the generator draws nothing more for it, and the programs of 600
+  seeds were compared text for text. It does not write resources, captured
+  outcomes, faults or boundaries yet. `generate::DATA_CONSTRUCTS` lists the
+  52 constructs of the slice, and a campaign names those it did not reach.
+  `v2/tests/harness.rs` runs 160 seeds in the two semantics and asks the
+  checker about 30; over 300 seeds `vn2 fuzz --slice 2` gives 11,836 runs
+  with no stuck run and no difference, and the checker accepts 299 programs
+  and does not answer on one (review finding RC22).
 - **Fuzzing (`fuzz`, `vn2 fuzz`).** `vn2 fuzz --seed N --count N` takes the
   program of each seed through the reader, the oracle and the erased
   semantics on entries that satisfy its precondition, and asks the checker.
@@ -1011,6 +1041,15 @@ Two smaller findings went with them.
   `u32`, which `a + 1` in a formula need not have, and the planes of a
   product by it proved what is false. A component now has that interval
   only as a component of a place.
+- **The histories of a contingency** (RC21, [F5], [F6], [P6]). `B₂` was
+  checked on every history of its boundary. It is checked now on the
+  histories of the statements of `B₁` that may fault: the disjunction of
+  the reach that `check_may_fault` records for each, so that `⊥` is
+  accepted in the contingency of work that cannot fault and a fact of the
+  faulting histories is known in `B₂`. The `B₂` of a named boundary has a
+  diagram of its own, and is entered on every history or on none, by
+  whether a statement of `B₁` that no lexical boundary encloses may fault
+  on a history that can happen (`work_can_fault`).
 
 ## 14. Slice 2 Phase 4: Call Expansion and Typed LLVM IR Backend for Data, Resources, and Boundaries
 

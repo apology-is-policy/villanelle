@@ -1,0 +1,85 @@
+// Open finding RC22 of docs/v2/review.md: a valid program, written by the
+// generator of slice 2 (seed 56 on 23 November 2026), on which the checker
+// gives no answer in two minutes. No run of it is stuck. The control `c1`
+// alone is enough. No test reads this file.
+
+copy struct st0 {m0 : bool, m1 : u32, m2 : u32}
+
+copy struct st1 {m0 : st0, m1 : st0, m2 : i16}
+
+struct st2 {m0 : string, m1 : usize}
+
+function f0(a0 : i64, a1 : u32, a2 : u32) ⊢ a0 < 1 ∧ 0 ≤ a0 ∧ 22 ≥ a1 : i64 := -2
+
+extern control e0(p0 : u32, p1 : &st1, p2 : i16) ■ { more {} │ some {r0 : i16, r1 : string} ⇐ r0 ≤ p2 │ high {} }
+
+extern control e1(p0 : &st0, p1 : &st1, p2 : u32) ■ { miss {} │ none {r0 : u32} ⇐ p2 ≤ r0 }
+
+extern control e2(p0 : i16, p1 : i8, p2 : u32) ⊢ p1 ≤ 24 ∧ p1 ≥ -1 ■ { more {} }
+
+control c0(p0 : i16, p1 : [string]) ■ { none {} │ low {r0 : u32} } uses log
+⊤ ▷ st2 {v1, v2} := st2 {"", 7}
+⊤ ▷ t3 : ? p0 mod 5 * ((-9 - p0 ÷ 2) mod 2) ≠ 10
+t3.false ∨ t3.true ▷ v4 : i8 := 8 ÷ 3
+⊤ ▷ v5 : st0 := st0 {9 - 5 ≠ 2, 2, 0 mod 7 * (5 mod 2)}
+⊤ ▷ v6 : u32 := v5.m2
+⊤ ▷ s7 : ↻ l8(i9 : u16 := 0, x10 : string := clone(v1), x11 : st0 := st0 {¬(v4 < v4), v6, v6 + v6}) {
+    ⊤ ▷ t12 : ? i9 < 3
+    ¬t12.true ∨ t12.true ▷ d13 : Δ e0(5, st1 {v5, st0 {len(v1) = len(p1), v6, v6}, p0 ÷ 3}, p0 mod 9) ▸ more {} │ some {v14, v15} │ high {}
+    ¬t12.true ∨ t12.true ▷ ~v16 : i16 ⇀ st2 := ∅
+    d13.high ∧ t12.false ▷ ~v17 := i9 mod i9 = i9 mod 9
+    t12.false ∧ d13.more ▷ ~v18 := st1 {st0 {8 mod 4 = 5 - 2, x11.m1, v5.m1}, st0 {v4 ≠ 3, x11.m2, v6}, 3 + p0 mod 9}
+    ¬t12.false ▷ v19 := st2 {"hello", v2 + v2}
+    ⊤ ▷ □ miss {1 * (v6 + v5.m1)}
+} ▸ miss {v20}
+⊤ ▷ v21 : bool := len(v1) mod 6 ÷ 5 ≠ 1
+t3.false ▷ v22 := st0 {v2 = 0 ∨ 2 = 8 + 0, v20 + 5, v20 - v20}
+t3.true ▷ st0 {v23, v24, v25} := v5
+s7.miss ▷ ■ none {}
+
+control c1() ■ { more {} │ hit {r0 : bool, r1 : string} } uses console.write
+⊤ ▷ v1 : i16 := 5
+⊤ ▷ v2 : u32 := 3
+⊤ ▷ ⊢ v2 = 3
+⊤ ▷ d3 : Δ e1(st0 {v2 ≠ 0 mod 9, 4 mod 6 * (v2 mod 6), v2 mod 8 * (v2 mod 5)}, st1 {st0 {9 = 9, 3, v2}, st0 {2 mod 2 * (2 mod 8) ≠ 4294967294, v2, v2}, v1 * 5}, 8 + 1 * 4) ▸ miss {} │ none {v4}
+¬d3.none ∨ d3.none ▷ d5 : Δ e1(st0 {0 mod 9 * (v2 mod 7) < 0, 7, v2 mod 9}, st1 {st0 {v2 ≠ v2, 8, v2}, st0 {true, v2, 9}, v1}, v2) ▸ miss {} │ none {v6}
+¬d3.none ∨ d3.none ▷ s7 : ↻ l8(i9 : usize := 0) {
+    ⊢ i9 ≤ 1
+    ⊤ ▷ t10 : ? i9 = 1
+    ¬t10.true ▷ ~v11 : i16 := v1
+    ⊤ ▷ s12 : ↻ l13(i14 : i64 := 0) {
+        ⊢ i14 ≤ 3 ∧ 0 ≤ i14
+        ⊤ ▷ t15 : ? i14 < 3
+        ⊤ ▷ v16 : i16 := 2 * (-1 * v1 + (v1 - v1))
+        ⊤ ▷ t17 : ? i14 ≥ i14 + i14 ∨ -8 > v1 + v1
+        t17.false ▷ □ low {i14 mod -2 < 6 ∨ 0 ≥ i9, 2 + v2}
+        ⊤ ▷ ↑ l13(i14 + 1)
+    } ▸ low {v18, v19}
+    ⊤ ▷ st0 {v20, v21, v22} := st0 {i9 mod 6 > 1, 6 mod v19, v19}
+    ⊤ ▷ st1 {v23, v24, v25} := st1 {st0 {8 ≠ 8, v19, v19}, st0 {0 ÷ 6 ≤ 7, v21, v22}, -v1}
+    s12.low ▷ □ some {v23.m2 + v2 - v23.m2}
+} ▸ some {v26}
+¬d3.none ∨ d3.none ▷ t27 : ? v1 mod 9 * (v1 mod 1 mod 2) ≥ 0
+¬d3.none ∨ d3.none ▷ v28 : u32 := 0 ÷ 5 + v2 mod 5
+¬d3.none ∨ d3.none ▷ ⊢ v28 = 0 ÷ 5 + v2 mod 5
+⊤ ▷ ~v29 : string ⇀ u32 := ∅
+⊤ ▷ d30 : Δ emit("b") ▸ done {}
+⊤ ▷ v31 : i16 := v1
+⊤ ▷ ~v32 := v1
+⊤ ▷ ⊢ v32 = v1
+⊤ ▷ d33 : Δ e1(st0 {4 + v28 > v2, v26 ÷ v28, v2}, st1 {st0 {4 ÷ 2 < 5 ÷ 7, 4, v2}, st0 {v2 ≤ v28, v26, v2}, v32}, v28 mod 3 * (v26 mod 3) mod v28) ▸ miss {} │ none {v34}
+t27.true ▷ ■ hit {0 ≠ 1 ∨ v1 ÷ -4 = v1 mod 8 * (9 mod 8), "b"}
+
+control c2() ■ { miss {r0 : i16, r1 : u32} │ high {} │ hit {} } uses console.write
+⊤ ▷ t1 : ? 2 * 7 > 13 ∨ 5 ÷ 9 ≤ 4294967295 mod 4
+t1.false ▷ ⊥
+⊤ ▷ d2 : Δ e0(9 - (7 - 3), st1 {st0 {true, 2, 1}, st0 {1 ≥ 2, 0, 0}, -8}, -7 ÷ 7) ▸ more {} │ some {v3, v4} │ high {}
+⊤ ▷ ~v5 : bool := 8 = 8
+⊤ ▷ d6 : Δ emit("") ▸ done {}
+d2.high ▷ t7 : ? 2 + 3 > 7 mod 4
+d2.high ∧ t7.false ▷ ⊥
+d2.more ▷ ~v8 : [st0] := [st0 {5 + 9 ≠ 5, 5, 4294967294}, st0 {2 ≤ 0, 9, 4294967294}]
+d2.more ▷ t9 : ? 3 * 0 = 1
+d2.more ∧ t9.true ▷ ⊥
+⊤ ▷ v5 ← 8 mod 3 ≤ 4 mod 5
+t1.true ▷ ■ high {}

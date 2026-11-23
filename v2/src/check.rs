@@ -2129,6 +2129,12 @@ struct BodyChecker<'a> {
     /// While the `B₂` of a lexical boundary is checked: the states in which
     /// its `B₁` may fault, and the number of scopes around the boundary.
     after_fault: Option<(Vec<FaultState>, usize)>,
+    /// Whether this body is the work of a named boundary, and whether a
+    /// statement of it that no lexical boundary encloses may fault on a
+    /// history that can happen: the contingency runs on nothing else
+    /// ([F6], [P6]).
+    named_work: bool,
+    work_can_fault: bool,
     /// What each lexical boundary whose `B₁` is being checked has in its
     /// care, with the body of that `B₁` ([E-Boundary]).
     care: Vec<(BodyId, Vec<VarId>)>,
@@ -2844,6 +2850,11 @@ impl<'a> BodyChecker<'a> {
                 }],
             };
             self.fault_frames[frame].extend(states);
+        } else if self.named_work
+            && !self.work_can_fault
+            && self.is_feasible(r_i, visible_vars, in_loop)
+        {
+            self.work_can_fault = true;
         }
         Ok(())
     }
@@ -4915,13 +4926,22 @@ impl<'a> BodyChecker<'a> {
                         let not_ri = self.solver.bdd.not(r_i);
                         self.moved[*mvar] = self.solver.bdd.and(self.moved[*mvar], not_ri);
                     }
+                    // [F5]: `B₂` runs after a fault at a statement of `B₁`,
+                    // so its histories are those of the statements of `B₁`
+                    // that may fault, and none when there is no such
+                    // statement.
+                    let mut faulted = bdd::FALSE;
+                    for state in &fault_states {
+                        faulted = self.solver.bdd.or(faulted, state.reach);
+                    }
+                    let b2_live = self.solver.bdd.and(r_i, faulted);
                     let outer_after_fault = self
                         .after_fault
                         .replace((fault_states, self.active_scopes.len()));
                     self.active_scopes.push(*b2_body);
                     self.permits_faults = outer_permits_faults;
                     self.in_contingency = true;
-                    self.check_body_inner(*b2_body, r_i, in_loop, loop_leaves, false)?;
+                    self.check_body_inner(*b2_body, b2_live, in_loop, loop_leaves, false)?;
                     self.active_scopes.pop();
                     self.after_fault = outer_after_fault;
 
@@ -5438,6 +5458,8 @@ fn check_boundary(
         boundary_can_fault: false,
         fault_frames: Vec::new(),
         after_fault: None,
+        named_work: true,
+        work_can_fault: false,
         care: Vec::new(),
         named_contingency: false,
         certificates,
@@ -5456,6 +5478,7 @@ fn check_boundary(
         .check_body(0, bdd::TRUE, false, &mut loop_leaves1)
         .and_then(|()| checker1.check_loans());
     checker1.settle(result)?;
+    let work_can_fault = checker1.work_can_fault;
     let solver1 = checker1.solver;
     certificates.close_body(solver1);
 
@@ -5498,6 +5521,8 @@ fn check_boundary(
         boundary_can_fault: false,
         fault_frames: Vec::new(),
         after_fault: None,
+        named_work: false,
+        work_can_fault: false,
         care: Vec::new(),
         named_contingency: true,
         certificates,
@@ -5512,8 +5537,15 @@ fn check_boundary(
         checker2.entry_parameters.push(LinearTerm::var(tid));
     }
     let mut loop_leaves2 = BTreeMap::new();
+    // [F6]: `B₂` runs after a fault of `B₁`, and on no history when `B₁`
+    // cannot fault.
+    let entry2 = if work_can_fault {
+        bdd::TRUE
+    } else {
+        bdd::FALSE
+    };
     let result = checker2
-        .check_body(0, bdd::TRUE, false, &mut loop_leaves2)
+        .check_body(0, entry2, false, &mut loop_leaves2)
         .and_then(|()| checker2.check_loans());
     checker2.settle(result)?;
     let can_fault = checker2.boundary_can_fault;
@@ -5563,6 +5595,8 @@ fn check_control(
         boundary_can_fault: false,
         fault_frames: Vec::new(),
         after_fault: None,
+        named_work: false,
+        work_can_fault: false,
         care: Vec::new(),
         named_contingency: false,
         certificates,

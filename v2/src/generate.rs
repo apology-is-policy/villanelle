@@ -16,7 +16,9 @@
 //!   selectors, obligations, effects and decision arms are not constrained to
 //!   avoid runtime stuck states.
 
-use crate::host::{draw_int_between, draw_int_near, draw_value, hints_of, plain_bounds};
+use crate::host::{
+    draw_int_between, draw_int_near, draw_value, draw_value_in_program, hints_of, plain_bounds,
+};
 use crate::int::Int;
 use crate::oracle::{Config, Value, signature_holds};
 use crate::rng::Rng;
@@ -30,7 +32,7 @@ use std::collections::BTreeMap;
 mod interval;
 mod valid;
 
-pub use valid::valid;
+pub use valid::{valid, valid_data};
 
 /// Every syntactic construct of slice 1.
 pub const CONSTRUCTS: [&str; 61] = [
@@ -97,6 +99,63 @@ pub const CONSTRUCTS: [&str; 61] = [
     "binary-mod",
 ];
 
+/// The constructs that slice 2 adds: the data, its operations, resources,
+/// captured outcomes, faults and boundaries.
+pub const DATA_CONSTRUCTS: [&str; 52] = [
+    "struct",
+    "copy-struct",
+    "variant",
+    "copy-variant",
+    "resource",
+    "resource-on-fault-release",
+    "named-boundary",
+    "retains",
+    "contingent-control",
+    "faults",
+    "where-len",
+    "type-string",
+    "type-struct",
+    "type-variant",
+    "type-vector",
+    "type-map",
+    "type-resource",
+    "type-shared-borrow",
+    "type-exclusive-borrow",
+    "unpack",
+    "assign-field",
+    "assign-element",
+    "decide-variant",
+    "push",
+    "pop",
+    "take",
+    "get",
+    "insert",
+    "remove",
+    "entry-at",
+    "emit",
+    "capture",
+    "decide-outcome",
+    "boundary",
+    "boundary-care",
+    "supervise",
+    "fault",
+    "escalate",
+    "recover",
+    "terminate-status",
+    "terminate",
+    "expr-string",
+    "expr-move",
+    "expr-borrow-shared",
+    "expr-borrow-exclusive",
+    "expr-field",
+    "expr-index",
+    "expr-struct",
+    "expr-variant",
+    "expr-vector",
+    "expr-empty-map",
+    "expr-len",
+];
+
 const TYPES: [Type; 10] = [
     Type::Bool,
     Type::Int(IntType::U8),
@@ -134,6 +193,8 @@ const ARITHMETIC_OPS: [Binary; 5] = [
 #[derive(Clone, Debug, Default)]
 pub struct Coverage {
     pub counts: BTreeMap<&'static str, u64>,
+    /// The declared types of the program being observed, by name.
+    named: BTreeMap<String, &'static str>,
 }
 
 impl Coverage {
@@ -157,6 +218,24 @@ impl Coverage {
             Type::Int(IntType::I32) => "type-i32",
             Type::Int(IntType::I64) => "type-i64",
             Type::Int(IntType::Usize) => "type-usize",
+            Type::String => "type-string",
+            Type::Named(name) => self.named.get(name).copied().unwrap_or("type-resource"),
+            Type::Vector(item) => {
+                self.observe_type(item);
+                "type-vector"
+            }
+            Type::Map(key, value) => {
+                self.observe_type(key);
+                self.observe_type(value);
+                "type-map"
+            }
+            Type::Ref(mode, inner) => {
+                self.observe_type(inner);
+                match mode {
+                    typed::BorrowMode::Shared => "type-shared-borrow",
+                    typed::BorrowMode::Exclusive => "type-exclusive-borrow",
+                }
+            }
             _ => return,
         };
         self.hit(label);
@@ -220,6 +299,51 @@ impl Coverage {
                 self.observe_expr(left);
                 self.observe_expr(right);
             }
+            Expr::String(_) => self.hit("expr-string"),
+            Expr::Move(inner) => {
+                self.hit("expr-move");
+                self.observe_expr(inner);
+            }
+            Expr::Borrow(mode, inner) => {
+                self.hit(match mode {
+                    typed::BorrowMode::Shared => "expr-borrow-shared",
+                    typed::BorrowMode::Exclusive => "expr-borrow-exclusive",
+                });
+                self.observe_expr(inner);
+            }
+            Expr::Field(base, _) => {
+                self.hit("expr-field");
+                self.observe_expr(base);
+            }
+            Expr::Index(base, index) => {
+                self.hit("expr-index");
+                self.observe_expr(base);
+                self.observe_expr(index);
+            }
+            Expr::Struct(_, fields) => {
+                self.hit("expr-struct");
+                for field in fields {
+                    self.observe_expr(field);
+                }
+            }
+            Expr::Variant(_, _, fields) => {
+                self.hit("expr-variant");
+                for field in fields {
+                    self.observe_expr(field);
+                }
+            }
+            Expr::Vector(items) => {
+                self.hit("expr-vector");
+                for item in items {
+                    self.observe_expr(item);
+                }
+            }
+            Expr::EmptyMap => self.hit("expr-empty-map"),
+            Expr::Len(inner) => {
+                self.hit("expr-len");
+                self.observe_expr(inner);
+            }
+            Expr::Clone(inner) => self.observe_expr(inner),
             _ => {}
         }
     }
@@ -255,12 +379,75 @@ impl Coverage {
                     self.hit("test");
                     self.observe_expr(condition);
                 }
-                Command::Decide { arguments, .. } => {
-                    self.hit("decide");
+                Command::Decide {
+                    operation,
+                    arguments,
+                    ..
+                } => {
+                    self.hit(match operation.as_str() {
+                        "push" => "push",
+                        "pop" => "pop",
+                        "take" => "take",
+                        "get" => "get",
+                        "insert" => "insert",
+                        "remove" => "remove",
+                        "entry_at" => "entry-at",
+                        "emit" => "emit",
+                        "outcome" => "decide-outcome",
+                        name if self.named.get(name) == Some(&"type-variant") => "decide-variant",
+                        _ => "decide",
+                    });
                     for argument in arguments {
                         self.observe_expr(argument);
                     }
                 }
+                Command::Unpack { value, .. } => {
+                    self.hit("unpack");
+                    self.observe_expr(value);
+                }
+                Command::AssignPlace { target, value } => {
+                    self.hit(match target.steps.last() {
+                        Some(crate::syntax::PlaceStep::Index(_)) => "assign-element",
+                        _ => "assign-field",
+                    });
+                    self.observe_expr(value);
+                }
+                Command::Capture { arguments, .. } => {
+                    self.hit("capture");
+                    for argument in arguments {
+                        self.observe_expr(argument);
+                    }
+                }
+                Command::Boundary {
+                    body,
+                    captures,
+                    contingency,
+                    ..
+                } => {
+                    self.hit("boundary");
+                    if !captures.is_empty() {
+                        self.hit("boundary-care");
+                    }
+                    self.observe_statements(body);
+                    self.observe_statements(contingency);
+                }
+                Command::Supervise { arguments, .. } => {
+                    self.hit("supervise");
+                    for argument in arguments {
+                        self.observe_expr(argument);
+                    }
+                }
+                Command::Fault { message, .. } => {
+                    self.hit("fault");
+                    self.observe_expr(message);
+                }
+                Command::Escalate => self.hit("escalate"),
+                Command::Recover { .. } => self.hit("recover"),
+                Command::Terminate(status) => self.hit(if status.is_some() {
+                    "terminate-status"
+                } else {
+                    "terminate"
+                }),
                 Command::Loop {
                     parameters,
                     invariant,
@@ -313,8 +500,56 @@ impl Coverage {
 
     /// Records every construct that `program` uses.
     pub fn observe(&mut self, program: &Program) {
+        self.named.clear();
         for declaration in &program.declarations {
             match declaration {
+                Declaration::Struct(decl) => {
+                    self.named.insert(decl.name.clone(), "type-struct");
+                }
+                Declaration::Variant(decl) => {
+                    self.named.insert(decl.name.clone(), "type-variant");
+                }
+                _ => {}
+            }
+        }
+        for declaration in &program.declarations {
+            match declaration {
+                Declaration::Struct(decl) => {
+                    self.hit(if decl.is_copy {
+                        "copy-struct"
+                    } else {
+                        "struct"
+                    });
+                    for field in &decl.fields {
+                        self.observe_type(&field.ty);
+                    }
+                }
+                Declaration::Variant(decl) => {
+                    self.hit(if decl.is_copy {
+                        "copy-variant"
+                    } else {
+                        "variant"
+                    });
+                    for field in decl.constructors.iter().flat_map(|made| &made.fields) {
+                        self.observe_type(&field.ty);
+                    }
+                }
+                Declaration::Resource(decl) => self.hit(if decl.on_fault_release {
+                    "resource-on-fault-release"
+                } else {
+                    "resource"
+                }),
+                Declaration::Boundary(decl) => {
+                    self.hit("named-boundary");
+                    if !decl.retains.is_empty() {
+                        self.hit("retains");
+                    }
+                    for parameter in &decl.parameters {
+                        self.observe_type(&parameter.ty);
+                    }
+                    self.observe_statements(&decl.body);
+                    self.observe_statements(&decl.contingency);
+                }
                 Declaration::Function(function) => {
                     self.hit("function");
                     for parameter in &function.parameters {
@@ -335,6 +570,19 @@ impl Coverage {
                     }
                     if control.public {
                         self.hit("pub-control");
+                    }
+                    if control.contingent {
+                        self.hit("contingent-control");
+                    }
+                    if control.faults {
+                        self.hit("faults");
+                    }
+                    if control
+                        .precondition
+                        .as_ref()
+                        .is_some_and(|formula| formula.to_string().contains("len("))
+                    {
+                        self.hit("where-len");
                     }
                     for parameter in &control.parameters {
                         self.observe_type(&parameter.ty);
@@ -370,6 +618,15 @@ impl Coverage {
     /// The constructs of [`CONSTRUCTS`] that have not been seen yet.
     pub fn missing(&self) -> Vec<&'static str> {
         CONSTRUCTS
+            .iter()
+            .copied()
+            .filter(|name| !self.counts.contains_key(name))
+            .collect()
+    }
+
+    /// The constructs of [`DATA_CONSTRUCTS`] that have not been seen yet.
+    pub fn missing_data(&self) -> Vec<&'static str> {
+        DATA_CONSTRUCTS
             .iter()
             .copied()
             .filter(|name| !self.counts.contains_key(name))
@@ -1218,6 +1475,8 @@ pub fn entry_runs(
             None => vec![(None, None); control.parameters.len()],
         };
         let mut found = 0;
+        // The resources that an entry is given are open, each its own.
+        let mut resources = 0;
         for _ in 0..each * 24 {
             if found == each {
                 break;
@@ -1236,7 +1495,10 @@ pub fn entry_runs(
                         }
                     }
                     Type::Int(ty) => Value::Int(draw_int_near(rng, *ty, &hints, config)),
-                    other => draw_value(rng, other, &[], config),
+                    Type::Bool => draw_value(rng, &Type::Bool, &[], config),
+                    other => {
+                        draw_value_in_program(program, rng, other, &[], config, &mut resources)
+                    }
                 })
                 .collect();
             let holds = match &control.precondition {
