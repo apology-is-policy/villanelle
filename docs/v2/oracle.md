@@ -426,6 +426,14 @@ clause of [surface.md](surface.md) that excludes the text:
 test every one of the 33 surface clauses of slice 1 with both an accepting
 program and a rejecting or warning (`//! reject` / `//! warn`) test.
 
+Since 23 November 2026 `v2/tests/surface.rs` also holds the tests that close
+the reader's findings of the [review](review.md) (RS2, RS4, RS7 to RS9,
+RS11), with their programs in `v2/tests/format/` (comments through the
+formatter, and the canonical text of `spend.rails`, whose second control is
+in the plain form on purpose) and `v2/tests/loop_names/` (the renaming of
+[U9]). One of them puts a comment at every position of every Rails file of
+the suite and requires that the formatter keeps it.
+
 ## 10. The phase 3 checker, certificates and counterexamples
 
 `check::check` judges a resolved `typed::Program` against every checking clause

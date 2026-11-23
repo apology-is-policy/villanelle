@@ -102,7 +102,7 @@ control show_file(filename: u32) ■ auto
 
 ### Running the v2 Toolchain (`vn2`)
 
-`v2/` is a self-contained crate with zero external dependencies. Do not run `vn2 format --write` on source you care about yet: the formatter loses comments ([review](docs/v2/review.md), RS4).
+`v2/` is a self-contained crate with zero external dependencies.
 
 ```sh
 cd v2

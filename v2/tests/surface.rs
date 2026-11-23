@@ -582,15 +582,18 @@ fn g10_formatter_canonical_rails_idempotence_and_semantic_equivalence() {
             orig_core, fmt_core,
             "{name}: formatting changed elaborated core program"
         );
-        assert_eq!(
-            source, formatted,
-            "{name} is not in canonical Rails form ([G10])"
-        );
+        // `spend.rails` holds one control in the plain form ([G9]) on
+        // purpose, so that the plain form runs through every stage. Its
+        // canonical text is kept beside the formatter's tests.
+        if name == "spend.rails" {
+            assert_eq!(formatted, include_str!("format/spend_canonical.rails"));
+        } else {
+            assert_eq!(
+                source, formatted,
+                "{name} is not in canonical Rails form ([G10])"
+            );
+        }
     }
-    assert_eq!(
-        surface::format(include_str!("format/spend_mixed.rails")).unwrap(),
-        include_str!("slice1_surface/spend.rails"),
-    );
 
     // [G10] accepting: word-form ([G8]) and plain braced form ([G9]) format into
     // canonical Rails glyph form with aligned arrows and aligned short labels.
@@ -898,4 +901,121 @@ fn hidden_payload_names_are_inaccessible_and_auto_needs_type_evidence() {
     }
     let inferred = "control sample(x: u64) ■ auto\n│ ? x = 0 → ■ ok {4294967296}\n│ ■ ok {x}\n╵\n//! run sample(0) => done ok {4294967296}\n";
     assert!(script::check_surface(inferred).failures.is_empty());
+}
+
+/// The comments of a Rails text, in order: what follows `┄` or `//` outside
+/// a text literal, to the end of the line. A directive (`//!`) is not one.
+fn comments_of(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("//!") {
+            continue;
+        }
+        let mut quoted = false;
+        let mut escaped = false;
+        for (at, ch) in line.char_indices() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quoted = false;
+                }
+                continue;
+            }
+            if ch == '"' {
+                quoted = true;
+                continue;
+            }
+            let rest = &line[at..];
+            if let Some(comment) = rest.strip_prefix('┄').or_else(|| rest.strip_prefix("//")) {
+                out.push(comment.trim().to_string());
+                break;
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn g10_keeps_a_comment_in_every_position() {
+    // [G10]: the formatter keeps comments. A comment is put after each line,
+    // and on a line of its own before each line, of every Rails file of the
+    // suite, one position at a time. The reader may refuse the text (a
+    // comment in column 1 where a rail or a continuation is required); what
+    // it reads, the formatter prints with every comment, in order, and is
+    // the identity on.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut files = Vec::new();
+    for directory in [
+        "slice1_surface",
+        "slice2_surface",
+        "slice3_surface",
+        "slice4_surface",
+        "format",
+        "loop_names",
+        "kernels",
+    ] {
+        for entry in std::fs::read_dir(root.join(directory)).expect(directory) {
+            let path = entry.expect("an entry").path();
+            if path.extension().is_some_and(|ext| ext == "rails") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let (mut kept, mut refused) = (0, 0);
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("readable");
+        surface::format(&source).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//!") {
+                continue;
+            }
+            let rails: String = line
+                .chars()
+                .take_while(|c| matches!(c, '│' | '║' | '┆' | ' '))
+                .collect();
+            let rails = rails.trim_end();
+            let space = if rails.is_empty() { "" } else { " " };
+            let before = {
+                let mut changed: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+                changed.insert(index, format!("{rails}{space}┄ probe {index}"));
+                changed
+            };
+            let after = (!line.trim().is_empty() && comments_of(line).is_empty()).then(|| {
+                let mut changed: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+                changed[index] = format!("{line} ┄ probe {index}");
+                changed
+            });
+            for changed in std::iter::once(before).chain(after) {
+                let text = changed.join("\n") + "\n";
+                let Ok(printed) = surface::format(&text) else {
+                    refused += 1;
+                    continue;
+                };
+                assert_eq!(
+                    comments_of(&printed),
+                    comments_of(&text),
+                    "{}: a comment at line {} is lost or out of order",
+                    path.display(),
+                    index + 1
+                );
+                assert_eq!(
+                    surface::format(&printed).unwrap(),
+                    printed,
+                    "{}: with a comment at line {} the formatter is not the identity on its output",
+                    path.display(),
+                    index + 1
+                );
+                kept += 1;
+            }
+        }
+    }
+    assert!(
+        kept >= 1000 && refused * 8 < kept,
+        "{kept} positions kept, {refused} refused"
+    );
 }

@@ -151,8 +151,7 @@ reader, the two semantics and the checker, their mutants, and with `--native`
 their compiled code, and prints the counts of the search over the campaign;
 a program is a function of its seed, and
 a release build (`cargo run --release`) is some ten times faster. Inputs are `.core` (the
-core text form) or `.rails`. Do not use `vn2 format --write` on source that
-matters until review finding RS4 is closed.
+core text form) or `.rails`.
 
 Set `TELLUR_NATIVE_TARGET_DIR` to share the native dependency cache between
 builds. `./bin/vnc` is the installed release compiler when present; otherwise use
