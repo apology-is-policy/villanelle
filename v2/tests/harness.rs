@@ -292,3 +292,23 @@ control unachievable(x : u8) ■ { done }
     );
     assert!(matches!(failed.end, End::HostFailed(_)));
 }
+
+/// The checker accepts what the generator calls valid ([N3], [J5]): it gives
+/// no rejection, no limit and no fault, and its certificates pass the
+/// kernel. More seeds are tried by `vn2 fuzz`.
+#[test]
+fn the_checker_accepts_generated_valid_programs() {
+    let options = fuzz::Options {
+        entries: 1,
+        hosts: 1,
+        ..fuzz::Options::default()
+    };
+    let report = fuzz::campaign(1, 40, &options);
+    let findings: Vec<String> = report
+        .findings
+        .iter()
+        .map(|finding| format!("seed {} {}: {}", finding.seed, finding.kind, finding.detail))
+        .collect();
+    assert!(findings.is_empty(), "{}", findings.join("\n"));
+    assert_eq!(report.accepted, 40);
+}

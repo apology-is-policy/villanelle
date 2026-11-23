@@ -129,8 +129,8 @@ python3 -B ci/check-collections.py --vnc /absolute/path/to/vnc   # library adopt
 
 The v2 crate builds on its own, in seconds, and needs no LLVM install. Its
 backend tests compile the emitted IR with `clang` and their reference kernels
-with `rustc`, so both must be on the path; the whole suite takes about two
-minutes:
+with `rustc`, so both must be on the path; the whole suite takes about five
+minutes, most of it the checker on the kernel programs of the backend tests:
 
 ```sh
 (cd v2 && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test)
@@ -261,5 +261,5 @@ Adapted from the Thylacine operational contract.
 | `applications/settings/` | The one maintained real application (settings service); also the style reference |
 | `examples/`, `playground/`, `experiments/` | Runnable examples, small live programs, performance and representation experiments |
 | `tests/` | About 115 integration suites: conformance, differential, native and live host tests |
-| `v2/` | The v2 crate (`villanelle-v2`, binary `vn2`), with no dependencies: mathematical integers (`int`), the core text form (`syntax`, `text`), the Rails reader and formatter (`surface`), `resolve` to the typed core (`typed`), the oracle and its hosts (`oracle`, `host`, `script`), the erased interpreter and the comparison with it (`erased`, `differential`), generator, mutations and fuzzing (`generate`, `mutate`, `fuzz`, `rng`), the checker (`check`, `facts`, `kernel`, `bdd`), call expansion (`expand`), the LLVM IR backend (`codegen`), and the conformance suite under `v2/tests/`. `docs/v2/oracle.md` section 1 has the module table |
+| `v2/` | The v2 crate (`villanelle-v2`, binary `vn2`), with no dependencies: mathematical integers (`int`), the core text form (`syntax`, `text`), the Rails reader and formatter (`surface`), `resolve` to the typed core (`typed`), the oracle and its hosts (`oracle`, `host`, `script`), the erased interpreter and the comparison with it (`erased`, `differential`), generator, mutations and fuzzing (`generate`, `mutate`, `fuzz`, `rng`), the checker (`check`, `facts`, `terms`, `lia`, `rational`, `kernel`, `bdd`), call expansion (`expand`), the LLVM IR backend (`codegen`), and the conformance suite under `v2/tests/`. `docs/v2/oracle.md` section 1 has the module table |
 | `ci/`, `.github/workflows/` | Release qualification, Windows, Linux and Thylacine pack scripts |

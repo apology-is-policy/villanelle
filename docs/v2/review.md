@@ -64,7 +64,7 @@ for every clause implemented.
 | Generator reaches every construct of the slice (phase 2 exit) | Met since 23 November (section 9, RG1) | No generator | No generator | No generator |
 | Oracle against erased semantics | 62 runs of the suite and 11,728 runs of 300 generated programs | The erased interpreter is a transcription of the oracle (RO7) and wrong under faults (RO5) | As slice 2 | As slice 2 |
 | Mutations rejected at the rate the author sets (phase 3 exit) | Five kinds on one program shape, 8 seeds | None | None | None |
-| No generated checked program is stuck over a long campaign (phase 3 exit) | No campaign yet; `vn2 fuzz` is the tool, and the checker must first accept the valid programs (RC12, RC16) | None | None | None |
+| No generated checked program is stuck over a long campaign (phase 3 exit) | No long campaign yet. The checker accepts all of 300 generated programs, and 838 mutants of 25 of them gave none that was accepted and stuck (before the new decision procedure; to be repeated) | None | None | None |
 | Compiled code agrees with the oracle on generated programs (phase 4 exit) | One program shape | None; double free (RB1) | None | No backend; `emit-llvm` panics (RB9) |
 | Every kernel under `experiments/` within 1.2× of optimized Rust (phase 4 exit) | None measured (RB6) | None measured | None measured | |
 
@@ -423,7 +423,10 @@ A finding is closed here with the date and the test that holds it.
 | Finding | State |
 | --- | --- |
 | RD1 | Closed 23 November 2026 by the corrected status statements |
-| RG1 | Closed 23 November 2026 for the reader and the two semantics: `generate::valid` writes programs from their histories, and `generated_valid_programs_run_to_an_end_and_reach_every_construct` (`v2/tests/harness.rs`) holds it. Open for what was built on the old program: the checker and backend tests still run on `generate::template`, and the checker does not accept every generated program (RC12, RC16: of 300, it rejects 13, panics on 16 and times out on 3) |
+| RG1 | Closed 23 November 2026 for the reader, the two semantics and the checker: `generate::valid` writes programs from their histories; `generated_valid_programs_run_to_an_end_and_reach_every_construct` and `the_checker_accepts_generated_valid_programs` (`v2/tests/harness.rs`) hold it, and `vn2 fuzz --seed 1 --count 300` reports no finding. Open for the mutation and backend tests, which still run on `generate::template` |
+| RC11 | Closed 23 November 2026: every question the checker asks goes through one function that validates a yes in the kernel and lists the certificate, with the clause `N1` for the feasibility of a history. `an_infeasible_history_is_ruled_out_by_a_validated_certificate` (`v2/tests/checker.rs`) holds it |
+| RC12 | Closed 23 November 2026 for the panic and for the wrong answers: the theory check (`v2/src/lia.rs`) gives a proof that the kernel validates (with the Split step of [V3]), a model that is evaluated, or the counted limit, which the checker reports with the clause `J6`. `the_procedure_is_exact_on_integers_and_gives_up_only_at_a_counted_limit` (`v2/tests/checker.rs`) and the tests of `lia.rs`, which compare 3,000 sets of rows with a search of every point, hold it. Open: the method is not complete without bounds, so a query can reach the limit that a complete method would decide (the note in section 7 of the [fact logic](facts.md)); none of the 300 generated programs does |
+| RC16 | Partly. The three generated programs that had no answer in 20 seconds are answered, and the 300 are checked in under 30 seconds. Open: the kernel program of the slice 2 backend test takes about 2.5 seconds to check and its expansion about 12, most of it in a few satisfiable queries of 130 rows; `check_body_inner` is still one function |
 | All others | Open |
 
 ## 10. The course

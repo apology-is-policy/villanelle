@@ -198,6 +198,17 @@ pub fn remainder_by_literal(a: Range, divisor: i128) -> Range {
     }
 }
 
+/// The declared interval of `t mod k` for a nonzero literal `k` ([A9]): the
+/// remainders that the sign of the dividend's declared interval allows, and
+/// nothing finer. [`remainder_by_literal`] is what the facts give.
+pub fn remainder_declared(a: Range, divisor: i128) -> Range {
+    let top = divisor.abs() - 1;
+    Range::new(
+        if a.has_lo() && a.lo >= 0 { 0 } else { -top },
+        if a.has_hi() && a.hi <= 0 { 0 } else { top },
+    )
+}
+
 /// `div(s, t)` for a divisor that is not a literal ([A8]). `None` when the
 /// divisor is not known to be nonzero.
 pub fn divide_by_term(s: Range, t: Range) -> Option<Range> {

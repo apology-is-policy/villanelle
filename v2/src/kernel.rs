@@ -8,133 +8,163 @@
 //! instances and the lemmas reduces to `FALSE` in the binary decision diagram.
 
 use crate::bdd;
-use crate::facts::{Certificate, ProofStep, Row, TheoryLemma, div_floor};
+use crate::facts::Certificate;
 use crate::int::Int;
+use crate::terms::{End, Proof, Row, Step, TheoryLemma};
 use std::collections::BTreeMap;
 
-/// Validates a [`TheoryLemma`] against `theory_atoms` ([V3]).
-pub fn validate_lemma(lemma: &TheoryLemma, theory_atoms: &[Row]) -> Result<(), String> {
-    if lemma.steps.is_empty() {
-        return Err("a lemma proof cannot be empty".to_string());
+/// The row that holds exactly when `row` does not, over the integers.
+fn complement(row: &Row) -> Row {
+    Row {
+        coeffs: row
+            .coeffs
+            .iter()
+            .map(|(term, coeff)| (*term, coeff.negate()))
+            .collect(),
+        rhs: row.rhs.negate().minus(&Int::from_u64(1)),
     }
-    let mut derived: Vec<Row> = Vec::with_capacity(lemma.steps.len());
-    let mut closed = false;
+}
 
-    for (index, step) in lemma.steps.iter().enumerate() {
-        match step {
-            ProofStep::Row(lit_idx) => {
-                let Some(&(atom_id, polarity)) = lemma.literals.get(*lit_idx) else {
-                    return Err(format!(
-                        "step {index}: literal index {lit_idx} out of range"
-                    ));
+/// `⌊a / d⌋` for `d ≥ 1`.
+fn floor(a: &Int, d: &Int) -> Int {
+    let (quotient, remainder) = a.divide(d).expect("the divisor is positive");
+    if a.is_negative() && !remainder.is_zero() {
+        quotient.minus(&Int::from_u64(1))
+    } else {
+        quotient
+    }
+}
+
+/// The row that a step derives from the rows of its path.
+fn derive(
+    step: &Step,
+    literals: &[(usize, bool)],
+    atoms: &[Row],
+    path: &[Row],
+) -> Result<Row, String> {
+    match step {
+        Step::Literal(index) => {
+            let Some(&(atom, positive)) = literals.get(*index) else {
+                return Err(format!("the lemma has no literal {index}"));
+            };
+            let Some(row) = atoms.get(atom) else {
+                return Err(format!("there is no theory atom {atom}"));
+            };
+            Ok(if positive {
+                row.clone()
+            } else {
+                complement(row)
+            })
+        }
+        Step::Combine(parts) => {
+            if parts.is_empty() {
+                return Err("a sum of no rows".to_string());
+            }
+            let mut coeffs: BTreeMap<usize, Int> = BTreeMap::new();
+            let mut rhs = Int::zero();
+            for (source, multiplier) in parts {
+                let Some(row) = path.get(*source) else {
+                    return Err(format!("row {source} is not on the path"));
                 };
-                let Some(atom) = theory_atoms.get(atom_id) else {
-                    return Err(format!("step {index}: theory atom {atom_id} out of range"));
-                };
-                let row = if polarity {
-                    atom.clone()
-                } else {
-                    atom.complement()
-                };
-                derived.push(row);
-            }
-            ProofStep::Combine(terms) => {
-                if terms.is_empty() {
-                    return Err(format!("step {index}: empty Combine step"));
+                if multiplier.is_negative() || multiplier.is_zero() {
+                    return Err(format!("the multiplier {multiplier} is not positive"));
                 }
-                let mut coeffs: BTreeMap<usize, Int> = BTreeMap::new();
-                let mut rhs = Int::zero();
-                for (src, multiplier) in terms {
-                    if *src >= derived.len() {
-                        return Err(format!("step {index}: Combine refers to future step {src}"));
-                    }
-                    if multiplier.is_negative() {
-                        return Err(format!(
-                            "step {index}: Combine multiplier {multiplier} is negative"
-                        ));
-                    }
-                    let row = &derived[*src];
-                    for (&var, coeff) in &row.coeffs {
-                        let sum = coeffs
-                            .get(&var)
-                            .cloned()
-                            .unwrap_or_default()
-                            .plus(&coeff.times(multiplier));
-                        if sum.is_zero() {
-                            coeffs.remove(&var);
-                        } else {
-                            coeffs.insert(var, sum);
-                        }
-                    }
-                    rhs = rhs.plus(&row.rhs.times(multiplier));
-                }
-                derived.push(Row { coeffs, rhs });
-            }
-            ProofStep::Round { source, divisor } => {
-                if *source >= derived.len() {
-                    return Err(format!(
-                        "step {index}: Round refers to future step {source}"
-                    ));
-                }
-                if *divisor < Int::from_u64(1) {
-                    return Err(format!(
-                        "step {index}: Round divisor {divisor} is not positive"
-                    ));
-                }
-                let src_row = &derived[*source];
-                let mut coeffs = BTreeMap::new();
-                for (&var, coeff) in &src_row.coeffs {
-                    let Some((q, r)) = coeff.divide(divisor) else {
-                        return Err(format!("step {index}: zero divisor in Round"));
-                    };
-                    if !r.is_zero() {
-                        return Err(format!(
-                            "step {index}: Round divisor {divisor} does not divide coefficient {coeff}"
-                        ));
-                    }
-                    if !q.is_zero() {
-                        coeffs.insert(var, q);
+                for (term, coeff) in &row.coeffs {
+                    let sum = coeffs
+                        .get(term)
+                        .cloned()
+                        .unwrap_or_default()
+                        .plus(&coeff.times(multiplier));
+                    if sum.is_zero() {
+                        coeffs.remove(term);
+                    } else {
+                        coeffs.insert(*term, sum);
                     }
                 }
-                let rhs = div_floor(&src_row.rhs, divisor);
-                derived.push(Row { coeffs, rhs });
+                rhs = rhs.plus(&row.rhs.times(multiplier));
             }
-            ProofStep::Merge { le_row, ge_row } => {
-                if *le_row >= derived.len() || *ge_row >= derived.len() {
-                    return Err(format!("step {index}: Merge refers to future step"));
-                }
-                let a = &derived[*le_row];
-                let b = &derived[*ge_row];
-                let sum = a.combine(&Int::from_u64(1), b, &Int::from_u64(1));
-                if !sum.coeffs.is_empty() || !sum.rhs.is_zero() {
+            Ok(Row { coeffs, rhs })
+        }
+        Step::Round { source, divisor } => {
+            let Some(row) = path.get(*source) else {
+                return Err(format!("row {source} is not on the path"));
+            };
+            if *divisor < Int::from_u64(1) {
+                return Err(format!("the divisor {divisor} is not positive"));
+            }
+            let mut coeffs = BTreeMap::new();
+            for (term, coeff) in &row.coeffs {
+                let (quotient, remainder) = coeff.divide(divisor).expect("a positive divisor");
+                if !remainder.is_zero() {
                     return Err(format!(
-                        "step {index}: Merge rows are not opposite inequalities"
+                        "the divisor {divisor} does not divide the coefficient {coeff}"
                     ));
                 }
-                derived.push(a.clone());
+                coeffs.insert(*term, quotient);
             }
-            ProofStep::Close(source) => {
-                if *source >= derived.len() {
-                    return Err(format!(
-                        "step {index}: Close refers to future step {source}"
-                    ));
-                }
-                let row = &derived[*source];
-                if !row.coeffs.is_empty() || !row.rhs.is_negative() {
-                    return Err(format!(
-                        "step {index}: Close row is not `0 ≤ b` with `b < 0`"
-                    ));
-                }
-                closed = true;
-                derived.push(row.clone());
-            }
+            Ok(Row {
+                coeffs,
+                rhs: floor(&row.rhs, divisor),
+            })
         }
     }
+}
 
-    if !closed {
-        return Err("the lemma proof does not end with a valid Close step".to_string());
+/// Validates one branch of a proof, and the branches below it. `path` holds
+/// the rows of the branches above.
+fn branch(
+    proof: &Proof,
+    literals: &[(usize, bool)],
+    atoms: &[Row],
+    path: &mut Vec<Row>,
+) -> Result<(), String> {
+    let base = path.len();
+    for (index, step) in proof.steps.iter().enumerate() {
+        let row = derive(step, literals, atoms, path)
+            .map_err(|error| format!("row {}: {error}", base + index))?;
+        path.push(row);
     }
+    match &proof.end {
+        End::Close(row) => {
+            let Some(row) = path.get(*row) else {
+                return Err(format!("the closing row {row} is not on the path"));
+            };
+            if !row.coeffs.is_empty() || !row.rhs.is_negative() {
+                return Err("the closing row is not `0 ≤ b` with `b < 0`".to_string());
+            }
+        }
+        End::Split {
+            form,
+            bound,
+            low,
+            high,
+        } => {
+            if form.values().any(Int::is_zero) {
+                return Err("a split on a term with the coefficient 0".to_string());
+            }
+            // `form ≤ bound`, and then `form ≥ bound + 1`: every integer
+            // value of the form is in one of the two.
+            let split = path.len();
+            let at_most = Row {
+                coeffs: form.clone(),
+                rhs: bound.clone(),
+            };
+            let above = complement(&at_most);
+            path.push(at_most);
+            branch(low, literals, atoms, path)?;
+            path.truncate(split);
+            path.push(above);
+            branch(high, literals, atoms, path)?;
+        }
+    }
+    path.truncate(base);
     Ok(())
+}
+
+/// Validates the proof of a [`TheoryLemma`] against the atoms that its
+/// literals name ([V3]): every branch of the tree ends in a contradiction.
+pub fn validate_lemma(lemma: &TheoryLemma, theory_atoms: &[Row]) -> Result<(), String> {
+    branch(&lemma.proof, &lemma.literals, theory_atoms, &mut Vec::new())
 }
 
 /// Validates a complete [`Certificate`] ([V1] to [V4]).

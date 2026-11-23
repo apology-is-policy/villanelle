@@ -415,6 +415,25 @@ fn interval_unfolded(expr: &Expr, constants: &HashMap<VarId, Int>) -> (Option<In
             )
         }
         Expr::Arithmetic(Arithmetic::Multiply, l, r, _) => {
+            // A multiple by a literal keeps the ends that its operand has.
+            let multiple = |factor: Int, operand: &Expr| {
+                let (low, high) = interval_unfolded(operand, constants);
+                let low = low.map(|end| end.times(&factor));
+                let high = high.map(|end| end.times(&factor));
+                if factor.is_zero() {
+                    (Some(Int::zero()), Some(Int::zero()))
+                } else if factor.is_negative() {
+                    (high, low)
+                } else {
+                    (low, high)
+                }
+            };
+            if let Some(factor) = eval_const_unfolded(l, constants) {
+                return multiple(factor, r);
+            }
+            if let Some(factor) = eval_const_unfolded(r, constants) {
+                return multiple(factor, l);
+            }
             let (l1, h1) = interval_unfolded(l, constants);
             let (l2, h2) = interval_unfolded(r, constants);
             if let (Some(a), Some(big_a), Some(b), Some(big_b)) = (l1, h1, l2, h2) {
@@ -855,6 +874,17 @@ fn translate_formula(program: &Program, solver: &mut Solver, expr: &Expr, env: &
     }
 }
 
+/// What is reported when the count of steps of [J6] runs out. It is not a
+/// verdict on the program.
+fn limit_message(steps: u64, about: &str) -> String {
+    format!("the compiler's limit of {steps} steps was reached before this was decided: {about}")
+}
+
+/// What is reported when the decision procedure contradicts itself ([M1]).
+fn fault_message(fault: &str, about: &str) -> String {
+    format!("a defect of the compiler: {fault}; it arose while deciding: {about}")
+}
+
 /// Proves that `negated_goal` is unsatisfiable under `solver`, validates the
 /// resulting [`Certificate`] in [`kernel::validate`] ([V1]), and records it.
 #[allow(clippy::too_many_arguments)]
@@ -889,6 +919,20 @@ fn require_entailment(
             clause,
             message: message.into(),
             counterexample: Some(cex),
+        }),
+        Decision::Limit { steps } => Err(Error {
+            control: control.to_string(),
+            line,
+            clause: "J6",
+            message: limit_message(steps, &message.into()),
+            counterexample: None,
+        }),
+        Decision::Fault(fault) => Err(Error {
+            control: control.to_string(),
+            line,
+            clause: "M1",
+            message: fault_message(&fault, &message.into()),
+            counterexample: None,
         }),
     }
 }
@@ -1940,9 +1984,74 @@ struct BodyChecker<'a> {
     boundary_can_fault: bool,
     certificates: &'a mut Vec<(String, u32, &'static str, Certificate)>,
     warnings: &'a mut Vec<crate::surface::Warning>,
+    /// The line of the statement being checked.
+    at_line: u32,
+    /// The first question that got no verdict: a limit ([J6]), a fault of
+    /// the procedure ([M1]) or a certificate that the kernel refused
+    /// ([V1]). It is reported in place of whatever the body's check
+    /// concludes, since that may rest on the missing answer.
+    trouble: Option<Error>,
 }
 
 impl<'a> BodyChecker<'a> {
+    fn note_trouble(&mut self, clause: &'static str, message: String) {
+        if self.trouble.is_none() {
+            self.trouble = Some(Error {
+                control: self.owner_name.clone(),
+                line: self.at_line,
+                clause,
+                message,
+                counterexample: None,
+            });
+        }
+    }
+
+    /// The result of checking the body, unless a question got no verdict.
+    fn settle<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+        match self.trouble.take() {
+            Some(trouble) => Err(trouble),
+            None => result,
+        }
+    }
+
+    /// Whether `negated` has no model under what the body states. A yes is
+    /// validated by the kernel and recorded, as every entailment is ([V1]).
+    /// Without a verdict the answer is no, and the trouble is noted.
+    fn has_no_model(
+        &mut self,
+        negated: Formula,
+        visible_vars: &[(String, TermId, bool)],
+        in_loop: bool,
+        clause: &'static str,
+        about: &str,
+    ) -> bool {
+        match self.solver.decide(negated, visible_vars, in_loop) {
+            Decision::Proved(cert) => match kernel::validate(&cert) {
+                Ok(()) => {
+                    self.certificates
+                        .push((self.owner_name.clone(), self.at_line, clause, cert));
+                    true
+                }
+                Err(kernel_err) => {
+                    self.note_trouble(
+                        "V1",
+                        format!("certificate rejected by the kernel: {kernel_err}"),
+                    );
+                    false
+                }
+            },
+            Decision::Refuted(_) => false,
+            Decision::Limit { steps } => {
+                self.note_trouble("J6", limit_message(steps, about));
+                false
+            }
+            Decision::Fault(fault) => {
+                self.note_trouble("M1", fault_message(&fault, about));
+                false
+            }
+        }
+    }
+
     fn atom(&mut self, site: SiteId, alt_pos: usize) -> Formula {
         let var = self.site_atoms[site][alt_pos];
         self.solver.bdd.variable(var)
@@ -2006,9 +2115,12 @@ impl<'a> BodyChecker<'a> {
         if guard == bdd::FALSE {
             return false;
         }
-        matches!(
-            self.solver.decide(guard, visible_vars, in_loop),
-            Decision::Refuted(_)
+        !self.has_no_model(
+            guard,
+            visible_vars,
+            in_loop,
+            "N1",
+            "whether a history is feasible",
         )
     }
 
@@ -3116,10 +3228,14 @@ impl<'a> BodyChecker<'a> {
             if !r_i_feasible {
                 break;
             }
-            if let Decision::Proved(cert) = self.solver.decide(atom, visible_vars, in_loop) {
-                kernel::validate(&cert).expect("valid U16 certificate");
-                self.certificates
-                    .push((self.owner_name.clone(), line, "U16", cert));
+            self.at_line = line;
+            if self.has_no_model(
+                atom,
+                visible_vars,
+                in_loop,
+                "U16",
+                "whether an alternative can happen",
+            ) {
                 self.warnings.push(crate::surface::Warning {
                     control: self.owner_name.clone(),
                     line,
@@ -3240,6 +3356,7 @@ impl<'a> BodyChecker<'a> {
 
         for (stmt_idx, statement) in statements.iter().enumerate() {
             let line = statement.line;
+            self.at_line = line;
             let g_i = self.selector(&statement.selector);
             // [K2]: Rᵢ = Lᵢ ∧ gᵢ
             let r_i = self.solver.bdd.and(live, g_i);
@@ -4281,30 +4398,21 @@ impl<'a> BodyChecker<'a> {
                             if !has_leaf || same_as_entry_bad == bdd::FALSE {
                                 continue;
                             }
-                            if let Decision::Proved(cert) =
-                                self.solver
-                                    .decide(same_as_entry_bad, &visible_vars, in_loop)
-                            {
-                                kernel::validate(&cert).expect("valid O6 certificate");
-                                self.certificates
-                                    .push((self.owner_name.clone(), line, "O6", cert));
+                            let about = "the ownership of a name after a loop";
+                            if self.has_no_model(
+                                same_as_entry_bad,
+                                &visible_vars,
+                                in_loop,
+                                "O6",
+                                about,
+                            ) {
                                 continue;
                             }
-                            if let Decision::Proved(cert) =
-                                self.solver.decide(moved_bad, &visible_vars, in_loop)
-                            {
-                                kernel::validate(&cert).expect("valid O6 certificate");
-                                self.certificates
-                                    .push((self.owner_name.clone(), line, "O6", cert));
+                            if self.has_no_model(moved_bad, &visible_vars, in_loop, "O6", about) {
                                 self.moved[var] = self.solver.bdd.or(self.moved[var], atom);
                                 continue;
                             }
-                            if let Decision::Proved(cert) =
-                                self.solver.decide(avail_bad, &visible_vars, in_loop)
-                            {
-                                kernel::validate(&cert).expect("valid O6 certificate");
-                                self.certificates
-                                    .push((self.owner_name.clone(), line, "O6", cert));
+                            if self.has_no_model(avail_bad, &visible_vars, in_loop, "O6", about) {
                                 self.defined[var] = self.solver.bdd.or(self.defined[var], atom);
                                 let not_atom = self.solver.bdd.not(atom);
                                 self.moved[var] = self.solver.bdd.and(self.moved[var], not_atom);
@@ -4976,6 +5084,8 @@ fn check_boundary(
         boundary_can_fault: false,
         certificates,
         warnings,
+        at_line: 1,
+        trouble: None,
     };
     for param_idx in 0..boundary.parameters.len() {
         let tid = checker1.alloc_var_term(param_idx);
@@ -4984,8 +5094,10 @@ fn check_boundary(
         checker1.entry_parameters.push(LinearTerm::var(tid));
     }
     let mut loop_leaves1 = HashMap::new();
-    checker1.check_body(0, bdd::TRUE, false, &mut loop_leaves1)?;
-    checker1.check_loans()?;
+    let result = checker1
+        .check_body(0, bdd::TRUE, false, &mut loop_leaves1)
+        .and_then(|()| checker1.check_loans());
+    checker1.settle(result)?;
 
     // 2. Check `B₂` (`boundary.contingency`) with `retains` + `message` bound ([F6]).
     let cont_param_count = boundary.retains.len() + 1;
@@ -5026,6 +5138,8 @@ fn check_boundary(
         boundary_can_fault: false,
         certificates,
         warnings,
+        at_line: 1,
+        trouble: None,
     };
     for param_idx in 0..cont_param_count.min(var_count2) {
         let tid = checker2.alloc_var_term(param_idx);
@@ -5034,8 +5148,10 @@ fn check_boundary(
         checker2.entry_parameters.push(LinearTerm::var(tid));
     }
     let mut loop_leaves2 = HashMap::new();
-    checker2.check_body(0, bdd::TRUE, false, &mut loop_leaves2)?;
-    checker2.check_loans()?;
+    let result = checker2
+        .check_body(0, bdd::TRUE, false, &mut loop_leaves2)
+        .and_then(|()| checker2.check_loans());
+    checker2.settle(result)?;
     Ok(checker2.boundary_can_fault)
 }
 
@@ -5080,6 +5196,8 @@ fn check_control(
         boundary_can_fault: false,
         certificates,
         warnings,
+        at_line: 1,
+        trouble: None,
     };
 
     for param_idx in 0..control.parameters.len() {
@@ -5096,8 +5214,10 @@ fn check_control(
     }
 
     let mut loop_leaves = HashMap::new();
-    checker.check_body(0, bdd::TRUE, false, &mut loop_leaves)?;
-    checker.check_loans()
+    let result = checker
+        .check_body(0, bdd::TRUE, false, &mut loop_leaves)
+        .and_then(|()| checker.check_loans());
+    checker.settle(result)
 }
 
 // ============================================================================

@@ -11,6 +11,7 @@
 //! | `surface` | The Rails surface syntax: layout, grammar and elaboration into the core |
 //! | `typed`, `resolve` | The typed core, and the way to it from the tree |
 //! | `bdd`, `facts`, `kernel` | The ROBDD engine, the fact logic `Th_Z`, and the certificate validator |
+//! | `terms`, `lia`, `rational` | Terms, rows and proofs; the theory check on integers; the rationals of its simplex method |
 //! | `check` | The Phase 3 checker: coverage, acknowledgement, availability, obligations and effects |
 //! | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls |
 //! | `codegen` | The Phase 4 typed LLVM IR and C ABI backend under the erased semantics ([R1] to [R3]) |
@@ -35,13 +36,16 @@ pub mod generate;
 pub mod host;
 pub mod int;
 pub mod kernel;
+pub mod lia;
 pub mod mutate;
 pub mod oracle;
+pub mod rational;
 pub mod resolve;
 pub mod rng;
 pub mod script;
 pub mod surface;
 pub mod syntax;
+pub mod terms;
 pub mod text;
 pub mod typed;
 

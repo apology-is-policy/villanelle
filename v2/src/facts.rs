@@ -5,408 +5,14 @@
 
 use crate::bdd::{self, Bdd, Formula};
 use crate::int::Int;
-use crate::typed::{ControlId, IntType, StructId, Type, VariantId};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use crate::lia;
+pub use crate::terms::{
+    AtomTerm, End, LinearTerm, Proof, Row, SortTag, Step, TermId, TheoryAtomId, TheoryLemma,
+    div_ceil, div_floor, gcd,
+};
+use crate::typed::{IntType, StructId, Type};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-
-pub type TermId = usize;
-pub type TheoryAtomId = usize;
-
-/// Greatest common divisor of two magnitudes, always non-negative.
-pub fn gcd(a: &Int, b: &Int) -> Int {
-    let mut x = if a.is_negative() {
-        a.negate()
-    } else {
-        a.clone()
-    };
-    let mut y = if b.is_negative() {
-        b.negate()
-    } else {
-        b.clone()
-    };
-    while !y.is_zero() {
-        let (_, r) = x.divide(&y).expect("non-zero divisor");
-        x = y;
-        y = r;
-    }
-    x
-}
-
-/// Floor quotient `⌊a / d⌋` toward `-∞`, for `d > 0`.
-pub fn div_floor(a: &Int, d: &Int) -> Int {
-    let (q, r) = a.divide(d).expect("positive divisor");
-    if a.is_negative() && !r.is_zero() {
-        q.minus(&Int::from_u64(1))
-    } else {
-        q
-    }
-}
-
-/// Ceiling quotient `⌈a / d⌉` toward `+∞`, for `d > 0`.
-pub fn div_ceil(a: &Int, d: &Int) -> Int {
-    let (q, r) = a.divide(d).expect("positive divisor");
-    if !a.is_negative() && !r.is_zero() {
-        q.plus(&Int::from_u64(1))
-    } else {
-        q
-    }
-}
-
-/// An atomic integer term (`[S6]`).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum AtomTerm {
-    /// A logical name. `is_value_term` is true when `[A1]` gives it the range
-    /// of `ty`.
-    Var {
-        name: String,
-        ty: Option<IntType>,
-        is_value_term: bool,
-    },
-    /// The constant `usize.max` ([A2]).
-    UsizeMax,
-    /// `t ÷ k` for a literal `k ≥ 1` ([A7]).
-    DivConst(LinearTerm, Int),
-    /// `div(s, t)` for a non-constant divisor ([A8]).
-    Div(LinearTerm, LinearTerm),
-    /// `rem(s, t)` for a non-constant divisor ([A8]).
-    Rem(LinearTerm, LinearTerm),
-    /// `mul(s, t)` with ordered operands and their declared intervals ([A9]).
-    Mul {
-        left: LinearTerm,
-        right: LinearTerm,
-        left_bounds: (Option<Int>, Option<Int>),
-        right_bounds: (Option<Int>, Option<Int>),
-    },
-    /// Uninterpreted alternative `alt_f(args)` of a pure operation ([I10]).
-    PureAlt(ControlId, Vec<LinearTerm>),
-    /// Uninterpreted payload `pay_{f, alt, field}(args)` of a pure operation ([I10]).
-    PurePay(ControlId, usize, usize, Vec<LinearTerm>),
-    /// `len(t)` for vectors, strings, and maps ([A3]).
-    Len(LinearTerm),
-    /// String literal ([A3]).
-    StrLit(String),
-    /// Empty map literal `∅` ([A3]).
-    EmptyMap,
-    /// Vector literal `[t₁, …, tₙ]` ([A3]).
-    VecLit(Vec<LinearTerm>),
-    /// Struct constructor `S {t̄}` ([A4]).
-    StructCtor(StructId, Vec<LinearTerm>),
-    /// Struct field projection `t.xᵢ` ([A4], [A1]).
-    Field {
-        base: LinearTerm,
-        struct_id: StructId,
-        field_idx: usize,
-        int_ty: Option<IntType>,
-        is_bool: bool,
-        is_value_term: bool,
-    },
-    /// Variant constructor `V.c {t̄}` ([A5]).
-    VariantCtor {
-        variant_id: VariantId,
-        ctor_idx: usize,
-        fields: Vec<LinearTerm>,
-        num_ctors: usize,
-    },
-    /// Variant constructor tag `tag(t)` in `0..num_ctors` ([A5]).
-    VariantTag {
-        base: LinearTerm,
-        variant_id: VariantId,
-        num_ctors: usize,
-    },
-    /// Vector element `t[i]` ([A6], [A1]).
-    Index {
-        base: LinearTerm,
-        index: LinearTerm,
-        int_ty: Option<IntType>,
-        is_bool: bool,
-        is_value_term: bool,
-    },
-    /// Vector element update `t[i ↦ e]` ([A6]).
-    Update {
-        base: LinearTerm,
-        index: LinearTerm,
-        value: LinearTerm,
-    },
-    /// Uninterpreted `trim(s)` on strings ([S5]).
-    Trim(LinearTerm),
-}
-
-/// Sort tag of a logical term for `[J3]` and `[M7]`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SortTag {
-    Bool,
-    Int,
-    String,
-    Struct(StructId),
-    Variant(VariantId),
-    Resource(usize),
-    Outcome(usize),
-    Vector(String),
-    Map(String, String),
-}
-
-impl SortTag {
-    pub fn from_type(ty: &Type) -> Option<SortTag> {
-        match ty.deref_type() {
-            Type::Bool => Some(SortTag::Bool),
-            Type::Int(_) => Some(SortTag::Int),
-            Type::String => Some(SortTag::String),
-            Type::Struct(id, _) => Some(SortTag::Struct(*id)),
-            Type::Variant(id, _) => Some(SortTag::Variant(*id)),
-            Type::Resource(id, _) => Some(SortTag::Resource(*id)),
-            Type::Outcome(id, _) => Some(SortTag::Outcome(*id)),
-            Type::Vector(elem) => Some(SortTag::Vector(elem.to_string())),
-            Type::Map(k, v) => Some(SortTag::Map(k.to_string(), v.to_string())),
-            Type::Named(_)
-            | Type::OutcomeNamed(_)
-            | Type::TasksNamed(_)
-            | Type::Tasks(_, _)
-            | Type::Ref(_, _) => None,
-        }
-    }
-
-    pub fn is_extensional_collection(&self) -> bool {
-        matches!(
-            self,
-            SortTag::Vector(_) | SortTag::Map(_, _) | SortTag::String
-        )
-    }
-}
-
-/// A linear combination `constant + Σ coeff_i · u_i` ([S6]).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct LinearTerm {
-    pub constant: Int,
-    pub coeffs: BTreeMap<TermId, Int>,
-}
-
-impl LinearTerm {
-    pub fn constant(value: Int) -> LinearTerm {
-        LinearTerm {
-            constant: value,
-            coeffs: BTreeMap::new(),
-        }
-    }
-
-    pub fn from_i128(value: i128) -> LinearTerm {
-        LinearTerm::constant(Int::from_i128(value))
-    }
-
-    pub fn var(id: TermId) -> LinearTerm {
-        let mut coeffs = BTreeMap::new();
-        coeffs.insert(id, Int::from_u64(1));
-        LinearTerm {
-            constant: Int::zero(),
-            coeffs,
-        }
-    }
-
-    pub fn as_constant(&self) -> Option<Int> {
-        if self.coeffs.is_empty() {
-            Some(self.constant.clone())
-        } else {
-            None
-        }
-    }
-
-    pub fn as_var(&self) -> Option<TermId> {
-        if self.constant.is_zero()
-            && self.coeffs.len() == 1
-            && let Some((&id, coeff)) = self.coeffs.iter().next()
-            && *coeff == Int::from_u64(1)
-        {
-            Some(id)
-        } else {
-            None
-        }
-    }
-
-    pub fn negate(&self) -> LinearTerm {
-        LinearTerm {
-            constant: self.constant.negate(),
-            coeffs: self
-                .coeffs
-                .iter()
-                .map(|(id, c)| (*id, c.negate()))
-                .collect(),
-        }
-    }
-
-    pub fn add(&self, other: &LinearTerm) -> LinearTerm {
-        let mut coeffs = self.coeffs.clone();
-        for (id, c) in &other.coeffs {
-            let sum = coeffs.get(id).cloned().unwrap_or_default().plus(c);
-            if sum.is_zero() {
-                coeffs.remove(id);
-            } else {
-                coeffs.insert(*id, sum);
-            }
-        }
-        LinearTerm {
-            constant: self.constant.plus(&other.constant),
-            coeffs,
-        }
-    }
-
-    pub fn sub(&self, other: &LinearTerm) -> LinearTerm {
-        self.add(&other.negate())
-    }
-
-    pub fn scale(&self, factor: &Int) -> LinearTerm {
-        if factor.is_zero() {
-            return LinearTerm::default();
-        }
-        LinearTerm {
-            constant: self.constant.times(factor),
-            coeffs: self
-                .coeffs
-                .iter()
-                .map(|(id, c)| (*id, c.times(factor)))
-                .collect(),
-        }
-    }
-
-    pub fn eval(&self, model: &BTreeMap<TermId, Int>) -> Int {
-        let mut sum = self.constant.clone();
-        for (id, coeff) in &self.coeffs {
-            let val = model.get(id).cloned().unwrap_or_default();
-            sum = sum.plus(&coeff.times(&val));
-        }
-        sum
-    }
-}
-
-/// A linear inequality row `Σ a_i · u_i ≤ rhs` (`docs/v2/facts.md`, section 7).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Row {
-    pub coeffs: BTreeMap<TermId, Int>,
-    pub rhs: Int,
-}
-
-impl Row {
-    /// Builds the row `term ≤ 0`.
-    pub fn le_zero(term: &LinearTerm) -> Row {
-        Row {
-            coeffs: term.coeffs.clone(),
-            rhs: term.constant.negate(),
-        }
-    }
-
-    /// Builds `left ≤ right`.
-    pub fn le(left: &LinearTerm, right: &LinearTerm) -> Row {
-        Row::le_zero(&left.sub(right))
-    }
-
-    /// Builds `left < right` (`left + 1 ≤ right`).
-    pub fn lt(left: &LinearTerm, right: &LinearTerm) -> Row {
-        Row::le(&left.add(&LinearTerm::from_i128(1)), right)
-    }
-
-    /// The negation `¬(Σ a_i · u_i ≤ rhs)` over the integers:
-    /// `Σ (-a_i) · u_i ≤ -rhs - 1`.
-    pub fn complement(&self) -> Row {
-        Row {
-            coeffs: self
-                .coeffs
-                .iter()
-                .map(|(id, c)| (*id, c.negate()))
-                .collect(),
-            rhs: self.rhs.negate().minus(&Int::from_u64(1)),
-        }
-    }
-
-    /// The positive common factor of all coefficients, or `1` if `coeffs` is
-    /// empty.
-    pub fn coeff_gcd(&self) -> Int {
-        let mut g = Int::zero();
-        for coeff in self.coeffs.values() {
-            g = if g.is_zero() {
-                if coeff.is_negative() {
-                    coeff.negate()
-                } else {
-                    coeff.clone()
-                }
-            } else {
-                gcd(&g, coeff)
-            };
-        }
-        if g.is_zero() { Int::from_u64(1) } else { g }
-    }
-
-    /// Divides all coefficients by their GCD `g ≥ 1` and replaces `rhs` with
-    /// `⌊rhs / g⌋`.
-    pub fn normalize(&self) -> (Row, Int) {
-        let g = self.coeff_gcd();
-        if g <= Int::from_u64(1) {
-            return (self.clone(), Int::from_u64(1));
-        }
-        let coeffs = self
-            .coeffs
-            .iter()
-            .map(|(id, c)| (*id, c.divide(&g).expect("divisible").0))
-            .collect();
-        let rhs = div_floor(&self.rhs, &g);
-        (Row { coeffs, rhs }, g)
-    }
-
-    pub fn combine(&self, mult_self: &Int, other: &Row, mult_other: &Int) -> Row {
-        let mut coeffs = BTreeMap::new();
-        for (id, c) in &self.coeffs {
-            let prod = c.times(mult_self);
-            if !prod.is_zero() {
-                coeffs.insert(*id, prod);
-            }
-        }
-        for (id, c) in &other.coeffs {
-            let sum = coeffs
-                .get(id)
-                .cloned()
-                .unwrap_or_default()
-                .plus(&c.times(mult_other));
-            if sum.is_zero() {
-                coeffs.remove(id);
-            } else {
-                coeffs.insert(*id, sum);
-            }
-        }
-        Row {
-            coeffs,
-            rhs: self.rhs.times(mult_self).plus(&other.rhs.times(mult_other)),
-        }
-    }
-
-    pub fn holds(&self, model: &BTreeMap<TermId, Int>) -> bool {
-        let mut lhs = Int::zero();
-        for (id, coeff) in &self.coeffs {
-            let val = model.get(id).cloned().unwrap_or_default();
-            lhs = lhs.plus(&coeff.times(&val));
-        }
-        lhs <= self.rhs
-    }
-}
-
-/// One step in the proof of a theory lemma (`docs/v2/facts.md`, [V3]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProofStep {
-    /// A row from literal `index` of the lemma's literal list.
-    Row(usize),
-    /// A non-negative integer linear combination of earlier derived rows.
-    Combine(Vec<(usize, Int)>),
-    /// Chvátal–Gomory rounding of an earlier row by common factor `divisor ≥ 1`.
-    Round { source: usize, divisor: Int },
-    /// Equality `s = t` merged from `s - t ≤ 0` and `t - s ≤ 0`.
-    Merge { le_row: usize, ge_row: usize },
-    /// Contradiction `0 ≤ b` with `b < 0` on the given row.
-    Close(usize),
-}
-
-/// A theory lemma: a conjunction of theory literals that cannot hold together,
-/// with its [V3] proof.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TheoryLemma {
-    pub literals: Vec<(TheoryAtomId, bool)>,
-    pub steps: Vec<ProofStep>,
-}
 
 /// An axiom instance added to a query ([J3], [V2]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -446,9 +52,10 @@ impl fmt::Display for Certificate {
         for (idx, lemma) in self.lemmas.iter().enumerate() {
             writeln!(
                 formatter,
-                "  lemma {idx} ({} literals, {} steps)",
+                "  lemma {idx} ({} literals, {} steps, {} splits)",
                 lemma.literals.len(),
-                lemma.steps.len()
+                lemma.proof.size(),
+                lemma.proof.splits()
             )?;
         }
         Ok(())
@@ -511,9 +118,36 @@ impl fmt::Display for Counterexample {
     }
 }
 
+/// The answer to a query. Only the first two are verdicts ([J5], [J6]).
 pub enum Decision {
     Proved(Certificate),
     Refuted(Box<Counterexample>),
+    /// The count of steps ran out: the limit of the compiler ([J6]). It is
+    /// neither a yes nor a counterexample.
+    Limit {
+        steps: u64,
+    },
+    /// The procedure contradicted itself: a model that fails what it was
+    /// found for ([M1]). A defect of the compiler, reported as one.
+    Fault(String),
+}
+
+/// The count of steps that one query may take ([J6]): candidates, exchanges
+/// of the simplex method and splits together. It is a count, so the answer
+/// does not depend on the machine.
+pub const STEP_LIMIT: u64 = 2_000_000;
+
+thread_local! {
+    static STEP_LIMIT_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(STEP_LIMIT) };
+}
+
+/// Runs `work` with another count of steps for each query. The tests use it
+/// to reach the limit of [J6] on a small program.
+pub fn with_step_limit<T>(steps: u64, work: impl FnOnce() -> T) -> T {
+    let before = STEP_LIMIT_HERE.with(|limit| limit.replace(steps));
+    let result = work();
+    STEP_LIMIT_HERE.with(|limit| limit.set(before));
+    result
 }
 
 #[derive(Clone, Debug)]
@@ -553,6 +187,8 @@ pub struct Solver {
     instantiated_update_frames: HashSet<(TermId, LinearTerm)>,
     /// Theory lemmas learned across queries of this body.
     pub lemmas: Vec<TheoryLemma>,
+    /// The count of steps that one query may take ([J6]).
+    pub step_limit: u64,
 }
 
 impl Solver {
@@ -578,6 +214,7 @@ impl Solver {
             instantiated_ext: HashSet::new(),
             instantiated_update_frames: HashSet::new(),
             lemmas: Vec::new(),
+            step_limit: STEP_LIMIT_HERE.with(std::cell::Cell::get),
         };
         solver.usize_max_term = solver.intern_term(AtomTerm::UsizeMax);
         solver
@@ -1665,6 +1302,7 @@ impl Solver {
         let mut added_lemmas = vec![false; self.lemmas.len()];
         let mut used_instances = Vec::new();
         let mut used_lemmas = Vec::new();
+        let mut budget = self.step_limit;
 
         for (idx, &s) in self.structure.iter().enumerate() {
             query = self.bdd.and(query, s);
@@ -1673,6 +1311,12 @@ impl Solver {
         }
 
         'search: while let Some(assignment) = self.bdd.witness(working) {
+            if budget == 0 {
+                return Decision::Limit {
+                    steps: self.step_limit,
+                };
+            }
+            budget -= 1;
             for (idx, added) in added_lemmas.iter_mut().enumerate() {
                 if *added {
                     continue;
@@ -1697,15 +1341,43 @@ impl Solver {
                 }
             }
 
-            match solve_candidate(&candidate_literals, &self.theory_atoms) {
-                CandidateResult::Unsat(lemma) => {
+            let rows: Vec<Row> = candidate_literals
+                .iter()
+                .map(|&(atom_id, polarity)| {
+                    let atom = &self.theory_atoms[atom_id];
+                    if polarity {
+                        atom.clone()
+                    } else {
+                        atom.complement()
+                    }
+                })
+                .collect();
+            match lia::solve(&rows, &mut budget) {
+                lia::Outcome::Limit => {
+                    return Decision::Limit {
+                        steps: self.step_limit,
+                    };
+                }
+                lia::Outcome::Unsat { proof, literals } => {
+                    let lemma = TheoryLemma {
+                        literals: literals
+                            .iter()
+                            .map(|index| candidate_literals[*index])
+                            .collect(),
+                        proof,
+                    };
                     let lf = self.lemma_formula(&lemma);
                     working = self.bdd.and(working, lf);
                     self.lemmas.push(lemma.clone());
                     added_lemmas.push(true);
                     used_lemmas.push(lemma);
                 }
-                CandidateResult::Sat(mut int_model) => {
+                lia::Outcome::Sat(mut int_model) => {
+                    if let Some(row) = rows.iter().find(|row| !row.holds(&int_model)) {
+                        return Decision::Fault(format!(
+                            "the theory check gave a model that fails the row {row:?}"
+                        ));
+                    }
                     self.complete_int_model(&candidate_literals, &assignment, &mut int_model);
                     let full_bool_model = self.complete_bool_model(&assignment, &int_model);
 
@@ -1741,14 +1413,16 @@ impl Solver {
                         }
                     }
 
-                    let cex = self.build_counterexample(
+                    return match self.build_counterexample(
                         query,
                         full_bool_model,
                         int_model,
                         visible_vars,
                         in_loop,
-                    );
-                    return Decision::Refuted(Box::new(cex));
+                    ) {
+                        Ok(cex) => Decision::Refuted(Box::new(cex)),
+                        Err(fault) => Decision::Fault(fault),
+                    };
                 }
             }
         }
@@ -1770,24 +1444,19 @@ impl Solver {
         int_model: BTreeMap<TermId, Int>,
         visible_vars: &[(String, TermId, bool)],
         in_loop: bool,
-    ) -> Counterexample {
-        // [M1]: Verify that the query evaluates to true in the model.
-        assert!(
-            self.bdd.evaluate(query, &bool_model),
-            "counterexample must satisfy the Boolean query"
-        );
+    ) -> Result<Counterexample, String> {
+        // [M1]: the query is evaluated in the model before it is shown.
+        if !self.bdd.evaluate(query, &bool_model) {
+            return Err("the model of a counterexample fails the query".to_string());
+        }
         for (&bdd_var, &polarity) in &bool_model {
             if bdd_var >= self.first_theory_var {
                 let atom = &self.theory_atoms[bdd_var - self.first_theory_var];
-                let row = if polarity {
-                    atom.clone()
-                } else {
-                    atom.complement()
-                };
-                assert!(
-                    row.holds(&int_model),
-                    "counterexample integer valuation must satisfy every active theory literal"
-                );
+                if atom.holds(&int_model) != polarity {
+                    return Err(format!(
+                        "the model of a counterexample disagrees with itself on the row {atom:?}"
+                    ));
+                }
             }
         }
 
@@ -1945,7 +1614,7 @@ impl Solver {
             }
         }
 
-        Counterexample {
+        Ok(Counterexample {
             history,
             values,
             assumed_remark,
@@ -1953,283 +1622,6 @@ impl Solver {
             in_loop,
             bool_model,
             int_model,
-        }
-    }
-}
-
-enum CandidateResult {
-    Unsat(TheoryLemma),
-    Sat(BTreeMap<TermId, Int>),
-}
-
-/// Decides whether `literals` can hold simultaneously over the integers.
-/// Either produces a pruned [`TheoryLemma`] with its `[V3]` proof or a
-/// satisfying integer valuation `ν`.
-fn solve_candidate(literals: &[(TheoryAtomId, bool)], theory_atoms: &[Row]) -> CandidateResult {
-    let mut steps = Vec::new();
-    let mut active: Vec<(Row, usize)> = Vec::new();
-    let mut seen = HashSet::new();
-
-    for (idx, &(atom_id, polarity)) in literals.iter().enumerate() {
-        let base = &theory_atoms[atom_id];
-        let row = if polarity {
-            base.clone()
-        } else {
-            base.complement()
-        };
-        if let Some(close_step) =
-            push_derived_row(row, ProofStep::Row(idx), &mut steps, &mut active, &mut seen)
-        {
-            let _ = close_step;
-            return CandidateResult::Unsat(prune_lemma(literals, &steps));
-        }
-    }
-
-    let mut eliminated: Vec<(TermId, Vec<Row>, Vec<Row>)> = Vec::new();
-
-    while active.iter().any(|(row, _)| !row.coeffs.is_empty()) {
-        // Pick a variable to eliminate: prefer one with 0 upper or 0 lower
-        // bounds, then one with unit coefficients and fewest pairs.
-        let mut vars = BTreeSet::new();
-        for (row, _) in &active {
-            for &var in row.coeffs.keys() {
-                vars.insert(var);
-            }
-        }
-        let chosen_var = vars
-            .into_iter()
-            .min_by_key(|&var| {
-                let mut pos = 0usize;
-                let mut neg = 0usize;
-                let mut all_unit = true;
-                for (row, _) in &active {
-                    if let Some(c) = row.coeffs.get(&var) {
-                        if c.is_negative() {
-                            neg += 1;
-                            if *c != Int::from_i128(-1) {
-                                all_unit = false;
-                            }
-                        } else {
-                            pos += 1;
-                            if *c != Int::from_u64(1) {
-                                all_unit = false;
-                            }
-                        }
-                    }
-                }
-                let pairs = pos * neg;
-                let unit_penalty = usize::from(!all_unit && pairs > 0);
-                (pairs > 0, unit_penalty, pairs, var)
-            })
-            .expect("at least one variable");
-
-        let mut pos = Vec::new();
-        let mut neg = Vec::new();
-        let mut next_active = Vec::new();
-
-        for (row, step_id) in active {
-            match row.coeffs.get(&chosen_var) {
-                None => next_active.push((row, step_id)),
-                Some(c) if c.is_negative() => neg.push((row, step_id)),
-                Some(_) => pos.push((row, step_id)),
-            }
-        }
-
-        for (p_row, p_id) in &pos {
-            let c_pos = p_row.coeffs[&chosen_var].clone();
-            for (n_row, n_id) in &neg {
-                let c_neg = n_row.coeffs[&chosen_var].negate();
-                let g = gcd(&c_pos, &c_neg);
-                let m_pos = c_neg.divide(&g).expect("divisible").0;
-                let m_neg = c_pos.divide(&g).expect("divisible").0;
-                let combined = p_row.combine(&m_pos, n_row, &m_neg);
-                let step = ProofStep::Combine(vec![(*p_id, m_pos), (*n_id, m_neg)]);
-                if push_derived_row(combined, step, &mut steps, &mut next_active, &mut seen)
-                    .is_some()
-                {
-                    return CandidateResult::Unsat(prune_lemma(literals, &steps));
-                }
-            }
-        }
-
-        eliminated.push((
-            chosen_var,
-            pos.into_iter().map(|(r, _)| r).collect(),
-            neg.into_iter().map(|(r, _)| r).collect(),
-        ));
-        active = next_active;
-    }
-
-    // Back-substitute to construct an integer valuation `ν` ([M1], [M6]).
-    let mut model = BTreeMap::new();
-    while let Some((var, pos_rows, neg_rows)) = eliminated.pop() {
-        let mut upper: Option<Int> = None;
-        for row in &pos_rows {
-            let c_pos = &row.coeffs[&var];
-            let mut rest = Int::zero();
-            for (&other_var, coeff) in &row.coeffs {
-                if other_var != var {
-                    let val = model.get(&other_var).cloned().unwrap_or_default();
-                    rest = rest.plus(&coeff.times(&val));
-                }
-            }
-            let bound = div_floor(&row.rhs.minus(&rest), c_pos);
-            upper = Some(match upper {
-                None => bound,
-                Some(prev) => prev.min(bound),
-            });
-        }
-
-        let mut lower: Option<Int> = None;
-        for row in &neg_rows {
-            let c_neg = row.coeffs[&var].negate();
-            let mut rest = Int::zero();
-            for (&other_var, coeff) in &row.coeffs {
-                if other_var != var {
-                    let val = model.get(&other_var).cloned().unwrap_or_default();
-                    rest = rest.plus(&coeff.times(&val));
-                }
-            }
-            let bound = div_ceil(&rest.minus(&row.rhs), &c_neg);
-            lower = Some(match lower {
-                None => bound,
-                Some(prev) => prev.max(bound),
-            });
-        }
-
-        let chosen = match (lower, upper) {
-            (Some(lo), Some(hi)) => {
-                if Int::zero() >= lo && Int::zero() <= hi {
-                    Int::zero()
-                } else if Int::zero() < lo {
-                    lo
-                } else {
-                    hi
-                }
-            }
-            (Some(lo), None) => lo.max(Int::zero()),
-            (None, Some(hi)) => hi.min(Int::zero()),
-            (None, None) => Int::zero(),
-        };
-        model.insert(var, chosen);
-    }
-
-    CandidateResult::Sat(model)
-}
-
-fn push_derived_row(
-    row: Row,
-    step: ProofStep,
-    steps: &mut Vec<ProofStep>,
-    active: &mut Vec<(Row, usize)>,
-    seen: &mut HashSet<Row>,
-) -> Option<usize> {
-    let step_id = steps.len();
-    steps.push(step);
-    if row.coeffs.is_empty() {
-        if row.rhs.is_negative() {
-            let close_id = steps.len();
-            steps.push(ProofStep::Close(step_id));
-            return Some(close_id);
-        }
-        return None;
-    }
-
-    let (rounded, divisor) = row.normalize();
-    let (final_row, final_id) = if divisor > Int::from_u64(1) {
-        let round_id = steps.len();
-        steps.push(ProofStep::Round {
-            source: step_id,
-            divisor,
-        });
-        (rounded, round_id)
-    } else {
-        (row, step_id)
-    };
-
-    if final_row.coeffs.is_empty() {
-        if final_row.rhs.is_negative() {
-            let close_id = steps.len();
-            steps.push(ProofStep::Close(final_id));
-            return Some(close_id);
-        }
-        return None;
-    }
-
-    if seen.insert(final_row.clone()) {
-        active.push((final_row, final_id));
-    }
-    None
-}
-
-/// Extracts only the steps and input literals that participate in deriving the
-/// final `ProofStep::Close` step.
-fn prune_lemma(literals: &[(TheoryAtomId, bool)], steps: &[ProofStep]) -> TheoryLemma {
-    let last = steps.len() - 1;
-    let mut used = vec![false; steps.len()];
-    used[last] = true;
-    for idx in (0..steps.len()).rev() {
-        if !used[idx] {
-            continue;
-        }
-        match &steps[idx] {
-            ProofStep::Row(_) => {}
-            ProofStep::Combine(items) => {
-                for &(src, _) in items {
-                    used[src] = true;
-                }
-            }
-            ProofStep::Round { source, .. } | ProofStep::Close(source) => {
-                used[*source] = true;
-            }
-            ProofStep::Merge { le_row, ge_row } => {
-                used[*le_row] = true;
-                used[*ge_row] = true;
-            }
-        }
-    }
-
-    let mut lit_remap: BTreeMap<usize, usize> = BTreeMap::new();
-    let mut pruned_literals = Vec::new();
-    let mut step_remap = vec![0usize; steps.len()];
-    let mut pruned_steps = Vec::new();
-
-    for (idx, step) in steps.iter().enumerate() {
-        if !used[idx] {
-            continue;
-        }
-        let new_id = pruned_steps.len();
-        step_remap[idx] = new_id;
-        let mapped = match step {
-            ProofStep::Row(lit_idx) => {
-                let new_lit = *lit_remap.entry(*lit_idx).or_insert_with(|| {
-                    let id = pruned_literals.len();
-                    pruned_literals.push(literals[*lit_idx]);
-                    id
-                });
-                ProofStep::Row(new_lit)
-            }
-            ProofStep::Combine(items) => ProofStep::Combine(
-                items
-                    .iter()
-                    .map(|(src, mult)| (step_remap[*src], mult.clone()))
-                    .collect(),
-            ),
-            ProofStep::Round { source, divisor } => ProofStep::Round {
-                source: step_remap[*source],
-                divisor: divisor.clone(),
-            },
-            ProofStep::Merge { le_row, ge_row } => ProofStep::Merge {
-                le_row: step_remap[*le_row],
-                ge_row: step_remap[*ge_row],
-            },
-            ProofStep::Close(source) => ProofStep::Close(step_remap[*source]),
-        };
-        pruned_steps.push(mapped);
-    }
-
-    TheoryLemma {
-        literals: pruned_literals,
-        steps: pruned_steps,
+        })
     }
 }

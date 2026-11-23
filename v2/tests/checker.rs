@@ -8,13 +8,14 @@
 //! `[M1]`–`[M6]`).
 
 use villanelle_v2::check::{self, CheckedProgram};
-use villanelle_v2::facts::ProofStep;
+use villanelle_v2::facts;
 use villanelle_v2::generate;
 use villanelle_v2::int::Int;
 use villanelle_v2::kernel;
 use villanelle_v2::mutate::{self, Class};
 use villanelle_v2::oracle::Config;
 use villanelle_v2::rng::Rng;
+use villanelle_v2::terms::{End, Proof, Step};
 use villanelle_v2::{load, load_surface, resolve, text};
 
 fn check_core(source: &str) -> Result<CheckedProgram, check::Error> {
@@ -679,31 +680,105 @@ fn fact_logic_axioms_a7_a8_a9_i10_and_chvatal_gomory_j3() {
         ",
     );
 
-    // [J3]: Chvátal–Gomory integer rounding cut: `x + y ≥ 1` and `x >= y`
-    // combine (eliminating `y`) into `2 * x ≥ 1`, which rounds via `[J3] Round`
-    // to `x ≥ 1`, contradicting `x ≤ 0`.
+    // [V3] Round: `x = 2 * q` and `x = 2 * r + 1` have rational solutions and
+    // no integer one. Replacing `x` leaves `2 * q - 2 * r = 1`, which rounds
+    // to a contradiction.
     let report = accept_core(
-        "J3",
+        "V3",
         "
-        pub control parity_impossible(x : i32, y : i32)
-            ⊢ x ≥ -100 ∧ x ≤ 100 ∧ y ≥ -100 ∧ y ≤ 100
+        pub control parity_impossible(x : i32, q : i32, r : i32)
+            ⊢ q ≥ -100 ∧ q ≤ 100 ∧ r ≥ -100 ∧ r ≤ 100
             ■ { done } :=
-            ⊤ ▷ t1 : ? x + y ≥ 1
-            ⊤ ▷ t2 : ? x ≥ y
-            ⊤ ▷ t3 : ? x ≤ 0
-            t1.true ∧ t2.true ∧ t3.true ▷ ⊥
-            ¬(t1.true ∧ t2.true ∧ t3.true) ▷ ■ done
+            ⊤ ▷ t1 : ? x = 2 * q
+            ⊤ ▷ t2 : ? x = 2 * r + 1
+            t1.true ∧ t2.true ▷ ⊥
+            ¬(t1.true ∧ t2.true) ▷ ■ done
         ",
     );
-    let saw_round = report.certificates.iter().any(|(_, _, _, cert)| {
-        cert.lemmas.iter().any(|lemma| {
-            lemma
-                .steps
-                .iter()
-                .any(|step| matches!(step, ProofStep::Round { .. }))
-        })
-    });
-    assert!(saw_round, "expected a [J3] Round step in the certificate");
+    let saw_round = report
+        .certificates
+        .iter()
+        .any(|(_, _, _, cert)| cert.lemmas.iter().any(|lemma| lemma.proof.rounds()));
+    assert!(saw_round, "expected a [V3] Round step in a certificate");
+}
+
+/// Review finding RC12. The procedure is exact on integers ([J5]): a
+/// precondition with rational solutions and no integer one makes `⊥`
+/// unreachable, and the proof splits. It gives up only at the counted limit
+/// of [J6], which is reported as the compiler's limit and never as a verdict
+/// on the program.
+#[test]
+fn the_procedure_is_exact_on_integers_and_gives_up_only_at_a_counted_limit() {
+    let source = "
+        pub control c(x : i32, y : i32)
+            ⊢ 11 * x + 13 * y ≥ 27 ∧ 11 * x + 13 * y ≤ 45 ∧ 7 * x - 9 * y ≥ -10 ∧ 7 * x - 9 * y ≤ 4
+            ■ { r } :=
+            ⊤ ▷ ⊥
+    ";
+    let report = accept_core("J5", source);
+    assert!(
+        report
+            .certificates
+            .iter()
+            .any(|(_, _, _, cert)| cert.lemmas.iter().any(|lemma| lemma.proof.splits() > 0)),
+        "only a split refutes the precondition"
+    );
+    for (_, _, _, cert) in &report.certificates {
+        kernel::validate(cert).expect("the kernel validates a proof with splits");
+    }
+
+    // With three steps the same question has no answer. That is an error
+    // of its own kind, with no counterexample.
+    let error = facts::with_step_limit(3, || check_core(source)).expect_err("no answer");
+    assert_eq!(error.clause, "J6", "{error}");
+    assert!(error.counterexample.is_none());
+    assert!(
+        error.to_string().contains("limit of 3 steps"),
+        "the report names the limit: {error}"
+    );
+
+    // An obligation that does not hold is refuted with a model, not with a
+    // limit: `x` and `y` may be 2 and 1.
+    let error = reject_core(
+        "P6",
+        "
+        pub control c(x : i32, y : i32)
+            ⊢ 11 * x + 13 * y ≥ 27 ∧ 11 * x + 13 * y ≤ 45 ∧ 7 * x - 9 * y ≥ -10 ∧ 7 * x - 9 * y ≤ 5
+            ■ { r } :=
+            ⊤ ▷ ⊥
+        ",
+    );
+    assert!(error.counterexample.is_some());
+}
+
+/// Review finding RC11. Whether a history is feasible is an entailment like
+/// any other: a history that is ruled out is ruled out by a certificate that
+/// the kernel validated ([V1]), and the certificate is listed.
+#[test]
+fn an_infeasible_history_is_ruled_out_by_a_validated_certificate() {
+    let report = accept_core(
+        "V1",
+        "
+        extern control read(port : u32) ■ { value {v : u32} │ closed } uses io
+
+        pub control c(a : u8) ■ { r } :=
+            ⊤ ▷ t : ? a > 255
+            t.true ▷ d : Δ read(1) ▸ value {v} │ closed
+            ⊤ ▷ ■ r
+        ",
+    );
+    let feasibility: Vec<_> = report
+        .certificates
+        .iter()
+        .filter(|(_, _, clause, _)| *clause == "N1")
+        .collect();
+    assert!(
+        !feasibility.is_empty(),
+        "the decision on `read` needs `uses io` unless its history is infeasible"
+    );
+    for (_, _, _, cert) in feasibility {
+        kernel::validate(cert).expect("the kernel validates the certificate");
+    }
 }
 
 #[test]
@@ -752,11 +827,13 @@ fn certificate_kernel_rejects_corrupted_proofs_v1_to_v5() {
 
     // Tamper 2 ([V2]/[V3]): replace a `Combine` multiplier with -1.
     let mut bad_mult = lemma_cert.clone();
-    bad_mult.lemmas[0]
-        .steps
-        .push(ProofStep::Combine(vec![(0, Int::from_i128(-1))]));
-    let last_idx = bad_mult.lemmas[0].steps.len() - 1;
-    bad_mult.lemmas[0].steps.push(ProofStep::Close(last_idx));
+    bad_mult.lemmas[0].proof = Proof {
+        steps: vec![
+            Step::Literal(0),
+            Step::Combine(vec![(0, Int::from_i128(-1))]),
+        ],
+        end: End::Close(1),
+    };
     assert!(
         kernel::validate(&bad_mult).is_err(),
         "kernel must reject a negative Combine multiplier ([V3])"
@@ -764,11 +841,13 @@ fn certificate_kernel_rejects_corrupted_proofs_v1_to_v5() {
 
     // Tamper 3 ([V3]): reference an out-of-range premise row index in `Combine`.
     let mut bad_index = lemma_cert.clone();
-    bad_index.lemmas[0].steps = vec![
-        ProofStep::Row(0),
-        ProofStep::Combine(vec![(99, Int::from_i128(1))]),
-        ProofStep::Close(1),
-    ];
+    bad_index.lemmas[0].proof = Proof {
+        steps: vec![
+            Step::Literal(0),
+            Step::Combine(vec![(99, Int::from_i128(1))]),
+        ],
+        end: End::Close(1),
+    };
     assert!(
         kernel::validate(&bad_index).is_err(),
         "kernel must reject an out-of-range premise index ([V3])"
@@ -776,7 +855,10 @@ fn certificate_kernel_rejects_corrupted_proofs_v1_to_v5() {
 
     // Tamper 4 ([V3]): close on a non-contradictory row (`ProofStep::Row(0)`).
     let mut non_contradictory = lemma_cert.clone();
-    non_contradictory.lemmas[0].steps = vec![ProofStep::Row(0), ProofStep::Close(0)];
+    non_contradictory.lemmas[0].proof = Proof {
+        steps: vec![Step::Literal(0)],
+        end: End::Close(0),
+    };
     assert!(
         kernel::validate(&non_contradictory).is_err(),
         "kernel must reject a lemma that closes on a non-contradictory row ([V3])"

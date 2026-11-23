@@ -32,7 +32,8 @@ can be read on its own. Nothing in it is built for speed.
 | `syntax`, `text` | The core text form (section 3): its tree, printer and reader |
 | `surface` | The Rails surface syntax ([surface](surface.md)): layout ([Y1] to [Y10]), grammar ([G1] to [G10]), elaboration ([U1] to [U15]) into `syntax::Program` and surface warnings ([U5], [U17], [U18]) (section 9) |
 | `typed`, `resolve` | The typed core, and what is checked on the way to it (section 4) |
-| `bdd`, `facts`, `kernel` | The ROBDD engine, the `Th_Z` fact logic, the certificate format and the certificate validator, which checks lemma steps and the Boolean step and does not yet check axiom instances ([V1] to [V5] are not met: [review](review.md), RC9 to RC12), and counterexamples ([M1] to [M6]) (section 10) |
+| `bdd`, `facts`, `kernel` | The ROBDD engine, the `Th_Z` fact logic, the certificate format and the certificate validator, which checks the proof of every lemma (a tree of the steps of [V3], with Split) and the Boolean step and does not yet check axiom instances ([V1] to [V5] are not met: [review](review.md), RC9, RC10, RC13), and counterexamples ([M1] to [M6]) (section 10) |
+| `terms`, `lia`, `rational` | The terms, rows and proofs that the search and the kernel both read; the theory check for the rows of a candidate, which answers with a model, a proof or the counted limit of [J6] (section 7 of the [fact logic](facts.md) has a note on what it does not decide); and the rationals of its simplex method |
 | `check` | The phase 3 checker: coverage ([K1] to [K8]), conditional facts and SSA renaming ([N1] to [N5]), acknowledgement ([C2]), availability ([O1], [O2], [O4], [O6]), obligations ([P1] to [P8]), effects ([F3]) and impossible-arm warnings ([U16]) (section 10) |
 | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls, lifting loop exits and preserving checking and observations (section 11) |
 | `codegen` | The phase 4 typed LLVM IR and C ABI backend under the erased semantics ([R1] to [R3]), with native `-O0`/`-O2`/`-O3` compilation and differential execution (section 11) |
@@ -316,11 +317,11 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   `--mutants` does the same for every mutant, where a mutant that the
   checker accepts must have no stuck run. Each failure is a finding with
   its seed, and `--out DIR` writes the programs. The state on 23 November
-  2026: the reader and the two semantics have no finding over 300 seeds. Of
-  the 300 valid programs the checker accepts 268, rejects 13, panics on 16
-  and does not answer within 20 seconds on 3. The rejected programs were
-  looked at one by one only in part; the one analysed is valid by [A7] and
-  [A9], so these count against the decision procedure
+  2026: the reader, the two semantics and the checker have no finding over
+  300 seeds. The first run of the checker on these programs accepted 268,
+  rejected 13, panicked on 16 and gave no answer within 20 seconds on 3;
+  all 32 were defects of the decision procedure and of the declared
+  interval of a multiple by a literal, and are repaired
   ([review](review.md), RC12, RC16). Of 838 mutants of the first 25
   programs, `resolve` refuses 132, the checker rejects 319 (a stuck run was
   found for 218 of them) and accepts 353, none of which has a stuck run
@@ -404,8 +405,13 @@ of slice 1:
   Boolean value terms ([I13]), fixed-width and `usize` ranges ([A1], [A2]),
   division and remainder by constants ([A7]) and terms ([A8]), four-corner
   product envelopes from declared intervals ([A9]), lazy CEGAR refinement over
-  `Ω`, `Ψ` and `[J3]`, and integer Fourier–Motzkin elimination with
-  Chvátal–Gomory `Round` cuts and proof-tree pruning. Checked obligations cover
+  `Ω`, `Ψ` and `[J3]`, and the theory check of `lia`: equalities replaced,
+  variables with a unit coefficient projected out, the simplex method over
+  the rationals, rounded sums, and splits, with a proof as a tree of the
+  steps of [V3] that is pruned to what its ends rely on. A query has three
+  answers besides a fault of the procedure itself: proved, refuted with a
+  model, and the counted limit of [J6], which is reported with the clause
+  `J6` and is not a verdict. Checked obligations cover
   `⊢ φ` ([P1]), loop invariants at entry and `↑` ([P2]), function and control
   preconditions ([P3]), exit contract conditions `⇐ φₐ` ([P4]), arithmetic
   bounds and non-zero divisors ([P5]), unreachable `⊥` ([P6]), left-to-right
@@ -857,9 +863,9 @@ Rails surface:
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
   lists the defects and, in its section 3, what each slice owes: a generator
-  that is not one program, a kernel that validates axiom instances and every
-  proof the checker relies on, a counted limit where the decision procedure
-  panics, the fault-boundary rules of the oracle, the unsound cases of the
+  that is not one program (done for slice 1), a kernel that validates axiom
+  instances, a decision procedure that is complete without bounds, the
+  fault-boundary rules of the oracle, the unsound cases of the
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.

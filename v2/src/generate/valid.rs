@@ -28,7 +28,8 @@
 
 use super::interval::{
     NEG, POS, Range, above, add, below, divide_by_literal, divide_by_term, multiply, negate,
-    product_by_planes, remainder_by_literal, remainder_by_term, scale, subtract,
+    product_by_planes, remainder_by_literal, remainder_by_term, remainder_declared, scale,
+    subtract,
 };
 use super::{bin, int, name, stmt};
 use crate::int::Int;
@@ -447,15 +448,18 @@ impl Lib<'_> {
                                 dividend % divisor
                             }),
                             (Some(divisor), None) => {
-                                let by = if quotient {
-                                    divide_by_literal
+                                if quotient {
+                                    Val {
+                                        flow: divide_by_literal(a.flow, divisor),
+                                        declared: divide_by_literal(a.declared, divisor),
+                                        constant: None,
+                                    }
                                 } else {
-                                    remainder_by_literal
-                                };
-                                Val {
-                                    flow: by(a.flow, divisor),
-                                    declared: by(a.declared, divisor),
-                                    constant: None,
+                                    Val {
+                                        flow: remainder_by_literal(a.flow, divisor),
+                                        declared: remainder_declared(a.declared, divisor),
+                                        constant: None,
+                                    }
                                 }
                             }
                             (None, _) => {

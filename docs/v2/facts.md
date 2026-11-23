@@ -2,8 +2,9 @@
 
 Status: **draft 1**, 19 November 2026. Phase 1, deliverable 2 of the
 [redesign plan](../redesign-plan.md). Accepted by the author on 20 November
-2026 as the working specification ([index](README.md)). Nothing here is
-implemented.
+2026 as the working specification ([index](README.md)). The crate in `v2/`
+implements it in part; [the review](review.md) says what of that is verified.
+Section 14 lists what has changed here since the acceptance.
 
 One independent review has been folded in. It confirmed the worked proofs and
 most of the axioms. It also found that the first version of the theory was
@@ -380,13 +381,25 @@ denotes a value of the element type that depends only on `t` and `i`
   of which is a literal or absent. It is computed from the term as section 4
   produces it, before the procedure rewrites anything. A literal is its own
   interval. A value term has the bounds of its type that are literals (so a
-  `usize` has the lower bound 0 and no upper bound). Sums, differences,
-  multiples by literals, and quotients and remainders by literals combine
-  intervals in the usual way. A conversion has the interval of its operand. A
-  product has the least and the greatest of the four products of its
-  operands' bounds, when all four exist. Every other term (a quotient or
-  remainder by a term, the result of a total operator, any other application)
-  has no bounds. For `w = mul(s, t)`, with `s` in `[a, A]` and `t` in
+  `usize` has the lower bound 0 and no upper bound), and a measure has the
+  lower bound 0. The other intervals follow from those of the operands, and
+  an end exists when the ends it is computed from exist:
+
+  | Term | Interval, for operands in `[a, A]` and `[b, B]` |
+  | --- | --- |
+  | `-s` | `[-A, -a]` |
+  | `s + t`, `s - t` | `[a + b, A + B]`, `[a - B, A - b]` |
+  | `k·s`, for a literal `k` | `[k·a, k·A]` for `k > 0`, `[k·A, k·a]` for `k < 0`, `[0, 0]` for `k = 0` |
+  | `s ÷ k`, for a literal `k ≠ 0` | `[a ÷ k, A ÷ k]` for `k > 0`, `[A ÷ k, a ÷ k]` for `k < 0` |
+  | `s mod k`, for a literal `k ≠ 0`, with `m = \|k\| - 1` | The lower end is `0` if `a` exists and `a ≥ 0`, and `-m` otherwise. The upper end is `0` if `A` exists and `A ≤ 0`, and `m` otherwise. |
+  | `mul(s, t)` | The least and the greatest of `a·b`, `a·B`, `A·b` and `A·B`, when all four ends exist; no end otherwise |
+  | A conversion of `s` | `[a, A]` |
+
+  Every other term (a quotient or remainder by a term, the result of a total
+  operator, any other application) has no bounds. The interval of a
+  remainder is deliberately no finer than the sign of its dividend allows:
+  the declared interval is read off the text, and what the facts add comes
+  from the instances. For `w = mul(s, t)`, with `s` in `[a, A]` and `t` in
   `[b, B]`, the instances are those of the four below whose two bounds
   exist:
 
@@ -512,6 +525,19 @@ current candidate, and the integrality step is required to be a method that
 decides linear integer arithmetic without assuming bounds, since a product or
 a quotient by a term may have none. The Omega test is one. Branching within
 the bound that the small-model property of integer programs gives is another.
+
+**The integrality step of the crate in `v2/`** (`lia.rs`) is not yet such a
+method. It replaces a variable that an equality defines, removes a variable
+whose coefficient is a unit on one side by adding up its bounds, rounds every
+row it derives, adds the rounded sum of two rows where rounding says more
+than the rows did, and then splits. Every answer it gives is right: a yes
+has a proof that the kernel validated, and a no has a model that was
+evaluated. On rows that have rational solutions without a bound and no
+integer one, and that the first steps do not decide, the splitting does not
+end, and the count of steps of [J6] ends it. Such a query is reported as the
+compiler's limit. The remedy is the remaining part of the Omega test (the
+dark shadow and the splinters); it is open as finding RC12 of the
+[review](review.md).
 
 Two properties keep the work small. Step 2 settles most obligations of ordinary
 code in step 3, as in section 2.1: a test and the obligation it serves are the
@@ -842,3 +868,18 @@ the recommendation in each case:
 | Q8 | Is a function's body visible to the logic at its calls? | **Yes** ([I8]). Functions are non-recursive expressions, and a caller usually needs exactly what the body computes. The body of a public function is then part of its interface. Phase 5, which adds recursion, has to revisit this; the alternative is a stated result condition, as controls have. |
 | Q9 | Is an operation with no declared effects a function of its arguments? | **Yes** ([I10]). It is what the plan's section 5.2 says of pure decisions, and it removes filler arms for repeated questions. It makes "no `uses`" a real assertion about an extern control: observing the world is an effect too. |
 | Q10 | How does signed division round? | **Toward zero**, and the remainder has the sign of the dividend ([I4]): what the hardware and the systems languages do. v1 had no infix division, so nothing is carried over. |
+
+## 14. Changes after the acceptance
+
+Changes to this document since 20 November 2026, each with what asked for
+it.
+
+1. **23 November 2026, [A9]: the declared interval is stated rule by rule.**
+   "In the usual way" left two readings of the interval of a remainder by a
+   literal (with or without the ends of the dividend), and the checker read
+   a multiple by a literal as a product, which lost the ends that a `usize`
+   has. The generator of valid programs and the checker disagreed on four of
+   300 programs. Both now compute the table of [A9].
+2. **23 November 2026, section 7: a note on the integrality step of the
+   crate.** The step is exact where it answers and is not complete without
+   bounds; the note says what it does and where the limit of [J6] ends it.
