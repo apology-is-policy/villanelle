@@ -94,6 +94,12 @@ enum Marker {
 }
 
 #[derive(Clone, Debug)]
+struct SourceComment {
+    line: u32,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
 struct RailLine {
     line: u32,
     segments: Vec<Seg>,
@@ -106,11 +112,11 @@ struct RailLine {
     comment: Option<String>,
 }
 
-fn split_comment(text: &str) -> (&str, Option<String>) {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
+fn split_comment(text: &str) -> (&str, Option<&str>) {
+    let mut chars = text.char_indices().peekable();
     let mut in_string = false;
     let mut escaped = false;
-    for (i, &(byte_pos, ch)) in chars.iter().enumerate() {
+    while let Some((byte_pos, ch)) = chars.next() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -127,11 +133,11 @@ fn split_comment(text: &str) -> (&str, Option<String>) {
         }
         if ch == '┄' {
             let after = text[byte_pos + '┄'.len_utf8()..].trim_end();
-            return (&text[..byte_pos], Some(after.to_string()));
+            return (&text[..byte_pos], Some(after));
         }
-        if ch == '/' && chars.get(i + 1).is_some_and(|(_, next)| *next == '/') {
+        if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
             let after = text[byte_pos + 2..].trim_end();
-            return (&text[..byte_pos], Some(after.to_string()));
+            return (&text[..byte_pos], Some(after));
         }
     }
     (text, None)
@@ -260,14 +266,14 @@ fn parse_rail_line(line_no: u32, raw: &str) -> Result<RailLine, Error> {
         marker,
         indented,
         content,
-        comment,
+        comment: comment.map(str::to_owned),
     })
 }
 
 #[derive(Clone, Debug)]
 enum RawItem {
     Blank,
-    Comment(String),
+    Comment(SourceComment),
     Simple {
         line: u32,
         text: String,
@@ -649,7 +655,10 @@ fn build_rails_body(raw_lines: &[RailLine]) -> Result<Vec<RawItem>, Error> {
                     pop_one_frame(&mut frames)?;
                 }
                 let item = match line.comment {
-                    Some(text) => RawItem::Comment(text),
+                    Some(text) => RawItem::Comment(SourceComment {
+                        line: line.line,
+                        text,
+                    }),
                     None => RawItem::Blank,
                 };
                 frames
@@ -1304,6 +1313,7 @@ fn lex_fragment(source: &str, base_line: u32) -> Result<Vec<Token>, Error> {
 
 #[derive(Clone, Debug)]
 struct OutcomeAlt {
+    line: u32,
     alt: Alternative,
     status: Option<String>,
 }
@@ -1319,7 +1329,7 @@ struct OutcomeDecl {
 
 #[derive(Clone, Debug)]
 enum SurfaceContractEntry {
-    Alt(Alternative),
+    Alt(Alternative, u32),
     Group(String, u32),
 }
 
@@ -1341,6 +1351,9 @@ struct SurfaceVariantDecl {
 
 #[derive(Clone, Debug)]
 struct SurfaceBoundaryDecl {
+    body_end: u32,
+    contingency_line: u32,
+    end_line: u32,
     name: String,
     parameters: Vec<Parameter>,
     retains: Vec<String>,
@@ -1352,6 +1365,7 @@ struct SurfaceBoundaryDecl {
 
 #[derive(Clone, Debug)]
 struct SurfaceControl {
+    end_line: u32,
     name: String,
     public: bool,
     external: bool,
@@ -1391,7 +1405,7 @@ enum SurfaceOperand {
 #[derive(Clone, Debug)]
 enum SurfaceItem {
     Blank,
-    Comment(String),
+    Comment(SourceComment),
     Stmt(SurfaceStmt),
     Label {
         inline: bool,
@@ -1414,6 +1428,15 @@ enum Mask {
     },
     And(Box<Mask>, Box<Mask>),
     Or(Box<Mask>, Box<Mask>),
+}
+
+impl Mask {
+    fn line(&self) -> u32 {
+        match self {
+            Self::Path { line, .. } | Self::Not { line, .. } => *line,
+            Self::And(left, _) | Self::Or(left, _) => left.line(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1456,7 +1479,7 @@ struct LeaveOut {
 #[derive(Clone, Debug)]
 enum SurfaceStmt {
     Blank,
-    Comment(String),
+    Comment(SourceComment),
     Bind {
         line: u32,
         mutable: bool,
@@ -1822,6 +1845,7 @@ impl Parser {
     }
 
     fn outcome_alt(&mut self) -> Result<OutcomeAlt, Error> {
+        let line = self.line();
         let name = self.name("G2", "an alternative")?;
         let fields = self.fields("G2")?;
         let status = if self.eat(&Tok::MapsTo) {
@@ -1842,6 +1866,7 @@ impl Parser {
             None
         };
         Ok(OutcomeAlt {
+            line,
             alt: Alternative {
                 name,
                 fields,
@@ -1873,11 +1898,14 @@ impl Parser {
                 } else {
                     None
                 };
-                into.push(SurfaceContractEntry::Alt(Alternative {
-                    name,
-                    fields,
-                    condition,
-                }));
+                into.push(SurfaceContractEntry::Alt(
+                    Alternative {
+                        name,
+                        fields,
+                        condition,
+                    },
+                    line,
+                ));
             }
             if !self.eat(&Tok::Bar) {
                 break;
@@ -3264,7 +3292,7 @@ fn parse_raw_items(raw: Vec<RawItem>) -> Result<Vec<SurfaceItem>, Error> {
 #[derive(Clone, Debug)]
 enum TopDecl {
     Blank,
-    Comment(String),
+    Comment(SourceComment),
     Struct(StructDecl),
     Variant(SurfaceVariantDecl),
     Resource(ResourceDecl),
@@ -3360,14 +3388,20 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
             continue;
         }
         if raw.trim_start().starts_with("//!") {
-            decls.push(TopDecl::Comment(raw.to_string()));
+            decls.push(TopDecl::Comment(SourceComment {
+                line: line_no,
+                text: raw.to_string(),
+            }));
             index += 1;
             continue;
         }
         let (stripped, comment) = split_comment(raw);
         if stripped.trim().is_empty() {
             if let Some(c) = comment {
-                decls.push(TopDecl::Comment(format!("┄{}", c)));
+                decls.push(TopDecl::Comment(SourceComment {
+                    line: line_no,
+                    text: format!("┄{c}"),
+                }));
             }
             index += 1;
             continue;
@@ -3397,6 +3431,11 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
             let (cont_line, cont_raw) = lines[index];
             let cont_stripped = strip_comment(cont_raw);
             if cont_stripped.trim().is_empty() {
+                if cont_raw.starts_with("    ") && split_comment(cont_raw).1.is_some() {
+                    header.push('\n');
+                    index += 1;
+                    continue;
+                }
                 break;
             }
             if cont_stripped.starts_with("    ") {
@@ -3621,6 +3660,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
             if parser.peek() == &Tok::LeftBrace {
                 // Plain form ([G9]): `boundary name(...) { ... } contingency (m: string) { ... }`.
                 let body = parser.plain_body_items()?;
+                let body_end = parser.tokens[parser.pos - 1].line;
                 if parser.peek() == &Tok::End {
                     // `contingency` may begin on the next line in plain form.
                     while index < lines.len() && strip_comment(lines[index].1).trim().is_empty() {
@@ -3685,6 +3725,9 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                         );
                     }
                     decls.push(TopDecl::Boundary(SurfaceBoundaryDecl {
+                        body_end,
+                        contingency_line: cont_line,
+                        end_line: lines[index - 1].0,
                         name,
                         parameters,
                         retains,
@@ -3695,6 +3738,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                     }));
                     continue;
                 }
+                let cont_line = parser.line();
                 parser.expect(Tok::Contingency, "Y12", "`contingency`")?;
                 let cparams = parser.parameters("G12")?;
                 if cparams.len() != 1 {
@@ -3713,6 +3757,9 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                     );
                 }
                 decls.push(TopDecl::Boundary(SurfaceBoundaryDecl {
+                    body_end,
+                    contingency_line: cont_line,
+                    end_line: lines[index - 1].0,
                     name,
                     parameters,
                     retains,
@@ -3731,6 +3778,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                 );
             }
             let body = read_rails_body_lines(&lines, &mut index, &name, line_no, "Y12")?;
+            let body_end = lines[index - 1].0;
             // [Y12]: `contingency` follows at once, starting in column 1.
             if index >= lines.len() {
                 return fail(
@@ -3783,6 +3831,9 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                 "Y12",
             )?;
             decls.push(TopDecl::Boundary(SurfaceBoundaryDecl {
+                body_end,
+                contingency_line: cont_line,
+                end_line: lines[index - 1].0,
                 name,
                 parameters,
                 retains,
@@ -3973,6 +4024,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                 return fail(line_no, "G8", "an extern control has no body");
             }
             decls.push(TopDecl::Control(SurfaceControl {
+                end_line: lines[index - 1].0,
                 name,
                 public,
                 external: true,
@@ -3997,6 +4049,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                 return fail(parser.line(), "G9", "unexpected tokens after `}`");
             }
             decls.push(TopDecl::Control(SurfaceControl {
+                end_line: lines[index - 1].0,
                 name,
                 public,
                 external: false,
@@ -4028,6 +4081,7 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
         // Rails form ([Y3]): read lines until `╵` in column 1.
         let body = read_rails_body_lines(&lines, &mut index, &name, line_no, "Y3")?;
         decls.push(TopDecl::Control(SurfaceControl {
+            end_line: lines[index - 1].0,
             name,
             public,
             external: false,
@@ -4124,7 +4178,7 @@ impl Elaborator {
     ) -> Result<ResolvedContract, Error> {
         // [G2]: A contract that is one name declared as an outcome is that
         // declaration's contract.
-        if let [SurfaceContractEntry::Alt(single)] = entries
+        if let [SurfaceContractEntry::Alt(single, _)] = entries
             && single.fields.is_empty()
             && single.condition.is_none()
             && let Some(group_alts) = self.outcomes.get(&single.name)
@@ -4164,7 +4218,7 @@ impl Elaborator {
                         alternatives.push(alt.clone());
                     }
                 }
-                SurfaceContractEntry::Alt(alt) => {
+                SurfaceContractEntry::Alt(alt, _) => {
                     if alternatives.iter().any(|a| a.name == alt.name) {
                         return fail(
                             line,
@@ -8189,6 +8243,108 @@ pub fn elaborate(source: &str) -> Result<Program, Error> {
 // Stage 4: Canonical Rails formatter ([G10])
 // ---------------------------------------------------------------------------
 
+// The semantic tree drops trailing comments and trivia between arms. Keep the
+// source positions of printed nodes so this trivia follows its syntax when
+// plain braces become rails or a header changes its number of lines.
+#[derive(Default)]
+struct FormatLines {
+    text: Vec<String>,
+    // Pairs of zero-based source and output lines, in print order.
+    starts: Vec<(usize, usize)>,
+}
+
+impl FormatLines {
+    fn mark(&mut self, line: u32) {
+        let start = (line as usize - 1, self.text.len());
+        if self
+            .starts
+            .last()
+            .is_none_or(|&(s, d)| start.0 > s && start.1 > d)
+        {
+            self.starts.push(start);
+        }
+    }
+
+    fn push(&mut self, text: String) {
+        self.text.push(text);
+    }
+
+    fn with_comments(mut self, source: &str) -> Vec<String> {
+        let source: Vec<_> = source.lines().collect();
+        let end = self.text.len();
+        if self.starts.first() != Some(&(0, 0)) {
+            self.starts.insert(0, (0, 0));
+        }
+        self.starts.push((source.len(), end));
+        let mut before = vec![Vec::new(); end + 1];
+        for pair in self.starts.windows(2) {
+            let ((first, mut out), (until, limit)) = (pair[0], pair[1]);
+            for raw in &source[first..until] {
+                let (code, comment) = split_comment(raw);
+                if let Some(comment) = comment {
+                    let own_line = code
+                        .chars()
+                        .all(|c| c.is_whitespace() || matches!(c, '│' | '║' | '┆'));
+                    if own_line && out < limit && split_comment(&self.text[out]).1 == Some(comment)
+                    {
+                        // A comment represented by its own tree node, including //! directives.
+                        out += 1;
+                        continue;
+                    }
+                    if own_line || out == limit {
+                        let next = self.text.get(out).map(String::as_str).unwrap_or("");
+                        before[out].push(format!("{}┄{comment}", comment_prefix(next)));
+                        continue;
+                    }
+                    self.text[out].push_str(" ┄");
+                    self.text[out].push_str(comment);
+                }
+                out = (out + 1).min(limit);
+            }
+        }
+        // [Y12] requires the two bodies of a named boundary to touch.
+        // Plain form permits comments between them. Keep those comments at
+        // the end of the work body, after any comment on its closing brace.
+        for header in 1..end {
+            if !before[header].is_empty() && self.text[header].starts_with("contingency (") {
+                let close = header - 1;
+                if let Some(comment) = split_comment(&self.text[close]).1 {
+                    before[close].push(format!("│ ┄{comment}"));
+                    self.text[close] = "╵".to_owned();
+                }
+                for comment in std::mem::take(&mut before[header]) {
+                    before[close].push(format!("│ {comment}"));
+                }
+            }
+        }
+        let mut result = Vec::new();
+        for (mut comments, line) in before
+            .into_iter()
+            .zip(self.text.into_iter().map(Some).chain([None]))
+        {
+            result.append(&mut comments);
+            result.extend(line);
+        }
+        result
+    }
+}
+
+fn comment_prefix(next: &str) -> String {
+    let n = next
+        .find(|c: char| !matches!(c, '│' | '║' | '┆' | ' '))
+        .unwrap_or(next.len());
+    let (rail, rest) = next.split_at(n);
+    if rest.starts_with('╵') || rest.starts_with("╞═") {
+        format!("{rail}│ ")
+    } else if rest.starts_with("╠═") {
+        format!("{rail}║ ")
+    } else if !rail.is_empty() && !rail.ends_with(' ') {
+        format!("{rail} ")
+    } else {
+        rail.to_string()
+    }
+}
+
 /// Formats a Rails, word-form or plain-form surface program into canonical
 /// Rails glyph text ([G10]).
 pub fn format(source: &str) -> Result<String, Error> {
@@ -8196,17 +8352,18 @@ pub fn format(source: &str) -> Result<String, Error> {
     // surface text.
     let _ = elaborate(source)?;
     let top_decls = parse_surface_file(source)?;
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines = FormatLines::default();
 
     for decl in &top_decls {
         match decl {
             TopDecl::Blank => {
-                if lines.last().is_some_and(|l| !l.is_empty()) {
+                if lines.text.last().is_some_and(|l| !l.is_empty()) {
                     lines.push(String::new());
                 }
             }
             TopDecl::Comment(c) => {
-                lines.push(c.clone());
+                lines.mark(c.line);
+                lines.push(c.text.clone());
             }
             TopDecl::Struct(st) => {
                 format_struct(st, &mut lines);
@@ -8232,10 +8389,10 @@ pub fn format(source: &str) -> Result<String, Error> {
         }
     }
 
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
+    while lines.text.last().is_some_and(|l| l.is_empty()) {
+        lines.text.pop();
     }
-    let mut out = lines.join("\n");
+    let mut out = lines.with_comments(source).join("\n");
     out.push('\n');
     Ok(out)
 }
@@ -8270,7 +8427,8 @@ fn format_outcome_alt(oa: &OutcomeAlt) -> String {
     s
 }
 
-fn format_struct(st: &StructDecl, lines: &mut Vec<String>) {
+fn format_struct(st: &StructDecl, lines: &mut FormatLines) {
+    lines.mark(st.line);
     let mut head = String::new();
     if st.public {
         head.push_str("pub ");
@@ -8289,7 +8447,8 @@ fn format_struct(st: &StructDecl, lines: &mut Vec<String>) {
     lines.push(head);
 }
 
-fn format_variant(var: &SurfaceVariantDecl, lines: &mut Vec<String>) {
+fn format_variant(var: &SurfaceVariantDecl, lines: &mut FormatLines) {
+    lines.mark(var.line);
     let mut prefix = String::new();
     if var.public {
         prefix.push_str("pub ");
@@ -8314,7 +8473,8 @@ fn format_variant(var: &SurfaceVariantDecl, lines: &mut Vec<String>) {
     }
 }
 
-fn format_resource(res: &ResourceDecl, lines: &mut Vec<String>) {
+fn format_resource(res: &ResourceDecl, lines: &mut FormatLines) {
+    lines.mark(res.line);
     if res.on_fault_release {
         lines.push(format!("extern resource {} on fault release", res.name));
     } else {
@@ -8322,23 +8482,28 @@ fn format_resource(res: &ResourceDecl, lines: &mut Vec<String>) {
     }
 }
 
-fn format_boundary(bnd: &SurfaceBoundaryDecl, lines: &mut Vec<String>) {
+fn format_boundary(bnd: &SurfaceBoundaryDecl, lines: &mut FormatLines) {
+    lines.mark(bnd.line);
     let mut head = format!("boundary {}({})", bnd.name, format_params(&bnd.parameters));
     if !bnd.retains.is_empty() {
         head.push_str(&format!(" retains {}", bnd.retains.join(", ")));
     }
     lines.push(head);
     format_items(&bnd.body, "│ ", false, lines);
+    lines.mark(bnd.body_end);
     lines.push("╵".to_string());
+    lines.mark(bnd.contingency_line);
     lines.push(format!(
         "contingency ({}: {})",
         bnd.message.name, bnd.message.ty
     ));
     format_items(&bnd.contingency, "│ ", false, lines);
+    lines.mark(bnd.end_line);
     lines.push("╵".to_string());
 }
 
-fn format_outcome(outcome: &OutcomeDecl, lines: &mut Vec<String>) {
+fn format_outcome(outcome: &OutcomeDecl, lines: &mut FormatLines) {
+    lines.mark(outcome.line);
     let pub_prefix = if outcome.public { "pub " } else { "" };
     let alts: Vec<String> = outcome
         .alternatives
@@ -8352,13 +8517,15 @@ fn format_outcome(outcome: &OutcomeDecl, lines: &mut Vec<String>) {
     } else {
         lines.push(format!("{pub_prefix}outcome {}", outcome.name));
         for (idx, alt) in alts.iter().enumerate() {
+            lines.mark(outcome.alternatives[idx].line);
             let marker = if idx + 1 == alts.len() { "└" } else { "├" };
             lines.push(format!("{marker} {alt}"));
         }
     }
 }
 
-fn format_function(function: &Function, lines: &mut Vec<String>) {
+fn format_function(function: &Function, lines: &mut FormatLines) {
+    lines.mark(function.line);
     let mut s = format!(
         "function {}({})",
         function.name,
@@ -8374,7 +8541,7 @@ fn format_function(function: &Function, lines: &mut Vec<String>) {
 fn format_contract_entry(entry: &SurfaceContractEntry) -> String {
     match entry {
         SurfaceContractEntry::Group(group, _) => format!("…{group}"),
-        SurfaceContractEntry::Alt(alt) => {
+        SurfaceContractEntry::Alt(alt, _) => {
             let mut s = format!("{}{}", alt.name, format_fields(&alt.fields));
             if let Some(cond) = &alt.condition {
                 s.push_str(&format!(" ⇐ {cond}"));
@@ -8395,7 +8562,8 @@ fn format_surface_type(ty: &Type) -> String {
     }
 }
 
-fn format_control(control: &SurfaceControl, lines: &mut Vec<String>) {
+fn format_control(control: &SurfaceControl, lines: &mut FormatLines) {
+    lines.mark(control.line);
     let mut head = String::new();
     if control.public {
         head.push_str("pub ");
@@ -8462,10 +8630,13 @@ fn format_control(control: &SurfaceControl, lines: &mut Vec<String>) {
             let any_cond = entries.iter().any(|e| {
                 matches!(
                     e,
-                    SurfaceContractEntry::Alt(Alternative {
-                        condition: Some(_),
-                        ..
-                    })
+                    SurfaceContractEntry::Alt(
+                        Alternative {
+                            condition: Some(_),
+                            ..
+                        },
+                        _
+                    )
                 )
             });
             let contract_one_line = format!("■ {}", formatted_entries.join(" │ "));
@@ -8489,6 +8660,9 @@ fn format_control(control: &SurfaceControl, lines: &mut Vec<String>) {
                     lines.push(format!("    {pre}"));
                 }
                 for (idx, entry_str) in formatted_entries.iter().enumerate() {
+                    let (SurfaceContractEntry::Alt(_, line) | SurfaceContractEntry::Group(_, line)) =
+                        &entries[idx];
+                    lines.mark(*line);
                     let mut entry_line = format!("    ■ {entry_str}");
                     if idx + 1 == formatted_entries.len()
                         && let Some(uses) = &uses_part
@@ -8510,6 +8684,7 @@ fn format_control(control: &SurfaceControl, lines: &mut Vec<String>) {
 
     if !control.external {
         format_items(&control.body, "│ ", false, lines);
+        lines.mark(control.end_line);
         lines.push("╵".to_string());
     }
 }
@@ -9015,7 +9190,7 @@ fn is_inline_test_stmt(stmt: &SurfaceStmt) -> bool {
     }
 }
 
-fn format_items(items: &[SurfaceItem], prefix: &str, in_loop: bool, lines: &mut Vec<String>) {
+fn format_items(items: &[SurfaceItem], prefix: &str, in_loop: bool, lines: &mut FormatLines) {
     let mut idx = 0usize;
     while idx < items.len() {
         match &items[idx] {
@@ -9024,7 +9199,8 @@ fn format_items(items: &[SurfaceItem], prefix: &str, in_loop: bool, lines: &mut 
                 idx += 1;
             }
             SurfaceItem::Comment(c) => {
-                lines.push(format!("{prefix}┄{c}"));
+                lines.mark(c.line);
+                lines.push(format!("{prefix}┄{}", c.text));
                 idx += 1;
             }
             SurfaceItem::Stmt(stmt) => {
@@ -9070,9 +9246,11 @@ fn format_items(items: &[SurfaceItem], prefix: &str, in_loop: bool, lines: &mut 
                         .collect();
                     let max_mask = masks.iter().map(|m| m.chars().count()).max().unwrap_or(0);
                     for (offset, mask_str) in masks.iter().enumerate() {
-                        let SurfaceItem::Label { body: b, .. } = &items[start + offset] else {
+                        let SurfaceItem::Label { body: b, mask, .. } = &items[start + offset]
+                        else {
                             unreachable!();
                         };
+                        lines.mark(mask.line());
                         let stmts: Vec<String> = b.iter().map(format_simple_stmt_inline).collect();
                         let pad = " ".repeat(max_mask.saturating_sub(mask_str.chars().count()));
                         lines.push(format!(
@@ -9083,6 +9261,7 @@ fn format_items(items: &[SurfaceItem], prefix: &str, in_loop: bool, lines: &mut 
                     idx = end;
                 } else {
                     let label_prefix = replace_last_segment_with_label(prefix, in_loop);
+                    lines.mark(mask.line());
                     let mask_str = format_mask(mask);
                     lines.push(format!("{label_prefix}{mask_str}"));
                     let dash_prefix = format!("{prefix}┆ ");
@@ -9106,13 +9285,42 @@ fn replace_last_segment_with_label(prefix: &str, in_loop: bool) -> String {
     format!("{prefix}╞═ ")
 }
 
-fn format_stmt(stmt: &SurfaceStmt, prefix: &str, lines: &mut Vec<String>) {
+fn format_stmt(stmt: &SurfaceStmt, prefix: &str, lines: &mut FormatLines) {
+    match stmt {
+        SurfaceStmt::Bind { line, .. }
+        | SurfaceStmt::Unpack { line, .. }
+        | SurfaceStmt::Capture { line, .. }
+        | SurfaceStmt::Assign { line, .. }
+        | SurfaceStmt::AssignPlace { line, .. }
+        | SurfaceStmt::Oblige { line, .. }
+        | SurfaceStmt::Test { line, .. }
+        | SurfaceStmt::Decide { line, .. }
+        | SurfaceStmt::Forward { line, .. }
+        | SurfaceStmt::Call { line, .. }
+        | SurfaceStmt::Spawn { line, .. }
+        | SurfaceStmt::Cancel { line, .. }
+        | SurfaceStmt::MethodCall { line, .. }
+        | SurfaceStmt::Loop { line, .. }
+        | SurfaceStmt::ForAll { line, .. }
+        | SurfaceStmt::Supervise { line, .. }
+        | SurfaceStmt::Again { line, .. }
+        | SurfaceStmt::Leave { line, .. }
+        | SurfaceStmt::Exit { line, .. }
+        | SurfaceStmt::ExitOutcome { line, .. }
+        | SurfaceStmt::Fault { line, .. }
+        | SurfaceStmt::Terminate { line, .. }
+        | SurfaceStmt::Escalate { line, .. }
+        | SurfaceStmt::Recover { line, .. }
+        | SurfaceStmt::Impossible { line, .. } => lines.mark(*line),
+        SurfaceStmt::Blank | SurfaceStmt::Comment(_) => {}
+    }
     match stmt {
         SurfaceStmt::Blank => {
             lines.push(prefix.trim_end().to_string());
         }
         SurfaceStmt::Comment(c) => {
-            lines.push(format!("{prefix}┄{c}"));
+            lines.mark(c.line);
+            lines.push(format!("{prefix}┄{}", c.text));
         }
         SurfaceStmt::Test {
             inline,
@@ -9183,6 +9391,7 @@ fn format_stmt(stmt: &SurfaceStmt, prefix: &str, lines: &mut Vec<String>) {
                 .unwrap_or(0);
 
             for (idx, (arm, arm_head)) in arms.iter().zip(&arm_heads).enumerate() {
+                lines.mark(arm.line);
                 let is_last = idx + 1 == arms.len();
                 let marker = if is_last { "└" } else { "├" };
                 match &arm.target {

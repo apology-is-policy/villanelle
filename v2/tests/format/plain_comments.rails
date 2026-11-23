@@ -1,0 +1,20 @@
+// P1 before
+extern control ask(x: u32) exits a {v: u32} | b
+
+control go(n: u32) exits done {out: u32} | failed {
+    // P2 first in body
+    mutable x: u32 := n + 1   // P3 trailing
+
+    // P4 after a blank line
+    delta ask(x) {
+        // P5 inside arms
+        a {v} => { exit done {v} },   // P6 trailing on arm
+        b
+    }
+    [b]: {
+        // P7 inside label block
+        exit failed
+    }
+    // P8 last
+}
+// P9 after

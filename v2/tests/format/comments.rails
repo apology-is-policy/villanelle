@@ -1,0 +1,35 @@
+┄ C1 top-level before declaration
+extern control ask(x: u32) ■ a {v: u32} │ b │ c ┄ C2 trailing on extern
+
+pub outcome err ┄ C3 trailing on outcome header
+├ bad {code: u32} ┄ C4 trailing on alternative
+┄ C5 between alternatives
+└ late
+
+control go(n: u32) ┄ C6 trailing on signature line
+    ■ done {out: u32} ┄ C7 trailing on contract continuation
+    ■ failed
+│ ┄ C8 first line of body
+│ x: u32 := n + 1 ┄ C9 trailing on a statement
+│ Δ ask(x) ┄ C10 trailing on a decision header
+│ ┄ C11 between header and arms
+│ ├ a {v} → ┄ C12 trailing on an arm that opens a block
+│ │ ┆ ┄ C13 inside an arm block
+│ │ ┆ ■ done {v}
+│ ┄ C14 between arms
+│ ├ b ┄ C15 trailing on an arm
+│ └ c → ■ failed
+│
+│ ? x > 3 → ┄ C16 trailing on a test header
+│ ┆ ┄ C17 inside a test block
+│ ┆ ■ failed
+│ ↻ spin(i: u32 := 0) ┄ C18 trailing on a loop header
+│ ║ ┄ C19 inside a loop
+│ ║ ? i = 3 → □ ┄ C20 trailing in a loop
+│ ║ ↑ spin(i + 1)
+╞═ b ┄ C21 trailing on a label
+│ ┆ ┄ C22 inside a label block
+│ ┆ ■ failed
+│ ■ done {x} ┄ C23 trailing on last statement
+╵
+┄ C24 after the body

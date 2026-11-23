@@ -582,15 +582,15 @@ fn g10_formatter_canonical_rails_idempotence_and_semantic_equivalence() {
             orig_core, fmt_core,
             "{name}: formatting changed elaborated core program"
         );
-        // `show_file.rails`, `groups_and_auto.rails`, and `loops_and_paths.rails`
-        // are written entirely in canonical Rails form and must be fixed points.
-        if name != "spend.rails" {
-            assert_eq!(
-                source, formatted,
-                "{name} is not in canonical Rails form ([G10])"
-            );
-        }
+        assert_eq!(
+            source, formatted,
+            "{name} is not in canonical Rails form ([G10])"
+        );
     }
+    assert_eq!(
+        surface::format(include_str!("format/spend_mixed.rails")).unwrap(),
+        include_str!("slice1_surface/spend.rails"),
+    );
 
     // [G10] accepting: word-form ([G8]) and plain braced form ([G9]) format into
     // canonical Rails glyph form with aligned arrows and aligned short labels.
@@ -733,4 +733,64 @@ pub control bad_route(x: u32) ■ done
     assert_eq!(elab_u17.warnings.len(), 1);
     assert_eq!(elab_u17.warnings[0].clause, "U17");
     assert!(elab_u17.warnings[0].message.contains("unused_path"));
+}
+
+#[test]
+fn g10_keeps_comments_in_order_through_layout_changes() {
+    let rails = include_str!("format/comments.rails");
+    let plain = include_str!("format/plain_comments.rails");
+    for (source, marker) in [(rails, '┄'), (plain, '/')] {
+        let comments: Vec<_> = source
+            .lines()
+            .filter_map(|line| {
+                let (_, comment) = line.split_once(marker)?;
+                Some(comment.trim_start_matches('/').trim())
+            })
+            .collect();
+        let printed = surface::format(source).unwrap();
+        let kept: Vec<_> = printed
+            .lines()
+            .filter_map(|line| {
+                let (_, comment) = line.split_once('┄')?;
+                Some(comment.trim())
+            })
+            .collect();
+        assert_eq!(kept, comments);
+        assert_eq!(surface::format(&printed).unwrap(), printed);
+        assert_eq!(
+            surface::elaborate(source).unwrap().print(),
+            surface::elaborate(&printed).unwrap().print()
+        );
+    }
+
+    // A comment cannot take the place of the required last decision arm.
+    let invalid = rails.replace("│ └ c → ■ failed", "│ ┄ └ c → ■ failed");
+    assert!(surface::format(&invalid).is_err());
+}
+
+#[test]
+fn g10_keeps_comments_on_folded_lines_and_delimiters() {
+    let source = r#"control f(s: string) ■ done
+│ x: string := "// not a comment ┄ either" // same
+│ n: u32 := 1 + // same
+│     2 // sum
+│ ■ done // end
+╵ // close
+"#;
+    let printed = surface::format(source).unwrap();
+    assert_eq!(printed.matches("┄ same").count(), 2);
+    assert!(printed.contains("\"// not a comment ┄ either\" ┄ same"));
+    assert!(printed.contains("│ ┄ sum\n│ ■ done ┄ end\n╵ ┄ close"));
+    assert_eq!(surface::format(&printed).unwrap(), printed);
+
+    let plain = include_str!("format/plain_comments.rails");
+    assert!(surface::format(plain).unwrap().contains("│ ┄ P8 last\n╵"));
+}
+
+#[test]
+fn g10_keeps_plain_boundary_comments_next_to_the_work_body() {
+    let source = "boundary guard() {\n    terminate\n} // work closed\n// between\ncontingency (m: string) {\n    terminate\n} // handler closed\n";
+    let printed = surface::format(source).unwrap();
+    assert!(printed.contains("│ ┄ work closed\n│ ┄ between\n╵\ncontingency"));
+    assert_eq!(surface::format(&printed).unwrap(), printed);
 }
