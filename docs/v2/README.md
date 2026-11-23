@@ -11,13 +11,14 @@ v1, the language and compiler at 0.306, is described by the
 
 | Document | Deliverable | State |
 | --- | --- | --- |
-| [Core calculus](core.md) | The core language, its instrumented semantics, the checker's judgments, and the claims to test and mechanize | Draft 2, accepted. The synchronous language has two reviews folded in. Tasks and named boundaries were read by the combined review, which found four programs that the task rules accepted and the semantics left stuck, and no checking rule for named boundaries; the implementation of slice 4 folded three further repairs into `[W11]`, `[E-AwaitHost]`, `[TK6]` and `[I10]` (`core.md` section 12). An independent second review of the task rules is still owed. Records the decisions on Q1 to Q5 and Q18. |
+| [Core calculus](core.md) | The core language, its instrumented semantics, the checker's judgments, and the claims to test and mechanize | Draft 2, accepted. The synchronous language has two reviews folded in. Tasks and named boundaries were read by the combined review, which found four programs that the task rules accepted and the semantics left stuck, and no checking rule for named boundaries; the implementation of slice 4 folded three further repairs into `[W11]`, `[E-AwaitHost]`, `[TK6]` and `[I10]` (`core.md` section 12). The independent second review of the task rules ([task-review.md](task-review.md), 23 November 2026) found them right and four further defects open. Records the decisions on Q1 to Q5 and Q18. |
 | [Fact logic](facts.md) | The interpreted fragment behind `⊨`, the decision procedure, certificates, counterexamples, worked examples | Draft 1, accepted; two reviews folded in. Records the decisions on Q6 to Q10. The corpus added the length of a vector literal. |
 | [Reference model](references.md) | Second-class borrows and views: the model, 36 worked examples in Rails and core form with verdicts, the tag semantics on an example | Draft 1, accepted; one review folded in, which found the 36 verdicts to agree with their clauses. Records the decisions on Q16 and Q17. |
 | [Surface](surface.md) | The Rails grammar, layout, and the elaboration into the core, including the acknowledgement rule and outcome groups | Draft 1, accepted, with the task forms of the core's draft 2 and the forms the corpus needed (traits, named boundaries, `copy` types); one review folded in. Records the decisions on Q11 to Q15 and Q19. |
 | [Corpus on paper](corpus.md) | The settings application, the eight collection modules and three new programs, rewritten by hand, with counts and findings | Draft 1, accepted; checked by hand and read by one review, which found no error in the programs. Library 476 to 231 lines, application 635 to 304, no filler arm; thirteen gaps repaired in the other documents, thirteen limits left open. |
 | [Oracle](oracle.md) | Phases 2, 3 and 4: the instrumented semantics, the Rails surface reader, elaborator and formatter, the certificate-producing checker, call expansion (Theorem 4) and the typed LLVM IR and C ABI backend (the crate `v2/`), with the conformance suite | **Under requalification.** Code exists for slices 1 to 3 through oracle, checker and backend, and for slice 4 in the oracle. No slice meets its exit: the oracle of slice 1 is qualified, and the rest is draft. Slice 1 is being requalified first. |
-| [Review](review.md) | What the implementation of 21 and 22 November is verified to do, the findings against it with reproductions, what each slice still owes, and the course | Open, 23 November 2026. One finding closed. |
+| [Review](review.md) | What the implementation of 21 and 22 November is verified to do, the findings against it with reproductions, what each slice still owes, and the course | Open, 23 November 2026. Its section 9 has the state of each finding. |
+| [Second review of the task rules](task-review.md) | An independent reading of the task rules of the core and the fact logic against the semantics, with probes of the oracle of slice 4 | 23 November 2026. Four findings, RT1 to RT4, open for slice 4; the repairs of 22 November hold up. |
 | [Reading and repair test](reading-test.md) | v1 and v2 versions of the same programs, given to people and to agents | First run with agents done: 24 runs, 23 fully correct, so no difference between the versions is shown on reading. The repair needs 8 edits in v2 against 14. People have not taken it. |
 
 ## Acceptance
@@ -38,7 +39,9 @@ Three things were open at acceptance, and the author accepted with them named:
   folded three further repairs into `[W11]`, `[E-AwaitHost]`, `[TK6]`
   (`core.md` section 12) and `[I10]` (`facts.md`). They read as correct and
   stay, but they were made by the implementation and no review was written
-  ([review](review.md), RD2). An independent review is still owed.
+  ([review](review.md), RD2). The independent review was made on 23
+  November 2026 ([task-review.md](task-review.md)): the repairs hold up,
+  and four findings of its own, RT1 to RT4, are open for slice 4.
 - **Workarounds.** The plan's exit asks that the corpus show no construct that
   v2 cannot express without a workaround. Three of the thirteen open limits of
   the [corpus](corpus.md) (section 6.2) are workarounds until phase 5:
@@ -147,4 +150,5 @@ Items 9 to 16 were written on 21 and 22 November. The [review](review.md) of
     a real generator for slice 1 and fuzzing with it; the kernel and the
     decision procedure brought to the fact logic; slices 2, 3 and 4 in order
     with a test for each clause; the reader extended until the corpus runs;
-    an independent second review of the task rules (in progress).
+    an independent second review of the task rules (in progress; the
+    review of the task rules is [task-review.md](task-review.md)).

@@ -23,8 +23,10 @@ checking rule. The repairs are in [TK3] to [TK6], [E-Await], [E-AwaitHost],
 implementation of the task slice folded three further repairs into [W11],
 [E-AwaitHost], [TK6] and [I10] (section 12); the entries there call their
 source a second review, but it was made by the implementation and left no
-written record, so an independent second review of the task rules is still
-owed ([review](review.md), RD2). The author has answered the five questions
+written record. The independent second review of the task rules was made on
+23 November 2026 ([task-review.md](task-review.md)); it found the repairs
+right and four further defects, RT1 to RT4, which are open
+([review](review.md), section 9). The author has answered the five questions
 that draft 1 raised (section 11).
 
 [Index of the v2 design](README.md) · [Fact logic](facts.md) ·
