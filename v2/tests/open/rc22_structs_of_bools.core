@@ -1,0 +1,73 @@
+// Open finding RC22 of docs/v2/review.md: a valid program, written by the
+// generator of slice 2 (seed 23 on 23 November 2026, with resources and
+// captured outcomes), on which the checker gives no answer in two minutes.
+// No run of it is stuck. No test reads this file.
+struct st0 {m0 : bool}
+
+function f0(a0 : usize, a1 : i16, a2 : i16) ⊢ a0 < 9 : u32 := 8 mod 7
+
+function f1(a0 : bool) : u32 := (5 + 0) ÷ 3 + 3 mod 7 * (8 mod 9)
+
+extern control e0(p0 : string, p1 : i16) ■ { more {r0 : i16} ⇐ p1 < -32767 │ ok {r0 : [u32]} ⇐ ¬(p1 < -32767) }
+
+extern control e1(p0 : u32) ■ { low {} │ ok {r0 : i32, r1 : u32} ⇐ r1 ≤ 61 │ hit {} }
+
+control c0(p0 : st0) ■ { done {r0 : bool, r1 : st0} }
+⊤ ▷ t1 : ? 0 > 8 mod 7
+⊤ ▷ t2 : ? true
+t2.false ▷ ⊥
+⊤ ▷ st0 {v3} := p0
+⊤ ▷ ~v4 := capture e0("hello", 0 ÷ 3)
+⊤ ▷ v5 := 1 mod 8 - 0 ÷ 6 + 1
+⊤ ▷ d8 : Δ outcome(▾v4) ▸ more {v6} │ ok {v7}
+⊤ ▷ ■ done {v5 < 1 ∧ v5 ≥ v5 ∨ v5 ÷ 4 ≥ 1, st0 {¬(5 ≠ 6)}}
+
+control c1(p0 : i16, p1 : u32) ⊢ p1 ≥ 1 ■ { high {} │ right {r0 : string} }
+⊤ ▷ s1 : ↻ l2(i3 : u64 := 0) {
+    ⊢ i3 ≤ 1
+    ⊤ ▷ t4 : ? i3 ≠ 1
+    t4.false ▷ ■ right {""}
+    t4.true ▷ st0 {v5} := st0 {p1 = 6}
+    t4.true ▷ st0 {v6} := st0 {p0 > -32763 ∧ i3 ≥ i3}
+    t4.true ∨ t4.true ▷ d7 : Δ e1(p1) ▸ low {} │ ok {v8, v9} │ hit {}
+    t4.true ∨ t4.true ▷ ~v10 : i16 ⇀ i16 := ∅
+    t4.true ▷ v11 : [st0] := [st0 {p1 = 7}, st0 {0 > i3}, st0 {i3 ≤ i3}]
+    t4.true ▷ v12 : i64 := -2 mod 8
+    t4.true ▷ □ more {v11, v12}
+} ▸ more {v13, v14}
+⊤ ▷ ~v15 : i32 := 3
+⊤ ▷ ⊢ v15 = 3
+s1.more ∨ s1.more ▷ ~v16 : i32 := (v15 + (v15 - v15)) mod 3
+⊤ ▷ st0 {v17} := st0 {0 ≤ 4}
+⊤ ▷ t18 : ? true ∧ v17
+t18.false ▷ ⊥
+⊤ ▷ v19 := f1(-2 ≤ v15 ÷ -3)
+t18.true ▷ s20 : ↻ l21(i22 : u64 := 0) {
+    ⊢ i22 < 3
+    ⊤ ▷ t23 : ? 2 > i22
+    t23.false ∨ t23.false ▷ v24 : string := "ok"
+    t23.false ∧ s1.more ▷ v25 : i8 := 6
+    t23.false ∧ s1.more ▷ □ miss {p0, v25}
+    ⊤ ▷ d26 : Δ c0(st0 {¬(v14 ≤ v14)}) ▸ done {v27, v28}
+    ¬t23.false ▷ t29 : ? ¬(p0 ≠ 32767)
+    ¬t23.false ▷ v30 := st0 {7 mod 5 * (8 mod 7) ≠ 8}
+    ⊤ ▷ ↑ l21(i22 + 1)
+} ▸ miss {v31, v32}
+s1.more ∧ t18.true ▷ t33 : ? v19 mod 2 > v19 * 3 - p1 mod 5 * (v19 mod 7)
+s1.more ∧ t18.true ∧ t33.true ▷ ⊥
+s1.more ∧ t18.true ▷ v15 ← (v15 ÷ 16 + v16 mod 4) ÷ -1
+s1.more ∧ t18.true ▷ v15 ← v15 ÷ 100 * 0 ÷ -4 mod 3 * (v16 mod 8 * (-9 mod -3 mod 4) mod 2)
+s1.more ∧ t18.true ▷ s34 : ↻ l35(i36 : u32 := 0) {
+    ⊤ ▷ t37 : ? i36 < 4
+    ⊤ ▷ st0 {v38} := st0 {¬(v31 < -32768)}
+    t37.true ∨ t37.true ▷ t39 : ? p0 > p0
+    t37.true ∨ t37.true ▷ d40 : Δ e1(v19 - 0) ▸ low {} │ ok {v41, v42} │ hit {}
+    t37.true ∨ t37.true ▷ v43 : string ⇀ st0 := ∅
+    t37.true ∨ t37.true ▷ ~v44 : outcome⟨e0⟩ := capture e0("b", v31)
+    t37.true ∧ t39.true ▷ v45 : string := "ok"
+    ⊤ ▷ v46 : string := ""
+    t37.true ▷ d49 : Δ outcome(▾v44) ▸ more {v47} │ ok {v48}
+    ⊤ ▷ □ more {v46}
+} ▸ more {v50}
+⊤ ▷ v15 ← 6 * -1 - v15
+⊤ ▷ ■ high {}

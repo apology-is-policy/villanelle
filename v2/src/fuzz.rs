@@ -33,7 +33,7 @@ use crate::rng::{Rng, mix};
 use crate::{resolve, text};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -123,11 +123,15 @@ pub fn checker(source: &str, seconds: u64) -> Checked {
 }
 
 /// As [`checker`], with the work of the search. A check runs on a thread of
-/// its own, so the counts of that thread are the counts of the check.
+/// its own, so the counts of that thread are the counts of the check. The
+/// check ends when its time is up ([`counts::set_deadline`]): one that went
+/// on after nobody waits for it would take the processor, and memory where
+/// its diagrams grow.
 pub fn checker_with_counts(source: &str, seconds: u64) -> (Checked, Counts) {
     let (sender, receiver) = mpsc::channel();
     let source = source.to_string();
     std::thread::spawn(move || {
+        counts::set_deadline(Some(Instant::now() + Duration::from_secs(seconds)));
         let answer = std::panic::catch_unwind(|| match crate::load(&source) {
             Ok(program) => match check::check(&program) {
                 Ok(_) => Checked::Accepted,
@@ -136,6 +140,9 @@ pub fn checker_with_counts(source: &str, seconds: u64) -> (Checked, Counts) {
             Err(error) => Checked::Rejected(format!("not resolved: {error}")),
         });
         let answer = answer.unwrap_or_else(|panic| {
+            if panic.is::<counts::OutOfTime>() {
+                return Checked::TimedOut;
+            }
             let message = panic
                 .downcast_ref::<String>()
                 .cloned()
@@ -143,10 +150,19 @@ pub fn checker_with_counts(source: &str, seconds: u64) -> (Checked, Counts) {
                 .unwrap_or_else(|| "a panic without a message".to_string());
             Checked::Panicked(message)
         });
-        let _ = sender.send((answer, counts::now()));
+        // The work of a check that gave no answer depends on the clock, and
+        // is not counted.
+        let work = if answer == Checked::TimedOut {
+            Counts::default()
+        } else {
+            counts::now()
+        };
+        let _ = sender.send((answer, work));
     });
+    // The check ends itself where the search asks for the time; this is for
+    // a stretch of it that does not ask.
     receiver
-        .recv_timeout(Duration::from_secs(seconds))
+        .recv_timeout(Duration::from_secs(seconds.saturating_add(30)))
         .unwrap_or((Checked::TimedOut, Counts::default()))
 }
 

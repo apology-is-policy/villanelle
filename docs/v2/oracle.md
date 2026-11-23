@@ -374,13 +374,44 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   index in range; preconditions on the length of a vector; and `&τ` and
   `&~τ` parameters of extern controls. A program of slice 1 is unchanged by
   this: the generator draws nothing more for it, and the programs of 600
-  seeds were compared text for text. It does not write resources, captured
-  outcomes, faults or boundaries yet. `generate::DATA_CONSTRUCTS` lists the
-  52 constructs of the slice, and a campaign names those it did not reach.
+  seeds were compared text for text. It does not write faults or
+  boundaries yet. `generate::DATA_CONSTRUCTS` lists the 52 constructs of
+  the slice, and a campaign names those it did not reach.
   `v2/tests/harness.rs` runs 160 seeds in the two semantics and asks the
-  checker about 30; over 300 seeds `vn2 fuzz --slice 2` gives 11,836 runs
-  with no stuck run and no difference, and the checker accepts 299 programs
-  and does not answer on one (review finding RC22).
+  checker about 28; over 900 seeds `vn2 fuzz --slice 2` gives
+  37,340 runs with no stuck run and no difference, and the
+  checker accepts 897 programs and does not answer on
+  three in ten seconds (review finding RC22).
+- **Obligations in generated programs.** A program with data declares up to
+  two resources, and for each a contingent extern control that takes a
+  value of it and ends it. A value of kind `must` ([T1]) is a resource, a
+  struct or a variant that holds one, or a captured outcome. It comes from
+  the payload of a decision, from a parameter or from `x := capture f(ō)`,
+  and it moves like other data: into a name, a constructor, a payload, an
+  operand, a parameter of a loop. A name that holds one is lent as `&x` and
+  is never a temporary ([O3a]); it is assigned only where its value has
+  moved on every history ([O4]). Before every terminator the generator
+  discharges what the histories of its selector still hold in the scopes
+  that the terminator ends ([O5]): all bodies of the control for `■`, the
+  loop body for `□`, the bodies up to the loop for `↑ ℓ`. It closes a
+  resource, takes a struct apart, and decides on a variant or on a captured
+  outcome, until nothing is held. Where only some of the histories hold a
+  name, the statement stands under the selector and one more atom that
+  picks them, or under every atom of one history. The expressions of the
+  terminator are written first, since they may give an obligation away, and
+  they read nothing of a name that holds one. A loop is entered only where
+  every obligation is held by all of the histories that enter or by none:
+  the others are discharged before it, since its body could not end them.
+  Inside a body, a name of a body around it is not consumed ([O6]), except
+  before `■` and before the `↑` of a loop further out, which end its scope.
+  One alternative of every contract and of every loop has no obligation in
+  its payload, so that a history can end whatever it holds. A captured
+  outcome keeps, for each history, the intervals of the arguments at its
+  capture; a decision on it gives each alternative what the conditions of
+  the captured operation say over them ([I12]), and what they say over
+  names of which nothing is known once the outcome has passed through a
+  loop. No value of an outcome type crosses a contract (review finding
+  RG7).
 - **Fuzzing (`fuzz`, `vn2 fuzz`).** `vn2 fuzz --seed N --count N` takes the
   program of each seed through the reader, the oracle and the erased
   semantics on entries that satisfy its precondition, and asks the checker.
@@ -401,7 +432,12 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   first 25 programs, `resolve` refuses 285, the checker rejects
   1,052 (a stuck run was found for 761 of them) and accepts
   4,066, none of which has a stuck run among those tried. The time
-  limit of the checker is of the clock. On a machine under load, a campaign
+  limit of the checker is of the clock. A check that reaches it ends
+  (`counts::set_deadline`: the search asks for the time now and then, and
+  so does the diagram package as a diagram grows); before 23 November it
+  went on in its thread after the campaign had stopped waiting, and on a
+  program of review finding RC22 it took 800 megabytes of memory in five
+  seconds. On a machine under load, a campaign
   with a limit of four seconds reported four mutants as unanswered that the
   checker accepts in a third of a second; the numbers here are of a campaign
   with the limit of 20 seconds. `the_checker_accepts_generated_valid_programs`
@@ -1050,6 +1086,14 @@ Two smaller findings went with them.
   diagram of its own, and is entered on every history or on none, by
   whether a statement of `B₁` that no lexical boundary encloses may fault
   on a history that can happen (`work_can_fault`).
+- **A captured outcome whose capture is not visible** (RC23, [I12]). The
+  record of a capture is kept for the histories that saw it. On the others,
+  where the outcome arrived as a parameter of a control or of a loop or as
+  the payload of a loop, a decision on it now adds the conditions of the
+  captured operation over fresh names: one for each parameter, of the type
+  of the parameter, and a second one for `old(p)` where the parameter is
+  `&~`. The operation is the control that the outcome type names
+  (`outcome_control`).
 
 ## 14. Slice 2 Phase 4: Call Expansion and Typed LLVM IR Backend for Data, Resources, and Boundaries
 

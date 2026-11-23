@@ -99,6 +99,10 @@ pub const CONSTRUCTS: [&str; 61] = [
     "binary-mod",
 ];
 
+/// The resources of an entry are numbered from here on. A host numbers the
+/// ones it opens from 1, and a handle is given once ([E-Host]).
+const ENTRY_RESOURCES: u64 = 1_000_000;
+
 /// The constructs that slice 2 adds: the data, its operations, resources,
 /// captured outcomes, faults and boundaries.
 pub const DATA_CONSTRUCTS: [&str; 52] = [
@@ -1475,8 +1479,9 @@ pub fn entry_runs(
             None => vec![(None, None); control.parameters.len()],
         };
         let mut found = 0;
-        // The resources that an entry is given are open, each its own.
-        let mut resources = 0;
+        // The resources that an entry is given are open, each its own, and
+        // numbered apart from those that a host opens.
+        let mut resources = ENTRY_RESOURCES;
         for _ in 0..each * 24 {
             if found == each {
                 break;

@@ -88,6 +88,11 @@ impl Bdd {
         let id = self.nodes.len() + 2;
         self.nodes.push(node);
         self.unique.insert(node, id);
+        // A diagram that grows takes time and memory that no count of the
+        // search shows; a check that has a time to end by asks here.
+        if id.is_multiple_of(16_384) {
+            crate::counts::keep_time();
+        }
         id
     }
 

@@ -15,14 +15,25 @@
 //! and [`Ctx`] is the state of the names while one is written: a name that
 //! an operand has consumed is gone for the operands after it, and a name
 //! that an operand lends is not consumed by another.
+//!
+//! A value of kind `must` is an obligation ([T1]): a resource, a struct or
+//! a variant that holds one, a captured outcome. It comes from the payload
+//! of a decision, from a parameter or from a capture, and a history ends
+//! only where none is left ([O5]). So before every terminator the generator
+//! discharges what the histories of its selector still hold in the scopes
+//! that the terminator ends ([`Generator::settle`]): a resource by the
+//! contingent operation that closes it, a struct by taking it apart, a
+//! variant or a captured outcome by a decision on it. Where only some of
+//! the histories hold a name, the statement stands under a selector that
+//! picks those.
 
 use super::{
-    Arm, BTreeSet, BorrowMode, CallMode, Command, Declaration, Env, Expr, Generator, IntType, Know,
-    POS, Path, Range, Selector, SiteInfo, Slot, Tri, Type, Val, add, and_selector, bin, int, name,
-    subtract,
+    AltSig, Arm, BTreeSet, BorrowMode, CallMode, Command, Control, Declaration, Env, Expr,
+    Generator, IntType, Know, POS, ParamInfo, Path, Range, Selector, Sig, SiteInfo, Slot, Tri,
+    Type, Val, add, and_selector, bin, int, name, subtract,
 };
 use crate::syntax::{
-    Binary, Parameter, Place, PlaceStep, StructDecl, VariantConstructor, VariantDecl,
+    Binary, Parameter, Place, PlaceStep, ResourceDecl, StructDecl, VariantConstructor, VariantDecl,
 };
 
 const STRINGS: [&str; 6] = ["", "a", "b", "ok", "hello", "key"];
@@ -49,14 +60,27 @@ pub(super) struct VariantInfo {
     pub(super) constructors: Vec<(String, Vec<(String, Type)>)>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct ResourceInfo {
+    pub(super) name: String,
+    /// The contingent operation that takes a value of the resource and
+    /// ends it.
+    pub(super) closer: String,
+}
+
 /// The types that the program declares.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Types {
+    pub(super) resources: Vec<ResourceInfo>,
     pub(super) structs: Vec<StructInfo>,
     pub(super) variants: Vec<VariantInfo>,
 }
 
 impl Types {
+    pub(super) fn resource(&self, name: &str) -> Option<&ResourceInfo> {
+        self.resources.iter().find(|info| info.name == name)
+    }
+
     pub(super) fn structure(&self, name: &str) -> Option<&StructInfo> {
         self.structs.iter().find(|info| info.name == name)
     }
@@ -146,6 +170,7 @@ fn held(ty: &Type, know: Know) -> Know {
 }
 
 /// The names while one statement is written.
+#[derive(Clone)]
 pub(super) struct Ctx {
     pub(super) env: Env,
     /// The names that an operand lends, and those that one lends
@@ -227,7 +252,7 @@ impl Walk<'_> {
                 self.walk(inner, depth - 1);
             }
         }
-        if (self.wanted)(&spot.ty) {
+        if (self.wanted)(&spot.ty) && self.types.kind(&spot.ty) != Kind::Must {
             self.out.push(spot);
         }
     }
@@ -293,7 +318,7 @@ impl Generator<'_> {
     /// The innermost body that is a loop. A name of a body around it is, at
     /// every `↑`, as available as it was when the loop began ([O6]), so the
     /// body moves no such name.
-    fn floor(&self) -> usize {
+    pub(super) fn floor(&self) -> usize {
         (0..self.scopes.len())
             .rev()
             .find(|&index| self.scopes[index].looping.is_some())
@@ -344,6 +369,65 @@ impl Generator<'_> {
         Some(Type::Named(self.types.structs[index].name.clone()))
     }
 
+    fn resource_type(&mut self) -> Option<Type> {
+        if self.types.resources.is_empty() {
+            return None;
+        }
+        let index = self.rng.index(self.types.resources.len());
+        Some(Type::Named(self.types.resources[index].name.clone()))
+    }
+
+    /// A type for a parameter or for a payload field: a resource now and
+    /// then, which is how one comes to a body and leaves it.
+    pub(super) fn payload_type(&mut self) -> Type {
+        if self.data && !self.types.resources.is_empty() && self.rng.chance(1, 8) {
+            self.resource_type().expect("a resource")
+        } else {
+            self.value_type()
+        }
+    }
+
+    /// Now and then, the type of an obligation that the statement could
+    /// give away: a loop takes it as a parameter.
+    pub(super) fn held_type(&mut self, ctx: &Ctx) -> Option<Type> {
+        if !self.data || !self.rng.chance(1, 4) {
+            return None;
+        }
+        let held: Vec<Type> = ctx
+            .env
+            .iter()
+            .filter(|(name, slot)| {
+                self.types.kind(&slot.ty) == Kind::Must
+                    && self.consumable(slot)
+                    && !ctx.lent.contains(*name)
+            })
+            .map(|(_, slot)| slot.ty.clone())
+            .collect();
+        if held.is_empty() {
+            None
+        } else {
+            Some(self.rng.pick(&held).clone())
+        }
+    }
+
+    /// Now and then, the type of a parameter of the loop that holds an
+    /// obligation: an iteration leaves with it.
+    pub(super) fn parameter_type(&mut self, params: &[ParamInfo]) -> Option<Type> {
+        if !self.data || !self.rng.chance(1, 3) {
+            return None;
+        }
+        let held: Vec<Type> = params
+            .iter()
+            .filter(|info| self.types.kind(&info.ty) == Kind::Must)
+            .map(|info| info.ty.clone())
+            .collect();
+        if held.is_empty() {
+            None
+        } else {
+            Some(self.rng.pick(&held).clone())
+        }
+    }
+
     fn variant_type(&mut self) -> Option<Type> {
         if self.types.variants.is_empty() {
             return None;
@@ -352,17 +436,22 @@ impl Generator<'_> {
         Some(Type::Named(self.types.variants[index].name.clone()))
     }
 
-    /// The type of an element or of a field: a scalar most often.
+    /// The type of an element or of a field: a scalar most often, and
+    /// none that holds an obligation.
     fn element_type(&mut self) -> Type {
         match self.rng.below(6) {
             0 => Type::String,
-            1 => self.struct_type().unwrap_or(Type::String),
+            1 => self
+                .struct_type()
+                .filter(|ty| self.types.kind(ty) != Kind::Must)
+                .unwrap_or(Type::String),
             _ => self.random_type(),
         }
     }
 
     fn data_type(&mut self) -> Type {
-        match self.rng.below(10) {
+        match self.rng.below(11) {
+            10 => self.resource_type().unwrap_or(Type::String),
             0 | 1 => Type::String,
             2..=4 => self.struct_type().unwrap_or(Type::String),
             5 | 6 => self.variant_type().unwrap_or(Type::String),
@@ -378,16 +467,58 @@ impl Generator<'_> {
         }
     }
 
-    /// The structs and the variants of the program.
+    /// The resources, the structs and the variants of the program, and for
+    /// each resource the operation that closes it.
     pub(super) fn declare_types(&mut self) -> Vec<Declaration> {
         let mut out = Vec::new();
+        for index in 0..self.rng.index(3) {
+            let name = format!("rs{index}");
+            out.push(Declaration::Resource(ResourceDecl {
+                name: name.clone(),
+                on_fault_release: self.rng.chance(1, 2),
+                line: 1,
+            }));
+            let sig = Sig {
+                name: format!("k{index}"),
+                params: vec![("p0".to_string(), Type::Named(name.clone()))],
+                pre: vec![Range::ALL],
+                order: None,
+                alts: vec![AltSig {
+                    name: "done".to_string(),
+                    fields: Vec::new(),
+                    params: vec![None],
+                }],
+                uses: Vec::new(),
+            };
+            let (parameters, precondition, contract) = self.signature(&sig);
+            out.push(Declaration::Control(Control {
+                name: sig.name.clone(),
+                public: false,
+                external: true,
+                is_async: false,
+                contingent: true,
+                faults: false,
+                parameters,
+                precondition,
+                contract,
+                uses: Vec::new(),
+                body: Vec::new(),
+                line: 1,
+            }));
+            self.types.resources.push(ResourceInfo {
+                name,
+                closer: sig.name.clone(),
+            });
+            self.callables.push(sig);
+        }
         for index in 0..1 + self.rng.index(3) {
             let mut fields = Vec::new();
             for position in 0..1 + self.rng.index(3) {
-                let ty = match self.rng.below(8) {
+                let ty = match self.rng.below(9) {
                     0 => Type::String,
                     1 => self.struct_type().unwrap_or(Type::Bool),
                     2 => Type::Vector(Box::new(self.random_type())),
+                    8 => self.resource_type().unwrap_or(Type::Bool),
                     _ => self.random_type(),
                 };
                 fields.push((format!("m{position}"), ty));
@@ -413,7 +544,16 @@ impl Generator<'_> {
             for constructor in self.alternative_names(count) {
                 let mut fields = Vec::new();
                 for position in 0..self.rng.index(3) {
-                    fields.push((format!("m{position}"), self.element_type()));
+                    let ty = if self.rng.chance(1, 9) {
+                        self.resource_type()
+                    } else {
+                        None
+                    };
+                    let ty = match ty {
+                        Some(resource) => resource,
+                        None => self.element_type(),
+                    };
+                    fields.push((format!("m{position}"), ty));
                 }
                 constructors.push((constructor, fields));
             }
@@ -462,8 +602,9 @@ impl Generator<'_> {
 
     // Places and values.
 
-    /// The places of `env` whose type `wanted` accepts: an available name
-    /// that holds no obligation, or a field of one, two fields deep at most.
+    /// The places of `env` whose type `wanted` accepts and that hold no
+    /// obligation: an available name, or a field of one, two fields deep at
+    /// most.
     fn places(&self, env: &Env, wanted: &dyn Fn(&Type) -> bool) -> Vec<Spot> {
         let mut walk = Walk {
             types: &self.types,
@@ -471,7 +612,7 @@ impl Generator<'_> {
             out: Vec::new(),
         };
         for (root, slot) in env {
-            if slot.gone || self.types.kind(&slot.ty) == Kind::Must {
+            if slot.gone || self.ending && self.types.kind(&slot.ty) == Kind::Must {
                 continue;
             }
             walk.walk(
@@ -562,12 +703,15 @@ impl Generator<'_> {
         if ty.is_scalar() {
             return Some(self.gen_expr(&ctx.env, ty, depth));
         }
+        // An obligation is given by the name that holds it, or it is made
+        // of names that hold its parts.
+        let must = self.types.kind(ty) == Kind::Must;
         let names = self.owned(ctx, ty);
-        if !names.is_empty() && self.rng.chance(1, 2) {
+        if !names.is_empty() && (must || self.rng.chance(1, 2)) {
             let chosen = self.rng.pick(&names).clone();
             return Some(self.take_name(ctx, &chosen));
         }
-        if self.rng.chance(1, 5) {
+        if !must && self.rng.chance(1, 5) {
             let spots = self.places(&ctx.env, &|seen| seen == ty);
             if !spots.is_empty() {
                 let spot = self.rng.pick(&spots).clone();
@@ -700,6 +844,9 @@ impl Generator<'_> {
                 Some(Expr::Borrow(BorrowMode::Exclusive, Box::new(name(&chosen))))
             }
             Type::Ref(BorrowMode::Shared, inner) => {
+                // An obligation is lent by the name that holds it, and is
+                // no temporary ([O3a]).
+                let must = self.types.kind(inner) == Kind::Must;
                 let names: Vec<String> = ctx
                     .env
                     .iter()
@@ -707,15 +854,17 @@ impl Generator<'_> {
                         !slot.gone
                             && slot.ty == **inner
                             && !ctx.exclusive.contains(*name)
-                            && self.types.kind(&slot.ty) != Kind::Must
                             && long(slot)
                     })
                     .map(|(name, _)| name.clone())
                     .collect();
-                if !names.is_empty() && self.rng.chance(3, 4) {
+                if !names.is_empty() && (must || self.rng.chance(3, 4)) {
                     let chosen = self.rng.pick(&names).clone();
                     ctx.lent.insert(chosen.clone());
                     return Some(Expr::Borrow(BorrowMode::Shared, Box::new(name(&chosen))));
+                }
+                if must {
+                    return None;
                 }
                 // A value that is read where it is.
                 self.sized_value(ctx, inner, pre)
@@ -728,7 +877,7 @@ impl Generator<'_> {
 
     /// One statement on data. False when none could be written.
     pub(super) fn data_step(&mut self, selector: &Selector, running: &[usize], room: bool) -> bool {
-        match self.rng.below(13) {
+        match self.rng.below(16) {
             0 | 1 => self.unpack(selector, running),
             2..=4 => self.assign_data(selector, running),
             5 | 6 if room => self.decide_variant(selector, running),
@@ -737,6 +886,8 @@ impl Generator<'_> {
             10 if room => self.map_op(selector, running),
             11 if room => self.guarded_index(selector, running),
             12 => self.emit_op(selector, running),
+            13 | 14 => self.capture_op(selector, running),
+            15 if room => self.decide_outcome(selector, running),
             _ => {
                 let ty = self.data_type();
                 self.bind_data(selector, running, ty)
@@ -785,21 +936,38 @@ impl Generator<'_> {
             })
             .map(|(name, _)| name.clone())
             .collect();
-        let (value, know, ty) = if !candidates.is_empty() && self.rng.chance(3, 4) {
+        if !candidates.is_empty() && self.rng.chance(3, 4) {
             let chosen = self.rng.pick(&candidates).clone();
-            let ty = ctx.env[&chosen].ty.clone();
-            let (value, know) = self.take_name(&mut ctx, &chosen);
-            (value, know, ty)
-        } else {
-            let Some(ty) = self.struct_type() else {
-                return false;
-            };
-            let Some((value, know)) = self.build(&mut ctx, &ty, 2) else {
-                return false;
-            };
-            (value, know, ty)
+            self.unpack_name(selector, running, &chosen);
+            return true;
+        }
+        let Some(ty) = self.struct_type() else {
+            return false;
         };
-        let Type::Named(struct_name) = &ty else {
+        let Some((value, know)) = self.build(&mut ctx, &ty, 2) else {
+            return false;
+        };
+        self.unpack_value(selector, running, &ctx, value, know, &ty)
+    }
+
+    /// Takes apart the struct that the name `chosen` holds.
+    fn unpack_name(&mut self, selector: &Selector, running: &[usize], chosen: &str) {
+        let mut ctx = self.ctx(running);
+        let ty = ctx.env[chosen].ty.clone();
+        let (value, know) = self.take_name(&mut ctx, chosen);
+        self.unpack_value(selector, running, &ctx, value, know, &ty);
+    }
+
+    fn unpack_value(
+        &mut self,
+        selector: &Selector,
+        running: &[usize],
+        ctx: &Ctx,
+        value: Expr,
+        know: Know,
+        ty: &Type,
+    ) -> bool {
+        let Type::Named(struct_name) = ty else {
             return false;
         };
         let Some(info) = self.types.structure(struct_name).cloned() else {
@@ -814,7 +982,7 @@ impl Generator<'_> {
                 value,
             },
         );
-        self.apply(running, &ctx);
+        self.apply(running, ctx);
         let knows = match know {
             Know::Struct(fields) => fields,
             _ => info
@@ -836,14 +1004,19 @@ impl Generator<'_> {
         let floor = self.floor();
         // A whole name: one that was moved may be assigned where it could
         // have been moved, so that a loop leaves it as it found it ([O6]).
+        // A name that holds an obligation is assigned only where its value
+        // has moved on every history ([O4]).
         let whole: Vec<String> = ctx
             .env
             .iter()
-            .filter(|(_, slot)| {
+            .filter(|(name, slot)| {
                 slot.mutable
                     && !slot.ty.is_scalar()
-                    && self.types.kind(&slot.ty) != Kind::Must
-                    && (!slot.gone || slot.home >= floor)
+                    && if self.types.kind(&slot.ty) == Kind::Must {
+                        slot.home >= floor && self.gone_on_all(running, name)
+                    } else {
+                        !slot.gone || slot.home >= floor
+                    }
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -989,7 +1162,7 @@ impl Generator<'_> {
 
     /// `d : Δ V(x) ▸ …` ([E-Outcome], [I11]): a variant is taken apart.
     fn decide_variant(&mut self, selector: &Selector, running: &[usize]) -> bool {
-        let mut ctx = self.ctx(running);
+        let ctx = self.ctx(running);
         let candidates: Vec<String> = ctx
             .env
             .iter()
@@ -1003,13 +1176,20 @@ impl Generator<'_> {
             return false;
         }
         let chosen = self.rng.pick(&candidates).clone();
-        let Type::Named(variant) = ctx.env[&chosen].ty.clone() else {
-            return false;
+        self.decide_variant_name(selector, running, &chosen);
+        true
+    }
+
+    /// Takes apart the variant that the name `chosen` holds.
+    fn decide_variant_name(&mut self, selector: &Selector, running: &[usize], chosen: &str) {
+        let mut ctx = self.ctx(running);
+        let Type::Named(variant) = ctx.env[chosen].ty.clone() else {
+            return;
         };
         let Some(info) = self.types.variant(&variant).cloned() else {
-            return false;
+            return;
         };
-        let operand = self.take_name(&mut ctx, &chosen).0;
+        let operand = self.take_name(&mut ctx, chosen).0;
         let arms: Vec<Arm> = info
             .constructors
             .iter()
@@ -1022,7 +1202,7 @@ impl Generator<'_> {
         // What each history knows of the value, before it moves.
         let seen: Vec<Know> = running
             .iter()
-            .map(|&index| self.scope().live[index].env[&chosen].know.clone())
+            .map(|&index| self.scope().live[index].env[chosen].know.clone())
             .collect();
         self.apply(running, &ctx);
         let mut outcomes = Vec::new();
@@ -1050,7 +1230,6 @@ impl Generator<'_> {
             .map(|(constructor, _)| constructor.as_str())
             .collect();
         self.split(selector, running, &site, &alternatives, outcomes);
-        true
     }
 
     fn vectors(&self, env: &Env) -> Vec<Spot> {
@@ -1412,5 +1591,303 @@ impl Generator<'_> {
             .collect();
         self.split(selector, running, &site, &["done"], outcomes);
         true
+    }
+
+    // Obligations.
+
+    fn gone_on_all(&self, running: &[usize], name: &str) -> bool {
+        running.iter().all(|&index| {
+            self.scope().live[index]
+                .env
+                .get(name)
+                .is_some_and(|slot| slot.gone)
+        })
+    }
+
+    /// `x := capture f(ō)` ([E-Capture]): the operation runs here, and the
+    /// name holds its outcome until a decision takes it ([I12]).
+    fn capture_op(&mut self, selector: &Selector, running: &[usize]) -> bool {
+        // An `&~` argument has two terms in the record of a capture; the
+        // generator keeps one interval for each argument.
+        let callables: Vec<Sig> = self
+            .callables
+            .iter()
+            .filter(|sig| {
+                sig.params
+                    .iter()
+                    .all(|(_, ty)| !matches!(ty, Type::Ref(BorrowMode::Exclusive, _)))
+            })
+            .cloned()
+            .collect();
+        if callables.is_empty() {
+            return false;
+        }
+        let callee = self.rng.pick(&callables).clone();
+        let mut ctx = self.ctx(running);
+        let Some(arguments) = self.arguments(&mut ctx, &callee) else {
+            return false;
+        };
+        let recorded: Vec<Vec<Range>> = running
+            .iter()
+            .map(|&index| {
+                let env = &self.scope().live[index].env;
+                callee
+                    .params
+                    .iter()
+                    .zip(&arguments)
+                    .map(|((_, ty), argument)| match ty {
+                        Type::Int(_) => self
+                            .lib()
+                            .int(argument, env, None)
+                            .map_or(Range::ALL, |val| val.flow),
+                        _ => Range::ALL,
+                    })
+                    .collect()
+            })
+            .collect();
+        self.apply(running, &ctx);
+        let bound = self.fresh("v");
+        let mutable = self.rng.chance(1, 4);
+        let ty = Type::OutcomeNamed(callee.name.clone());
+        let typed = self.rng.chance(1, 3);
+        self.effects.extend(callee.uses.iter().cloned());
+        self.push(
+            selector,
+            Command::Capture {
+                mutable,
+                name: bound.clone(),
+                ty: typed.then(|| ty.clone()),
+                mode: CallMode::Sync,
+                operation: callee.name.clone(),
+                arguments,
+            },
+        );
+        let last = self.here();
+        for (&index, ranges) in running.iter().zip(recorded) {
+            let slot = self.slot(&ty, mutable, Know::Outcome(ranges));
+            self.scopes[last].live[index]
+                .env
+                .insert(bound.clone(), slot);
+        }
+        true
+    }
+
+    /// `d : Δ outcome(x) ▸ …` on a name that holds a captured outcome.
+    fn decide_outcome(&mut self, selector: &Selector, running: &[usize]) -> bool {
+        let env = self.running_env(running);
+        let candidates: Vec<String> = env
+            .iter()
+            .filter(|(_, slot)| matches!(slot.ty, Type::OutcomeNamed(_)) && self.consumable(slot))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        let chosen = self.rng.pick(&candidates).clone();
+        self.decide_outcome_name(selector, running, &chosen);
+        true
+    }
+
+    /// The decision on the captured outcome that `chosen` holds
+    /// ([E-Outcome]): each alternative is known by the conditions of the
+    /// captured operation, over the arguments of the capture where the
+    /// capture is visible and over names of which nothing is known where it
+    /// is not ([I12]).
+    fn decide_outcome_name(&mut self, selector: &Selector, running: &[usize], chosen: &str) {
+        let mut ctx = self.ctx(running);
+        let Type::OutcomeNamed(captured) = ctx.env[chosen].ty.clone() else {
+            return;
+        };
+        let Some(callee) = self
+            .callables
+            .iter()
+            .find(|sig| sig.name == captured)
+            .cloned()
+        else {
+            return;
+        };
+        let operand = self.take_name(&mut ctx, chosen).0;
+        let arms: Vec<Arm> = callee
+            .alts
+            .iter()
+            .map(|alternative| Arm {
+                alternative: alternative.name.clone(),
+                names: alternative.fields.iter().map(|_| self.fresh("v")).collect(),
+            })
+            .collect();
+        let site = self.operation(selector, "outcome", vec![operand], arms.clone());
+        let seen: Vec<Know> = running
+            .iter()
+            .map(|&index| self.scope().live[index].env[chosen].know.clone())
+            .collect();
+        self.apply(running, &ctx);
+        let mut outcomes = Vec::new();
+        for (&index, know) in running.iter().zip(seen) {
+            let recorded = match know {
+                Know::Outcome(ranges) if ranges.len() == callee.params.len() => ranges,
+                _ => vec![Range::ALL; callee.params.len()],
+            };
+            let mut per = Vec::new();
+            'alternative: for (which, alternative) in callee.alts.iter().enumerate() {
+                let mut narrowed = recorded.clone();
+                for (position, bound) in alternative.params.iter().enumerate() {
+                    if let Some(bound) = bound {
+                        narrowed[position] = narrowed[position].meet(*bound);
+                        if narrowed[position].is_empty() {
+                            per.push(None);
+                            continue 'alternative;
+                        }
+                    }
+                }
+                let mut env = self.scope().live[index].env.clone();
+                for (field, bound) in alternative.fields.iter().zip(&arms[which].names) {
+                    let Some(know) = self.payload_know(field, &|position| narrowed[position])
+                    else {
+                        per.push(None);
+                        continue 'alternative;
+                    };
+                    env.insert(bound.clone(), self.slot(&field.ty, false, know));
+                }
+                per.push(Some(env));
+            }
+            outcomes.push(per);
+        }
+        let alternatives: Vec<&str> = callee
+            .alts
+            .iter()
+            .map(|alternative| alternative.name.as_str())
+            .collect();
+        self.split(selector, running, &site, &alternatives, outcomes);
+    }
+
+    /// `d : Δ k(▾x) ▸ done {}`: the resource that `chosen` holds is closed.
+    fn close(&mut self, selector: &Selector, running: &[usize], chosen: &str) {
+        let mut ctx = self.ctx(running);
+        let Type::Named(resource) = ctx.env[chosen].ty.clone() else {
+            return;
+        };
+        let Some(closer) = self
+            .types
+            .resource(&resource)
+            .map(|info| info.closer.clone())
+        else {
+            return;
+        };
+        let operand = self.take_name(&mut ctx, chosen).0;
+        let site = self.operation(selector, &closer, vec![operand], vec![arm("done", &[])]);
+        self.apply(running, &ctx);
+        let outcomes = running
+            .iter()
+            .map(|&index| vec![Some(self.scope().live[index].env.clone())])
+            .collect();
+        self.split(selector, running, &site, &["done"], outcomes);
+    }
+
+    /// An obligation that a history of `running` holds in a body from
+    /// `floor` inward, and the histories that hold it. With `uneven`, only
+    /// one that some of the histories hold and others do not.
+    fn owed(&self, running: &[usize], floor: usize, uneven: bool) -> Option<(String, Vec<usize>)> {
+        let scope = self.scope();
+        let holds = |index: usize, name: &str| {
+            scope.live[index]
+                .env
+                .get(name)
+                .is_some_and(|slot| !slot.gone)
+        };
+        for &index in running {
+            for (name, slot) in &scope.live[index].env {
+                if slot.gone || slot.home < floor || self.types.kind(&slot.ty) != Kind::Must {
+                    continue;
+                }
+                let holders: Vec<usize> = running
+                    .iter()
+                    .copied()
+                    .filter(|&other| holds(other, name))
+                    .collect();
+                if uneven && holders.len() == running.len() {
+                    continue;
+                }
+                return Some((name.clone(), holders));
+            }
+        }
+        None
+    }
+
+    /// A selector, within `selector`, whose histories are some of `holders`
+    /// and no other: `selector` itself where all of its histories are
+    /// holders, else `selector` and the one atom that picks most of them,
+    /// else every atom of one of them.
+    fn selector_of(
+        &self,
+        selector: &Selector,
+        running: &[usize],
+        holders: &[usize],
+    ) -> (Selector, Vec<usize>) {
+        if holders.len() == running.len() {
+            return (selector.clone(), running.to_vec());
+        }
+        let scope = self.scope();
+        let atom = |site: usize, which: usize| {
+            let info = &scope.sites[site];
+            Selector::Atom(info.name.clone(), info.alternatives[which].clone())
+        };
+        let mut best: Option<(Selector, Vec<usize>)> = None;
+        for &holder in holders {
+            for &(site, which) in &scope.live[holder].atoms {
+                let under = and_selector(selector, atom(site, which));
+                let picked = self.running(&under);
+                if picked.iter().all(|index| holders.contains(index))
+                    && best
+                        .as_ref()
+                        .is_none_or(|(_, seen)| picked.len() > seen.len())
+                {
+                    best = Some((under, picked));
+                }
+            }
+        }
+        if let Some(best) = best {
+            return best;
+        }
+        let mut under = selector.clone();
+        for &(site, which) in &scope.live[holders[0]].atoms {
+            under = and_selector(&under, atom(site, which));
+        }
+        let picked = self.running(&under);
+        (under, picked)
+    }
+
+    fn discharge(&mut self, selector: &Selector, floor: usize, uneven: bool) {
+        loop {
+            let running = self.running(selector);
+            let Some((owed, holders)) = self.owed(&running, floor, uneven) else {
+                return;
+            };
+            let (under, picked) = self.selector_of(selector, &running, &holders);
+            let ty = self.scope().live[picked[0]].env[&owed].ty.clone();
+            match &ty {
+                Type::OutcomeNamed(_) => self.decide_outcome_name(&under, &picked, &owed),
+                Type::Named(named) if self.types.structure(named).is_some() => {
+                    self.unpack_name(&under, &picked, &owed);
+                }
+                Type::Named(named) if self.types.variant(named).is_some() => {
+                    self.decide_variant_name(&under, &picked, &owed);
+                }
+                _ => self.close(&under, &picked, &owed),
+            }
+        }
+    }
+
+    /// What [O5] asks before a terminator that ends the bodies from `floor`
+    /// inward: no history of `selector` holds an obligation there. The
+    /// statements that discharge them stand before the terminator, and the
+    /// histories of `selector` are other ones afterwards.
+    pub(super) fn settle(&mut self, selector: &Selector, floor: usize) {
+        self.discharge(selector, floor, false);
+    }
+
+    /// Before a loop: every obligation is held by all the histories of
+    /// `selector` or by none of them.
+    pub(super) fn level(&mut self, selector: &Selector) {
+        self.discharge(selector, 0, true);
     }
 }

@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod data;
 
-use data::Types;
+use data::{Ctx, Kind, Types};
 
 const ALTERNATIVES: [&str; 12] = [
     "done", "ok", "low", "high", "none", "some", "left", "right", "stop", "more", "hit", "miss",
@@ -63,6 +63,9 @@ const MAX_HISTORIES: usize = 24;
 /// The control body and at most two loops inside each other.
 const MAX_BODIES: usize = 3;
 const MAX_LOOPS: usize = 3;
+/// How deep the calls of functions nest in one expression. The arguments of
+/// a call are expressions of their own, with a budget of their own.
+const MAX_CALLS: usize = 8;
 
 /// The values of a type on the widest target.
 fn value_range(ty: IntType) -> Range {
@@ -180,7 +183,10 @@ enum Know {
     Variant(Vec<Option<Vec<Know>>>),
     /// A vector, a map or a string: the interval of its length ([A3]).
     Sized(Range),
-    /// A resource or a captured outcome, of which nothing is known.
+    /// A captured outcome whose capture is visible: for each parameter of
+    /// the captured operation, the interval of its argument there ([I12]).
+    Outcome(Vec<Range>),
+    /// A resource, or a captured outcome whose capture is not visible.
     Opaque,
 }
 
@@ -220,6 +226,10 @@ impl Know {
                     .collect(),
             ),
             (Know::Sized(a), Know::Sized(b)) => Know::Sized(a.hull(*b)),
+            (Know::Outcome(a), Know::Outcome(b)) if a.len() == b.len() => {
+                Know::Outcome(a.iter().zip(b).map(|(x, y)| x.hull(*y)).collect())
+            }
+            (Know::Outcome(_), _) | (_, Know::Outcome(_)) => Know::Opaque,
             (seen, _) => seen.clone(),
         }
     }
@@ -928,6 +938,12 @@ struct Generator<'r> {
     /// declares.
     data: bool,
     types: Types,
+    /// How many calls of functions the expression being written is inside.
+    calls: usize,
+    /// Whether the expressions of a terminator are being written. What the
+    /// scopes it ends still hold is discharged before it, so its
+    /// expressions read nothing of a name that holds an obligation.
+    ending: bool,
 }
 
 fn conjunction(parts: Vec<Expr>) -> Option<Expr> {
@@ -1257,10 +1273,17 @@ impl Generator<'_> {
         let candidates: Vec<usize> = (0..self.functions.len())
             .filter(|&index| &self.functions[index].result == result)
             .collect();
-        if candidates.is_empty() {
+        if candidates.is_empty() || self.calls >= MAX_CALLS {
             return None;
         }
         let index = *self.rng.pick(&candidates);
+        self.calls += 1;
+        let arguments = self.call_arguments(env, index, depth);
+        self.calls -= 1;
+        Some(Expr::Call(self.functions[index].name.clone(), arguments?))
+    }
+
+    fn call_arguments(&mut self, env: &Env, index: usize, depth: u8) -> Option<Vec<Expr>> {
         let params = self.functions[index].params.clone();
         let pre = self.functions[index].pre.clone();
         let mut arguments = Vec::new();
@@ -1270,7 +1293,7 @@ impl Generator<'_> {
                 _ => self.gen_bool(env, depth.saturating_sub(1)).0,
             });
         }
-        Some(Expr::Call(self.functions[index].name.clone(), arguments))
+        Some(arguments)
     }
 
     /// An integer expression of `ty` that is known to lie in `target`.
@@ -1853,6 +1876,36 @@ impl Generator<'_> {
         }
     }
 
+    /// What the condition of an alternative says of a payload field, given
+    /// the intervals of the arguments, or `None` where it says that the
+    /// alternative does not occur.
+    fn payload_know(&self, field: &FieldSig, argument: &dyn Fn(usize) -> Range) -> Option<Know> {
+        let Type::Int(int_ty) = &field.ty else {
+            return Some(self.types.top(&field.ty));
+        };
+        let mut range = value_range(*int_ty);
+        match field.lo {
+            End::Open => {}
+            End::Literal(literal) => range.lo = range.lo.max(literal),
+            End::Parameter(position, offset) => {
+                let from = add(argument(position), Range::point(offset));
+                range.lo = range.lo.max(from.lo);
+            }
+        }
+        match field.hi {
+            End::Open => {}
+            End::Literal(literal) => range.hi = range.hi.min(literal),
+            End::Parameter(position, offset) => {
+                let to = add(argument(position), Range::point(offset));
+                range.hi = range.hi.min(to.hi);
+            }
+        }
+        if range.is_empty() {
+            return None;
+        }
+        Some(Know::Int(Val::value(*int_ty, range)))
+    }
+
     /// The histories on which a completed operation continues: one for each
     /// running history and each alternative that its condition allows there.
     fn complete(
@@ -1884,36 +1937,16 @@ impl Generator<'_> {
                     self.lib().narrow(&arguments[position], narrowed, &mut env);
                 }
                 for (field, bound) in alternative.fields.iter().zip(&arms[which].names) {
-                    let know = match &field.ty {
-                        Type::Int(int_ty) => {
-                            let mut range = value_range(*int_ty);
-                            let lib = self.lib();
-                            let argument = |position: usize| {
-                                lib.int(&arguments[position], &env, None)
-                                    .map_or(Range::ALL, |val| val.flow)
-                            };
-                            match field.lo {
-                                End::Open => {}
-                                End::Literal(literal) => range.lo = range.lo.max(literal),
-                                End::Parameter(position, offset) => {
-                                    let from = add(argument(position), Range::point(offset));
-                                    range.lo = range.lo.max(from.lo);
-                                }
-                            }
-                            match field.hi {
-                                End::Open => {}
-                                End::Literal(literal) => range.hi = range.hi.min(literal),
-                                End::Parameter(position, offset) => {
-                                    let to = add(argument(position), Range::point(offset));
-                                    range.hi = range.hi.min(to.hi);
-                                }
-                            }
-                            if range.is_empty() {
-                                continue 'alternative;
-                            }
-                            Know::Int(Val::value(*int_ty, range))
-                        }
-                        other => self.types.top(other),
+                    let know = {
+                        let lib = self.lib();
+                        let argument = |position: usize| {
+                            lib.int(&arguments[position], &env, None)
+                                .map_or(Range::ALL, |val| val.flow)
+                        };
+                        self.payload_know(field, &argument)
+                    };
+                    let Some(know) = know else {
+                        continue 'alternative;
                     };
                     env.insert(
                         bound.clone(),
@@ -1949,12 +1982,14 @@ impl Generator<'_> {
         }
     }
 
-    fn decide(&mut self, selector: &Selector, running: &[usize]) -> bool {
-        let mut ctx = self.ctx(running);
-        let env = ctx.env.clone();
-        let callee = self.rng.pick(&self.callables).clone();
+    /// The operands of a decision or of a capture on `callee`, or `None`
+    /// where one of them cannot be written here.
+    fn arguments(&mut self, ctx: &mut Ctx, callee: &Sig) -> Option<Vec<Expr>> {
         let mut arguments: Vec<Expr> = Vec::new();
         for (position, (_, ty)) in callee.params.iter().enumerate() {
+            // An operand sees the names as the operands before it left
+            // them ([O0]).
+            let env = ctx.env.clone();
             let argument = match ty {
                 Type::Int(int_ty) => {
                     let mut target = callee.pre[position];
@@ -1966,9 +2001,7 @@ impl Generator<'_> {
                             });
                         }
                         Some((small, large)) if position == large => {
-                            let Some(first) = self.lib().int(&arguments[small], &env, None) else {
-                                return false;
-                            };
+                            let first = self.lib().int(&arguments[small], &env, None)?;
                             target = target.meet(Range {
                                 lo: first.flow.hi,
                                 hi: POS,
@@ -1976,19 +2009,22 @@ impl Generator<'_> {
                         }
                         _ => {}
                     }
-                    match self.gen_int_in(&env, *int_ty, target) {
-                        Some((expr, _)) => expr,
-                        None => return false,
-                    }
+                    self.gen_int_in(&env, *int_ty, target)?.0
                 }
                 Type::Bool => self.gen_bool(&env, 1).0,
-                other => match self.operand_for(&mut ctx, other, callee.pre[position]) {
-                    Some(expr) => expr,
-                    None => return false,
-                },
+                other => self.operand_for(ctx, other, callee.pre[position])?,
             };
             arguments.push(argument);
         }
+        Some(arguments)
+    }
+
+    fn decide(&mut self, selector: &Selector, running: &[usize]) -> bool {
+        let mut ctx = self.ctx(running);
+        let callee = self.rng.pick(&self.callables).clone();
+        let Some(arguments) = self.arguments(&mut ctx, &callee) else {
+            return false;
+        };
         self.apply(running, &ctx);
         let site = self.fresh("d");
         let arms: Vec<Arm> = callee
@@ -2015,6 +2051,17 @@ impl Generator<'_> {
     }
 
     fn make_loop(&mut self, selector: &Selector, running: &[usize]) {
+        // A name that holds an obligation on some of the histories and not
+        // on the others is one that the body can neither use nor end
+        // ([O5]): it is discharged before the loop.
+        let level;
+        let running = if self.data {
+            self.level(selector);
+            level = self.running(selector);
+            &level[..]
+        } else {
+            running
+        };
         let env = self.running_env(running);
         self.loops += 1;
         let site = self.fresh("s");
@@ -2037,25 +2084,39 @@ impl Generator<'_> {
         }];
         let mut ctx = self.ctx(running);
         for _ in 0..self.rng.below(3) {
-            let ty = self.value_type();
+            let ty = match self.held_type(&ctx) {
+                Some(held) => held,
+                None => self.value_type(),
+            };
             let mutable = self.rng.chance(1, 4);
+            // An initial value sees the names as the ones before it left
+            // them ([O0]).
+            let seen = ctx.env.clone();
             let (initial, invariant) = match &ty {
                 Type::Int(int_ty) => {
                     let invariant = self.rng.chance(1, 2).then(|| self.subrange(*int_ty));
                     let initial = match invariant {
-                        Some(range) => match self.gen_int_in(&env, *int_ty, range) {
+                        Some(range) => match self.gen_int_in(&seen, *int_ty, range) {
                             Some((expr, _)) => expr,
                             None => continue,
                         },
-                        None => self.gen_int(&env, *int_ty, 2).0,
+                        None => self.gen_int(&seen, *int_ty, 2).0,
                     };
                     (initial, invariant)
                 }
-                Type::Bool => (self.gen_bool(&env, 1).0, None),
-                other => match self.value(&mut ctx, other, 2) {
-                    Some((initial, _)) => (initial, None),
-                    None => continue,
-                },
+                Type::Bool => (self.gen_bool(&seen, 1).0, None),
+                other => {
+                    let before = ctx.clone();
+                    match self.value(&mut ctx, other, 2) {
+                        Some((initial, _)) => (initial, None),
+                        None => {
+                            // What the parts of a value that was not
+                            // written had consumed is still there.
+                            ctx = before;
+                            continue;
+                        }
+                    }
+                }
             };
             let parameter = self.fresh("x");
             parameters.push(LoopParameter {
@@ -2126,8 +2187,22 @@ impl Generator<'_> {
             if planned.iter().any(|(seen, _)| seen == &alternative) {
                 continue;
             }
-            let types = (0..self.rng.below(3)).map(|_| self.value_type()).collect();
+            let types = (0..self.rng.below(3))
+                .map(|_| match self.parameter_type(&params) {
+                    Some(held) => held,
+                    None => self.value_type(),
+                })
+                .collect();
             planned.push((alternative, types));
+        }
+        // One alternative has no obligation in its payload, so that an
+        // iteration can leave whatever it holds.
+        if planned
+            .iter()
+            .all(|(_, types)| types.iter().any(|ty| self.types.kind(ty) == Kind::Must))
+        {
+            let types = &self.types;
+            planned[0].1.retain(|ty| types.kind(ty) != Kind::Must);
         }
         let mut outer_atoms = self.scope().outer_atoms.clone();
         if let Some(&first) = running.first() {
@@ -2222,6 +2297,8 @@ impl Generator<'_> {
                         (Type::Int(int_ty), Know::Int(val)) => {
                             Know::Int(Val::value(*int_ty, val.flow))
                         }
+                        // The capture is not visible through the loop.
+                        (_, Know::Outcome(_)) => Know::Opaque,
                         (_, know) => know,
                     };
                     env.insert(
@@ -2309,14 +2386,67 @@ impl Generator<'_> {
         }
     }
 
+    /// Writes a terminator. What its expressions consumed is gone, what the
+    /// scopes that it ends still hold is discharged before it ([O5]), and
+    /// its histories end.
+    fn end(
+        &mut self,
+        selector: &Selector,
+        running: &[usize],
+        ctx: &Ctx,
+        floor: usize,
+        command: Command,
+    ) {
+        self.apply(running, ctx);
+        if self.data {
+            self.settle(selector, floor);
+            self.push(selector, command);
+            let ended = self.running(selector);
+            self.replace(&ended, Vec::new());
+        } else {
+            self.push(selector, command);
+            self.replace(running, Vec::new());
+        }
+    }
+
+    /// The payload of one of the alternatives `payloads`, beginning with
+    /// one that is drawn: an alternative whose payload cannot be written
+    /// here gives way to the next one, and one of them holds no obligation.
+    fn payload(
+        &mut self,
+        running: &[usize],
+        payloads: &[Vec<Type>],
+    ) -> (usize, Ctx, Vec<(Expr, Know)>) {
+        let first = self.rng.index(payloads.len());
+        self.ending = self.data;
+        for turn in 0..payloads.len() {
+            let which = (first + turn) % payloads.len();
+            let mut ctx = self.ctx(running);
+            let mut values = Vec::new();
+            for ty in &payloads[which] {
+                match self.value(&mut ctx, ty, 2) {
+                    Some(value) => values.push(value),
+                    None => break,
+                }
+            }
+            if values.len() == payloads[which].len() {
+                self.ending = false;
+                return (which, ctx, values);
+            }
+        }
+        unreachable!("an alternative that holds no obligation");
+    }
+
     fn exit(&mut self, selector: &Selector, running: &[usize]) {
-        let mut ctx = self.ctx(running);
-        let env = ctx.env.clone();
-        let which = self.rng.index(self.contract.len());
-        let (alternative, fields) = self.contract[which].clone();
+        let env = self.running_env(running);
+        let payloads: Vec<Vec<Type>> = self
+            .contract
+            .iter()
+            .map(|(_, fields)| fields.iter().map(|(_, ty)| ty.clone()).collect())
+            .collect();
+        let (which, ctx, values) = self.payload(running, &payloads);
         let mut payload = Vec::new();
-        for (position, (_, ty)) in fields.iter().enumerate() {
-            let (expr, know) = self.value(&mut ctx, ty, 2).expect("a payload");
+        for (position, (expr, know)) in values.into_iter().enumerate() {
             if let Know::Int(val) = know {
                 let seen = &mut self.exits[which].fields[position];
                 *seen = Some(seen.map_or(val.flow, |range| range.hull(val.flow)));
@@ -2336,26 +2466,27 @@ impl Generator<'_> {
             }
         }
         self.exits[which].used = true;
-        self.push(
-            selector,
-            Command::Exit {
-                alternative,
-                payload,
-            },
-        );
-        self.replace(running, Vec::new());
+        let alternative = self.contract[which].0.clone();
+        let command = Command::Exit {
+            alternative,
+            payload,
+        };
+        self.end(selector, running, &ctx, 0, command);
     }
 
     fn leave(&mut self, selector: &Selector, running: &[usize]) {
-        let mut ctx = self.ctx(running);
-        let env = ctx.env.clone();
+        let env = self.running_env(running);
         let info = self.scope().looping.clone().expect("a loop to leave");
-        let which = self.rng.index(info.planned.len());
+        let payloads: Vec<Vec<Type>> = info
+            .planned
+            .iter()
+            .map(|(_, types)| types.clone())
+            .collect();
+        let (which, ctx, values) = self.payload(running, &payloads);
         let (alternative, types) = info.planned[which].clone();
         let mut payload = Vec::new();
         let mut knows = Vec::new();
-        for ty in &types {
-            let (mut expr, know) = self.value(&mut ctx, ty, 2).expect("a payload");
+        for (ty, (mut expr, know)) in types.iter().zip(values) {
             // The type of a payload of data is that of its operand too, and
             // a literal of a collection does not say it.
             if !ty.is_scalar() && !matches!(expr, Expr::Name(_) | Expr::Move(_)) {
@@ -2403,19 +2534,24 @@ impl Generator<'_> {
                 assigned,
             });
         }
-        self.push(
-            selector,
-            Command::Leave {
-                alternative,
-                payload,
-            },
-        );
-        self.replace(running, Vec::new());
+        let command = Command::Leave {
+            alternative,
+            payload,
+        };
+        let floor = self.floor();
+        self.end(selector, running, &ctx, floor, command);
     }
 
     /// `↑ ℓ` for the loop whose body is the scope `target`. It needs room
     /// for the counter to move, which a test gave or did not.
     fn again(&mut self, selector: &Selector, running: &[usize], target: usize) -> bool {
+        self.ending = self.data;
+        let written = self.go_again(selector, running, target);
+        self.ending = false;
+        written
+    }
+
+    fn go_again(&mut self, selector: &Selector, running: &[usize], target: usize) -> bool {
         let mut ctx = self.ctx(running);
         let env = ctx.env.clone();
         let info = self.scopes[target].looping.clone().expect("a loop");
@@ -2447,8 +2583,9 @@ impl Generator<'_> {
         }
         let mut arguments = vec![moved];
         for parameter in &info.params[1..] {
+            let seen = ctx.env.clone();
             arguments.push(match (&parameter.ty, parameter.invariant) {
-                (Type::Int(int_ty), Some(range)) => match self.gen_int_in(&env, *int_ty, range) {
+                (Type::Int(int_ty), Some(range)) => match self.gen_int_in(&seen, *int_ty, range) {
                     Some((expr, _)) => expr,
                     None => return false,
                 },
@@ -2458,14 +2595,12 @@ impl Generator<'_> {
                 },
             });
         }
-        self.push(
-            selector,
-            Command::Again {
-                name: info.name,
-                arguments,
-            },
-        );
-        self.replace(running, Vec::new());
+        let command = Command::Again {
+            name: info.name,
+            arguments,
+        };
+        self.ending = false;
+        self.end(selector, running, &ctx, target, command);
         true
     }
 
@@ -2508,7 +2643,7 @@ impl Generator<'_> {
         let mut pre = Vec::new();
         for index in 0..count {
             let ty = if wide {
-                self.value_type()
+                self.payload_type()
             } else {
                 self.random_type()
             };
@@ -2677,7 +2812,7 @@ impl Generator<'_> {
         for alternative in names {
             let mut fields = Vec::new();
             for position in 0..self.rng.index(3) {
-                let ty = self.value_type();
+                let ty = self.payload_type();
                 let (mut lo, mut hi) = (End::Open, End::Open);
                 if let Type::Int(int_ty) = &ty {
                     let same: Vec<usize> = (0..params.len())
@@ -2797,11 +2932,23 @@ impl Generator<'_> {
             .into_iter()
             .map(|alternative| {
                 let fields = (0..self.rng.index(3))
-                    .map(|position| (format!("r{position}"), self.value_type()))
+                    .map(|position| (format!("r{position}"), self.payload_type()))
                     .collect();
                 (alternative, fields)
             })
             .collect();
+        // One alternative has no obligation in its payload, so that a
+        // history can end whatever it holds.
+        if self.contract.iter().all(|(_, fields)| {
+            fields
+                .iter()
+                .any(|(_, ty)| self.types.kind(ty) == Kind::Must)
+        }) {
+            let types = &self.types;
+            self.contract[0]
+                .1
+                .retain(|(_, ty)| types.kind(ty) != Kind::Must);
+        }
         self.exits = self
             .contract
             .iter()
@@ -2960,6 +3107,8 @@ pub fn valid(rng: &mut Rng) -> Program {
         effects: BTreeSet::new(),
         data: false,
         types: Types::default(),
+        calls: 0,
+        ending: false,
     };
     let mut declarations = Vec::new();
     for index in 0..generator.rng.index(3) {
@@ -2993,6 +3142,8 @@ pub fn valid_data(rng: &mut Rng) -> Program {
         effects: BTreeSet::new(),
         data: true,
         types: Types::default(),
+        calls: 0,
+        ending: false,
     };
     let mut declarations = generator.declare_types();
     for index in 0..generator.rng.index(3) {

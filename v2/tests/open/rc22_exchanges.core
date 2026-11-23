@@ -1,0 +1,61 @@
+// Open finding RC22 of docs/v2/review.md: a valid program, written by the
+// generator of slice 2 (seed 11 on 23 November 2026, with resources and
+// captured outcomes), which the checker accepts after 136 theory checks
+// that write 81,786,060 entries of tableaus in 158,958 exchanges. No run
+// of it is stuck. No test reads this file.
+extern resource rs0
+
+contingent extern control k0(p0 : rs0) ■ { done {} }
+
+struct st0 {m0 : [u16], m1 : u16, m2 : u8}
+
+copy struct st1 {m0 : i16}
+
+struct st2 {m0 : bool, m1 : u16}
+
+variant vt0 { miss {m0 : st0} │ ok {m0 : rs0, m1 : i32} │ hit {} }
+
+variant vt1 { some {} │ hit {m0 : st0, m1 : st0} }
+
+function f0(a0 : i64, a1 : i32) ⊢ -2147483641 ≥ a1 : i16 := 1 mod 5
+
+extern control e0(p0 : &~string, p1 : &vt1, p2 : st0) ■ { some {} │ more {} │ none {} }
+
+extern control e1(p0 : &st0, p1 : &rs0) ■ { high {r0 : u16} │ some {r0 : i32} ⇐ r0 ≤ -2147483645 │ low {r0 : rs0, r1 : u16} ⇐ 65530 ≤ r1 } uses io
+
+control c0(p0 : vt1, p1 : i64, p2 : rs0, p3 : u8) ■ { more {r0 : u16} ⇐ 13 ≤ r0 │ left {r0 : bool, r1 : u8} ⇐ r1 ≤ 132 } uses console.write
+⊤ ▷ d3 : Δ vt1(p0) ▸ some {} │ hit {v1, v2}
+⊤ ▷ v4 := f0(p1, -2147483647)
+⊤ ▷ st0 {v5, v6, v7} := st0 {[1], 4, p3 ÷ 2 + p3 mod 6}
+⊤ ▷ v8 : string := ""
+⊤ ▷ s9 : ↻ l10(i11 : i16 := 0, x12 : vt0 := vt0.hit {}) {
+    ⊤ ▷ t13 : ? i11 < 3
+    t13.false ▷ t14 : ? p1 ≥ p1
+    t13.false ∧ ¬t14.false ▷ v15 : i32 ⇀ string := ∅
+    ⊤ ▷ t16 : ? (v7 mod 9 + v7 mod 3) mod 5 * ((p3 mod 4 + v7 mod 8) mod 4) ≤ 11
+    ⊤ ▷ t17 : ? ¬(3 ≠ v6)
+    t17.true ▷ ⊥
+    ¬t17.true ∨ ¬t16.true ∧ t17.false ▷ v18 : i32 := 9
+    ¬t17.true ∨ ¬t16.true ∧ t17.false ▷ d22 : Δ vt0(x12) ▸ miss {v19} │ ok {v20, v21} │ hit {}
+    (¬t17.true ∨ ¬t16.true ∧ t17.false) ∧ d22.ok ▷ d23 : Δ k0(v20) ▸ done {}
+    ¬t17.true ∨ ¬t16.true ∧ t17.false ▷ □ hit {v18}
+} ▸ hit {v24}
+⊤ ▷ d25 : Δ emit(&v8) ▸ done {}
+s9.hit ∧ d25.done ▷ v26 := st2 {2 mod 1 < 4, 2}
+s9.hit ∧ d25.done ▷ v27 := st0 {v5, v26.m1, v7 mod 8}
+d3.some ∨ d25.done ▷ v28 := v8
+d25.done ∧ d3.hit ▷ d29 : Δ k0(p2) ▸ done {}
+d25.done ∧ d3.hit ▷ ■ left {4294967295 ≥ 1 ÷ 2, v7}
+⊤ ▷ d30 : Δ k0(p2) ▸ done {}
+⊤ ▷ ■ more {9 + 7}
+
+control c1(p0 : i32, p1 : i16, p2 : i32, p3 : st0) ⊢ p0 ≤ 25 ∧ p1 ≥ 14 ■ { left {r0 : st2} }
+⊤ ▷ ~v1 : string := "ok"
+⊤ ▷ v2 : i32 := p0 mod 7 + (p0 ÷ -5 mod 6 + 3 * (p2 mod 7))
+⊤ ▷ v3 : u16 := 1
+⊤ ▷ ⊢ v3 = 1
+⊤ ▷ t4 : ? p3.m2 < 1
+⊤ ▷ st0 {v5, v6, v7} := p3
+⊤ ▷ v8 : u16 := v6
+t4.false ▷ ~v9 : [st1] := [st1 {p1}, st1 {5}]
+⊤ ▷ ■ left {st2 {7 + 7 < 8, 5}}

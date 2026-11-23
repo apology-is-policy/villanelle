@@ -4,8 +4,15 @@
 //! A count is the same on every machine and under every load, which a time
 //! is not. The counts are kept for each thread, and nothing reads them to
 //! decide anything: they change no answer.
+//!
+//! The module also holds the one clock of the search: a time by which the
+//! check of a thread ends, which a harness sets that waits for an answer
+//! only so long ([`set_deadline`]). A check that nobody waits for would go
+//! on, and one whose diagrams grow takes memory while it does. No answer
+//! depends on the clock: a check either ends before its time or gives none.
 
 use std::cell::Cell;
+use std::time::Instant;
 
 /// What the search did on this thread since the thread began.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,6 +75,38 @@ pub fn count(change: impl FnOnce(&mut Counts)) {
         change(&mut counts);
         here.set(counts);
     });
+    let ticks = TICKS.with(|ticks| {
+        let next = ticks.get().wrapping_add(1);
+        ticks.set(next);
+        next
+    });
+    if ticks.is_multiple_of(4096) {
+        keep_time();
+    }
+}
+
+thread_local! {
+    static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    static TICKS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// What a check whose time is up unwinds with.
+pub struct OutOfTime;
+
+/// Gives the search of this thread a time by which it ends, or with `None`
+/// takes the time away.
+pub fn set_deadline(deadline: Option<Instant>) {
+    DEADLINE.with(|here| here.set(deadline));
+}
+
+/// Ends the check of this thread, by unwinding with [`OutOfTime`], if it has
+/// a time and the time is up. The search asks now and then.
+pub fn keep_time() {
+    if let Some(deadline) = DEADLINE.with(Cell::get)
+        && Instant::now() >= deadline
+    {
+        std::panic::resume_unwind(Box::new(OutOfTime));
+    }
 }
 
 impl Counts {

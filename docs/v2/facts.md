@@ -303,7 +303,9 @@ piece of program text denotes at a statement.
 - **[I12] Captured outcomes.** A capture records the terms of its arguments
   with the captured value. A decision on that value adds the conditions of the
   captured operation over those terms. Where the capture is not visible (the
-  value arrived as a parameter or a payload), the arguments are fresh names.
+  value arrived as a parameter or a payload), the arguments are fresh names:
+  one for each parameter, of the type of the parameter, and for an `&~`
+  parameter a second one for its value at completion.
   The operation runs at the capture ([E-Capture]), so an `&~` argument has
   two terms in the record: its value at the capture, and a fresh name for
   its value at completion, which the place holds from the capture on
@@ -968,7 +970,7 @@ it.
    it does. No clause changed. The proofs use the steps of [V3] as they
    are: a variable that the test brings in is a sum of terms, the change
    to it leaves every row as it was, and a split names the sum.
-4. **23 November 2026, [I12]: the record of a capture has both terms of an
+8. **23 November 2026, [I12]: the record of a capture has both terms of an
    `&~` argument, and it goes with the value.** The checker left the facts
    about the collection of a captured `pop` as they were before the
    capture, and kept the record of a capture with the name after the name
@@ -976,3 +978,10 @@ it.
    each case (review findings RC2 and RC3). The clause said "the terms of
    its arguments" and "with the captured value", and now says what that
    means for an argument that is written and for a name that changes.
+9. **23 November 2026, [I12]: what a fresh name for an argument is.** The
+   checker added no condition where the capture was not visible (review
+   finding RC23). Adding them asked two things of the clause, which it now
+   answers: a fresh name has the type of its parameter, and so the interval
+   of that type, and a parameter that is not `&~` has one name for the
+   argument at the capture and at completion, since the two are one value
+   ([P4]).

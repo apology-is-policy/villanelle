@@ -1880,3 +1880,115 @@ control uses_rough()
 "#,
     );
 }
+
+#[test]
+fn a_captured_outcome_keeps_its_conditions_where_the_capture_is_not_visible_i12() {
+    // Review finding RC23. A decision on a captured outcome adds the
+    // conditions of the captured operation; where the capture is not
+    // visible, because the value arrived as a parameter or as a payload,
+    // they are over fresh names for the arguments. The checker added none.
+    let header = r#"
+extern control fetch(id : u32)
+    ■ { ok {} │ failed {code : u32} ⇐ code ≤ 9 }
+
+extern control scale(by : u32)
+    ■ { low {v : u32} ⇐ by ≤ 4 ∧ v ≤ by │ high {v : u32} ⇐ by > 4 }
+"#;
+    // Through the payload of a loop.
+    done_and_accepted(
+        "P4",
+        &format!(
+            r#"{header}
+control c(id : u32)
+    ■ {{ fine {{}} │ code {{c : u32}} ⇐ c ≤ 9 }}
+    1  ⊤ ▷ kept := capture fetch(id)
+    2  ⊤ ▷ s : ↻ once(i : u32 := 0) {{
+           1  ⊤ ▷ □ out {{▾kept}}
+       }} ▸ out {{given}}
+    3  ⊤ ▷ d : Δ outcome(▾given) ▸ ok {{}} │ failed {{code}}
+    4  d.ok ▷ ■ fine {{}}
+    5  d.failed ▷ ■ code {{code}}
+
+//! run c(1) with [fetch -> failed {{9}}] => done code {{9}}
+//! run c(1) with [fetch -> ok] => done fine
+"#
+        ),
+    );
+    // As the parameter of a loop, which is one name for every iteration.
+    done_and_accepted(
+        "P1",
+        &format!(
+            r#"{header}
+control c(id : u32)
+    ■ {{ fine {{}} }}
+    1  ⊤ ▷ kept := capture fetch(id)
+    2  ⊤ ▷ s : ↻ once(i : u32 := 0, held : outcome⟨fetch⟩ := ▾kept) {{
+           1  ⊤ ▷ d : Δ outcome(▾held) ▸ ok {{}} │ failed {{code}}
+           2  d.failed ▷ ⊢ code ≤ 9
+           3  ⊤ ▷ □ out {{}}
+       }} ▸ out {{}}
+    3  ⊤ ▷ ■ fine {{}}
+
+//! run c(1) with [fetch -> failed {{9}}] => done fine
+"#
+        ),
+    );
+    // One fresh name stands for an argument in the whole condition: `by ≤ 4`
+    // and `v ≤ by` give `v ≤ 4`.
+    done_and_accepted(
+        "P4",
+        &format!(
+            r#"{header}
+control c(by : u32)
+    ■ {{ small {{v : u32}} ⇐ v ≤ 4 │ large {{}} }}
+    1  ⊤ ▷ kept := capture scale(by)
+    2  ⊤ ▷ s : ↻ once(i : u32 := 0) {{
+           1  ⊤ ▷ □ out {{▾kept}}
+       }} ▸ out {{given}}
+    3  ⊤ ▷ d : Δ outcome(▾given) ▸ low {{v}} │ high {{w}}
+    4  d.low ▷ ■ small {{v}}
+    5  d.high ▷ ■ large {{}}
+
+//! run c(3) with [scale -> low {{2}}] => done small {{2}}
+//! run c(7) with [scale -> high {{70}}] => done large
+"#
+        ),
+    );
+    // The conditions say no more than they say.
+    stuck_and_rejected(
+        "P4",
+        &format!(
+            r#"{header}
+control c(id : u32)
+    ■ {{ fine {{}} │ code {{c : u32}} ⇐ c ≤ 8 }}
+    1  ⊤ ▷ kept := capture fetch(id)
+    2  ⊤ ▷ s : ↻ once(i : u32 := 0) {{
+           1  ⊤ ▷ □ out {{▾kept}}
+       }} ▸ out {{given}}
+    3  ⊤ ▷ d : Δ outcome(▾given) ▸ ok {{}} │ failed {{code}}
+    4  d.ok ▷ ■ fine {{}}
+    5  d.failed ▷ ■ code {{code}}
+
+//! run c(1) with [fetch -> failed {{9}}] => stuck X7 E-Exit
+"#
+        ),
+    );
+    // A fresh name is not the argument of the capture: what the condition
+    // says of the argument is not known of the name that was given.
+    reject_core(
+        "P4",
+        &format!(
+            r#"{header}
+control c(by : u32)
+    ■ {{ small {{v : u32}} ⇐ v ≤ by │ large {{}} }}
+    1  ⊤ ▷ kept := capture scale(by)
+    2  ⊤ ▷ s : ↻ once(i : u32 := 0) {{
+           1  ⊤ ▷ □ out {{▾kept}}
+       }} ▸ out {{given}}
+    3  ⊤ ▷ d : Δ outcome(▾given) ▸ low {{v}} │ high {{w}}
+    4  d.low ▷ ■ small {{v}}
+    5  d.high ▷ ■ large {{}}
+"#
+        ),
+    );
+}

@@ -38,8 +38,8 @@ use crate::int::Int;
 use crate::kernel::Kernel;
 use crate::typed::{
     Alternative, Arithmetic, BodyId, BorrowMode, BoundaryDef, BuiltinOp, Command, Comparison,
-    Control, ControlBody, ControlId, Expr, Function, FunctionId, IntType, Kind, Operation, Place,
-    PlaceStep, Program, Selector, SiteId, StructId, Type, VarId, VarRef,
+    Control, ControlBody, ControlId, Expr, Function, FunctionId, IntType, Kind, Operation,
+    OutcomeId, Place, PlaceStep, Program, Selector, SiteId, StructId, Type, VarId, VarRef,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -4449,10 +4449,14 @@ impl<'a> BodyChecker<'a> {
                                     self.solver.add_fact(atom, eq);
                                 }
                             }
-                            Operation::Outcome(_) => {
-                                // [I12]: Conditions of the captured operation over capture arguments.
+                            Operation::Outcome(oid) => {
+                                // [I12]: the conditions of the captured
+                                // operation over the arguments of the
+                                // capture, on the histories that saw it.
+                                let mut seen = bdd::FALSE;
                                 if let Some(entries) = &outcome_captures {
                                     for (cap_guard, info) in entries {
+                                        seen = self.solver.bdd.or(seen, *cap_guard);
                                         let g = self.solver.bdd.and(*cap_guard, atom);
                                         if g == bdd::FALSE {
                                             continue;
@@ -4502,31 +4506,67 @@ impl<'a> BodyChecker<'a> {
                                             _ => {}
                                         }
                                     }
-                                } else if let Some(cond) = &contract_alt.condition {
-                                    let max_p = max_param_index(cond);
-                                    let mut fresh_params = Vec::with_capacity(max_p);
-                                    for p in 0..max_p {
-                                        let tid = self.solver.fresh_var(
-                                            format!("_out_arg{p}"),
-                                            None,
-                                            false,
+                                }
+                                // Where the capture is not visible (the
+                                // value arrived as a parameter or as a
+                                // payload), the arguments are fresh names.
+                                let source = outcome_control(self.program, *oid);
+                                let condition = contract_alt.condition.clone().or_else(|| {
+                                    let control = &self.program.controls[source?];
+                                    control.contract[arm.alternative].condition.clone()
+                                });
+                                let unseen = self.solver.bdd.minus(r_i, seen);
+                                if unseen != bdd::FALSE
+                                    && let Some(cond) = condition
+                                {
+                                    let mut parameters = Vec::new();
+                                    let mut old_parameters = Vec::new();
+                                    for p in 0..max_param_index(&cond) {
+                                        let ty = source
+                                            .and_then(|cid| {
+                                                self.program.controls[cid].parameters.get(p)
+                                            })
+                                            .map(|parameter| parameter.ty.clone());
+                                        let fresh = |checker: &mut Self, tag: &str| match &ty {
+                                            Some(ty) => {
+                                                checker.alloc_type_term(&format!("{tag}{p}"), ty)
+                                            }
+                                            None => checker.solver.fresh_var(
+                                                format!("{tag}{p}"),
+                                                None,
+                                                false,
+                                            ),
+                                        };
+                                        let now = LinearTerm::var(fresh(self, "_out_arg"));
+                                        // `old(p)` is another value than `p`
+                                        // for an `&~` parameter alone ([P4]).
+                                        let exclusive = matches!(
+                                            ty,
+                                            None | Some(Type::Ref(BorrowMode::Exclusive, _))
                                         );
-                                        fresh_params.push(LinearTerm::var(tid));
+                                        old_parameters.push(if exclusive {
+                                            LinearTerm::var(fresh(self, "_out_old"))
+                                        } else {
+                                            now.clone()
+                                        });
+                                        parameters.push(now);
                                     }
                                     let cond_env = Env {
                                         locals: BTreeMap::new(),
-                                        parameters: fresh_params.clone(),
-                                        old_parameters: fresh_params,
+                                        parameters,
+                                        old_parameters,
                                         fields: field_terms,
                                         constants: BTreeMap::new(),
                                     };
                                     let cf = translate_formula(
                                         self.program,
                                         &mut self.solver,
-                                        cond,
+                                        &cond,
                                         &cond_env,
                                     );
-                                    self.solver.add_fact(atom, cf);
+                                    let not_seen = self.solver.bdd.not(seen);
+                                    let guard = self.solver.bdd.and(atom, not_seen);
+                                    self.solver.add_fact(guard, cf);
                                 }
                             }
                         }
@@ -5361,6 +5401,16 @@ fn functional_update_frozen(
             LinearTerm::var(uid)
         }
     }
+}
+
+/// The control whose contract the outcome type names ([C4]), where a control
+/// gives the type its name.
+fn outcome_control(program: &Program, outcome: OutcomeId) -> Option<ControlId> {
+    let name = &program.outcomes[outcome].name;
+    program
+        .controls
+        .iter()
+        .position(|control| &control.name == name)
 }
 
 fn max_param_index(expr: &Expr) -> usize {
