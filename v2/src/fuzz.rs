@@ -22,6 +22,7 @@
 
 use crate::check;
 use crate::codegen::{NativeRunSpec, run_native_batch};
+use crate::counts::{self, Counts};
 use crate::differential::{Verdict, compare};
 use crate::erased;
 use crate::generate::{Coverage, entry_runs, valid};
@@ -97,6 +98,8 @@ pub struct Report {
     pub survivors: BTreeMap<Kind, u64>,
     pub coverage: Coverage,
     pub rules: BTreeSet<&'static str>,
+    /// The work of the search in every check that gave an answer in time.
+    pub search: Counts,
     pub findings: Vec<Finding>,
 }
 
@@ -111,6 +114,12 @@ pub enum Checked {
 }
 
 pub fn checker(source: &str, seconds: u64) -> Checked {
+    checker_with_counts(source, seconds).0
+}
+
+/// As [`checker`], with the work of the search. A check runs on a thread of
+/// its own, so the counts of that thread are the counts of the check.
+pub fn checker_with_counts(source: &str, seconds: u64) -> (Checked, Counts) {
     let (sender, receiver) = mpsc::channel();
     let source = source.to_string();
     std::thread::spawn(move || {
@@ -129,11 +138,18 @@ pub fn checker(source: &str, seconds: u64) -> Checked {
                 .unwrap_or_else(|| "a panic without a message".to_string());
             Checked::Panicked(message)
         });
-        let _ = sender.send(answer);
+        let _ = sender.send((answer, counts::now()));
     });
     receiver
         .recv_timeout(Duration::from_secs(seconds))
-        .unwrap_or(Checked::TimedOut)
+        .unwrap_or((Checked::TimedOut, Counts::default()))
+}
+
+/// The answer of the checker, with its work added to the report.
+fn checked(report: &mut Report, source: &str, seconds: u64) -> Checked {
+    let (answer, work) = checker_with_counts(source, seconds);
+    report.search = report.search.plus(&work);
+    answer
 }
 
 fn show(arguments: &[oracle::Value]) -> String {
@@ -273,7 +289,7 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
     if !options.checker {
         return;
     }
-    let accepted = match checker(&printed, options.seconds) {
+    let accepted = match checked(report, &printed, options.seconds) {
         Checked::Accepted => {
             report.accepted += 1;
             true
@@ -385,7 +401,7 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
             "{:?} in `{}` ({})",
             mutant.kind, mutant.control, mutant.detail
         );
-        match checker(&source, options.seconds) {
+        match checked(report, &source, options.seconds) {
             Checked::Accepted => match stuck {
                 Some(run) => find(report, "unsound", format!("{about}; {run}"), &source),
                 None => {
@@ -469,6 +485,9 @@ impl Report {
                 missing.join(", ")
             }
         ));
+        if self.search != Counts::default() {
+            out.push_str(&format!("the search: {}\n", self.search));
+        }
         out.push_str(&format!("{} findings", self.findings.len()));
         for (kind, count) in by_kind {
             out.push_str(&format!("\n  {kind}: {count}"));

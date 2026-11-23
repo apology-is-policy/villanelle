@@ -6,7 +6,7 @@
 //! is validated by the kernel before anything relies on it, so a defect here
 //! can cost an answer and cannot change one.
 //!
-//! The method, in five parts:
+//! The method, in six parts:
 //!
 //! 1. **Equalities.** Two rows `e ≤ b` and `-e ≤ -b` are an equality. One
 //!    with a coefficient of `1` or `-1` defines its variable, which is then
@@ -37,23 +37,31 @@
 //!    branches is then found at once, and one that lies a turn away is
 //!    found before a branch that never ends is followed to the limit of
 //!    nesting.
+//! 6. **The Omega test** (`omega`), which decides every set of rows.
+//!    Splitting ends when the solutions are bounded; on rows that have
+//!    rational solutions without a bound and no integer one, and that the
+//!    first four parts do not decide, it can go on for ever. So part 5 has
+//!    half of the steps that are left when it begins, and where it runs out
+//!    of them, or of turns, part 6 starts from the rows as they were
+//!    given.
 //!
 //! Splitting without a turn is tried once before part 4. Most candidates
 //! have a model, and it is found in the tableau of the rows as they are:
 //! part 4 can add many times the rows it was given, and every exchange
 //! after that pays for them.
 //!
-//! Splitting ends when the solutions are bounded. On rows that have rational
-//! solutions without a bound and no integer one, and that the first four
-//! parts do not decide, it can go on for ever; the count of steps then ends
-//! it, and the caller reports the limit. See the note on step 5 in
-//! `docs/v2/facts.md`.
+//! With part 6 the method is complete: it ends without the count of steps
+//! on every set of rows. The count still ends a search that is too long,
+//! and the caller reports the limit.
 
 use crate::counts;
 use crate::int::Int;
 use crate::rational::{Rat, gcd_u128, lcm};
 use crate::terms::{End, LinearTerm, Proof, Row, Step, TermId, div_floor};
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
+
+mod omega;
 
 pub enum Outcome {
     /// No integers satisfy the rows. `Step::Literal(i)` of the proof is entry
@@ -293,24 +301,43 @@ fn projection(
     let (lower, upper): (Vec<_>, Vec<_>) = with
         .iter()
         .partition(|(row, _)| row.coeffs[&term].is_negative());
-    for (low, low_id) in &lower {
-        for (high, high_id) in &upper {
-            let on_low = high.coeffs[&term].clone();
-            let on_high = low.coeffs[&term].negate();
-            let combined = low.combine(&on_low, high, &on_high);
-            steps.push(Step::Combine(vec![(*low_id, on_low), (*high_id, on_high)]));
-            match normal(combined, steps.len() - 1, steps) {
-                Normal::Nothing => {}
-                Normal::Contradiction(contradiction) => return Err(contradiction),
-                Normal::Row(row, id) => active.push((row, id)),
-            }
-        }
+    if let Some(contradiction) = sums(term, &lower, &upper, steps, active) {
+        return Err(contradiction);
     }
     removed.push(Removed::Projected(
         term,
         with.into_iter().map(|(row, _)| row).collect(),
     ));
     Ok(true)
+}
+
+/// Adds up each row of `lower` with each row of `upper` so that `term` is
+/// gone, and puts the sums that say something into `active`. The two sides
+/// bound the term from opposite directions. Returns the number of a
+/// contradictory row if it meets one.
+fn sums<L: Borrow<(Row, usize)>, U: Borrow<(Row, usize)>>(
+    term: TermId,
+    lower: &[L],
+    upper: &[U],
+    steps: &mut Vec<Step>,
+    active: &mut Vec<(Row, usize)>,
+) -> Option<usize> {
+    for low in lower {
+        let (low, low_id) = low.borrow();
+        for high in upper {
+            let (high, high_id) = high.borrow();
+            let on_low = absolute(&high.coeffs[&term]);
+            let on_high = absolute(&low.coeffs[&term]);
+            let combined = low.combine(&on_low, high, &on_high);
+            steps.push(Step::Combine(vec![(*low_id, on_low), (*high_id, on_high)]));
+            match normal(combined, steps.len() - 1, steps) {
+                Normal::Nothing => {}
+                Normal::Contradiction(contradiction) => return Some(contradiction),
+                Normal::Row(row, id) => active.push((row, id)),
+            }
+        }
+    }
+    None
 }
 
 /// The rows in which a term occurs, each with the coefficient of the term.
@@ -1202,17 +1229,60 @@ pub fn solve(rows: &[Row], budget: &mut u64) -> Outcome {
             }
         }
     }
-    // Part 5. The number of turns is raised step by step: a search to the
-    // end of the branches it prefers would not return from one in which
-    // every split leaves a rational solution.
+    // Part 5, with half of the steps that are left. The number of turns is
+    // raised step by step: a search to the end of the branches it prefers
+    // would not return from one in which every split leaves a rational
+    // solution.
+    let mut share = *budget / 2;
+    *budget -= share;
     let mut turns = 0;
     loop {
-        match simplex.search(steps.len(), SPLIT_DEPTH, turns, budget) {
-            Err(Limit) => return Outcome::Limit,
+        match simplex.search(steps.len(), SPLIT_DEPTH, turns, &mut share) {
+            Err(Limit) => break,
             Ok(Found::Open) if turns < SPLIT_DEPTH => turns = (2 * turns).max(1),
-            Ok(Found::Open) => return Outcome::Limit,
-            Ok(Found::Refuted(found)) => return refuted(steps, found),
-            Ok(Found::Model(model)) => return finish(model, &removed),
+            Ok(Found::Open) => break,
+            Ok(Found::Refuted(found)) => {
+                *budget += share;
+                return refuted(steps, found);
+            }
+            Ok(Found::Model(model)) => {
+                *budget += share;
+                return finish(model, &removed);
+            }
+        }
+    }
+    *budget += share;
+    complete(rows, steps, budget)
+}
+
+/// Part 6, on the rows as they were given. `steps` holds the steps so far,
+/// the literals first.
+fn complete(rows: &[Row], mut steps: Vec<Step>, budget: &mut u64) -> Outcome {
+    counts::count(|counts| counts.omega_tests += 1);
+    let mut active = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        match normal(row.clone(), index, &mut steps) {
+            Normal::Nothing => {}
+            Normal::Contradiction(row) => {
+                return pruned(&Proof {
+                    steps,
+                    end: End::Close(row),
+                });
+            }
+            Normal::Row(row, id) => active.push((row, id)),
+        }
+    }
+    match omega::decide(active, &mut steps, budget) {
+        Err(Limit) => Outcome::Limit,
+        Ok(omega::Answer::Refuted(end)) => pruned(&Proof { steps, end }),
+        Ok(omega::Answer::Model(mut model)) => {
+            for row in rows {
+                for term in row.coeffs.keys() {
+                    model.entry(*term).or_default();
+                }
+            }
+            debug_assert!(rows.iter().all(|row| row.holds(&model)));
+            Outcome::Sat(model)
         }
     }
 }
@@ -1224,7 +1294,7 @@ mod tests {
     use crate::rng::Rng;
     use crate::terms::TheoryLemma;
 
-    fn row(coeffs: &[(TermId, i128)], rhs: i128) -> Row {
+    pub(super) fn row(coeffs: &[(TermId, i128)], rhs: i128) -> Row {
         Row {
             coeffs: coeffs
                 .iter()
@@ -1235,15 +1305,21 @@ mod tests {
         }
     }
 
-    /// The answer of [`solve`], with a proof validated by the kernel and a
+    /// What an outcome says, with a proof validated by the kernel and a
     /// model evaluated in the rows.
-    fn decided(rows: &[Row]) -> Option<bool> {
-        let mut budget = 200_000;
-        match solve(rows, &mut budget) {
+    pub(super) fn answer(outcome: Outcome, rows: &[Row]) -> Option<bool> {
+        match outcome {
             Outcome::Limit => None,
             Outcome::Sat(model) => {
                 for row in rows {
                     assert!(row.holds(&model), "the model fails {row:?}");
+                }
+                let terms: Vec<TermId> = rows
+                    .iter()
+                    .flat_map(|row| row.coeffs.keys().copied())
+                    .collect();
+                for term in model.keys() {
+                    assert!(terms.contains(term), "{term} is no term of the rows");
                 }
                 Some(true)
             }
@@ -1256,6 +1332,64 @@ mod tests {
                 Some(false)
             }
         }
+    }
+
+    /// The answer of [`solve`].
+    pub(super) fn decided(rows: &[Row]) -> Option<bool> {
+        let mut budget = 200_000;
+        answer(solve(rows, &mut budget), rows)
+    }
+
+    /// Rows of up to three variables in a small box, as the checker gives
+    /// them, and whether a point of the box satisfies them: every point is
+    /// tried.
+    pub(super) fn boxed(rng: &mut Rng) -> (Vec<Row>, bool) {
+        let variables = 1 + rng.below(3) as usize;
+        let mut rows = Vec::new();
+        // A box, so that every point can be tried.
+        for term in 0..variables {
+            rows.push(row(&[(term, 1)], 4));
+            rows.push(row(&[(term, -1)], 4));
+        }
+        for _ in 0..1 + rng.below(5) {
+            let coeffs: Vec<(TermId, i128)> = (0..variables)
+                .map(|term| (term, rng.below(15) as i128 - 7))
+                .collect();
+            if coeffs.iter().all(|(_, coeff)| *coeff == 0) {
+                continue;
+            }
+            let rhs = rng.below(41) as i128 - 20;
+            // An equality now and then.
+            if rng.below(4) == 0 {
+                let opposite: Vec<(TermId, i128)> =
+                    coeffs.iter().map(|(term, c)| (*term, -c)).collect();
+                rows.push(row(&opposite, -rhs));
+            }
+            rows.push(row(&coeffs, rhs));
+        }
+        let mut exists = false;
+        let mut point = vec![-4i128; variables];
+        'points: loop {
+            let model: BTreeMap<TermId, Int> = point
+                .iter()
+                .enumerate()
+                .map(|(term, value)| (term, Int::from_i128(*value)))
+                .collect();
+            if rows.iter().all(|row| row.holds(&model)) {
+                exists = true;
+                break;
+            }
+            for value in point.iter_mut() {
+                if *value < 4 {
+                    *value += 1;
+                    continue 'points;
+                }
+                *value = -4;
+            }
+            break;
+        }
+        // The rows as the checker gives them: with no common factor.
+        (rows.iter().map(|row| row.normalize().0).collect(), exists)
     }
 
     #[test]
@@ -1496,52 +1630,7 @@ mod tests {
         let mut refuted = 0;
         let mut with_split = 0;
         for _ in 0..3_000 {
-            let variables = 1 + rng.below(3) as usize;
-            let mut rows = Vec::new();
-            // A box, so that every point can be tried.
-            for term in 0..variables {
-                rows.push(row(&[(term, 1)], 4));
-                rows.push(row(&[(term, -1)], 4));
-            }
-            for _ in 0..1 + rng.below(5) {
-                let coeffs: Vec<(TermId, i128)> = (0..variables)
-                    .map(|term| (term, rng.below(15) as i128 - 7))
-                    .collect();
-                if coeffs.iter().all(|(_, coeff)| *coeff == 0) {
-                    continue;
-                }
-                let rhs = rng.below(41) as i128 - 20;
-                // An equality now and then.
-                if rng.below(4) == 0 {
-                    let opposite: Vec<(TermId, i128)> =
-                        coeffs.iter().map(|(term, c)| (*term, -c)).collect();
-                    rows.push(row(&opposite, -rhs));
-                }
-                rows.push(row(&coeffs, rhs));
-            }
-            let mut exists = false;
-            let mut point = vec![-4i128; variables];
-            'points: loop {
-                let model: BTreeMap<TermId, Int> = point
-                    .iter()
-                    .enumerate()
-                    .map(|(term, value)| (term, Int::from_i128(*value)))
-                    .collect();
-                if rows.iter().all(|row| row.holds(&model)) {
-                    exists = true;
-                    break;
-                }
-                for value in point.iter_mut() {
-                    if *value < 4 {
-                        *value += 1;
-                        continue 'points;
-                    }
-                    *value = -4;
-                }
-                break;
-            }
-            // The rows as the checker gives them: with no common factor.
-            let rows: Vec<Row> = rows.iter().map(|row| row.normalize().0).collect();
+            let (rows, exists) = boxed(&mut rng);
             assert_eq!(decided(&rows), Some(exists), "{rows:?}");
             if !exists {
                 refuted += 1;

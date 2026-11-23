@@ -31,6 +31,10 @@ pub struct Counts {
     pub entries: u64,
     /// Splits of a variable at a value that is not an integer.
     pub splits: u64,
+    /// Theory checks that went on to the Omega test, and the splinters it
+    /// tried.
+    pub omega_tests: u64,
+    pub splinters: u64,
 }
 
 thread_local! {
@@ -47,6 +51,8 @@ thread_local! {
         exchanges: 0,
         entries: 0,
         splits: 0,
+        omega_tests: 0,
+        splinters: 0,
     }) };
 }
 
@@ -65,6 +71,26 @@ pub fn count(change: impl FnOnce(&mut Counts)) {
 }
 
 impl Counts {
+    /// These counts and `other` together.
+    pub fn plus(&self, other: &Counts) -> Counts {
+        Counts {
+            queries: self.queries + other.queries,
+            candidates: self.candidates + other.candidates,
+            lemmas_reused: self.lemmas_reused + other.lemmas_reused,
+            theory_checks: self.theory_checks + other.theory_checks,
+            rows: self.rows + other.rows,
+            refuted: self.refuted + other.refuted,
+            models: self.models + other.models,
+            premises: self.premises + other.premises,
+            tableaus: self.tableaus + other.tableaus,
+            exchanges: self.exchanges + other.exchanges,
+            entries: self.entries + other.entries,
+            splits: self.splits + other.splits,
+            omega_tests: self.omega_tests + other.omega_tests,
+            splinters: self.splinters + other.splinters,
+        }
+    }
+
     /// What was done between `earlier` and these counts.
     pub fn since(&self, earlier: &Counts) -> Counts {
         Counts {
@@ -80,6 +106,8 @@ impl Counts {
             exchanges: self.exchanges - earlier.exchanges,
             entries: self.entries - earlier.entries,
             splits: self.splits - earlier.splits,
+            omega_tests: self.omega_tests - earlier.omega_tests,
+            splinters: self.splinters - earlier.splinters,
         }
     }
 }
@@ -90,7 +118,7 @@ impl std::fmt::Display for Counts {
             out,
             "{} queries, {} candidates ({} by an earlier lemma), {} theory checks of {} rows \
              ({} refuted, {} with a model), {} premises added, {} tableaus, {} exchanges \
-             writing {} entries, {} splits",
+             writing {} entries, {} splits, {} Omega tests with {} splinters",
             self.queries,
             self.candidates,
             self.lemmas_reused,
@@ -103,6 +131,8 @@ impl std::fmt::Display for Counts {
             self.exchanges,
             self.entries,
             self.splits,
+            self.omega_tests,
+            self.splinters,
         )
     }
 }

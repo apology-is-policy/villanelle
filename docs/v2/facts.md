@@ -526,19 +526,26 @@ decides linear integer arithmetic without assuming bounds, since a product or
 a quotient by a term may have none. The Omega test is one. Branching within
 the bound that the small-model property of integer programs gives is another.
 
-**The integrality step of the crate in `v2/`** (`lia.rs`) is not yet such a
-method. It replaces a variable that an equality defines, removes a variable
+**The integrality step of the crate in `v2/`** (`lia.rs`) is such a method.
+It replaces a variable that an equality defines, removes a variable
 whose coefficient is a unit on one side by adding up its bounds, rounds every
 row it derives, looks once for a model along the splits it prefers, adds the
 rounded sum of two rows where rounding says more than the rows did, and then
-splits. Every answer it gives is right: a yes
-has a proof that the kernel validated, and a no has a model that was
-evaluated. On rows that have rational solutions without a bound and no
-integer one, and that the first steps do not decide, the splitting does not
-end, and the count of steps of [J6] ends it. Such a query is reported as the
-compiler's limit. The remedy is the remaining part of the Omega test (the
-dark shadow and the splinters); it is open as finding RC12 of the
-[review](review.md).
+splits, with half of the steps that it has left. Where the splits do not
+end, the Omega test decides the rows as they were given. In an equality
+without a unit coefficient it changes a variable for a new one, which is a
+sum of the terms, until a coefficient is a unit. For a variable that no
+side bounds with units it splits on each bound of one side, at a distance
+that the coefficients fix. Beyond the split, the bound holds with less than
+that distance to spare: with one of so many equalities, the splinters, and
+each is decided on its own. Where every bound has that distance to spare,
+the sums of a bound of each side, in which the variable is gone, leave an
+integer for it, and the method goes on without the variable. Every answer
+of the step is right: a yes has a proof that the kernel validated, and a no
+has a model that was evaluated. The count of steps of [J6] still ends a
+search that is too long, and such a query is reported as the compiler's
+limit: the number of splinters grows with the coefficients, so the step
+ends on every set of rows and is not fast on every one.
 
 Two properties keep the work small. Step 2 settles most obligations of ordinary
 code in step 3, as in section 2.1: a test and the obligation it serves are the
@@ -945,3 +952,11 @@ it.
    (finding RC16 of the review). No clause changed. The crate was also
    brought to [J6] as it stands: a check depended on the order of a hash
    table (finding RC19).
+7. **23 November 2026, section 7: the integrality step of the crate is
+   complete.** The note said that the step was not a method that decides
+   linear integer arithmetic without bounds, and that a query could reach
+   the limit of [J6] for that reason (finding RC12 of the review). The
+   crate now has the Omega test behind its splits, and the note says what
+   it does. No clause changed. The proofs use the steps of [V3] as they
+   are: a variable that the test brings in is a sum of terms, the change
+   to it leaves every row as it was, and a split names the sum.

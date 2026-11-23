@@ -87,11 +87,10 @@ Items 9 to 16 were written on 21 and 22 November. The [review](review.md) of
 10. Phase 3 for slice 1: the checker on the typed core with ROBDD histories,
     the `Th_Z` fact logic, the independent certificate kernel, counterexample
     models, the canonical Rails formatter and compiler warnings (draft: the
-    decision procedure is not complete without bounds, and the formatter
-    loses comments; since 23 November the kernel makes every axiom instance
-    itself, a certificate text is validated without the checker, and the
-    procedure gives a proof, a model or a counted limit: review, RC9 to
-    RC13, RC16).
+    formatter loses comments; since 23 November the kernel makes every
+    axiom instance itself, a certificate text is validated without the
+    checker, and the procedure gives a proof, a model or a counted limit
+    and is complete without bounds: review, RC9 to RC13, RC16).
 11. Phase 4 for slice 1: Theorem 4 call expansion and the typed LLVM IR and C
     ABI backend under the erased semantics ([R1] to [R3]), verified against the
     oracle and the erased interpreter at `-O0` and `-O2` (original and expanded)

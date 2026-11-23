@@ -17,7 +17,9 @@ use villanelle_v2::mutate::{self, Class};
 use villanelle_v2::oracle::Config;
 use villanelle_v2::rng::Rng;
 use villanelle_v2::terms::{Certificate, End, Instance, Part, Proof, Step};
-use villanelle_v2::{expand, fuzz, load, load_surface, resolve, surface, syntax, text, typed};
+use villanelle_v2::{
+    certificate, expand, fuzz, load, load_surface, resolve, surface, syntax, text, typed,
+};
 
 fn check_core(source: &str) -> Result<CheckedProgram, check::Error> {
     let program = load(source).unwrap_or_else(|error| panic!("resolve failed: {error}\n{source}"));
@@ -766,6 +768,68 @@ fn the_procedure_is_exact_on_integers_and_gives_up_only_at_a_counted_limit() {
         ",
     );
     assert!(error.counterexample.is_some());
+}
+
+/// Review finding RC12, the rest of it. The procedure is complete without
+/// bounds. The precondition speaks of the difference of two parameters, so
+/// its four rows bound neither, and the splits on one of them do not end:
+/// the answer was the limit of [J6]. The Omega test refutes the rows by
+/// their splinters, and the kernel validates its proof from the text.
+#[test]
+fn a_condition_without_a_bound_is_decided_by_the_omega_test() {
+    let source = "
+        pub control c(u : i64, v : i64, y : i64)
+            ⊢ 11 * (u - v) + 13 * y ≥ 27 ∧ 11 * (u - v) + 13 * y ≤ 45 ∧ 7 * (u - v) - 9 * y ≥ -10 ∧ 7 * (u - v) - 9 * y ≤ 4
+            ■ { r } :=
+            ⊤ ▷ ⊥
+    ";
+    let before = counts::now();
+    let report = accept_core("J5", source);
+    let done = counts::now().since(&before);
+    assert_eq!(done.omega_tests, 1, "{done}");
+    assert_eq!(done.splinters, 16, "{done}");
+    assert!(
+        report.certificates.iter().any(|proved| proved
+            .certificate
+            .lemmas()
+            .any(|lemma| lemma.proof.splits() >= 16)),
+        "the proof splits for every splinter"
+    );
+    let text = report.certificate_text().expect("a text");
+    assert_eq!(
+        certificate::validate(&text),
+        Ok(report.certificates.len()),
+        "the text validates"
+    );
+
+    // One more value of the last row, and the obligation does not hold:
+    // the difference may be 2 and `y` 1.
+    let error = reject_core(
+        "P6",
+        "
+        pub control c(u : i64, v : i64, y : i64)
+            ⊢ 11 * (u - v) + 13 * y ≥ 27 ∧ 11 * (u - v) + 13 * y ≤ 45 ∧ 7 * (u - v) - 9 * y ≥ -10 ∧ 7 * (u - v) - 9 * y ≤ 5
+            ■ { r } :=
+            ⊤ ▷ ⊥
+        ",
+    );
+    assert!(error.counterexample.is_some());
+
+    // The limit of [J6] remains for a search that is too long. With
+    // `1 ≤ m·x - (m - 1)·y ≤ 3` and `4 ≤ y ≤ m` there is no `x`, every `y`
+    // has a rational one, and the splinters are about `m`: a million.
+    let wedge = "
+        pub control c(x : i64, y : i64)
+            ⊢ 1000000 * x - 999999 * y ≥ 1 ∧ 1000000 * x - 999999 * y ≤ 3 ∧ y ≥ 4 ∧ y ≤ 1000000
+            ■ { r } :=
+            ⊤ ▷ ⊥
+    ";
+    let before = counts::now();
+    let error = facts::with_step_limit(100_000, || check_core(wedge)).expect_err("no answer");
+    let done = counts::now().since(&before);
+    assert_eq!(error.clause, "J6", "{error}");
+    assert!(error.counterexample.is_none());
+    assert!(done.splinters > 1_000, "{done}");
 }
 
 /// Review finding RC11. Whether a history is feasible is an entailment like

@@ -148,7 +148,8 @@ as counts (theory checks, exchanges, entries written); measure the checker
 with them, since a time depends on the load of the machine. `vn2 fuzz --seed N
 --count N [--mutants] [--native] [--out DIR]` tries generated programs in the
 reader, the two semantics and the checker, their mutants, and with `--native`
-their compiled code; a program is a function of its seed, and
+their compiled code, and prints the counts of the search over the campaign;
+a program is a function of its seed, and
 a release build (`cargo run --release`) is some ten times faster. Inputs are `.core` (the
 core text form) or `.rails`. Do not use `vn2 format --write` on source that
 matters until review finding RS4 is closed.

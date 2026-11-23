@@ -35,7 +35,7 @@ can be read on its own. Nothing in it is built for speed.
 | `bdd`, `facts`, `kernel` | The ROBDD engine; the `Th_Z` fact logic with its search and its counterexamples ([M1] to [M6]); and the certificate kernel, which is given the query by the checker, makes the formula of every instance from its name with its own matcher for the axiom list, checks the proof of every lemma (a tree of the steps of [V3], with Split) and recomputes the Boolean step in a diagram of its own ([V1] to [V4]) (section 10) |
 | `certificate` | The text of certificates ([V5]): the writer, and a reader that makes the tables, the goals and the premises from a text alone and gives them to the kernel (section 10) |
 | `counts` | The work of the search as counts for each thread, which `vn2 check --counts` prints; nothing reads them to decide anything (section 10) |
-| `terms`, `lia`, `rational` | The terms, rows, proofs, names of instances and certificates that the search and the kernel both read; the theory check for the rows of a candidate, which answers with a model, a proof or the counted limit of [J6] (section 7 of the [fact logic](facts.md) has a note on what it does not decide); and the rationals of its simplex method |
+| `terms`, `lia`, `rational` | The terms, rows, proofs, names of instances and certificates that the search and the kernel both read; the theory check for the rows of a candidate, which answers with a model, a proof or the counted limit of [J6], and whose last part, the Omega test (`lia/omega.rs`), decides rows without bounds (section 7 of the [fact logic](facts.md) has a note on the method); and the rationals of its simplex method |
 | `check` | The phase 3 checker: coverage ([K1] to [K8]), conditional facts and SSA renaming ([N1] to [N5]), acknowledgement ([C2]), availability ([O1], [O2], [O4], [O6]), obligations ([P1] to [P8]), effects ([F3]) and impossible-arm warnings ([U16]) (section 10) |
 | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls, lifting loop exits and preserving checking and observations (section 11) |
 | `codegen` | The phase 4 typed LLVM IR and C ABI backend under the erased semantics ([R1] to [R3]), with native `-O0`/`-O2`/`-O3` compilation and differential execution (section 11) |
@@ -432,8 +432,16 @@ of slice 1:
   `Ω`, `Ψ` and `[J3]`, and the theory check of `lia`: equalities replaced,
   variables with a unit coefficient projected out, the simplex method over
   the rationals, a first search for a model along the splits, rounded sums,
-  and splits, with a proof as a tree of the
-  steps of [V3] that is pruned to what its ends rely on. The refinement
+  splits, and behind them the Omega test, with a proof as a tree of the
+  steps of [V3] that is pruned to what its ends rely on. The splits have
+  half of the steps that are left; where they do not end, the Omega test
+  starts from the rows as they were given. It changes variables in an
+  equality without a unit coefficient, and for a variable that no side
+  bounds with units it tries the sums of the bounds as they are, then the
+  sums of the bounds tightened by the distance that the coefficients fix,
+  and then one equality, a splinter, for each value within that distance.
+  Its search has the shape of its proof: a split for each bound, with the
+  splinters on one side and the tightened bound on the other. The refinement
   starts from the goal and the structure. A candidate that has a model is
   completed to one of every term. Every premise that this model fails is
   conjoined before the next candidate is taken, and where it fails none,
@@ -469,8 +477,10 @@ of slice 1:
 
 **The work of the search is measured by counts** (`counts`): queries,
 candidates, theory checks and their rows, premises added, tableaus,
-exchanges of the simplex method with the entries they write, and splits.
-`vn2 check --counts` prints them. A count is the same on every machine and
+exchanges of the simplex method with the entries they write, splits, and
+the theory checks that went on to the Omega test with the splinters it
+tried. `vn2 check --counts` prints them, and `vn2 fuzz` prints their sum
+over a campaign. A count is the same on every machine and
 under every load, and by [J6] the same in every run: the checker keeps
 names and terms in ordered tables, and a hash table is used only where
 nothing reads its order (the tables of the diagram, the tables that give
@@ -481,6 +491,11 @@ theory checks of 8,397 rows, 1,476 premises added, and no exchange. For the
 data kernel of slice 2 (`v2/tests/kernels/slice2_data.rails`): 212 queries,
 1,125 candidates, 786 theory checks of 45,172 rows, 1,454 exchanges that
 write 67,200 entries, and 689 splits.
+Over the 5,403 mutants of 25 generated programs: 1,116,283 queries,
+1,716,050 candidates, 1,552,087 theory checks of 27,456,158 rows, 346,577
+exchanges that write 3,358,331 entries, and 143,641 splits. No theory
+check of these programs, of the 300 generated ones or of the mutants goes
+on to the Omega test.
 
 `v2/tests/kernel.rs` tests the kernel's matcher: every instance of [A1],
 [A2] and [A7] to [A9] that it grants is evaluated with the values that the
@@ -507,7 +522,22 @@ and a program whose exit condition rests on remainders and a product
 (`v2/tests/kernels/remainders_and_products.core`) are checked within a
 stated number of theory checks and of entries written. The last is a mutant
 that a campaign found: it is valid, and a search that added every failed
-instance at once did not decide it.
+instance at once did not decide it. A precondition on the difference of two
+parameters, which bounds neither, holds the Omega test in the checker: the
+splits do not end on it, the answer was the limit of [J6], and it is now a
+proof with sixteen splinters that validates from the certificate text. The
+same test holds the limit that remains: a wedge between two lines with
+coefficients of a million has no integer point and about a million
+splinters, and its answer is the limit of [J6], after 283,119 splinters
+and 0.7 seconds with the two million steps of a query.
+
+The tests of `v2/src/lia.rs` compare the theory check with a search of
+every point on 3,000 sets of rows in a box. Those of `v2/src/lia/omega.rs`
+do the same for the Omega test alone, on 3,000 sets of rows in a box, on
+1,500 in which each variable is a sum of two terms and none has a bound,
+and on 1,500 pairs of thin bands, many of which have rational solutions and
+no integer one; the kernel validates every proof, and every model is
+evaluated.
 
 ### The certificate text ([V5])
 
@@ -1084,7 +1114,7 @@ Rails surface:
   lists the defects and, in its section 3, what each slice owes: a generator
   that is not one program (done for slice 1), a kernel that validates axiom
   instances and a certificate text that
-  a reader validates (done), a decision procedure that is complete without bounds, the
+  a reader validates (done), a decision procedure that is complete without bounds (done), the
   fault-boundary rules of the oracle, the unsound cases of the
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
