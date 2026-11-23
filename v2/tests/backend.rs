@@ -9,7 +9,7 @@ use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{Config, End, Value, run};
 use villanelle_v2::rng::Rng;
 use villanelle_v2::syntax::{Command as SynCommand, Declaration, Statement as SynStatement};
-use villanelle_v2::{check, erased, expand, generate, kernel, resolve, script, surface, text};
+use villanelle_v2::{check, erased, expand, generate, resolve, script, surface, text};
 
 fn surface_files() -> Vec<(String, String)> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/slice1_surface");
@@ -111,9 +111,7 @@ pub control outer_caller(n: u32) ⊢ n ≤ 50 ■ ok {res: u32} ⇐ res ≤ 100 
     let reparsed = text::parse(&printed).unwrap();
     let resolved_exp = resolve::resolve(&reparsed).unwrap();
     let checked_exp = check::check(&resolved_exp).unwrap();
-    for (_, _, _, cert) in &checked_exp.certificates {
-        kernel::validate(cert).unwrap();
-    }
+    checked_exp.revalidate().unwrap();
 
     // Directives on the expanded core text must pass identically.
     let directives_tail: Vec<&str> = nested_loop_callee
@@ -137,9 +135,7 @@ pub control outer_caller(n: u32) ⊢ n ≤ 50 ■ ok {res: u32} ⇐ res ≤ 100 
         let resolved = resolve::resolve(&expanded).unwrap();
         let checked = check::check(&resolved)
             .unwrap_or_else(|e| panic!("{name}: expanded check failed: {e}\n{}", expanded.print()));
-        for (_, _, _, cert) in &checked.certificates {
-            kernel::validate(cert).unwrap();
-        }
+        checked.revalidate().unwrap();
     }
 }
 
@@ -434,9 +430,7 @@ fn generated_valid_programs_agree_across_oracle_erased_expanded_and_native_o0_o2
         // Expanded program must pass the Phase 3 checker and certificate kernel.
         let checked_exp = check::check(&expanded_program)
             .unwrap_or_else(|e| panic!("seed {seed}: expanded check failed: {e}"));
-        for (_, _, _, cert) in &checked_exp.certificates {
-            kernel::validate(cert).unwrap();
-        }
+        checked_exp.revalidate().unwrap();
 
         let usize_bits = if seed % 2 == 0 { 32 } else { 64 };
         let config = Config::with_usize_bits(usize_bits);
@@ -647,9 +641,7 @@ pub control hot_bench(iters: u64) ⊢ iters ≤ 50000000 ■ result {checksum: u
     let expanded = expand::expand(&tree).unwrap();
     let program = resolve::resolve(&expanded).unwrap();
     let checked = check::check(&program).unwrap();
-    for (_, _, _, cert) in &checked.certificates {
-        kernel::validate(cert).unwrap();
-    }
+    checked.revalidate().unwrap();
 
     let mut v2_ir = emit_llvm(&program, 64);
     // Append a C timing driver around `@vn2_call_hot_bench` that measures only

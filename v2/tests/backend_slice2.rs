@@ -10,7 +10,7 @@ use villanelle_v2::host::{Answer, Script};
 use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{Config, End, Value, run};
 use villanelle_v2::syntax::{Command as SynCommand, Declaration, Statement as SynStatement};
-use villanelle_v2::{check, erased, expand, kernel, resolve, script, surface, text};
+use villanelle_v2::{check, erased, expand, resolve, script, surface, text};
 
 fn slice2_surface_files() -> Vec<(String, String)> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/slice2_surface");
@@ -207,9 +207,7 @@ fn slice_two_theorem_4_expansion_preserves_checking_and_semantics() {
             .unwrap_or_else(|e| panic!("{name}: expanded core failed to resolve: {e}\n{printed}"));
         let checked = check::check(&resolved)
             .unwrap_or_else(|e| panic!("{name}: expanded core failed check: {e}\n{printed}"));
-        for (_, _, _, cert) in &checked.certificates {
-            kernel::validate(cert).unwrap();
-        }
+        checked.revalidate().unwrap();
 
         let directives_tail: Vec<&str> = source
             .lines()
@@ -288,9 +286,7 @@ control run_all(fail_now: bool) ■ done {total: u32, count: usize, slen: usize}
     let orig_tree = surface::elaborate(borrow_and_fault_source).unwrap();
     let orig_prog = resolve::resolve(&orig_tree).unwrap();
     let orig_checked = check::check(&orig_prog).unwrap();
-    for (_, _, _, cert) in &orig_checked.certificates {
-        kernel::validate(cert).unwrap();
-    }
+    orig_checked.revalidate().unwrap();
 
     let exp_tree = expand::expand(&orig_tree).unwrap();
     assert_no_expandable_defined_calls(&exp_tree);
@@ -301,9 +297,7 @@ control run_all(fail_now: bool) ■ done {total: u32, count: usize, slen: usize}
         .unwrap_or_else(|e| panic!("expanded borrow/fault failed to resolve: {e}\n{exp_printed}"));
     let exp_checked = check::check(&exp_prog)
         .unwrap_or_else(|e| panic!("expanded borrow/fault failed check: {e}\n{exp_printed}"));
-    for (_, _, _, cert) in &exp_checked.certificates {
-        kernel::validate(cert).unwrap();
-    }
+    exp_checked.revalidate().unwrap();
 
     let specs = vec![
         NativeRunSpec {
@@ -956,9 +950,7 @@ pub control data_bench(n: usize, passes: u64)
     let expanded = expand::expand(&tree).unwrap();
     let program = resolve::resolve(&expanded).unwrap();
     let checked = check::check(&program).unwrap();
-    for (_, _, _, cert) in &checked.certificates {
-        kernel::validate(cert).unwrap();
-    }
+    checked.revalidate().unwrap();
 
     let mut v2_ir = emit_llvm(&program, 64);
     v2_ir.push_str(

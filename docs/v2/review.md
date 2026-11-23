@@ -209,6 +209,20 @@ compares the checker with the oracle for slices 2 and 3.
 program in 63 seconds of processor time. `check_body_inner` is one function
 of 1,582 lines.
 
+**RC17. The type of an element that only a frame instance speaks of was
+guessed.** Found on 23 November, while the kernel's matcher was written. For
+an update `t[i ↦ e]` and an index `j`, the instance of [A6] speaks of `t[j]`.
+The search gave that term the element type of another vector on which `j` is
+an index, when the sorts of the two vectors were equal or when one of them was
+not known to the solver, and with the type its range. An element of a vector
+of `u32` could so be given the range of `u8`. No wrong acceptance was
+reproduced.
+
+**RC18.** Found on 23 November by the comparison of the kernel with the
+search. For two constructor terms of one struct that differ in the number of
+arguments, the search concluded from the equality of the arguments they share
+that the terms are equal. A program that resolves has no such terms.
+
 Held up under attack: the arithmetic of slice 1 at the bounds of every type
 and at both `usize` widths, loops and invariants, mutable names in branches
 and effects; in slice 2, leaks at `↑`, `□` and `■`, overwriting a `must`
@@ -424,9 +438,14 @@ A finding is closed here with the date and the test that holds it.
 | --- | --- |
 | RD1 | Closed 23 November 2026 by the corrected status statements |
 | RG1 | Closed 23 November 2026 for the reader, the two semantics and the checker: `generate::valid` writes programs from their histories; `generated_valid_programs_run_to_an_end_and_reach_every_construct` and `the_checker_accepts_generated_valid_programs` (`v2/tests/harness.rs`) hold it, and `vn2 fuzz --seed 1 --count 300` reports no finding. Open for the mutation and backend tests, which still run on `generate::template` |
+| RC9 | Closed 23 November 2026. A certificate names its instances and holds no formula; the kernel makes the formula of each with its own matcher for the axiom list, and refuses a name that names none. `the_kernel_refuses_what_is_not_an_instance`, `the_kernel_grants_every_instance_that_the_search_makes` and `the_instances_of_the_arithmetic_axioms_hold_for_the_real_operations` (`v2/tests/kernel.rs`) hold it, with `certificate_kernel_rejects_corrupted_proofs_v1_to_v5` (`v2/tests/checker.rs`). Owed with slice 2: the instances of [A3] to [A6] against real values, as the last of these tests does for [A1], [A2] and [A7] to [A9] |
+| RC10 | Closed 23 November 2026. The checker gives the kernel the goal, the premises, the terms and the rows (`kernel::Query`); the certificate names premises by their position in the checker's lists. The kernel has its own arithmetic and its own diagram, and uses of the crate the integers, the diagram package and the data of `terms`. `certificate_kernel_rejects_corrupted_proofs_v1_to_v5` holds it: the same certificate is refused for another goal, and so is a premise that the checker did not state. `CheckedProgram::revalidate` validates every certificate of a check again with a kernel that saw nothing of it, and the tests of the three slices call it |
 | RC11 | Closed 23 November 2026: every question the checker asks goes through one function that validates a yes in the kernel and lists the certificate, with the clause `N1` for the feasibility of a history. `an_infeasible_history_is_ruled_out_by_a_validated_certificate` (`v2/tests/checker.rs`) holds it |
 | RC12 | Closed 23 November 2026 for the panic and for the wrong answers: the theory check (`v2/src/lia.rs`) gives a proof that the kernel validates (with the Split step of [V3]), a model that is evaluated, or the counted limit, which the checker reports with the clause `J6`. `the_procedure_is_exact_on_integers_and_gives_up_only_at_a_counted_limit` (`v2/tests/checker.rs`) and the tests of `lia.rs`, which compare 3,000 sets of rows with a search of every point, hold it. Open: the method is not complete without bounds, so a query can reach the limit that a complete method would decide (the note in section 7 of the [fact logic](facts.md)); none of the 300 generated programs does |
 | RC16 | Partly. The three generated programs that had no answer in 20 seconds are answered, and the 300 are checked in under 30 seconds. Open: the kernel program of the slice 2 backend test takes about 2.5 seconds to check and its expansion about 12, most of it in a few satisfiable queries of 130 rows; `check_body_inner` is still one function |
+| RC15 | Partly. Since 23 November tampering is tested on the instances, the premises and the goal of a certificate as well as on the steps of a lemma (`v2/tests/checker.rs`, `v2/tests/kernel.rs`). Open: no test compares the checker with the oracle for slices 2 and 3 |
+| RC17 | Closed 23 November 2026 for soundness: the kernel grants a range, the planes of a product and the constructor of a variant value only for a term that the checker wrote, and the search gives a term that it adds no range either. `a_term_that_the_search_added_has_no_range` (`v2/tests/kernel.rs`) holds it. Open: the element has the range by [A1], so a proof that needs it fails until the solver knows the sort of every vector term (the note in section 8 of the [fact logic](facts.md)); for slice 2 |
+| RC18 | Closed 23 November 2026: the search pairs constructor terms only when they have one number of arguments, and the kernel refuses the pair otherwise. `the_kernel_grants_every_instance_that_the_search_makes` and `the_kernel_refuses_what_is_not_an_instance` hold it |
 | All others | Open |
 
 ## 10. The course

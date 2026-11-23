@@ -32,8 +32,8 @@ can be read on its own. Nothing in it is built for speed.
 | `syntax`, `text` | The core text form (section 3): its tree, printer and reader |
 | `surface` | The Rails surface syntax ([surface](surface.md)): layout ([Y1] to [Y10]), grammar ([G1] to [G10]), elaboration ([U1] to [U15]) into `syntax::Program` and surface warnings ([U5], [U17], [U18]) (section 9) |
 | `typed`, `resolve` | The typed core, and what is checked on the way to it (section 4) |
-| `bdd`, `facts`, `kernel` | The ROBDD engine, the `Th_Z` fact logic, the certificate format and the certificate validator, which checks the proof of every lemma (a tree of the steps of [V3], with Split) and the Boolean step and does not yet check axiom instances ([V1] to [V5] are not met: [review](review.md), RC9, RC10, RC13), and counterexamples ([M1] to [M6]) (section 10) |
-| `terms`, `lia`, `rational` | The terms, rows and proofs that the search and the kernel both read; the theory check for the rows of a candidate, which answers with a model, a proof or the counted limit of [J6] (section 7 of the [fact logic](facts.md) has a note on what it does not decide); and the rationals of its simplex method |
+| `bdd`, `facts`, `kernel` | The ROBDD engine; the `Th_Z` fact logic with its search and its counterexamples ([M1] to [M6]); and the certificate kernel, which is given the query by the checker, makes the formula of every instance from its name with its own matcher for the axiom list, checks the proof of every lemma (a tree of the steps of [V3], with Split) and recomputes the Boolean step in a diagram of its own ([V1] to [V4]; the text of [V5] is not written: [review](review.md), RC13) (section 10) |
+| `terms`, `lia`, `rational` | The terms, rows, proofs, names of instances and certificates that the search and the kernel both read; the theory check for the rows of a candidate, which answers with a model, a proof or the counted limit of [J6] (section 7 of the [fact logic](facts.md) has a note on what it does not decide); and the rationals of its simplex method |
 | `check` | The phase 3 checker: coverage ([K1] to [K8]), conditional facts and SSA renaming ([N1] to [N5]), acknowledgement ([C2]), availability ([O1], [O2], [O4], [O6]), obligations ([P1] to [P8]), effects ([F3]) and impossible-arm warnings ([U16]) (section 10) |
 | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls, lifting loop exits and preserving checking and observations (section 11) |
 | `codegen` | The phase 4 typed LLVM IR and C ABI backend under the erased semantics ([R1] to [R3]), with native `-O0`/`-O2`/`-O3` compilation and differential execution (section 11) |
@@ -416,17 +416,37 @@ of slice 1:
   preconditions ([P3]), exit contract conditions `⇐ φₐ` ([P4]), arithmetic
   bounds and non-zero divisors ([P5]), unreachable `⊥` ([P6]), left-to-right
   and short-circuit `∧` / `∨` order ([P7]) and function bodies ([P8]).
-- **Independent certificate kernel and counterexamples (`kernel`, [V1] to [V5],
-  [M1] to [M6]).** Every proved entailment emits a `Certificate` validated by
-  `kernel::validate` before acceptance ([V1] to [V4]) and printable via
-  `vn2 check FILE --certificates` ([V5]). Every refuted obligation constructs
+- **Certificate kernel and counterexamples (`kernel`, [V1] to [V4],
+  [M1] to [M6]).** For every yes the search returns a `Certificate`: the
+  positions of the premises it used, the names of the instances
+  (`terms::Instance`) and the lemmas with their proofs. The checker has
+  `Kernel::validate` check it against the goal that the checker itself asked
+  about (`kernel::Query`), and accepts only then ([V1]). The kernel reads the
+  premises from the checker's lists, makes the formula of every instance
+  itself, grants what rests on the type of a term only for a term that the
+  checker wrote, validates the proof of every lemma, and conjoins all of it
+  in a diagram of its own ([V2], [V3]). One kernel serves the queries of one
+  body. `CheckedProgram` keeps the goal of every certificate and the solver
+  of every body, and `CheckedProgram::revalidate` validates all of them again
+  with a fresh kernel. `vn2 check FILE --certificates` lists the instances
+  and the lemmas of each; that listing is not yet the text of [V5]
+  (review, RC13). Every refuted obligation constructs
   an integer valuation and history witness verified against the query ([M1],
   [M2], [M6]), with nonlinear operator remarks ([M3]) and generic loop
   iteration notes ([M4]).
 
+`v2/tests/kernel.rs` tests the kernel's matcher: every instance of [A1],
+[A2] and [A7] to [A9] that it grants is evaluated with the values that the
+real operations give, on operands at the ends of every type and beyond them;
+the kernel grants every instance that the search makes for terms of every
+form; and it refuses eighteen names that name no instance, and the range of a
+term that the checker did not write.
+
 `v2/tests/checker.rs` tests every checking, fact-logic, certificate and
 counterexample clause of slice 1 with accepting and rejecting programs, verifies
-that corrupting a certificate causes `kernel::validate` to reject it, checks
+that the kernel refuses a certificate without its lemmas, its instances or its
+facts, with a wrong step, with a name that is no instance, with a premise that
+the checker did not state, and as the answer to another goal, checks
 all four `.rails` programs in `v2/tests/slice1_surface/` and all 80 seeds of
 `generate::valid` (over 1,000 kernel-validated certificates), and verifies that
 every stuck mutant and every `DropInvariant` mutant of `generate::valid` is
@@ -864,7 +884,7 @@ Rails surface:
 - **Requalification.** No slice meets its exit. The [review](review.md)
   lists the defects and, in its section 3, what each slice owes: a generator
   that is not one program (done for slice 1), a kernel that validates axiom
-  instances, a decision procedure that is complete without bounds, the
+  instances (done), a decision procedure that is complete without bounds, the
   fault-boundary rules of the oracle, the unsound cases of the
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows

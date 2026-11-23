@@ -165,9 +165,12 @@ fn check_files(arguments: &[String]) -> Result<bool, String> {
             Ok(report) => {
                 total_certificates += report.certificates.len();
                 if show_certificates {
-                    for (control, line, clause, certificate) in &report.certificates {
-                        println!("{path}:{line} ({control} [{clause}]):");
-                        print!("{certificate}");
+                    for proved in &report.certificates {
+                        println!(
+                            "{path}:{} ({} [{}]):",
+                            proved.line, proved.control, proved.clause
+                        );
+                        print!("{}", proved.certificate);
                     }
                 }
             }

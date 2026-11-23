@@ -15,7 +15,7 @@ use villanelle_v2::kernel;
 use villanelle_v2::mutate::{self, Class};
 use villanelle_v2::oracle::Config;
 use villanelle_v2::rng::Rng;
-use villanelle_v2::terms::{End, Proof, Step};
+use villanelle_v2::terms::{Certificate, End, Instance, Part, Proof, Step};
 use villanelle_v2::{load, load_surface, resolve, text};
 
 fn check_core(source: &str) -> Result<CheckedProgram, check::Error> {
@@ -31,9 +31,26 @@ fn check_rails(source: &str) -> Result<CheckedProgram, check::Error> {
 
 fn accept_core(clause: &str, source: &str) -> CheckedProgram {
     match check_core(source) {
-        Ok(report) => report,
+        Ok(report) => {
+            // A kernel that has seen nothing of the check validates every
+            // certificate again ([V1]).
+            report
+                .revalidate()
+                .unwrap_or_else(|error| panic!("[{clause}] the kernel rejected {error}"));
+            report
+        }
         Err(error) => panic!("[{clause}] expected acceptance, got: {error}\n{source}"),
     }
+}
+
+/// What the kernel says of `certificate` as an answer to the question that
+/// `proved` answered.
+fn kernel_says(
+    report: &CheckedProgram,
+    proved: &check::Proved,
+    certificate: &Certificate,
+) -> Result<(), String> {
+    kernel::validate(&report.bodies[proved.body].query(proved.goal), certificate)
 }
 
 fn reject_core(clause: &str, source: &str) -> check::Error {
@@ -695,10 +712,12 @@ fn fact_logic_axioms_a7_a8_a9_i10_and_chvatal_gomory_j3() {
             ¬(t1.true ∧ t2.true) ▷ ■ done
         ",
     );
-    let saw_round = report
-        .certificates
-        .iter()
-        .any(|(_, _, _, cert)| cert.lemmas.iter().any(|lemma| lemma.proof.rounds()));
+    let saw_round = report.certificates.iter().any(|proved| {
+        proved
+            .certificate
+            .lemmas()
+            .any(|lemma| lemma.proof.rounds())
+    });
     assert!(saw_round, "expected a [V3] Round step in a certificate");
 }
 
@@ -717,15 +736,12 @@ fn the_procedure_is_exact_on_integers_and_gives_up_only_at_a_counted_limit() {
     ";
     let report = accept_core("J5", source);
     assert!(
-        report
-            .certificates
-            .iter()
-            .any(|(_, _, _, cert)| cert.lemmas.iter().any(|lemma| lemma.proof.splits() > 0)),
+        report.certificates.iter().any(|proved| proved
+            .certificate
+            .lemmas()
+            .any(|lemma| lemma.proof.splits() > 0)),
         "only a split refutes the precondition"
     );
-    for (_, _, _, cert) in &report.certificates {
-        kernel::validate(cert).expect("the kernel validates a proof with splits");
-    }
 
     // With three steps the same question has no answer. That is an error
     // of its own kind, with no counterexample.
@@ -770,14 +786,15 @@ fn an_infeasible_history_is_ruled_out_by_a_validated_certificate() {
     let feasibility: Vec<_> = report
         .certificates
         .iter()
-        .filter(|(_, _, clause, _)| *clause == "N1")
+        .filter(|proved| proved.clause == "N1")
         .collect();
     assert!(
         !feasibility.is_empty(),
         "the decision on `read` needs `uses io` unless its history is infeasible"
     );
-    for (_, _, _, cert) in feasibility {
-        kernel::validate(cert).expect("the kernel validates the certificate");
+    for proved in feasibility {
+        kernel_says(&report, proved, &proved.certificate)
+            .expect("the kernel validates the certificate");
     }
 }
 
@@ -802,67 +819,167 @@ fn certificate_kernel_rejects_corrupted_proofs_v1_to_v5() {
         !report.certificates.is_empty(),
         "expected validated certificates"
     );
-    for (_, _, _, cert) in &report.certificates {
-        kernel::validate(cert).expect("every emitted certificate must pass kernel::validate");
-        let printed = cert.to_string();
+    for proved in &report.certificates {
+        kernel_says(&report, proved, &proved.certificate)
+            .expect("the kernel validates every certificate of the check");
+        let printed = proved.certificate.to_string();
         assert!(
-            printed.contains("certificate (atoms:"),
-            "certificate text must match [V5]:\n{printed}"
+            printed.contains("certificate (premises:"),
+            "the text of a certificate:\n{printed}"
         );
     }
 
-    // Tamper 1 ([V4]): delete the theory lemmas from a certificate that relies
-    // on linear arithmetic so the propositional implication is no longer a tautology.
-    let (_, _, _, lemma_cert) = report
+    // The certificate of `value ≤ total`: it needs the range of `used`
+    // ([A1]), the fact that `checked_sub` states, and a lemma.
+    let proved = report
         .certificates
         .iter()
-        .find(|(_, _, _, cert)| !cert.lemmas.is_empty())
-        .expect("certificate with a theory lemma");
-    let mut missing_lemma = lemma_cert.clone();
-    missing_lemma.lemmas.clear();
-    assert!(
-        kernel::validate(&missing_lemma).is_err(),
-        "kernel must reject a certificate whose theory lemma was stripped ([V4])"
+        .find(|proved| {
+            proved.certificate.lemmas().next().is_some()
+                && proved.certificate.instances().next().is_some()
+        })
+        .expect("a certificate with an instance and a lemma");
+    let whole = &proved.certificate;
+    let without = |drop: fn(&Part) -> bool| Certificate {
+        parts: whole
+            .parts
+            .iter()
+            .filter(|part| !drop(part))
+            .cloned()
+            .collect(),
+    };
+    let with_proof = |proof: Proof| Certificate {
+        parts: whole
+            .parts
+            .iter()
+            .map(|part| match part {
+                Part::Lemma(lemma) => {
+                    let mut lemma = lemma.clone();
+                    lemma.proof = proof.clone();
+                    Part::Lemma(lemma)
+                }
+                other => other.clone(),
+            })
+            .collect(),
+    };
+    let with_part = |part: Part| {
+        let mut certificate = whole.clone();
+        certificate.parts.push(part);
+        certificate
+    };
+    let refused = |certificate: &Certificate, why: &str| {
+        assert!(
+            kernel_says(&report, proved, certificate).is_err(),
+            "the kernel must refuse {why}"
+        );
+    };
+
+    // [V2]: the Boolean step is recomputed. Without its lemmas, without its
+    // instances or without its facts, the certificate leaves a case open.
+    refused(
+        &without(|part| matches!(part, Part::Lemma(_))),
+        "a certificate without its lemmas",
+    );
+    refused(
+        &without(|part| matches!(part, Part::Instance(_))),
+        "a certificate without its instances",
+    );
+    refused(
+        &without(|part| matches!(part, Part::Fact(_))),
+        "a certificate without its facts",
     );
 
-    // Tamper 2 ([V2]/[V3]): replace a `Combine` multiplier with -1.
-    let mut bad_mult = lemma_cert.clone();
-    bad_mult.lemmas[0].proof = Proof {
-        steps: vec![
-            Step::Literal(0),
-            Step::Combine(vec![(0, Int::from_i128(-1))]),
-        ],
-        end: End::Close(1),
-    };
-    assert!(
-        kernel::validate(&bad_mult).is_err(),
-        "kernel must reject a negative Combine multiplier ([V3])"
+    // [V3]: the steps of a proof.
+    refused(
+        &with_proof(Proof {
+            steps: vec![
+                Step::Literal(0),
+                Step::Combine(vec![(0, Int::from_i128(-1))]),
+            ],
+            end: End::Close(1),
+        }),
+        "a sum with a negative multiplier",
+    );
+    refused(
+        &with_proof(Proof {
+            steps: vec![
+                Step::Literal(0),
+                Step::Combine(vec![(99, Int::from_i128(1))]),
+            ],
+            end: End::Close(1),
+        }),
+        "a sum of a row that is not on the path",
+    );
+    refused(
+        &with_proof(Proof {
+            steps: vec![Step::Literal(0)],
+            end: End::Close(0),
+        }),
+        "a branch that closes on a row that is no contradiction",
     );
 
-    // Tamper 3 ([V3]): reference an out-of-range premise row index in `Combine`.
-    let mut bad_index = lemma_cert.clone();
-    bad_index.lemmas[0].proof = Proof {
-        steps: vec![
-            Step::Literal(0),
-            Step::Combine(vec![(99, Int::from_i128(1))]),
-        ],
-        end: End::Close(1),
-    };
-    assert!(
-        kernel::validate(&bad_index).is_err(),
-        "kernel must reject an out-of-range premise index ([V3])"
+    // [V2], review finding RC9: an instance is named, and the kernel makes
+    // its formula. A name that is not the name of an instance is refused,
+    // even beside a certificate that is complete without it.
+    let terms = report.bodies[proved.body].terms.len();
+    refused(
+        &with_part(Part::Instance(Instance::Term(terms))),
+        "an instance of a term that the query does not have",
+    );
+    let names: Vec<usize> = whole
+        .instances()
+        .filter_map(|instance| match instance {
+            Instance::Term(term) => Some(*term),
+            _ => None,
+        })
+        .collect();
+    refused(
+        &with_part(Part::Instance(Instance::Pair(names[0], names[0]))),
+        "an instance for two terms of which the theory says nothing together",
+    );
+    refused(
+        &with_part(Part::Instance(Instance::Frame {
+            update: names[0],
+            element: names[0],
+            original: names[0],
+        })),
+        "a frame instance for a term that is no update",
+    );
+    refused(
+        &with_part(Part::Instance(Instance::Extension {
+            structure: 0,
+            left: names[0],
+            left_fields: Vec::new(),
+            right: names[0],
+            right_fields: Vec::new(),
+        })),
+        "an extension instance for a struct that the program does not have",
     );
 
-    // Tamper 4 ([V3]): close on a non-contradictory row (`ProofStep::Row(0)`).
-    let mut non_contradictory = lemma_cert.clone();
-    non_contradictory.lemmas[0].proof = Proof {
-        steps: vec![Step::Literal(0)],
-        end: End::Close(0),
-    };
-    assert!(
-        kernel::validate(&non_contradictory).is_err(),
-        "kernel must reject a lemma that closes on a non-contradictory row ([V3])"
+    // [V2]: a premise is read from the checker's list, by its position.
+    let body = &report.bodies[proved.body];
+    refused(
+        &with_part(Part::Fact(body.facts.len())),
+        "a fact that the checker did not state",
     );
+    refused(
+        &with_part(Part::Structure(body.structure.len())),
+        "a formula that is not in `Ω`",
+    );
+
+    // [V1], review finding RC10: the kernel is told the goal by the checker.
+    // The same certificate is no answer to another question: here, whether
+    // the premises alone have no model.
+    let other = body.query(villanelle_v2::bdd::TRUE);
+    assert!(
+        kernel::validate(&other, whole).is_err(),
+        "the kernel must refuse a certificate as the answer to another goal"
+    );
+    // And the kernel reads only what it is given: a certificate with no
+    // part is an answer to a goal that is false, and to no other.
+    let nothing = Certificate::default();
+    assert!(kernel::validate(&body.query(villanelle_v2::bdd::FALSE), &nothing).is_ok());
+    refused(&nothing, "a certificate that names nothing");
 }
 
 #[test]

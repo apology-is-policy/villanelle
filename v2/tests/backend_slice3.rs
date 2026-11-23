@@ -10,7 +10,7 @@ use villanelle_v2::host::{Answer, Script};
 use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{Config, End, Value, run};
 use villanelle_v2::syntax::{Command as SynCommand, Declaration, Statement as SynStatement};
-use villanelle_v2::{check, erased, expand, kernel, resolve, script, surface, text};
+use villanelle_v2::{check, erased, expand, resolve, script, surface, text};
 
 fn slice3_surface_files() -> Vec<(String, String)> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/slice3_surface");
@@ -199,9 +199,7 @@ fn slice_three_theorem_4_expansion_preserves_checking_and_semantics() {
             .unwrap_or_else(|e| panic!("{name}: expanded core failed to resolve: {e}\n{printed}"));
         let checked = check::check(&resolved)
             .unwrap_or_else(|e| panic!("{name}: expanded core failed check: {e}\n{printed}"));
-        for (_, _, _, cert) in &checked.certificates {
-            kernel::validate(cert).unwrap();
-        }
+        checked.revalidate().unwrap();
 
         let directives_tail: Vec<&str> = source
             .lines()
@@ -330,9 +328,7 @@ pub control run_slice3_mut_and_loops(use_a: bool)
     let orig_tree = surface::elaborate(multi_source).unwrap();
     let orig_prog = resolve::resolve(&orig_tree).unwrap();
     let orig_checked = check::check(&orig_prog).unwrap();
-    for (_, _, _, cert) in &orig_checked.certificates {
-        kernel::validate(cert).unwrap();
-    }
+    orig_checked.revalidate().unwrap();
 
     let exp_tree = expand::expand(&orig_tree).unwrap();
     assert_no_expandable_defined_calls(&exp_tree);
@@ -343,9 +339,7 @@ pub control run_slice3_mut_and_loops(use_a: bool)
         .unwrap_or_else(|e| panic!("expanded multi_source failed to resolve: {e}\n{exp_printed}"));
     let exp_checked = check::check(&exp_prog)
         .unwrap_or_else(|e| panic!("expanded multi_source failed check: {e}\n{exp_printed}"));
-    for (_, _, _, cert) in &exp_checked.certificates {
-        kernel::validate(cert).unwrap();
-    }
+    exp_checked.revalidate().unwrap();
 
     let specs = vec![
         NativeRunSpec {
@@ -735,9 +729,7 @@ pub control call_host_borrows(m: &string ⇀ string, b: &bool) ■ out {found: b
     )
     .unwrap();
     let ext_checked = check::check(&ext_borrow_prog).unwrap();
-    for (_, _, _, cert) in &ext_checked.certificates {
-        kernel::validate(cert).unwrap();
-    }
+    ext_checked.revalidate().unwrap();
     let ext_specs = vec![
         NativeRunSpec {
             entry: "call_host_borrows".to_string(),
@@ -901,9 +893,7 @@ pub control borrow_view_bench(n: usize, passes: u64)
     let expanded = expand::expand(&tree).unwrap();
     let program = resolve::resolve(&expanded).unwrap();
     let checked = check::check(&program).unwrap();
-    for (_, _, _, cert) in &checked.certificates {
-        kernel::validate(cert).unwrap();
-    }
+    checked.revalidate().unwrap();
 
     let mut v2_ir = emit_llvm(&program, 64);
     v2_ir.push_str(

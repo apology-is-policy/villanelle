@@ -6,11 +6,12 @@
 //! structure of the base logic ([J1]); a value of another sort is a member of
 //! a non-empty set, and is counted by an integer too. A row is a linear
 //! comparison in canonical form (section 7, step 2). A proof is the tree of
-//! steps of [V3].
+//! steps of [V3], and a certificate is what [V2] lists.
 
 use crate::int::Int;
 use crate::typed::{ControlId, IntType, StructId, Type, VariantId};
 use std::collections::BTreeMap;
+use std::fmt;
 
 pub type TermId = usize;
 pub type TheoryAtomId = usize;
@@ -472,4 +473,142 @@ impl Proof {
 pub struct TheoryLemma {
     pub literals: Vec<(TheoryAtomId, bool)>,
     pub proof: Proof,
+}
+
+/// The name of an instance of the theory ([J3]). The search names the
+/// instances it used. The kernel makes the formula of each from the name and
+/// the terms, and takes no formula from the search ([V2]).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Instance {
+    /// What the theory says of one term by itself: its range ([A1], [A2],
+    /// [A3], [A5]), the length of a literal ([A3]), the constructor of a
+    /// variant value ([A5]), the first two parts of [A6], and the bounds of
+    /// [A7], [A8] and [A9].
+    Term(TermId),
+    /// What it says of two terms together: equal arguments of one symbol
+    /// give equal results ([S5]), and the constructor axioms of [A3], [A4]
+    /// and [A5].
+    Pair(TermId, TermId),
+    /// The frame part of [A6] for the update term `t[i ↦ e]` and an index
+    /// `j`: `element` is the term `t[i ↦ e][j]` and `original` is `t[j]`.
+    Frame {
+        update: TermId,
+        element: TermId,
+        original: TermId,
+    },
+    /// [A4], `t = S {t.x₁, …, t.xₙ}`, for two values of the struct `S`:
+    /// equal fields make them equal. A side is a constructor term, with no
+    /// field listed, or another term with the term of each of its fields.
+    Extension {
+        structure: StructId,
+        left: TermId,
+        left_fields: Vec<TermId>,
+        right: TermId,
+        right_fields: Vec<TermId>,
+    },
+}
+
+/// One thing that a certificate conjoins with the goal ([V2]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// A formula of `Ω`, by its position in the checker's list.
+    Structure(usize),
+    /// A fact of `Ψ`, by its position in the checker's list.
+    Fact(usize),
+    /// An instance of the theory, by its name.
+    Instance(Instance),
+    /// A theory lemma, with its proof.
+    Lemma(TheoryLemma),
+}
+
+/// What the search found for a yes ([V1], [V2]): the premises it used, the
+/// instances and the lemmas, in the order in which it added them. It holds
+/// no formula. The goal and the premises are the checker's, and the kernel
+/// is given them by the checker ([`crate::kernel::Query`]).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Certificate {
+    pub parts: Vec<Part>,
+}
+
+impl Certificate {
+    pub fn instances(&self) -> impl Iterator<Item = &Instance> {
+        self.parts.iter().filter_map(|part| match part {
+            Part::Instance(instance) => Some(instance),
+            _ => None,
+        })
+    }
+
+    pub fn lemmas(&self) -> impl Iterator<Item = &TheoryLemma> {
+        self.parts.iter().filter_map(|part| match part {
+            Part::Lemma(lemma) => Some(lemma),
+            _ => None,
+        })
+    }
+
+    /// The number of premises that the certificate names.
+    pub fn premises(&self) -> usize {
+        self.parts
+            .iter()
+            .filter(|part| matches!(part, Part::Structure(_) | Part::Fact(_)))
+            .count()
+    }
+}
+
+impl fmt::Display for Instance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let list = |terms: &[TermId]| {
+            terms
+                .iter()
+                .map(|term| format!("u{term}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        match self {
+            Instance::Term(term) => write!(formatter, "term u{term}"),
+            Instance::Pair(left, right) => write!(formatter, "pair u{left} u{right}"),
+            Instance::Frame {
+                update,
+                element,
+                original,
+            } => write!(formatter, "frame u{update} u{element} u{original}"),
+            Instance::Extension {
+                structure,
+                left,
+                left_fields,
+                right,
+                right_fields,
+            } => write!(
+                formatter,
+                "extension {structure} u{left} [{}] u{right} [{}]",
+                list(left_fields),
+                list(right_fields)
+            ),
+        }
+    }
+}
+
+impl fmt::Display for Certificate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            formatter,
+            "certificate (premises: {}, instances: {}, lemmas: {})",
+            self.premises(),
+            self.instances().count(),
+            self.lemmas().count()
+        )?;
+        for part in &self.parts {
+            match part {
+                Part::Structure(_) | Part::Fact(_) => {}
+                Part::Instance(instance) => writeln!(formatter, "  instance {instance}")?,
+                Part::Lemma(lemma) => writeln!(
+                    formatter,
+                    "  lemma ({} literals, {} steps, {} splits)",
+                    lemma.literals.len(),
+                    lemma.proof.size(),
+                    lemma.proof.splits()
+                )?,
+            }
+        }
+        Ok(())
+    }
 }

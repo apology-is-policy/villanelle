@@ -478,7 +478,7 @@ struct Limit;
 /// A bound of a variable, with the number of the row that states it.
 type Bound = Option<(Rat, usize)>;
 
-/// Part 3: a tableau in which every basic variable is a sum of the others,
+/// Part 2: a tableau in which every basic variable is a sum of the others,
 /// and every variable has its bounds and a value within them, or a basic
 /// variable is still out of its bounds.
 ///
@@ -1131,7 +1131,7 @@ pub fn solve(rows: &[Row], budget: &mut u64) -> Outcome {
     let mut simplex;
     let mut round = 0;
     loop {
-        // Part 2, with part 1 after each projection.
+        // Part 3, with part 1 after each projection.
         loop {
             if *budget == 0 {
                 return Outcome::Limit;
@@ -1146,7 +1146,7 @@ pub fn solve(rows: &[Row], budget: &mut u64) -> Outcome {
                 return close(steps, row);
             }
         }
-        // Part 3, and a rational solution that is whole.
+        // Part 2, and a rational solution that is whole.
         simplex = Simplex::new(&active);
         match simplex.search(steps.len(), 0, 0, budget) {
             Err(Limit) => return Outcome::Limit,

@@ -549,14 +549,20 @@ one growing set.
 
 - **[V1]** Every yes carries a certificate. The compiler accepts an entailment
   only after its **kernel** has validated the certificate. The kernel shares no
-  code with the search. A defect in the search can therefore cause a rejection
-  or a compiler error, and cannot cause a wrong acceptance.
+  code with the search, and it is given the query by the checker: the goal,
+  the premises and the terms as the checker wrote them, and not as the search
+  reports them. A defect in the search can therefore cause a rejection or a
+  compiler error, and cannot cause a wrong acceptance.
 - **[V2]** A certificate holds the query, the axiom instances used, and the
-  theory lemmas, each with a proof. The kernel checks that each instance is an
-  instance, validates each proof, and then recomputes the Boolean step: the
-  conjunction of the query, the instances and the lemmas is false. That step
-  needs no evidence, because it is a function of formulas the kernel already
-  has.
+  theory lemmas, each with a proof. An instance is given by its name: the
+  axiom, and the terms it is applied to. The kernel checks that each instance
+  is an instance by making its formula from the name. It validates each
+  proof, and then recomputes the Boolean step: the conjunction of the query,
+  the instances and the lemmas is false. That step needs no evidence, because
+  it is a function of formulas the kernel already has. A term that only an
+  instance speaks of ([J3]) is a term of the query like any other. What the
+  theory says of it by its type, it says by the type that section 4 gives the
+  term, and the search has no say in that.
 - **[V3]** The proof of a lemma refutes a set of literals. It is a tree of
   these steps, and every branch must close:
 
@@ -585,6 +591,33 @@ one growing set.
 The kernel is integer arithmetic of unbounded size, a congruence check, a
 matcher for the axiom list, and the diagram. It needs no search and no
 rationals, since multipliers are integers.
+
+**The kernel of the crate in `v2/`** (`kernel.rs`) is the integers, a matcher
+for the axiom list, and a diagram of its own, into which it copies the
+checker's formulas. Of the rest of the crate it uses the data that the search
+reads too (terms, rows, proofs) and has its own arithmetic on them. A
+certificate in memory holds what the search found: the positions, in the
+checker's lists, of the premises it used; the names of the instances; and the
+lemmas. The kernel reads the goal and the premises from the checker.
+
+It has no congruence check, because the crate has no Chain step. For every
+two applications of one symbol among the terms of a query, the search adds
+the instance "`s̄ = t̄` implies `g(s̄) = g(t̄)`", and the kernel makes that
+instance from its name as it makes any other. For symbols this decides the
+same entailment, since the terms of a query are finitely many. A proof
+therefore uses Row, Combine, Round, Split, and Close by a row `0 ≤ b`; Chain,
+Merge and the other forms of Close do not occur. Whether the instances that
+the crate has for constructors, fields and updates are all that [J1] asks is
+examined when slice 2 is requalified.
+
+Two things are open. The text of [V5] is not written (finding RC13 of the
+[review](review.md)). And the crate does not know the sort of every vector
+term, so it cannot always say which type an element has that only a frame
+instance of [A6] speaks of. The kernel grants what the theory says of a term
+by its type, by its declared interval or by the number of its constructors
+only for a term that the checker wrote. Such an element therefore has no
+range until the program mentions it. That is sound, and it can lose a proof
+that [A1] allows (finding RC17).
 
 ## 9. Counterexamples
 
@@ -883,3 +916,15 @@ it.
 2. **23 November 2026, section 7: a note on the integrality step of the
    crate.** The step is exact where it answers and is not complete without
    bounds; the note says what it does and where the limit of [J6] ends it.
+3. **23 November 2026, [V1] and [V2]: who tells the kernel what.** [V1] did
+   not say where the kernel gets the query, and the kernel of the crate took
+   the query, the diagram and the formula of every instance from the search
+   (findings RC9 and RC10 of the review). [V1] now says that the checker gives
+   the kernel the query. [V2] says that an instance is given by its name and
+   that the kernel makes the formula, and that the type of a term which only
+   an instance speaks of is the one that section 4 gives it.
+4. **23 November 2026, section 8: a note on the kernel of the crate.** It
+   says what the kernel shares with the rest of the crate, that congruence is
+   an instance and not a Chain step, which steps of [V3] occur, and what is
+   open: the text of [V5], and the range of an element that only a frame
+   instance speaks of.

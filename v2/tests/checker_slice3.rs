@@ -9,7 +9,6 @@
 
 use std::path::PathBuf;
 use villanelle_v2::check::{self, CheckedProgram};
-use villanelle_v2::kernel;
 use villanelle_v2::{load, load_surface};
 
 fn check_core(source: &str) -> Result<CheckedProgram, check::Error> {
@@ -28,11 +27,9 @@ fn accept_core(label: &str, source: &str) -> CheckedProgram {
         Ok(r) => r,
         Err(e) => panic!("[{label}] expected acceptance, got: {e}\n{source}"),
     };
-    for (ctrl, line, cert_clause, cert) in &report.certificates {
-        kernel::validate(cert).unwrap_or_else(|e| {
-            panic!("[{label}] kernel rejected {ctrl}:{line} [{cert_clause}]: {e}")
-        });
-    }
+    report
+        .revalidate()
+        .unwrap_or_else(|e| panic!("[{label}] the kernel rejected {e}"));
     report
 }
 
@@ -55,11 +52,9 @@ fn accept_rails(label: &str, source: &str) -> CheckedProgram {
         Ok(r) => r,
         Err(e) => panic!("[{label}] expected Rails acceptance, got: {e}\n{source}"),
     };
-    for (ctrl, line, cert_clause, cert) in &report.certificates {
-        kernel::validate(cert).unwrap_or_else(|e| {
-            panic!("[{label}] kernel rejected {ctrl}:{line} [{cert_clause}]: {e}")
-        });
-    }
+    report
+        .revalidate()
+        .unwrap_or_else(|e| panic!("[{label}] the kernel rejected {e}"));
     report
 }
 

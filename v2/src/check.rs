@@ -6,8 +6,9 @@
 //! - **[K1] to [K8]** Live histories, structure `Ω`, loop post-iteration facts
 //!   and coverage (`Θ ⊨ ¬Lₙ₊₁`, [K7]).
 //! - **[N1] to [N5]** Conditional facts `Ψ`, SSA renaming on mutation and loop
-//!   entry, and exact entailment backed by the independent certificate kernel
-//!   ([`crate::kernel::validate`], [V1]).
+//!   entry, and exact entailment. The checker gives the certificate of every
+//!   yes to the kernel, with the goal it asked about, and accepts only what
+//!   the kernel validates ([`crate::kernel::Kernel::validate`], [V1]).
 //! - **[C2]** Decision acknowledgement (every alternative of the operation's
 //!   contract is listed).
 //! - **[O0] to [O6]** Ownership and availability (`D(x)` and `M(x)` on
@@ -33,7 +34,7 @@
 use crate::bdd::{self, Bdd, Formula};
 use crate::facts::{AtomTerm, Certificate, Counterexample, Decision, LinearTerm, Solver, TermId};
 use crate::int::Int;
-use crate::kernel;
+use crate::kernel::Kernel;
 use crate::typed::{
     Alternative, Arithmetic, BodyId, BorrowMode, BoundaryDef, BuiltinOp, Command, Comparison,
     Control, ControlBody, ControlId, Expr, Function, FunctionId, IntType, Kind, Operation, Place,
@@ -65,15 +66,96 @@ impl fmt::Display for Error {
     }
 }
 
+/// An entailment that the kernel has validated ([V1]).
+#[derive(Clone, Debug)]
+pub struct Proved {
+    pub control: String,
+    pub line: u32,
+    /// The clause that asked.
+    pub clause: &'static str,
+    /// The position in [`CheckedProgram::bodies`] of the body whose lists
+    /// the certificate names.
+    pub body: usize,
+    /// The negated goal, as the checker gave it to the search and to the
+    /// kernel.
+    pub goal: Formula,
+    pub certificate: Certificate,
+}
+
+/// What the check of a program gathers: the entailments proved, each
+/// validated by the kernel when it was proved, and the solver of every body
+/// as it was at the end, which holds the lists that the certificates name.
+#[derive(Default)]
+pub struct Proofs {
+    proved: Vec<Proved>,
+    bodies: Vec<Solver>,
+    /// The kernel for the body that is being checked.
+    kernel: Kernel,
+}
+
+impl Proofs {
+    /// Has the kernel validate a certificate against the goal that the
+    /// checker asked about, and records it.
+    fn accept(
+        &mut self,
+        solver: &Solver,
+        goal: Formula,
+        control: &str,
+        line: u32,
+        clause: &'static str,
+        certificate: Certificate,
+    ) -> Result<(), String> {
+        self.kernel.validate(&solver.query(goal), &certificate)?;
+        self.proved.push(Proved {
+            control: control.to_string(),
+            line,
+            clause,
+            body: self.bodies.len(),
+            goal,
+            certificate,
+        });
+        Ok(())
+    }
+
+    /// Ends the check of a body. Its solver is kept for the certificates
+    /// that name its lists, and the next body gets a kernel of its own.
+    fn close_body(&mut self, solver: Solver) {
+        self.bodies.push(solver);
+        self.kernel = Kernel::new();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CheckedProgram {
-    pub certificates: Vec<(String, u32, &'static str, Certificate)>,
+    pub certificates: Vec<Proved>,
+    /// The solver of each body that was checked, as it was at the end.
+    pub bodies: Vec<Solver>,
     pub warnings: Vec<crate::surface::Warning>,
+}
+
+impl CheckedProgram {
+    /// Validates every certificate again, with a kernel that has seen
+    /// nothing of the check.
+    pub fn revalidate(&self) -> Result<(), String> {
+        let mut kernels: Vec<Kernel> = self.bodies.iter().map(|_| Kernel::new()).collect();
+        for proved in &self.certificates {
+            let query = self.bodies[proved.body].query(proved.goal);
+            kernels[proved.body]
+                .validate(&query, &proved.certificate)
+                .map_err(|error| {
+                    format!(
+                        "{}:{} [{}]: {error}",
+                        proved.control, proved.line, proved.clause
+                    )
+                })?;
+        }
+        Ok(())
+    }
 }
 
 /// Checks every function, named boundary, and defined control of `program`.
 pub fn check(program: &Program) -> Result<CheckedProgram, Error> {
-    let mut certificates = Vec::new();
+    let mut certificates = Proofs::default();
     let mut warnings = Vec::new();
     for (id, function) in program.functions.iter().enumerate() {
         check_function(program, id, function, &mut certificates)?;
@@ -102,7 +184,8 @@ pub fn check(program: &Program) -> Result<CheckedProgram, Error> {
         }
     }
     Ok(CheckedProgram {
-        certificates,
+        certificates: certificates.proved,
+        bodies: certificates.bodies,
         warnings,
     })
 }
@@ -886,7 +969,8 @@ fn fault_message(fault: &str, about: &str) -> String {
 }
 
 /// Proves that `negated_goal` is unsatisfiable under `solver`, validates the
-/// resulting [`Certificate`] in [`kernel::validate`] ([V1]), and records it.
+/// resulting [`Certificate`] in the kernel ([`Proofs::accept`], [V1]), and
+/// records it.
 #[allow(clippy::too_many_arguments)]
 fn require_entailment(
     solver: &mut Solver,
@@ -897,22 +981,18 @@ fn require_entailment(
     message: impl Into<String>,
     visible_vars: &[(String, TermId, bool)],
     in_loop: bool,
-    certificates: &mut Vec<(String, u32, &'static str, Certificate)>,
+    certificates: &mut Proofs,
 ) -> Result<(), Error> {
     match solver.decide(negated_goal, visible_vars, in_loop) {
-        Decision::Proved(cert) => {
-            if let Err(kernel_err) = kernel::validate(&cert) {
-                return Err(Error {
-                    control: control.to_string(),
-                    line,
-                    clause: "V1",
-                    message: format!("certificate rejected by the kernel: {kernel_err}"),
-                    counterexample: None,
-                });
-            }
-            certificates.push((control.to_string(), line, clause, cert));
-            Ok(())
-        }
+        Decision::Proved(cert) => certificates
+            .accept(solver, negated_goal, control, line, clause, cert)
+            .map_err(|kernel_err| Error {
+                control: control.to_string(),
+                line,
+                clause: "V1",
+                message: format!("certificate rejected by the kernel: {kernel_err}"),
+                counterexample: None,
+            }),
         Decision::Refuted(cex) => Err(Error {
             control: control.to_string(),
             line,
@@ -949,7 +1029,7 @@ fn require_formula(
     message: impl Into<String>,
     visible_vars: &[(String, TermId, bool)],
     in_loop: bool,
-    certificates: &mut Vec<(String, u32, &'static str, Certificate)>,
+    certificates: &mut Proofs,
 ) -> Result<(), Error> {
     let not_goal = solver.bdd.not(goal);
     let negated = solver.bdd.and(guard, not_goal);
@@ -990,7 +1070,7 @@ fn check_index_bounds(
     line: u32,
     visible_vars: &[(String, TermId, bool)],
     in_loop: bool,
-    certificates: &mut Vec<(String, u32, &'static str, Certificate)>,
+    certificates: &mut Proofs,
 ) -> Result<(), Error> {
     let len_id = solver.intern_term(AtomTerm::Len(base_term.clone()));
     solver.instantiate_all();
@@ -1025,7 +1105,7 @@ fn check_place_obligations(
     line: u32,
     visible_vars: &[(String, TermId, bool)],
     in_loop: bool,
-    certificates: &mut Vec<(String, u32, &'static str, Certificate)>,
+    certificates: &mut Proofs,
 ) -> Result<(), Error> {
     let mut cur = env.lookup(VarRef::Local(place.root));
     for step in &place.steps {
@@ -1079,7 +1159,7 @@ fn check_expr_obligations(
     line: u32,
     visible_vars: &[(String, TermId, bool)],
     in_loop: bool,
-    certificates: &mut Vec<(String, u32, &'static str, Certificate)>,
+    certificates: &mut Proofs,
 ) -> Result<(), Error> {
     match expr {
         Expr::Boolean(_)
@@ -1625,7 +1705,7 @@ fn check_function(
     program: &Program,
     _id: FunctionId,
     function: &Function,
-    certificates: &mut Vec<(String, u32, &'static str, Certificate)>,
+    certificates: &mut Proofs,
 ) -> Result<(), Error> {
     let mut solver = Solver::new(Vec::new());
     register_program_structs(program, &mut solver);
@@ -1664,7 +1744,7 @@ fn check_function(
         &function.name,
         1,
     )?;
-    check_expr_obligations(
+    let result = check_expr_obligations(
         program,
         &mut solver,
         &function.body,
@@ -1675,7 +1755,9 @@ fn check_function(
         &visible_vars,
         false,
         certificates,
-    )
+    );
+    certificates.close_body(solver);
+    result
 }
 
 fn collect_read_vars(expr: &Expr, out: &mut Vec<VarId>) {
@@ -1982,7 +2064,7 @@ struct BodyChecker<'a> {
     /// Set to `true` when checking a named boundary's `B₂` and a feasible
     /// `escalate` or `fault` occurs ([F6]).
     boundary_can_fault: bool,
-    certificates: &'a mut Vec<(String, u32, &'static str, Certificate)>,
+    certificates: &'a mut Proofs,
     warnings: &'a mut Vec<crate::surface::Warning>,
     /// The line of the statement being checked.
     at_line: u32,
@@ -2026,12 +2108,15 @@ impl<'a> BodyChecker<'a> {
         about: &str,
     ) -> bool {
         match self.solver.decide(negated, visible_vars, in_loop) {
-            Decision::Proved(cert) => match kernel::validate(&cert) {
-                Ok(()) => {
-                    self.certificates
-                        .push((self.owner_name.clone(), self.at_line, clause, cert));
-                    true
-                }
+            Decision::Proved(cert) => match self.certificates.accept(
+                &self.solver,
+                negated,
+                &self.owner_name,
+                self.at_line,
+                clause,
+                cert,
+            ) {
+                Ok(()) => true,
                 Err(kernel_err) => {
                     self.note_trouble(
                         "V1",
@@ -5048,7 +5133,7 @@ fn check_boundary(
     program: &Program,
     boundary: &BoundaryDef,
     boundary_may_fault: &[bool],
-    certificates: &mut Vec<(String, u32, &'static str, Certificate)>,
+    certificates: &mut Proofs,
     warnings: &mut Vec<crate::surface::Warning>,
 ) -> Result<bool, Error> {
     // 1. Check `B₁` (`boundary.body`) with `permits_faults = true` and `retains` checked ([F6]).
@@ -5098,6 +5183,8 @@ fn check_boundary(
         .check_body(0, bdd::TRUE, false, &mut loop_leaves1)
         .and_then(|()| checker1.check_loans());
     checker1.settle(result)?;
+    let solver1 = checker1.solver;
+    certificates.close_body(solver1);
 
     // 2. Check `B₂` (`boundary.contingency`) with `retains` + `message` bound ([F6]).
     let cont_param_count = boundary.retains.len() + 1;
@@ -5152,14 +5239,17 @@ fn check_boundary(
         .check_body(0, bdd::TRUE, false, &mut loop_leaves2)
         .and_then(|()| checker2.check_loans());
     checker2.settle(result)?;
-    Ok(checker2.boundary_can_fault)
+    let can_fault = checker2.boundary_can_fault;
+    let solver2 = checker2.solver;
+    certificates.close_body(solver2);
+    Ok(can_fault)
 }
 
 fn check_control(
     program: &Program,
     control: &Control,
     boundary_may_fault: &[bool],
-    certificates: &mut Vec<(String, u32, &'static str, Certificate)>,
+    certificates: &mut Proofs,
     warnings: &mut Vec<crate::surface::Warning>,
 ) -> Result<(), Error> {
     let body = control.body.as_ref().expect("a defined control");
@@ -5217,7 +5307,10 @@ fn check_control(
     let result = checker
         .check_body(0, bdd::TRUE, false, &mut loop_leaves)
         .and_then(|()| checker.check_loans());
-    checker.settle(result)
+    checker.settle(result)?;
+    let solver = checker.solver;
+    certificates.close_body(solver);
+    Ok(())
 }
 
 // ============================================================================

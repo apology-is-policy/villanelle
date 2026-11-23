@@ -10,7 +10,7 @@
 //! | `syntax`, `text` | The core text form: its tree, printer and reader |
 //! | `surface` | The Rails surface syntax: layout, grammar and elaboration into the core |
 //! | `typed`, `resolve` | The typed core, and the way to it from the tree |
-//! | `bdd`, `facts`, `kernel` | The ROBDD engine, the fact logic `Th_Z`, and the certificate validator |
+//! | `bdd`, `facts`, `kernel` | The ROBDD engine, the fact logic `Th_Z` with its search, and the certificate kernel, which is told the query by the checker and trusts nothing of the search |
 //! | `terms`, `lia`, `rational` | Terms, rows and proofs; the theory check on integers; the rationals of its simplex method |
 //! | `check` | The Phase 3 checker: coverage, acknowledgement, availability, obligations and effects |
 //! | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls |
