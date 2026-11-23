@@ -144,8 +144,9 @@ minutes, most of it the checker on the kernel programs of the backend tests:
 `format`, `expand`, `emit-llvm`, `emit-c`, `run`, `print`, `fuzz`). `check
 --certificates` prints the certificate text, and `validate` reads one and
 validates it in the kernel. `vn2 fuzz --seed N
---count N [--mutants] [--out DIR]` tries generated programs in the reader,
-the two semantics and the checker; a program is a function of its seed, and
+--count N [--mutants] [--native] [--out DIR]` tries generated programs in the
+reader, the two semantics and the checker, their mutants, and with `--native`
+their compiled code; a program is a function of its seed, and
 a release build (`cargo run --release`) is some ten times faster. Inputs are `.core` (the
 core text form) or `.rails`. Do not use `vn2 format --write` on source that
 matters until review finding RS4 is closed.

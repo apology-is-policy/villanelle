@@ -4,12 +4,13 @@
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use villanelle_v2::codegen::{NativeRunSpec, emit_c_header, emit_llvm, run_native_batch};
+use villanelle_v2::differential::compare;
 use villanelle_v2::host::{Answer, Arithmetic, Host, Script, Seeded};
 use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{Config, End, Value, run};
 use villanelle_v2::rng::Rng;
 use villanelle_v2::syntax::{Command as SynCommand, Declaration, Statement as SynStatement};
-use villanelle_v2::{check, erased, expand, generate, resolve, script, surface, text};
+use villanelle_v2::{check, erased, expand, fuzz, generate, resolve, script, surface, text};
 
 fn surface_files() -> Vec<(String, String)> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/slice1_surface");
@@ -411,135 +412,196 @@ impl Host for RecordingSeededHost<'_> {
     }
 }
 
-#[test]
-fn generated_valid_programs_agree_across_oracle_erased_expanded_and_native_o0_o2() {
-    // Test 8 seeds of `generate::valid` across both 32-bit and 64-bit `usize`:
-    // - Original program in `oracle::run` and `erased::run`
-    // - Theorem-4-expanded program in `check::check`, `oracle::run` and `erased::run`
-    // - Native compiled LLVM IR at `-O0` and `-O2` (original and expanded)
-    let mut total_native_runs = 0usize;
+/// One run of a program in the oracle that ended: what the host answered,
+/// how the run ended and what it did.
+struct Ended {
+    entry: String,
+    arguments: Vec<Value>,
+    answers: Vec<(String, Answer)>,
+    alternative: String,
+    payload: Vec<Value>,
+    trace: Vec<villanelle_v2::oracle::Event>,
+}
 
+/// Holds a program against its expansion (Theorem 4) and against the
+/// compiled code of both. The expansion passes the checker and the kernel.
+/// With the answers that the host gave, the expansion ends in the oracle as
+/// the program did and with the same trace, and so do the program compiled
+/// at `-O0` and `-O2` and the expansion compiled at `-O2`. Returns the
+/// number of runs.
+fn the_expansion_and_the_compiled_code_agree(
+    name: &str,
+    tree: &villanelle_v2::syntax::Program,
+    usize_bits: u32,
+    runs: Vec<Ended>,
+) -> usize {
+    let program = resolve::resolve(tree).unwrap();
+    let expanded_tree = expand::expand(tree).unwrap();
+    assert_no_defined_calls(&expanded_tree);
+    let expanded_program = resolve::resolve(&expanded_tree).unwrap();
+    let checked = check::check(&expanded_program)
+        .unwrap_or_else(|error| panic!("{name}: the expansion is rejected: {error}"));
+    checked.revalidate().unwrap();
+
+    let config = Config::with_usize_bits(usize_bits);
+    let mut specs = Vec::new();
+    let mut expected = Vec::new();
+    for ended in runs {
+        let end = erased::End::Done {
+            alternative: ended.alternative.clone(),
+            payload: ended.payload.clone(),
+        }
+        .to_string();
+        let mut host = Script {
+            answers: ended.answers.iter().cloned().collect(),
+        };
+        let of_expansion = run(
+            &expanded_program,
+            &ended.entry,
+            ended.arguments.clone(),
+            &mut host,
+            &config,
+        );
+        assert_eq!(
+            of_expansion.end.to_string(),
+            End::Done {
+                alternative: ended.alternative,
+                payload: ended.payload,
+            }
+            .to_string(),
+            "{name}: the expansion ends otherwise in the oracle"
+        );
+        assert_eq!(
+            of_expansion.trace, ended.trace,
+            "{name}: the trace of the expansion in the oracle"
+        );
+        specs.push(NativeRunSpec {
+            entry: ended.entry,
+            arguments: ended.arguments,
+            arithmetic: false,
+            answers: ended.answers,
+        });
+        expected.push((end, ended.trace));
+    }
+
+    for (what, of, level) in [
+        ("-O0", &program, 0),
+        ("-O2", &program, 2),
+        ("the expansion at -O2", &expanded_program, 2),
+    ] {
+        let results = run_native_batch(of, &specs, usize_bits, level)
+            .unwrap_or_else(|error| panic!("{name}: {what}: {error}"));
+        assert_eq!(results.len(), expected.len(), "{name}: {what}: runs");
+        for (index, ((end, trace), (native_end, native_trace))) in
+            expected.iter().zip(&results).enumerate()
+        {
+            assert_eq!(
+                &native_end.to_string(),
+                end,
+                "{name}: run {index} ({}), {what}: the end",
+                specs[index].entry
+            );
+            assert_eq!(
+                native_trace, trace,
+                "{name}: run {index} ({}), {what}: the trace",
+                specs[index].entry
+            );
+        }
+    }
+    expected.len()
+}
+
+#[test]
+fn the_template_agrees_across_oracle_expansion_and_native_o0_o2() {
+    // The fixed program of the first harness, with its seeded numbers, for
+    // both sizes of `usize`. Its host answers the arithmetic at random
+    // within the contracts.
+    let mut total = 0usize;
     for seed in 1..=8u64 {
         let mut rng = Rng::new(seed);
         let tree = generate::template(&mut rng);
         let program = resolve::resolve(&tree).unwrap();
-        let expanded_tree = expand::expand(&tree).unwrap();
-        assert_no_defined_calls(&expanded_tree);
-        let expanded_program = resolve::resolve(&expanded_tree).unwrap();
-
-        // Expanded program must pass the Phase 3 checker and certificate kernel.
-        let checked_exp = check::check(&expanded_program)
-            .unwrap_or_else(|e| panic!("seed {seed}: expanded check failed: {e}"));
-        checked_exp.revalidate().unwrap();
-
         let usize_bits = if seed % 2 == 0 { 32 } else { 64 };
         let config = Config::with_usize_bits(usize_bits);
-        let runs = generate::sample_runs(&mut rng, &program, &config);
-
-        let mut specs = Vec::new();
-        let mut expected = Vec::new();
-
-        for (run_idx, (entry, args)) in runs.into_iter().enumerate() {
-            let host_seed = seed * 1_000 + run_idx as u64;
-            let mut rec_host = RecordingSeededHost {
-                inner: Seeded::new(&program, host_seed),
+        let mut runs = Vec::new();
+        for (index, (entry, arguments)) in generate::sample_runs(&mut rng, &program, &config)
+            .into_iter()
+            .enumerate()
+        {
+            let mut host = RecordingSeededHost {
+                inner: Seeded::new(&program, seed * 1_000 + index as u64),
                 recorded: Vec::new(),
             };
-            let oracle_out = run(&program, &entry, args.clone(), &mut rec_host, &config);
+            let outcome = run(&program, &entry, arguments.clone(), &mut host, &config);
             let End::Done {
                 alternative,
                 payload,
-            } = oracle_out.end
+            } = outcome.end
             else {
-                panic!("seed {seed} stuck in oracle: {}", oracle_out.end);
+                panic!("seed {seed}: stuck in the oracle: {}", outcome.end);
             };
-
-            // Expanded program in oracle and erased must match!
-            let mut exp_host = Script {
-                answers: rec_host.recorded.iter().cloned().collect(),
-            };
-            let exp_oracle = run(
-                &expanded_program,
-                &entry,
-                args.clone(),
-                &mut exp_host,
-                &config,
-            );
-            assert_eq!(
-                format!("{}", exp_oracle.end),
-                format!(
-                    "{}",
-                    End::Done {
-                        alternative: alternative.clone(),
-                        payload: payload.clone(),
-                    }
-                ),
-                "seed {seed}: expanded oracle outcome mismatch"
-            );
-            assert_eq!(
-                exp_oracle.trace, oracle_out.trace,
-                "seed {seed}: expanded oracle trace mismatch"
-            );
-
-            specs.push(NativeRunSpec {
+            runs.push(Ended {
                 entry,
-                arguments: args,
-                arithmetic: false,
-                answers: rec_host.recorded,
+                arguments,
+                answers: host.recorded,
+                alternative,
+                payload,
+                trace: outcome.trace,
             });
-            expected.push((
-                erased::End::Done {
-                    alternative,
-                    payload,
-                },
-                oracle_out.trace,
-            ));
         }
-
-        let native_o0 = run_native_batch(&program, &specs, usize_bits, 0).unwrap();
-        let native_o2 = run_native_batch(&program, &specs, usize_bits, 2).unwrap();
-        let native_exp_o2 = run_native_batch(&expanded_program, &specs, usize_bits, 2).unwrap();
-
-        assert_eq!(native_o0.len(), expected.len());
-        assert_eq!(native_o2.len(), expected.len());
-        assert_eq!(native_exp_o2.len(), expected.len());
-
-        for (i, ((exp_end, exp_trace), ((o0_end, o0_tr), ((o2_end, o2_tr), (eo2_end, eo2_tr))))) in
-            expected
-                .iter()
-                .zip(
-                    native_o0
-                        .iter()
-                        .zip(native_o2.iter().zip(native_exp_o2.iter())),
-                )
-                .enumerate()
-        {
-            assert_eq!(
-                format!("{o0_end}"),
-                format!("{exp_end}"),
-                "seed {seed} run {i}: native -O0 outcome mismatch"
-            );
-            assert_eq!(o0_tr, exp_trace, "seed {seed} run {i}: native -O0 trace");
-            assert_eq!(
-                format!("{o2_end}"),
-                format!("{exp_end}"),
-                "seed {seed} run {i}: native -O2 outcome mismatch"
-            );
-            assert_eq!(o2_tr, exp_trace, "seed {seed} run {i}: native -O2 trace");
-            assert_eq!(
-                format!("{eo2_end}"),
-                format!("{exp_end}"),
-                "seed {seed} run {i}: expanded native -O2 outcome mismatch"
-            );
-            assert_eq!(
-                eo2_tr, exp_trace,
-                "seed {seed} run {i}: expanded native -O2 trace"
-            );
-            total_native_runs += 1;
-        }
+        total += the_expansion_and_the_compiled_code_agree(
+            &format!("template {seed}"),
+            &tree,
+            usize_bits,
+            runs,
+        );
     }
+    assert!(total >= 60, "{total} runs");
+}
 
-    assert!(total_native_runs >= 60);
+#[test]
+fn generated_valid_programs_agree_across_oracle_expansion_and_native_o0_o2() {
+    // Programs of the generator (`generate::valid`), which differ in shape
+    // and not only in their numbers, for both sizes of `usize`. The host
+    // computes the arithmetic. More seeds are tried by `vn2 fuzz --native`.
+    let mut total = 0usize;
+    for seed in 1..=6u64 {
+        let tree = fuzz::program_of(seed);
+        let program = resolve::resolve(&tree).unwrap();
+        let usize_bits = if seed % 2 == 0 { 32 } else { 64 };
+        let config = Config::with_usize_bits(usize_bits);
+        let mut rng = Rng::new(seed);
+        let mut runs = Vec::new();
+        for (index, (entry, arguments)) in generate::entry_runs(&mut rng, &program, &config, 3)
+            .into_iter()
+            .enumerate()
+        {
+            let mut host = Arithmetic(Seeded::new(&program, seed * 1_000 + index as u64));
+            let outcome = compare(&program, &entry, arguments.clone(), &mut host, &config);
+            let End::Done {
+                alternative,
+                payload,
+            } = outcome.oracle.end
+            else {
+                panic!("seed {seed}: the oracle ends in {}", outcome.oracle.end);
+            };
+            runs.push(Ended {
+                entry,
+                arguments,
+                answers: outcome.answers,
+                alternative,
+                payload,
+                trace: outcome.oracle.trace,
+            });
+        }
+        total += the_expansion_and_the_compiled_code_agree(
+            &format!("seed {seed}"),
+            &tree,
+            usize_bits,
+            runs,
+        );
+    }
+    assert!(total >= 24, "{total} runs");
 }
 
 fn verify_native_specs(

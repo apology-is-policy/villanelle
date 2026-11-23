@@ -31,9 +31,11 @@ Options of `fuzz`:
   --seed N       the first seed (default: 1); a program is a function of its seed
   --count N      the number of seeds (default: 100)
   --mutants      try the mutants of each program too
+  --native       compile each accepted program and run it too (needs clang)
   --show         print the programs and try nothing
   --out DIR      write each finding to a file in DIR
   --fuel N       steps of one run (default: 200000)
+  --mutant-fuel N  steps of one run of a mutant (default: 20000)
   --seconds N    time for the checker on one program (default: 20)
 ";
 
@@ -283,8 +285,10 @@ fn fuzz_command(arguments: &[String]) -> Result<bool, String> {
             "--seed" => first = number("--seed")?,
             "--count" => count = number("--count")?,
             "--fuel" => options.fuel = number("--fuel")?,
+            "--mutant-fuel" => options.mutant_fuel = number("--mutant-fuel")?,
             "--seconds" => options.seconds = number("--seconds")?,
             "--mutants" => options.mutants = true,
+            "--native" => options.native = true,
             "--show" => show = true,
             "--out" => out = Some(rest.next().ok_or("`--out` takes a directory")?.clone()),
             _ => return Err(USAGE.to_string()),

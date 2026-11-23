@@ -230,6 +230,8 @@ fn mutations_of_the_template_reach_every_stuck_state_of_the_slice() {
         Kind::DropGuard,
         Kind::DropInvariant,
         Kind::DropEffect,
+        Kind::ShiftLiteral,
+        Kind::FlipComparison,
     ] {
         assert!(kinds_seen.contains(&kind), "missing mutation kind {kind:?}");
     }

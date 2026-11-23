@@ -300,36 +300,55 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   all 61 constructs and all 12 statement rules. `generate::template` is the
   fixed program of 53 lines that was `valid` until 23 November
   ([review](review.md), RG1); it is kept as one regression program, and the
-  checker and backend tests that say "generated" still run on it.
+  tests that run on it say so. The checker, mutation and backend tests run
+  on programs of the generator as well.
   `generate::free` builds
   unconstrained well-resolved programs of 10 to 20 lines; across 250 seeds it
   reaches all 61 constructs, and every run that is not stuck in the oracle
   agrees with the erased semantics. Most of its runs are stuck in the first
   statements.
-- **Mutations (`mutate`, `v2/tests/harness.rs`).** `mutate::mutate` produces
-  all single-step mutants of a valid program across five kinds: `RemoveArm`
-  ([C2], X10), `RemoveDisposition` ([K7], X1), `DropGuard` ([O2] to [O4], [P1]
-  to [P8], X2, X3, X6, X7), `DropInvariant` ([K4], [P4]) and `DropEffect`
-  ([F3], X9). `mutate::classify` runs each mutant in the oracle; across 16
-  seeds of `generate::valid`, the stuck mutants reach all 15 stuck states of
-  slice 1. They are the target rejection set for the phase 3 checker. That
-  test runs on the template, so they are the mutants of one program.
+- **Mutations (`mutate`, `v2/tests/harness.rs`, `v2/tests/checker.rs`).**
+  `mutate::mutate` produces all single-step mutants of a valid program
+  across seven kinds: `RemoveArm` ([C2], X10), `RemoveDisposition` ([K7],
+  X1), `DropGuard` ([O2] to [O4], [P1] to [P8], X2, X3, X6, X7),
+  `DropInvariant` ([K4], [P4]), `DropEffect` ([F3], X9), `ShiftLiteral` (an
+  integer literal is one greater or one less) and `FlipComparison` (`<` and
+  `≤`, `>` and `≥`, `=` and `≠` are replaced by each other). The last two
+  change one expression of a control: of its precondition, of the conditions
+  of its contract or of its body ([P1] to [P8], X6, X7). `mutate::classify`
+  runs a mutant in the oracle; across 16 sets of numbers of the template,
+  the stuck mutants reach all 15 stuck states of slice 1. They are the
+  target rejection set for the phase 3 checker.
+  `every_stuck_mutant_of_a_generated_program_is_rejected`
+  (`v2/tests/checker.rs`) takes every mutant of four generated programs,
+  draws the runs of each for its own preconditions, and requires that
+  `resolve` or the checker rejects each mutant with a stuck run: 72 of them,
+  of every kind but `DropInvariant`, which leaves no run stuck.
 - **Fuzzing (`fuzz`, `vn2 fuzz`).** `vn2 fuzz --seed N --count N` takes the
   program of each seed through the reader, the oracle and the erased
-  semantics on entries that satisfy its precondition, and asks the checker;
-  `--mutants` does the same for every mutant, where a mutant that the
-  checker accepts must have no stuck run. Each failure is a finding with
-  its seed, and `--out DIR` writes the programs. The state on 23 November
-  2026: the reader, the two semantics and the checker have no finding over
-  300 seeds. The first run of the checker on these programs accepted 268,
-  rejected 13, panicked on 16 and gave no answer within 20 seconds on 3;
-  all 32 were defects of the decision procedure and of the declared
-  interval of a multiple by a literal, and are repaired
-  ([review](review.md), RC12, RC16). Of 838 mutants of the first 25
-  programs, `resolve` refuses 132, the checker rejects 319 (a stuck run was
-  found for 218 of them) and accepts 353, none of which has a stuck run
-  among those tried. The harness test asserts the part that holds and does
-  not ask the checker yet.
+  semantics on entries that satisfy its precondition, and asks the checker.
+  `--native` compiles each accepted program at `-O0` and `-O2`, for both
+  widths of `usize`, and requires that every run ends as the oracle's did
+  and with the same trace. `--mutants` tries every mutant too, where a
+  mutant that the checker accepts must have no stuck run. A run of a mutant
+  has 20,000 steps (`--mutant-fuel`), a tenth of the steps of a run of a
+  program: a mutant that never ends uses all of them in every run. Each
+  failure is a finding with its seed, and `--out DIR` writes the programs.
+  The state on 23 November 2026: the reader, the two semantics, the checker
+  and the compiled code have no finding over 300 seeds, in 11,728 runs in
+  the oracle and 23,456 runs of compiled programs. The first run of the
+  checker on these programs accepted 268, rejected 13, panicked on 16 and
+  gave no answer within 20 seconds on 3; all 32 were defects of the decision
+  procedure and of the declared interval of a multiple by a literal, and are
+  repaired ([review](review.md), RC12, RC16). Of 5,403 mutants of the
+  first 25 programs, `resolve` refuses 285, the checker rejects
+  1,052 (a stuck run was found for 761 of them) and accepts
+  4,066, none of which has a stuck run among those tried. The time
+  limit of the checker is of the clock. On a machine under load, a campaign
+  with a limit of four seconds reported four mutants as unanswered that the
+  checker accepts in a third of a second; the numbers here are of a campaign
+  with the limit of 20 seconds. `the_checker_accepts_generated_valid_programs`
+  (`v2/tests/harness.rs`) holds the first part for 40 seeds.
 
 ## 9. The Rails surface reader and elaborator
 
@@ -449,10 +468,11 @@ counterexample clause of slice 1 with accepting and rejecting programs, verifies
 that the kernel refuses a certificate without its lemmas, its instances or its
 facts, with a wrong step, with a name that is no instance, with a premise that
 the checker did not state, and as the answer to another goal, checks
-all four `.rails` programs in `v2/tests/slice1_surface/` and all 80 seeds of
-`generate::valid` (over 1,000 kernel-validated certificates), and verifies that
-every stuck mutant and every `DropInvariant` mutant of `generate::valid` is
-rejected by `resolve` or `check::check`.
+all four `.rails` programs in `v2/tests/slice1_surface/`, the template with
+80 sets of numbers (over 1,000 kernel-validated certificates) and ten
+generated programs, and verifies that every stuck mutant of four generated
+programs, and every stuck mutant and every `DropInvariant` mutant of the
+template, is rejected by `resolve` or `check::check`.
 
 ### The certificate text ([V5])
 
@@ -631,9 +651,12 @@ another hand writes from this description is not there.
 - **Differential native verification and paired Rust benchmark
   (`v2/tests/backend.rs`).** `codegen::run_native_batch` compiles programs with
   `clang -x ir` at both `-O0` and `-O2` (original and Theorem-4-expanded) and
-  verifies 100% agreement on outcomes and event traces against `oracle::run` and
-  `erased::run` across all `.rails` programs and generated valid programs
-  (32-bit and 64-bit `usize`). In paired hot-loop measurements on Apple M2
+  verifies agreement on outcomes and event traces against `oracle::run` and
+  `erased::run` across all `.rails` programs, the template with eight sets of
+  numbers and six generated programs (32-bit and 64-bit `usize`); the
+  expansion of each passes the checker and ends in the oracle as the program
+  does. `vn2 fuzz --native` does the same for the program of any seed
+  (section 8). In paired hot-loop measurements on Apple M2
   (`clang -x ir -O3` vs `rustc -C opt-level=3`, 5,000,000 iterations of composed
   Euclidean `gcd`, `spend_step` with `over → ⊥` erased, and modular accumulation,
   measured separately from launch and output with `clock_gettime`), compiled v2

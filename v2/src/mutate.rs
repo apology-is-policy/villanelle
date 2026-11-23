@@ -2,17 +2,21 @@
 //!
 //! Each mutant seeds one defect into a valid [`syntax::Program`]: removing an
 //! arm of a decision, removing a disposition (`■`, `□` or `↑`), dropping a
-//! statement's guard selector to `⊤`, dropping a loop's invariant, or
-//! dropping an effect from a control's `uses` clause.
+//! statement's guard selector to `⊤`, dropping a loop's invariant, dropping
+//! an effect from a control's `uses` clause, making an integer literal one
+//! greater or one less, or replacing a comparison by the one beside it.
 //!
 //! [`classify`] runs a mutant through `resolve` and the oracle across a set of
 //! inputs. The mutants that are stuck in the oracle are those that the checker
 //! of phase 3 must reject.
 
 use crate::host::{Arithmetic, Seeded};
+use crate::int::Int;
 use crate::oracle::{self, Config, End, Stuck, Value};
 use crate::resolve;
-use crate::syntax::{Command, Declaration, Program, Selector, Statement};
+use crate::syntax::{
+    Binary, Command, Control, Declaration, Expr, PlaceStep, Program, Selector, Statement,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
@@ -26,6 +30,12 @@ pub enum Kind {
     DropInvariant,
     /// An effect is removed from a control's `uses` clause ([F3], X9).
     DropEffect,
+    /// An integer literal is one greater or one less ([P1] to [P5], X6, X7).
+    ShiftLiteral,
+    /// A comparison is replaced by the one beside it: `<` and `≤` by each
+    /// other, `>` and `≥` by each other, `=` and `≠` by each other ([P1] to
+    /// [P8], X6).
+    FlipComparison,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +167,190 @@ fn collect_from_body(
     }
 }
 
+/// Calls `visit` on `expr` and then on every expression inside it.
+fn walk(expr: &mut Expr, visit: &mut dyn FnMut(&mut Expr)) {
+    visit(expr);
+    match expr {
+        Expr::Integer(_)
+        | Expr::Boolean(_)
+        | Expr::String(_)
+        | Expr::Name(_)
+        | Expr::Old(_)
+        | Expr::EmptyMap
+        | Expr::TasksEmpty(_)
+        | Expr::Count(_) => {}
+        Expr::Move(inner)
+        | Expr::Borrow(_, inner)
+        | Expr::Field(inner, _)
+        | Expr::Len(inner)
+        | Expr::Clone(inner)
+        | Expr::Unary(_, inner) => walk(inner, visit),
+        Expr::Index(left, right) | Expr::Binary(_, left, right) => {
+            walk(left, visit);
+            walk(right, visit);
+        }
+        Expr::Struct(_, items)
+        | Expr::Variant(_, _, items)
+        | Expr::Vector(items)
+        | Expr::Call(_, items) => {
+            for item in items {
+                walk(item, visit);
+            }
+        }
+    }
+}
+
+/// Calls `visit` on every expression of the statements, in their order.
+fn walk_statements(statements: &mut [Statement], visit: &mut dyn FnMut(&mut Expr)) {
+    for statement in statements {
+        match &mut statement.command {
+            Command::Bind { value, .. }
+            | Command::Unpack { value, .. }
+            | Command::Assign { value, .. }
+            | Command::Oblige(value)
+            | Command::Test {
+                condition: value, ..
+            }
+            | Command::Fault { message: value, .. }
+            | Command::Terminate(Some(value)) => walk(value, visit),
+            Command::AssignPlace { target, value } => {
+                for step in &mut target.steps {
+                    if let PlaceStep::Index(index) = step {
+                        walk(index, visit);
+                    }
+                }
+                walk(value, visit);
+            }
+            Command::Capture { arguments, .. }
+            | Command::Decide { arguments, .. }
+            | Command::Supervise { arguments, .. }
+            | Command::Spawn { arguments, .. }
+            | Command::Again { arguments, .. }
+            | Command::Leave {
+                payload: arguments, ..
+            }
+            | Command::Exit {
+                payload: arguments, ..
+            } => {
+                for argument in arguments {
+                    walk(argument, visit);
+                }
+            }
+            Command::Loop {
+                parameters,
+                invariant,
+                body,
+                ..
+            } => {
+                for parameter in parameters {
+                    walk(&mut parameter.initial, visit);
+                }
+                if let Some(invariant) = invariant {
+                    walk(invariant, visit);
+                }
+                walk_statements(body, visit);
+            }
+            Command::Boundary {
+                body, contingency, ..
+            } => {
+                walk_statements(body, visit);
+                walk_statements(contingency, visit);
+            }
+            Command::Cancel { .. }
+            | Command::Impossible
+            | Command::Terminate(None)
+            | Command::Escalate
+            | Command::Recover { .. } => {}
+        }
+    }
+}
+
+/// Calls `visit` on every expression of a control: its precondition, the
+/// conditions of its contract, and its body.
+fn walk_control(control: &mut Control, visit: &mut dyn FnMut(&mut Expr)) {
+    if let Some(precondition) = &mut control.precondition {
+        walk(precondition, visit);
+    }
+    for alternative in &mut control.contract {
+        if let Some(condition) = &mut alternative.condition {
+            walk(condition, visit);
+        }
+    }
+    walk_statements(&mut control.body, visit);
+}
+
+/// What one expression can become by a mutation of itself, and not of what
+/// is inside it: the kind, the expression, and words for the change.
+fn changes(expr: &Expr) -> Vec<(Kind, Expr, String)> {
+    match expr {
+        Expr::Integer(value) => {
+            let one = Int::from_u64(1);
+            [value.plus(&one), value.minus(&one)]
+                .into_iter()
+                .map(|shifted| {
+                    let detail = format!("literal `{value}` to `{shifted}`");
+                    (Kind::ShiftLiteral, Expr::Integer(shifted), detail)
+                })
+                .collect()
+        }
+        Expr::Binary(operator, left, right) => {
+            let beside = match operator {
+                Binary::Less => Binary::LessEqual,
+                Binary::LessEqual => Binary::Less,
+                Binary::Greater => Binary::GreaterEqual,
+                Binary::GreaterEqual => Binary::Greater,
+                Binary::Equal => Binary::NotEqual,
+                Binary::NotEqual => Binary::Equal,
+                _ => return Vec::new(),
+            };
+            let detail = format!("`{}` to `{}`", operator.glyph(), beside.glyph());
+            vec![(
+                Kind::FlipComparison,
+                Expr::Binary(beside, left.clone(), right.clone()),
+                detail,
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The mutants of a control that change one expression of it.
+fn collect_from_expressions(program: &Program, declaration: usize, out: &mut Vec<Mutant>) {
+    let Declaration::Control(control) = &program.declarations[declaration] else {
+        return;
+    };
+    // How many changes each expression has, in the order of the walk.
+    let mut counts = Vec::new();
+    walk_control(&mut control.clone(), &mut |expr| {
+        counts.push(changes(expr).len());
+    });
+    for (site, count) in counts.iter().enumerate() {
+        for choice in 0..*count {
+            let mut mutated = program.clone();
+            let Declaration::Control(target) = &mut mutated.declarations[declaration] else {
+                unreachable!();
+            };
+            let mut at = 0;
+            let mut made = None;
+            walk_control(target, &mut |expr| {
+                if at == site {
+                    let (kind, changed, detail) = changes(expr).swap_remove(choice);
+                    *expr = changed;
+                    made = Some((kind, detail));
+                }
+                at += 1;
+            });
+            let (kind, detail) = made.expect("the expression that was counted");
+            out.push(Mutant {
+                kind,
+                control: control.name.clone(),
+                detail: format!("{detail} (expression {site})"),
+                program: mutated,
+            });
+        }
+    }
+}
+
 /// Produces all single-step mutants of `program`.
 pub fn mutate(program: &Program) -> Vec<Mutant> {
     let mut out = Vec::new();
@@ -188,6 +382,7 @@ pub fn mutate(program: &Program) -> Vec<Mutant> {
             &mut loop_path,
             &mut out,
         );
+        collect_from_expressions(program, declaration, &mut out);
     }
     out
 }

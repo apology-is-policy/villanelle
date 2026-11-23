@@ -16,7 +16,7 @@ use villanelle_v2::mutate::{self, Class};
 use villanelle_v2::oracle::Config;
 use villanelle_v2::rng::Rng;
 use villanelle_v2::terms::{Certificate, End, Instance, Part, Proof, Step};
-use villanelle_v2::{load, load_surface, resolve, text};
+use villanelle_v2::{fuzz, load, load_surface, resolve, text};
 
 fn check_core(source: &str) -> Result<CheckedProgram, check::Error> {
     let program = load(source).unwrap_or_else(|error| panic!("resolve failed: {error}\n{source}"));
@@ -1065,8 +1065,9 @@ fn surface_files_and_generated_valid_programs_pass_the_checker() {
         accept_rails(path, &source);
     }
 
-    // Every generated `valid` program across 80 seeds must pass `check::check`
-    // and have every emitted certificate validated by `kernel::validate`.
+    // The fixed program of the first harness, with 80 sets of numbers: the
+    // checker accepts each, and a kernel that saw nothing of the check
+    // validates every certificate again.
     let mut total_certificates = 0usize;
     for seed in 1..=80 {
         let mut rng = Rng::new(seed);
@@ -1074,7 +1075,7 @@ fn surface_files_and_generated_valid_programs_pass_the_checker() {
         let program = resolve::resolve(&syntax_program).unwrap();
         let report = check::check(&program).unwrap_or_else(|error| {
             panic!(
-                "seed {seed}: generated valid program failed checker: {error}\n{}",
+                "seed {seed}: the template is rejected: {error}\n{}",
                 syntax_program.print()
             )
         });
@@ -1084,6 +1085,81 @@ fn surface_files_and_generated_valid_programs_pass_the_checker() {
         total_certificates >= 80 * 10,
         "expected at least 800 validated certificates across 80 seeds, got {total_certificates}"
     );
+
+    // Programs of the generator, which differ in shape. Seeds 1 to 40 are
+    // tried with their runs in `tests/harness.rs`; these are others.
+    let mut total_certificates = 0usize;
+    for seed in 41..=50 {
+        let syntax_program = fuzz::program_of(seed);
+        let program = resolve::resolve(&syntax_program).unwrap();
+        let report = check::check(&program).unwrap_or_else(|error| {
+            panic!(
+                "seed {seed}: a generated program is rejected: {error}\n{}",
+                syntax_program.print()
+            )
+        });
+        report
+            .revalidate()
+            .unwrap_or_else(|error| panic!("seed {seed}: the kernel rejected {error}"));
+        total_certificates += report.certificates.len();
+    }
+    assert!(
+        total_certificates >= 10 * 50,
+        "expected at least 500 validated certificates across 10 seeds, got {total_certificates}"
+    );
+}
+
+/// Every mutant of a generated program that has a stuck run is rejected:
+/// by `resolve`, or by the checker. The runs of a mutant are drawn for its
+/// own preconditions, so that a run that is stuck is the program's doing.
+#[test]
+fn every_stuck_mutant_of_a_generated_program_is_rejected() {
+    let config = Config {
+        fuel: 5_000,
+        ..Config::default()
+    };
+    let mut stuck: std::collections::BTreeMap<mutate::Kind, usize> = Default::default();
+    for seed in 1..=4 {
+        let tree = fuzz::program_of(seed);
+        for mutant in mutate::mutate(&tree) {
+            let Ok(typed) = resolve::resolve(&mutant.program) else {
+                continue;
+            };
+            let mut rng = Rng::new(seed);
+            let runs = generate::entry_runs(&mut rng, &typed, &config, 4);
+            let Class::Stuck(state) = mutate::classify(&mutant, &runs, seed, &config) else {
+                continue;
+            };
+            *stuck.entry(mutant.kind).or_default() += 1;
+            assert!(
+                check::check(&typed).is_err(),
+                "seed {seed}: {:?} in `{}` ({}) is stuck (X{} {}: {}) and the checker accepts it:\n{}",
+                mutant.kind,
+                mutant.control,
+                mutant.detail,
+                state.state,
+                state.clause,
+                state.detail,
+                mutant.program.print()
+            );
+        }
+    }
+    // A dropped invariant leaves no run stuck: the oracle does not ask for
+    // one. Every other kind does.
+    for kind in [
+        mutate::Kind::RemoveArm,
+        mutate::Kind::RemoveDisposition,
+        mutate::Kind::DropGuard,
+        mutate::Kind::ShiftLiteral,
+        mutate::Kind::FlipComparison,
+    ] {
+        assert!(
+            stuck.get(&kind).copied().unwrap_or(0) > 0,
+            "no stuck mutant of the kind {kind:?}: {stuck:?}"
+        );
+    }
+    let total: usize = stuck.values().sum();
+    assert!(total >= 60, "{total} stuck mutants: {stuck:?}");
 }
 
 #[test]
