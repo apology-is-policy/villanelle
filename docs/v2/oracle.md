@@ -32,7 +32,8 @@ can be read on its own. Nothing in it is built for speed.
 | `syntax`, `text` | The core text form (section 3): its tree, printer and reader |
 | `surface` | The Rails surface syntax ([surface](surface.md)): layout ([Y1] to [Y10]), grammar ([G1] to [G10]), elaboration ([U1] to [U15]) into `syntax::Program` and surface warnings ([U5], [U17], [U18]) (section 9) |
 | `typed`, `resolve` | The typed core, and what is checked on the way to it (section 4) |
-| `bdd`, `facts`, `kernel` | The ROBDD engine; the `Th_Z` fact logic with its search and its counterexamples ([M1] to [M6]); and the certificate kernel, which is given the query by the checker, makes the formula of every instance from its name with its own matcher for the axiom list, checks the proof of every lemma (a tree of the steps of [V3], with Split) and recomputes the Boolean step in a diagram of its own ([V1] to [V4]; the text of [V5] is not written: [review](review.md), RC13) (section 10) |
+| `bdd`, `facts`, `kernel` | The ROBDD engine; the `Th_Z` fact logic with its search and its counterexamples ([M1] to [M6]); and the certificate kernel, which is given the query by the checker, makes the formula of every instance from its name with its own matcher for the axiom list, checks the proof of every lemma (a tree of the steps of [V3], with Split) and recomputes the Boolean step in a diagram of its own ([V1] to [V4]) (section 10) |
+| `certificate` | The text of certificates ([V5]): the writer, and a reader that makes the tables, the goals and the premises from a text alone and gives them to the kernel (section 10) |
 | `terms`, `lia`, `rational` | The terms, rows, proofs, names of instances and certificates that the search and the kernel both read; the theory check for the rows of a candidate, which answers with a model, a proof or the counted limit of [J6] (section 7 of the [fact logic](facts.md) has a note on what it does not decide); and the rationals of its simplex method |
 | `check` | The phase 3 checker: coverage ([K1] to [K8]), conditional facts and SSA renaming ([N1] to [N5]), acknowledgement ([C2]), availability ([O1], [O2], [O4], [O6]), obligations ([P1] to [P8]), effects ([F3]) and impossible-arm warnings ([U16]) (section 10) |
 | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls, lifting loop exits and preserving checking and observations (section 11) |
@@ -56,7 +57,9 @@ Every value has kind `copy`, so no slot is moved and no borrow tag exists yet.
 cd v2
 cargo test                                     # unit tests and the conformance suite
 cargo run --bin vn2 -- test tests/slice1/*.core tests/slice1_surface/*.rails
-cargo run --bin vn2 -- check tests/slice1_surface/*.rails --certificates
+cargo run --bin vn2 -- check tests/slice1_surface/*.rails
+cargo run --bin vn2 -- check tests/slice1_surface/*.rails --certificates > certificates.txt
+cargo run --bin vn2 -- validate certificates.txt   # the kernel, from the text alone
 cargo run --bin vn2 -- format tests/slice1_surface/show_file.rails --check
 cargo run --bin vn2 -- expand tests/slice1_surface/groups_and_auto.rails
 cargo run --bin vn2 -- emit-llvm tests/slice1_surface/spend.rails
@@ -428,9 +431,8 @@ of slice 1:
   in a diagram of its own ([V2], [V3]). One kernel serves the queries of one
   body. `CheckedProgram` keeps the goal of every certificate and the solver
   of every body, and `CheckedProgram::revalidate` validates all of them again
-  with a fresh kernel. `vn2 check FILE --certificates` lists the instances
-  and the lemmas of each; that listing is not yet the text of [V5]
-  (review, RC13). Every refuted obligation constructs
+  with a fresh kernel. `vn2 check FILE --certificates` writes all of them as
+  a text, which is described below ([V5]). Every refuted obligation constructs
   an integer valuation and history witness verified against the query ([M1],
   [M2], [M6]), with nonlinear operator remarks ([M3]) and generic loop
   iteration notes ([M4]).
@@ -451,6 +453,145 @@ all four `.rails` programs in `v2/tests/slice1_surface/` and all 80 seeds of
 `generate::valid` (over 1,000 kernel-validated certificates), and verifies that
 every stuck mutant and every `DropInvariant` mutant of `generate::valid` is
 rejected by `resolve` or `check::check`.
+
+### The certificate text ([V5])
+
+`vn2 check FILE... --certificates` prints the certificates of the files as
+one text, and `vn2 validate TEXT...` reads such texts and validates every
+certificate in them. A text holds each query as well as what the search
+found for it ([V2]). What reads it therefore needs neither the program nor
+the checker: `certificate::read` makes the tables, the goals and the premises
+from the text alone, in a diagram of its own, and `Body::validate` gives them
+to a kernel. The reader uses the integers, the diagram and the data of
+`terms`, and nothing of the search. That the queries are the ones the program
+gives rise to is outside the text, as it is outside the kernel ([V4]).
+
+A text is lines. An empty line says nothing, and neither does a line that
+begins with `#`. A line is words with spaces between them. Each of `{`, `}`,
+`[` and `]` is a word by itself. A string is in double quotes, with the
+escapes `\"`, `\\`, `\n`, `\r`, `\t` and `\u{…}` (hexadecimal). The first
+line is `villanelle certificates 1`. Bodies follow, one for each body of the
+program that had a question. A body is the line `body`, its tables in the
+order of this list, its questions, and the line `end`:
+
+| Line | States |
+| --- | --- |
+| `history hK "site" "alternative"` | History atom `K`: the site took the alternative. Numbered from 0, in order |
+| `term uK written FORM`, `term uK added FORM` | Term `K`, numbered from 0, in order. `written`: the checker wrote the term. `added`: the search added it, as a term that an instance speaks of |
+| `row aK {FORM} <= B` | Row `K`, numbered from 0, in order: the linear form is at most the integer `B` |
+| `arity S N` | Struct `S` has `N` fields |
+| `node nK V nL nH` | Formula `K`: formula `H` if `V` holds, and formula `L` if not. `V` is a history atom `hK` or a row `aK`. `n0` is false and `n1` is true. A formula is stated before it is named |
+| `question "control" LINE "clause"` | A question: what the clause asked at that line of the control |
+| `goal nK` | The goal of the question, negated. It comes first |
+| `structure nK`, `fact nK` | A premise: a formula of `Ω`, a fact of `Ψ` |
+| `instance NAME` | An instance of the theory ([J3]), by its name |
+| `lemma LITERALS` | A theory lemma: the literals do not hold together. A literal is a row `aK`, or `!aK` for its negation. The proof follows, a step a line |
+
+The tables of a body are as they stood at the end of the body, and all its
+questions share them. A linear form is `{c k*uI …}`: the constant, which is
+left out when it is zero, and each term with its integer coefficient. The
+form of a row and of a split has no constant.
+
+The forms of a term ([S6]) are these. A term stands for one integer: a value
+of another sort is counted by one ([J1]).
+
+| Form | Term |
+| --- | --- |
+| `var "name" TYPE RANGE` | A logical name. `TYPE` is an integer type or `none`. `RANGE` is `ranged` when [A1] gives the name the range of its type, and `free` when it does not |
+| `usize-max` | `usize.max` ([A2]) |
+| `div-const {t} k` | `t ÷ k` for a literal `k ≥ 1` ([A7]) |
+| `div {s} {t}`, `rem {s} {t}` | `div(s, t)` and `rem(s, t)` ([A8]) |
+| `mul {s} {t} a A b B` | `mul(s, t)`, with the declared interval `[a, A]` of `s` and `[b, B]` of `t` ([A9]). A bound that is not known is `none` |
+| `pure-alt F [ARGUMENTS]` | `alt_F(t̄)`, the alternative that the pure operation `F` takes ([I10]) |
+| `pure-pay F A I [ARGUMENTS]` | `pay_{F, A, I}(t̄)`, field `I` of the payload of its alternative `A` |
+| `len {t}` | `len(t)` ([A3]) |
+| `str "text"` | A string literal |
+| `empty-map` | `∅` |
+| `vec [ITEMS]` | A vector literal |
+| `struct S [ARGUMENTS]` | The constructor term `S {t̄}` ([A4]) |
+| `field {t} S I TYPE KIND RANGE` | `t.xᵢ`, field `I` of struct `S`. `KIND` is `bool` or `other`; `TYPE` and `RANGE` are as for `var` |
+| `ctor V C N [ARGUMENTS]` | Constructor `C` of the `N` constructors of variant `V`, applied ([A5]) |
+| `tag {t} V N` | The number of the constructor of `t`, a value of variant `V` |
+| `index {t} {i} TYPE KIND RANGE` | `t[i]` ([A6]) |
+| `update {t} {i} {e}` | `t[i ↦ e]` ([A6]) |
+| `trim {t}` | `trim(t)` ([S5]) |
+
+An instance is named, and the kernel makes its formula ([V2]):
+
+| Name | The instance |
+| --- | --- |
+| `term uK` | What the theory says of term `K` by itself. For a `ranged` name, field or element that the checker wrote: the range of its type, or `0 ≤ u ≤ 1` for `bool` ([A1]); a field or an element of a constructor term, a literal or an update term has none. For `usize-max`: `2³² - 1 ≤ u ≤ 2⁶⁴ - 1` ([A2]). For `len`: `0 ≤ u ≤ usize.max`. For a vector literal and `∅`: the length ([A3]). For a `ctor` that the checker wrote: `tag(u) = C`. For a `tag` that the checker wrote, or whose value is such a `ctor`: `0 ≤ u ≤ N - 1` ([A5]). For an `update`: `len(u) = len(t)`, and `0 ≤ i < len(t)` implies `u[i] = e` ([A6]). For `div-const`, `div` and `rem`: the bounds of [A7] and [A8]. For a `mul` that the checker wrote: those planes of [A9] whose two bounds are known |
+| `pair uI uJ` | What it says of two terms together. For two applications of one symbol: equal arguments imply equal results ([S5]); for two applications of one constructor, the converse too ([A4], [A5]). For two different string literals and for two different constructors of one variant: the terms are not equal ([A3], [A5]). For a field term and a constructor term of its struct: if the value of the field term is the constructor term, the field is the argument ([A4]) |
+| `frame uU uE uO` | For the update term `U` = `t[i ↦ e]`, its element `E` = `U[j]` and the element `O` = `t[j]`: `j ≠ i` implies `E = O` ([A6]) |
+| `extension S uL [FIELDS] uR [FIELDS]` | For two values of struct `S`: equal fields imply equal values ([A4]). A side is a constructor term, with no field listed, or another term with the field term of each of its fields, in order, each written by the checker |
+
+The formula of an instance is over the rows of the table. Each comparison in
+it is brought to the canonical form of a row (step 2 of the reference
+procedure: the coefficients divided by their common factor and the bound
+rounded down, with the first coefficient positive; a comparison whose first
+coefficient is negative is the negation of the row of its complement). An
+instance is refused when the table lacks a row or a term that it needs.
+
+A proof ([V3]) refutes the literals of its lemma. Its steps and its end are
+these lines:
+
+| Line | Step |
+| --- | --- |
+| `literal I` | The row of literal `I` of the lemma, counted from 0: the row `e ≤ b` of `aK`, or for `!aK` its complement `-e ≤ -b - 1` |
+| `combine M*pR …` | The sum of rows of the path, each with a positive integer multiplier |
+| `round pR D` | From row `R`, whose coefficients the integer `D ≥ 1` divides: the coefficients divided by `D`, and the bound divided by `D` and rounded down |
+| `close pR` | The end of a branch: row `R` is `0 ≤ b` with `b < 0` |
+| `split {FORM} <= B` | The end of a branch in two. The proof of the first follows, with the row `FORM ≤ B` more, and then the proof of the second, with the row `FORM ≥ B + 1` |
+
+`pR` is a position on the path from the root of the proof, counted from 0.
+Every step adds its row to the path, and so does a split, for each of its two
+branches. A branch sees the rows of the branches above it and its own. The
+reader takes a proof in which at most 256 splits nest, which is as deep as
+the search goes.
+
+For a question the kernel validates the proof of every lemma, makes the
+formula of every instance, and requires that these have no case in common:
+the goal, the premises, the instances, and for each lemma the statement that
+its literals do not all hold. This text states that no `x` of type `u8` is
+greater than 300, and was written by hand:
+
+```text
+villanelle certificates 1
+body
+term u0 written usize-max
+term u1 written var "x" u8 ranged
+row a0 {1*u1} <= -1
+row a1 {1*u1} <= 255
+row a2 {1*u1} <= 300
+node n2 a2 n1 n0
+question "by hand" 1 "N2"
+goal n2
+instance term u1
+lemma a1 !a2
+ literal 0
+ literal 1
+ combine 1*p0 1*p1
+ close p2
+end
+```
+
+`v2/tests/certificate.rs` tests the text. The text of every surface program
+of slices 1 to 3 and of twelve generated programs is read back: the tables
+are those of the check, every goal and premise is the same formula, every
+certificate is the same, and the kernel validates all of them from the text.
+The text above validates, and is refused with the bound 200, without its
+lemma, and with `x` as a term that the search added. A text of the checker
+is refused after each of eight changes: a question without its facts, with
+another goal, with a row whose bound was raised, with a term marked as
+added, with an instance that is none, with a proof that closes on a row
+that is no contradiction, with a proof that has no end, and with the
+literals of a lemma negated. The reader refuses thirty-four texts that are
+not well formed. A proof in which 256 splits nest is read and validated, and
+one with 257 is refused. Names and literals with quotes, line breaks and
+brackets in them are read as they were written.
+
+The reader and the kernel are one crate, by one hand. A second checker that
+another hand writes from this description is not there.
 
 ## 11. Call expansion (Theorem 4) and the phase 4 typed LLVM IR backend
 
@@ -884,7 +1025,8 @@ Rails surface:
 - **Requalification.** No slice meets its exit. The [review](review.md)
   lists the defects and, in its section 3, what each slice owes: a generator
   that is not one program (done for slice 1), a kernel that validates axiom
-  instances (done), a decision procedure that is complete without bounds, the
+  instances and a certificate text that
+  a reader validates (done), a decision procedure that is complete without bounds, the
   fault-boundary rules of the oracle, the unsound cases of the
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows

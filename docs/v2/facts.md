@@ -610,8 +610,14 @@ Merge and the other forms of Close do not occur. Whether the instances that
 the crate has for constructors, fields and updates are all that [J1] asks is
 examined when slice 2 is requalified.
 
-Two things are open. The text of [V5] is not written (finding RC13 of the
-[review](review.md)). And the crate does not know the sort of every vector
+The text of [V5] is described in section 10 of the
+[oracle document](oracle.md). It holds the tables of a body (history atoms,
+terms, rows, formulas) and, for each question, the goal and the premises as
+formulas, the names of the instances and the lemmas with their proofs. What
+reads it needs neither the program nor the checker. The crate has a reader
+that gives a text to the kernel.
+
+One thing is open. The crate does not know the sort of every vector
 term, so it cannot always say which type an element has that only a frame
 instance of [A6] speaks of. The kernel grants what the theory says of a term
 by its type, by its declared interval or by the number of its constructors
@@ -928,3 +934,6 @@ it.
    an instance and not a Chain step, which steps of [V3] occur, and what is
    open: the text of [V5], and the range of an element that only a frame
    instance speaks of.
+5. **23 November 2026, section 8: the text of [V5] is written.** The note on
+   the kernel of the crate named it as open (finding RC13 of the review). It
+   now says what a text holds and where the format is described.

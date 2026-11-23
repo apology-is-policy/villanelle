@@ -35,7 +35,12 @@ jobs:
       - name: Conformance suite through the command line
         run: cargo run --locked --bin vn2 -- test tests/slice1/*.core tests/slice1_surface/*.rails tests/slice2/*.core tests/slice2_surface/*.rails tests/slice3/*.core tests/slice3_surface/*.rails tests/slice4/*.core tests/slice4_surface/*.rails
       - name: Check Rails surface programs and validate certificates
-        run: cargo run --locked --bin vn2 -- check tests/slice1_surface/*.rails tests/slice2_surface/*.rails tests/slice3_surface/*.rails --certificates
+        run: cargo run --locked --bin vn2 -- check tests/slice1_surface/*.rails tests/slice2_surface/*.rails tests/slice3_surface/*.rails
+      - name: Write the certificate text and validate it from the text alone
+        run: |
+          cargo run --locked --bin vn2 -- check tests/slice1_surface/*.rails tests/slice2_surface/*.rails tests/slice3_surface/*.rails --certificates > "$RUNNER_TEMP/certificates.txt" || { grep '^#' "$RUNNER_TEMP/certificates.txt"; exit 1; }
+          tail -n 1 "$RUNNER_TEMP/certificates.txt"
+          cargo run --locked --bin vn2 -- validate "$RUNNER_TEMP/certificates.txt"
       - name: Check canonical Rails surface formatting
         run: cargo run --locked --bin vn2 -- format tests/slice1_surface/show_file.rails tests/slice1_surface/groups_and_auto.rails tests/slice1_surface/loops_and_paths.rails tests/slice2_surface/*.rails tests/slice3_surface/*.rails tests/slice4_surface/*.rails --check
       - name: Expand calls (Theorem 4) and emit Phase 4 typed LLVM IR and C ABI

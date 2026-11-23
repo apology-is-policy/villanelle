@@ -5,12 +5,14 @@ use villanelle_v2::host::{Arithmetic, Host, Script};
 use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{Config, End, Value, run};
 use villanelle_v2::{
-    check, codegen, erased, expand, fuzz, load, load_surface, script, surface, text,
+    certificate, check, codegen, erased, expand, fuzz, load, load_surface, script, surface, text,
 };
 
 const USAGE: &str = "\
 vn2 test FILE...                          carry out the directives of core or Rails files
-vn2 check FILE... [--certificates]        check core or Rails files in the Phase 3 checker
+vn2 check FILE... [--certificates]        check core or Rails files in the Phase 3 checker;
+                                          with --certificates, print the certificate text
+vn2 validate FILE...                      read certificate texts and validate them in the kernel
 vn2 format FILE... [--write | --check]    format Rails files into canonical Rails glyph form
 vn2 expand FILE                           expand decisions on defined controls (Theorem 4)
 vn2 emit-llvm FILE [--usize 32|64]        emit Phase 4 typed LLVM IR for a core or Rails file
@@ -144,6 +146,12 @@ fn check_files(arguments: &[String]) -> Result<bool, String> {
     if files.is_empty() {
         return Err(USAGE.to_string());
     }
+    // With `--certificates` the output is one certificate text, and what is
+    // not a part of it is on lines that begin with `#`.
+    let note = if show_certificates { "# " } else { "" };
+    if show_certificates {
+        println!("{}", certificate::HEADER);
+    }
     let mut failed = 0usize;
     let mut total_certificates = 0usize;
     for path in &files {
@@ -153,27 +161,42 @@ fn check_files(arguments: &[String]) -> Result<bool, String> {
         } else {
             load_surface(&source)
         };
-        let program = match program {
-            Ok(program) => program,
-            Err(error) => {
-                println!("{path}: {error}");
-                failed += 1;
-                continue;
-            }
-        };
-        match check::check(&program) {
-            Ok(report) => {
-                total_certificates += report.certificates.len();
+        let report = program
+            .and_then(|program| check::check(&program).map_err(|error| error.to_string()))
+            .and_then(|report| {
+                let mut text = String::new();
                 if show_certificates {
-                    for proved in &report.certificates {
-                        println!(
-                            "{path}:{} ({} [{}]):",
-                            proved.line, proved.control, proved.clause
-                        );
-                        print!("{}", proved.certificate);
-                    }
+                    report.write_certificates(&mut text)?;
+                }
+                Ok((report.certificates.len(), text))
+            });
+        match report {
+            Ok((certificates, text)) => {
+                total_certificates += certificates;
+                if show_certificates {
+                    println!("# {path}");
+                    print!("{text}");
                 }
             }
+            Err(error) => {
+                println!("{note}{path}: {error}");
+                failed += 1;
+            }
+        }
+    }
+    println!(
+        "{note}{} files checked, {total_certificates} certificates validated, {failed} failures",
+        files.len()
+    );
+    Ok(failed == 0)
+}
+
+fn validate_files(files: &[String]) -> Result<bool, String> {
+    let mut failed = 0usize;
+    let mut total_certificates = 0usize;
+    for path in files {
+        match certificate::validate(&read(path)?) {
+            Ok(certificates) => total_certificates += certificates,
             Err(error) => {
                 println!("{path}: {error}");
                 failed += 1;
@@ -181,7 +204,7 @@ fn check_files(arguments: &[String]) -> Result<bool, String> {
         }
     }
     println!(
-        "{} files checked, {total_certificates} certificates validated, {failed} failures",
+        "{} texts read, {total_certificates} certificates validated, {failed} failures",
         files.len()
     );
     Ok(failed == 0)
@@ -306,6 +329,7 @@ fn main() -> ExitCode {
         Some((command, rest)) if command == "fuzz" => fuzz_command(rest),
         Some((command, rest)) if command == "test" && !rest.is_empty() => test(rest),
         Some((command, rest)) if command == "check" && !rest.is_empty() => check_files(rest),
+        Some((command, rest)) if command == "validate" && !rest.is_empty() => validate_files(rest),
         Some((command, rest)) if command == "format" && !rest.is_empty() => format_files(rest),
         Some((command, [path])) if command == "expand" => read(path).and_then(|source| {
             let tree = if is_core_file(path) {

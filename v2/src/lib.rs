@@ -11,6 +11,7 @@
 //! | `surface` | The Rails surface syntax: layout, grammar and elaboration into the core |
 //! | `typed`, `resolve` | The typed core, and the way to it from the tree |
 //! | `bdd`, `facts`, `kernel` | The ROBDD engine, the fact logic `Th_Z` with its search, and the certificate kernel, which is told the query by the checker and trusts nothing of the search |
+//! | `certificate` | The text of certificates ([V5]): a writer, and a reader that gives what a text states to the kernel |
 //! | `terms`, `lia`, `rational` | Terms, rows and proofs; the theory check on integers; the rationals of its simplex method |
 //! | `check` | The Phase 3 checker: coverage, acknowledgement, availability, obligations and effects |
 //! | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls |
@@ -25,6 +26,7 @@
 //! | `mutate` | Single-step mutations of valid programs, classified by the oracle |
 
 pub mod bdd;
+pub mod certificate;
 pub mod check;
 pub mod codegen;
 pub mod differential;

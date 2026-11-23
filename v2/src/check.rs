@@ -32,6 +32,7 @@
 //!   ([F4]), lexical boundaries ([F5]), and named boundaries ([F6]).
 
 use crate::bdd::{self, Bdd, Formula};
+use crate::certificate::{self, Asked};
 use crate::facts::{AtomTerm, Certificate, Counterexample, Decision, LinearTerm, Solver, TermId};
 use crate::int::Int;
 use crate::kernel::Kernel;
@@ -150,6 +151,37 @@ impl CheckedProgram {
                 })?;
         }
         Ok(())
+    }
+
+    /// Writes the certificates of every body in the text of [V5]
+    /// ([`crate::certificate`]), without the line that begins a text.
+    pub fn write_certificates(&self, out: &mut String) -> Result<(), String> {
+        for (position, solver) in self.bodies.iter().enumerate() {
+            let asked: Vec<Asked> = self
+                .certificates
+                .iter()
+                .filter(|proved| proved.body == position)
+                .map(|proved| Asked {
+                    control: &proved.control,
+                    line: proved.line,
+                    clause: proved.clause,
+                    goal: proved.goal,
+                    certificate: &proved.certificate,
+                })
+                .collect();
+            if !asked.is_empty() {
+                let tables = solver.query(crate::bdd::TRUE);
+                certificate::write_body(out, &tables, &solver.history_names, &asked)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The text of the certificates of the program.
+    pub fn certificate_text(&self) -> Result<String, String> {
+        let mut out = format!("{}\n", certificate::HEADER);
+        self.write_certificates(&mut out)?;
+        Ok(out)
     }
 }
 
