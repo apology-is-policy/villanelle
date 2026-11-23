@@ -1351,8 +1351,11 @@ removed. It is what release code implements.
   formula is that of the statement at which the scope ends. It covers the
   names of the bodies around that statement as the bodies inside them left
   them, so a terminator or a fault that ends several scopes ends each of
-  them by the formulas of its own statement. No value carries a flag of its
-  own.
+  them by the formulas of its own statement. A statement that holds a body
+  runs on some histories only: after it, a name of the bodies around it is
+  as the body left it on the histories on which the body ended there, and
+  as it was before the statement on the others. No value carries a flag of
+  its own.
 - **[R5]** Under a fault, resources declared `on fault release` are released
   under the same condition.
 - **[R6]** Tasks, sets, turns and cancellation flags are behavior and remain.
@@ -1528,3 +1531,4 @@ and what asked for it:
 | 23 November 2026 | [F5] says in which state the names around a lexical boundary are when its contingency ends: as they were at the statement of `B₁` that faulted, for every such statement; and that a statement of `B₂` that may fault is one of the `B₁` of a boundary around it. | The checker (RC4): it took the availability at the entry of the boundary, so it accepted a program whose `B₁` fills an outer name before it faults (stuck, `X5`) and refused one whose `B₁` consumes it. |
 | 23 November 2026 | [F5] says on which histories a contingency runs: those of the statements of `B₁` that may fault, and none where there is no such statement. | The generator of slice 2 (review finding RC21): the checker gave a contingency every history of its boundary and refused `⊥` in the contingency of work that cannot fault, which the oracle never runs. |
 | 23 November 2026 | [R3] says what the erased semantics keeps of a history beside its atoms: the `□` at which a loop ended and the statement of `B₁` at which a fault occurred, where the availability of a name around the loop or the boundary depends on it. [R4] says that a scope is ended by the formulas of the statement at which it ends. | The erased interpreter and the backend (review findings RO5 and RB1): both ended an outer scope by the formulas of the statement that holds the loop or the boundary, which do not see what the body inside did, and compiled code freed a moved value a second time. |
+| 23 November 2026 | [R4] says what a name of the bodies around a boundary or a loop is after the statement, on a history on which the statement did not run: as it was before. | The layout of the erased semantics and the backend (review finding RB12): it gave the name the state in which the body left it on every history. The allocation count of the native harness found it. |

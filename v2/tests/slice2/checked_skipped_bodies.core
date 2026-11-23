@@ -1,0 +1,112 @@
+// Slice 2 core conformance for a checked program ([R3], [R4]). The checker
+// accepts every control of this file, so the file is compiled, and each run
+// is compared in the oracle, the erased semantics and compiled code. A
+// statement that holds a body, a boundary or a loop, runs on some histories
+// only. Where it ran, a name of the bodies around it is as the body left it
+// ([E-Boundary], [O6]); where it did not, the name is as it was before. Each
+// control here has a run on which the statement does not run, and what that
+// run still owns is seen: memory by the allocation count of the compiled
+// run, a resource by its release under a fault.
+
+extern resource conn on fault release
+
+extern control open_conn()
+    ■ { opened {c : conn} }
+    uses net
+
+extern control close_conn(c : conn)
+    ■ { closed {} }
+    uses net
+
+extern control keep(s : string)
+    ■ { done {} }
+    uses net
+
+// The work of a boundary gives a name of the body around it away. Where the
+// boundary did not run, the control still owns the text.
+pub control work_not_entered(n : u32, s : string)
+    ■ { kept {size : usize} │ given {} }
+    uses net
+    1  ⊤ ▷ v : string := trim(s)
+    2  ⊤ ▷ t : ? n = 0
+    3  t.true ▷ b : boundary {
+    4      ⊤ ▷ d : Δ keep(▾v) ▸ done {}
+       } contingency (m : string) {
+    5      ⊤ ▷ ⊥
+       }
+    6  t.true ▷ ■ given {}
+    7  t.false ▷ size : usize := len(&v)
+    8  t.false ▷ ■ kept {size}
+
+// The same with a resource: where the boundary did not run, the fault that
+// follows meets the connection and releases it.
+pub control work_not_entered_then_fault(n : u32)
+    ■ { closed {} }
+    faults
+    uses net
+    1  ⊤ ▷ d0 : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ t : ? n = 0
+    3  t.true ▷ b : boundary {
+    4      ⊤ ▷ d : Δ close_conn(▾c) ▸ closed {}
+       } contingency (m : string) {
+    5      ⊤ ▷ ⊥
+       }
+    6  t.true ▷ ■ closed {}
+    7  t.false ▷ fault "late"
+
+// A loop gives a name of the body around it away as it ends. Where the loop
+// did not run, the name went before it, and nothing of it is left.
+pub control loop_not_entered(n : u32, s : string)
+    ■ { done {} }
+    uses net
+    1  ⊤ ▷ v : string := trim(s)
+    2  ⊤ ▷ t : ? n = 0
+    3  t.true ▷ d1 : Δ keep(▾v) ▸ done {}
+    4  t.false ▷ l : ↻ once(i : u32 := 0) {
+    5      ⊤ ▷ d2 : Δ keep(▾v) ▸ done {}
+    6      ⊤ ▷ □ out {}
+       } ▸ out {}
+    7  ⊤ ▷ ■ done {}
+
+// The same with a resource: the fault that follows meets no connection.
+pub control loop_not_entered_then_fault(n : u32)
+    ■ { done {} }
+    faults
+    uses net
+    1  ⊤ ▷ d0 : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ t : ? n = 0
+    3  t.true ▷ d1 : Δ close_conn(▾c) ▸ closed {}
+    4  t.false ▷ l : ↻ once(i : u32 := 0) {
+    5      ⊤ ▷ d2 : Δ close_conn(▾c) ▸ closed {}
+    6      ⊤ ▷ □ out {}
+       } ▸ out {}
+    7  t.true ▷ fault "late"
+    8  t.false ▷ ■ done {}
+
+// The work of a boundary writes a name that was given away before it. Where
+// the boundary did not run, the name holds nothing.
+pub control work_writes_again(n : u32, s : string, u : string)
+    ■ { written {size : usize} │ empty {} }
+    uses net
+    1  ⊤ ▷ ~v : string := trim(s)
+    2  ⊤ ▷ d0 : Δ keep(▾v) ▸ done {}
+    3  ⊤ ▷ t : ? n = 0
+    4  t.true ▷ b : boundary {
+    5      ⊤ ▷ v ← trim(u)
+       } contingency (m : string) {
+    6      ⊤ ▷ ⊥
+       }
+    7  t.true ▷ size : usize := len(&v)
+    8  t.true ▷ ■ written {size}
+    9  t.false ▷ ■ empty {}
+
+//! run work_not_entered(0, "  heap text ") with [keep -> done] => done given trace [keep("heap text") -> done]
+//! run work_not_entered(1, "  heap text ") with [] => done kept {9}
+//! run work_not_entered_then_fault(0) with [open_conn -> opened {conn#1}; close_conn -> closed] => done closed trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run work_not_entered_then_fault(1) with [open_conn -> opened {conn#1}] => faulted "late" trace [open_conn() -> opened {conn#1}; conn.release(conn#1) -> released]
+//! run loop_not_entered(0, "  heap text ") with [keep -> done] => done done trace [keep("heap text") -> done]
+//! run loop_not_entered(1, "  heap text ") with [keep -> done] => done done trace [keep("heap text") -> done]
+//! run loop_not_entered_then_fault(0) with [open_conn -> opened {conn#1}; close_conn -> closed] => faulted "late" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run loop_not_entered_then_fault(1) with [open_conn -> opened {conn#1}; close_conn -> closed] => done done trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run work_writes_again(0, " first ", " second text ") with [keep -> done] => done written {11} trace [keep("first") -> done]
+//! run work_writes_again(1, " first ", " second text ") with [keep -> done] => done empty trace [keep("first") -> done]

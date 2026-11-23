@@ -780,14 +780,26 @@ fn compute_body_availability(
                 // [O6](b): after the loop a name of the bodies around it is
                 // as the `□` that ended the loop left it. Which one that was
                 // is a bit of the history; where every `□` leaves the name
-                // as the loop found it, none is asked.
+                // as the loop found it, none is asked. On a history on which
+                // the loop did not run no `□` ended it, and the name is as
+                // it was before.
                 for var in 0..body.vars.len() {
                     if defined[var].is_none()
                         || leaves.iter().all(|leave| leave.moved[var] == moved[var])
                     {
                         continue;
                     }
-                    moved[var] = moved_at_one_of(&leaves, var, *site, arms.len());
+                    let ended = moved_at_one_of(&leaves, var, *site, arms.len());
+                    let ran = (0..leaves.len())
+                        .map(|index| Selector::Atom(*site, arms.len() + index))
+                        .reduce(|left, right| Selector::Or(Box::new(left), Box::new(right)));
+                    moved[var] = match (moved[var].take(), ran) {
+                        (Some(before), Some(ran)) => sel_or(
+                            ended,
+                            Selector::And(Box::new(Selector::Not(Box::new(ran))), Box::new(before)),
+                        ),
+                        _ => ended,
+                    };
                 }
                 for (index, leave) in leaves.iter().enumerate() {
                     nest.leave_marks
@@ -851,11 +863,32 @@ fn compute_body_availability(
                 }
                 // The histories that fall off the end of the work go on
                 // after the boundary: a name of the bodies around it is as
-                // the work left it ([E-Boundary]).
+                // the work left it ([E-Boundary]). They are the histories
+                // that have the alternative of the site; on one on which
+                // the boundary did not run, the name is as it was before.
+                let done = Selector::Atom(*site, 0);
                 for var in 0..body.vars.len() {
-                    if defined[var].is_some() {
-                        moved[var] = after[var].clone();
+                    if defined[var].is_none() || after[var] == moved[var] {
+                        continue;
                     }
+                    let left = match &after[var] {
+                        None => None,
+                        Some(Selector::Top) => Some(done.clone()),
+                        Some(inside) => Some(Selector::And(
+                            Box::new(done.clone()),
+                            Box::new(inside.clone()),
+                        )),
+                    };
+                    moved[var] = match moved[var].take() {
+                        None => left,
+                        Some(before) => sel_or(
+                            left,
+                            Selector::And(
+                                Box::new(Selector::Not(Box::new(done.clone()))),
+                                Box::new(before),
+                            ),
+                        ),
+                    };
                 }
                 // The contingency leaves no loop ([E-Contingency]); a
                 // fault in it is one of the boundary around this one.

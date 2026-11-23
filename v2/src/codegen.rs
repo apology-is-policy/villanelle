@@ -5699,6 +5699,16 @@ fn next_tmp(tmp_id: &mut usize) -> usize {
     id
 }
 
+/// A place that a host of the harness lends: a global, written when the
+/// answer that lends it is given. What it holds when the run has ended is
+/// freed by `main`, so that the allocation count of a run comes out even.
+struct Lent {
+    global: String,
+    ty: Type,
+}
+
+/// Writes `val` to `dst_ptr`. What a reference in it refers to is a global
+/// of the harness, entered in `lent`, or with no list a slot of `main`.
 #[allow(clippy::too_many_arguments)]
 fn emit_harness_value_into(
     ir: &mut String,
@@ -5708,31 +5718,34 @@ fn emit_harness_value_into(
     ty: &Type,
     dst_ptr: &str,
     tmp_id: &mut usize,
-    heap_refs: bool,
+    mut lent: Option<&mut Vec<Lent>>,
 ) {
     let u = reg.usize_ty;
     if let Type::Ref(_, inner) = ty {
         let inner_ll = llvm_ty(program, inner, reg.usize_bits);
         let id = next_tmp(tmp_id);
-        let backing = format!("%href_{id}");
-        if heap_refs {
-            reg.needed_libc = true;
-            let _ = writeln!(
-                ir,
-                "  %hrsp_{id} = getelementptr {inner_ll}, ptr null, i32 1"
-            );
-            let _ = writeln!(ir, "  %hrsz_{id} = ptrtoint ptr %hrsp_{id} to i64");
-            let _ = writeln!(ir, "  {backing} = call ptr @malloc(i64 %hrsz_{id})");
-        } else {
-            let _ = writeln!(ir, "  {backing} = alloca {inner_ll}");
-        }
+        let backing = match lent.as_deref_mut() {
+            Some(list) => {
+                let global = format!("@h_lent_{id}");
+                list.push(Lent {
+                    global: global.clone(),
+                    ty: (**inner).clone(),
+                });
+                global
+            }
+            None => {
+                let slot = format!("%href_{id}");
+                let _ = writeln!(ir, "  {slot} = alloca {inner_ll}");
+                slot
+            }
+        };
         let zero = if **inner == Type::Bool {
             "false"
         } else {
             "zeroinitializer"
         };
         let _ = writeln!(ir, "  store {inner_ll} {zero}, ptr {backing}");
-        emit_harness_value_into(ir, program, reg, val, inner, &backing, tmp_id, heap_refs);
+        emit_harness_value_into(ir, program, reg, val, inner, &backing, tmp_id, lent);
         let _ = writeln!(ir, "  store ptr {backing}, ptr {dst_ptr}");
         return;
     }
@@ -5804,7 +5817,7 @@ fn emit_harness_value_into(
                     &fparam.ty,
                     &format!("%hsf_{id}"),
                     tmp_id,
-                    heap_refs,
+                    lent.as_deref_mut(),
                 );
             }
         }
@@ -5851,7 +5864,7 @@ fn emit_harness_value_into(
                             &fparam.ty,
                             &format!("%hvf_{fid}"),
                             tmp_id,
-                            heap_refs,
+                            lent.as_deref_mut(),
                         );
                     }
                 }
@@ -5883,7 +5896,7 @@ fn emit_harness_value_into(
                         elem_ty,
                         &format!("%he_{eid}"),
                         tmp_id,
-                        heap_refs,
+                        lent.as_deref_mut(),
                     );
                 }
                 let _ = writeln!(
@@ -5941,7 +5954,7 @@ fn emit_harness_value_into(
                         k_ty,
                         &format!("%mk_{eid}"),
                         tmp_id,
-                        heap_refs,
+                        lent.as_deref_mut(),
                     );
                     emit_harness_value_into(
                         ir,
@@ -5951,7 +5964,7 @@ fn emit_harness_value_into(
                         v_ty,
                         &format!("%mv_{eid}"),
                         tmp_id,
-                        heap_refs,
+                        lent.as_deref_mut(),
                     );
                 }
                 let _ = writeln!(
@@ -6425,6 +6438,15 @@ pub fn emit_native_harness_llvm(
 
     let mut h_tmp = 0usize;
     let mut ext_code = String::new();
+    // What the answers of each run lend, and the globals for it.
+    let mut run_of_answer = vec![0usize; flat_ctrl_ids.len()];
+    for (run, (start, end)) in run_offsets.iter().enumerate() {
+        for slot in &mut run_of_answer[*start..*end] {
+            *slot = run;
+        }
+    }
+    let mut lent_of_run: Vec<Vec<Lent>> = specs.iter().map(|_| Vec::new()).collect();
+    let mut lent_globals = String::new();
     for res in &program.resources {
         if res.on_fault_release {
             let rg = reg.str_literal_map[res.name.as_bytes()].clone();
@@ -6596,13 +6618,16 @@ pub fn emit_native_harness_llvm(
                         i32::from(b)
                     );
                 } else if matches!(&field.ty, Type::Ref(_, inner) if **inner == Type::Bool) {
-                    reg.needed_libc = true;
                     let b = matches!(val, Value::Bool(true));
                     let id = next_tmp(&mut h_tmp);
-                    let _ = writeln!(ext_code, "  %hbp_{id} = call ptr @malloc(i64 1)");
-                    let _ = writeln!(ext_code, "  store i8 {}, ptr %hbp_{id}", i32::from(b));
-                    let _ = writeln!(ext_code, "  store ptr %hbp_{id}, ptr %out_{alt_idx}_{fi}");
+                    let _ = writeln!(lent_globals, "@h_lent_{id} = internal global i8 0");
+                    let _ = writeln!(ext_code, "  store i8 {}, ptr @h_lent_{id}", i32::from(b));
+                    let _ = writeln!(
+                        ext_code,
+                        "  store ptr @h_lent_{id}, ptr %out_{alt_idx}_{fi}"
+                    );
                 } else {
+                    let mut lent = Vec::new();
                     emit_harness_value_into(
                         &mut ext_code,
                         program,
@@ -6611,8 +6636,22 @@ pub fn emit_native_harness_llvm(
                         &field.ty,
                         &format!("%out_{alt_idx}_{fi}"),
                         &mut h_tmp,
-                        true,
+                        Some(&mut lent),
                     );
+                    for place in &lent {
+                        let ll = llvm_ty(program, &place.ty, usize_bits);
+                        let zero = if place.ty == Type::Bool {
+                            "false"
+                        } else {
+                            "zeroinitializer"
+                        };
+                        let _ = writeln!(
+                            lent_globals,
+                            "{} = internal global {ll} {zero}",
+                            place.global
+                        );
+                    }
+                    lent_of_run[run_of_answer[*idx]].append(&mut lent);
                 }
             }
             if !pure {
@@ -6709,6 +6748,14 @@ pub fn emit_native_harness_llvm(
                 let _ = writeln!(ext_code, "  call i32 @putchar(i32 125)");
                 let _ = writeln!(ext_code, "  call i32 @putchar(i32 10)");
             }
+            // A host has consumed what it was given by value.
+            for (pi, param) in control.parameters.iter().enumerate() {
+                if needs_drop(program, &param.ty) {
+                    let ptid = reg.intern_type(&param.ty);
+                    reg.require_drop(ptid);
+                    let _ = writeln!(ext_code, "  call fastcc void @vn2_drop_{ptid}(ptr %p{pi})");
+                }
+            }
             let _ = writeln!(ext_code, "  ret i32 {alt_idx}");
         }
         let _ = writeln!(ext_code, "}}\n");
@@ -6752,7 +6799,7 @@ pub fn emit_native_harness_llvm(
                     param.ty.deref_type(),
                     &islot,
                     &mut h_tmp,
-                    false,
+                    None,
                 );
                 call_args.push(format!("ptr {islot}"));
             } else {
@@ -6776,7 +6823,7 @@ pub fn emit_native_harness_llvm(
                     &param.ty,
                     &slot,
                     &mut h_tmp,
-                    false,
+                    None,
                 );
                 let lr = format!("%r{run_idx}_iv_{pi}");
                 let _ = writeln!(main_out, "  {lr} = load {ll}, ptr {slot}");
@@ -6899,9 +6946,58 @@ pub fn emit_native_harness_llvm(
             let _ = writeln!(main_out, "  br label %{end_lbl}");
         }
         let _ = writeln!(main_out, "{end_lbl}:");
+        // The harness frees what it kept: the places it lent to the entry
+        // control and those its hosts lent. Then every allocation of the
+        // run has been freed ([R4]), and a count that is not zero is
+        // written for the reader of the output.
+        for (pi, param) in control.parameters.iter().enumerate() {
+            if let Type::Ref(_, inner) = &param.ty
+                && needs_drop(program, inner)
+            {
+                let tid = reg.intern_type(inner);
+                reg.require_drop(tid);
+                let _ = writeln!(
+                    main_out,
+                    "  call fastcc void @vn2_drop_{tid}(ptr %r{run_idx}_rin_{pi})"
+                );
+            }
+        }
+        for place in &lent_of_run[run_idx] {
+            if needs_drop(program, &place.ty) {
+                let tid = reg.intern_type(&place.ty);
+                reg.require_drop(tid);
+                let _ = writeln!(
+                    main_out,
+                    "  call fastcc void @vn2_drop_{tid}(ptr {})",
+                    place.global
+                );
+            }
+        }
+        let _ = writeln!(main_out, "  %r{run_idx}_live = load i64, ptr @vn2_h_live");
+        let _ = writeln!(
+            main_out,
+            "  %r{run_idx}_even = icmp eq i64 %r{run_idx}_live, 0"
+        );
+        let _ = writeln!(
+            main_out,
+            "  br i1 %r{run_idx}_even, label %r{run_idx}_next, label %r{run_idx}_uneven"
+        );
+        let _ = writeln!(main_out, "r{run_idx}_uneven:");
+        let _ = writeln!(
+            main_out,
+            "  call i32 (ptr, ...) @printf(ptr @h_fmt_live, i64 %r{run_idx}_live)"
+        );
+        let _ = writeln!(main_out, "  store i64 0, ptr @vn2_h_live");
+        let _ = writeln!(main_out, "  br label %r{run_idx}_next");
+        let _ = writeln!(main_out, "r{run_idx}_next:");
         // What a run wrote is there if a later run ends the process.
         let _ = writeln!(main_out, "  call i32 @fflush(ptr null)");
     }
+    let _ = writeln!(main_out, "  %made = load i64, ptr @vn2_h_made");
+    let _ = writeln!(
+        main_out,
+        "  call i32 (ptr, ...) @printf(ptr @h_fmt_made, i64 %made)"
+    );
     let _ = writeln!(main_out, "  ret i32 0");
     let _ = writeln!(main_out, "}}\n");
 
@@ -6910,6 +7006,8 @@ pub fn emit_native_harness_llvm(
         out,
         "; Villanelle v2 Phase 4 native harness (usize_bits = {usize_bits})\n"
     );
+    // The harness counts allocations, so the allocator is always declared.
+    reg.needed_libc = true;
     emit_type_decls(&mut out, &reg, true);
 
     let mut helpers = String::new();
@@ -6953,10 +7051,71 @@ pub fn emit_native_harness_llvm(
 
     out.push_str(&printers);
     out.push_str(&harness_globals);
+    out.push_str(&lent_globals);
     out.push_str(&helpers);
     out.push_str(&ext_code);
     out.push_str(&body_out);
     out.push_str(&main_out);
+    count_allocations(&out)
+}
+
+/// The module `ir` with every allocation counted: the calls of `malloc`,
+/// `realloc` and `free` go through functions that keep in `@vn2_h_live` how
+/// many allocations are live, and in `@vn2_h_made` how many were made.
+/// `main` reads the first where a run has ended and the second at its end.
+fn count_allocations(ir: &str) -> String {
+    let mut out = ir
+        .replace("call ptr @malloc(", "call ptr @vn2_h_malloc(")
+        .replace("call ptr @realloc(", "call ptr @vn2_h_realloc(")
+        .replace("call void @free(", "call void @vn2_h_free(");
+    out.push_str(
+        "@vn2_h_live = internal global i64 0
+@vn2_h_made = internal global i64 0
+@h_fmt_live = private unnamed_addr constant [11 x i8] c\"LIVE %lld\\0A\\00\"
+@h_fmt_made = private unnamed_addr constant [11 x i8] c\"MADE %lld\\0A\\00\"
+
+define internal ptr @vn2_h_malloc(i64 %n) nounwind {
+entry:
+  %p = call ptr @malloc(i64 %n)
+  %some = icmp ne ptr %p, null
+  %one = zext i1 %some to i64
+  %live = load i64, ptr @vn2_h_live
+  %next = add i64 %live, %one
+  store i64 %next, ptr @vn2_h_live
+  %made = load i64, ptr @vn2_h_made
+  %more = add i64 %made, %one
+  store i64 %more, ptr @vn2_h_made
+  ret ptr %p
+}
+
+define internal ptr @vn2_h_realloc(ptr %old, i64 %n) nounwind {
+entry:
+  %p = call ptr @realloc(ptr %old, i64 %n)
+  %fresh = icmp eq ptr %old, null
+  %some = icmp ne ptr %p, null
+  %both = and i1 %fresh, %some
+  %one = zext i1 %both to i64
+  %live = load i64, ptr @vn2_h_live
+  %next = add i64 %live, %one
+  store i64 %next, ptr @vn2_h_live
+  %made = load i64, ptr @vn2_h_made
+  %more = add i64 %made, %one
+  store i64 %more, ptr @vn2_h_made
+  ret ptr %p
+}
+
+define internal void @vn2_h_free(ptr %p) nounwind {
+entry:
+  %some = icmp ne ptr %p, null
+  %one = zext i1 %some to i64
+  %live = load i64, ptr @vn2_h_live
+  %next = sub i64 %live, %one
+  store i64 %next, ptr @vn2_h_live
+  call void @free(ptr %p)
+  ret void
+}
+",
+    );
     out
 }
 
@@ -6997,20 +7156,51 @@ fn run_with_limit(
     }
 }
 
+/// What a compiled batch of runs gave.
+#[derive(Debug, Default)]
+pub struct NativeBatch {
+    /// The end and the trace of each run.
+    pub runs: Vec<(erased::End, Vec<Event>)>,
+    /// How many allocations the runs made together.
+    pub allocations: u64,
+}
+
 /// Compiles `program` with `clang -x ir` at optimization level `opt_level`
 /// (`0`, `2`, or `3`), executes all `specs` natively in a single process, and
-/// returns the `(erased::End, Vec<Event>)` of each run.
+/// returns the `(erased::End, Vec<Event>)` of each run. A run that ends with
+/// an allocation it did not free, or that frees more than it allocated, ends
+/// `Undefined` ([R4]).
 pub fn run_native_batch(
     program: &Program,
     specs: &[NativeRunSpec],
     usize_bits: u32,
     opt_level: u8,
 ) -> Result<Vec<(erased::End, Vec<Event>)>, String> {
+    run_native_counted(program, specs, usize_bits, opt_level).map(|batch| batch.runs)
+}
+
+/// As [`run_native_batch`], with the number of allocations the runs made.
+pub fn run_native_counted(
+    program: &Program,
+    specs: &[NativeRunSpec],
+    usize_bits: u32,
+    opt_level: u8,
+) -> Result<NativeBatch, String> {
     if specs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(NativeBatch::default());
     }
     let ir = emit_native_harness_llvm(program, specs, usize_bits);
+    run_native_ir(program, specs, &ir, opt_level)
+}
 
+/// Compiles and runs `ir`, the text that [`emit_native_harness_llvm`] gave
+/// for `specs` or a change of it, as [`run_native_counted`] does.
+pub fn run_native_ir(
+    program: &Program,
+    specs: &[NativeRunSpec],
+    ir: &str,
+    opt_level: u8,
+) -> Result<NativeBatch, String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
@@ -7018,13 +7208,13 @@ pub fn run_native_batch(
     let ll_path = tmp_dir.join(format!("vn2_native_{pid}_{id}.ll"));
     let bin_path = tmp_dir.join(format!("vn2_native_{pid}_{id}.bin"));
 
-    std::fs::write(&ll_path, &ir).map_err(|e| format!("write {}: {e}", ll_path.display()))?;
+    std::fs::write(&ll_path, ir).map_err(|e| format!("write {}: {e}", ll_path.display()))?;
     // For looking at what was compiled: `VN2_KEEP_IR` names a directory
     // that gets a copy of the text.
     if let Some(keep) = std::env::var_os("VN2_KEEP_IR") {
         let kept =
             std::path::Path::new(&keep).join(format!("vn2_native_{pid}_{id}_O{opt_level}.ll"));
-        let _ = std::fs::write(kept, &ir);
+        let _ = std::fs::write(kept, ir);
     }
 
     let opt_flag = format!("-O{}", opt_level.min(3));
@@ -7068,9 +7258,19 @@ pub fn run_native_batch(
         ));
     }
 
-    let stdout = String::from_utf8_lossy(&written);
-    let mut results = Vec::new();
+    native_results(program, specs, &String::from_utf8_lossy(&written))
+}
+
+/// The end and the trace of each run in what a compiled harness wrote, and
+/// the allocations it counted.
+fn native_results(
+    program: &Program,
+    specs: &[NativeRunSpec],
+    stdout: &str,
+) -> Result<NativeBatch, String> {
+    let mut results: Vec<(erased::End, Vec<Event>)> = Vec::new();
     let mut current_events = Vec::new();
+    let mut allocations = 0;
 
     for line in stdout.lines() {
         if let Some(ev_text) = line.strip_prefix("EVENT ") {
@@ -7094,8 +7294,24 @@ pub fn run_native_batch(
                 erased::End::HostFailed("native script exhausted or mismatched".to_string()),
                 events,
             ));
+        } else if let Some(count) = line.strip_prefix("LIVE ") {
+            // The count of the run that has just ended.
+            let run = results
+                .last_mut()
+                .ok_or_else(|| format!("`{line}` before the end of a run"))?;
+            run.0 = erased::End::Undefined(format!(
+                "the run ended as `{}` with {count} allocations live",
+                run.0
+            ));
+        } else if let Some(count) = line.strip_prefix("MADE ") {
+            allocations = count
+                .parse()
+                .map_err(|_| format!("bad count in `{line}`"))?;
         }
     }
 
-    Ok(results)
+    Ok(NativeBatch {
+        runs: results,
+        allocations,
+    })
 }

@@ -21,7 +21,7 @@
 //! its seed alone.
 
 use crate::check;
-use crate::codegen::{NativeRunSpec, run_native_batch};
+use crate::codegen::{NativeRunSpec, run_native_batch, run_native_counted};
 use crate::counts::{self, Counts};
 use crate::differential::{Verdict, compare};
 use crate::erased;
@@ -93,6 +93,9 @@ pub struct Report {
     pub accepted: u64,
     /// Runs of compiled programs that ended as the oracle's did.
     pub native_runs: u64,
+    /// The allocations that the compiled runs made. A run that does not
+    /// release every one of its own does not end as the oracle's ([R4]).
+    pub native_allocations: u64,
     pub mutants: u64,
     /// Mutants that `resolve` refuses.
     pub refused: u64,
@@ -403,8 +406,11 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
             let specs: Vec<NativeRunSpec> = runs.iter().map(|run| run.1.clone()).collect();
             for level in [0, 2] {
                 let target = format!("usize of {bits} bits, -O{level}");
-                let results = match run_native_batch(&program, &specs, bits, level) {
-                    Ok(results) => results,
+                let results = match run_native_counted(&program, &specs, bits, level) {
+                    Ok(batch) => {
+                        report.native_allocations += batch.allocations;
+                        batch.runs
+                    }
                     Err(error) => {
                         // The runs of a batch share a process. Each one
                         // alone says which of them ended it.
@@ -576,6 +582,10 @@ impl Report {
             out.push_str(&format!(
                 "{} runs of compiled programs end as the oracle's do\n",
                 self.native_runs
+            ));
+            out.push_str(&format!(
+                "the compiled runs made {} allocations\n",
+                self.native_allocations
             ));
         }
         if self.mutants > 0 {

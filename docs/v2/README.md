@@ -111,8 +111,10 @@ Items 9 to 16 were written on 21 and 22 November. The [review](review.md) of
     boundaries of the oracle are requalified since 23 November 2026, sections
     6.9 and 7.7 of the core say how each end of a contingency runs, and so
     are pure operations and the operands and contracts of the built-in
-    operations; the checker accepts stuck programs, and
-    compiled code can free a value twice).
+    operations; the findings by which the checker accepted stuck programs
+    of this slice (RC2 to RC8) and compiled code freed a value twice (RB1)
+    are closed, every compiled run is counted for allocations left live,
+    and the review lists the open findings and what the slice still owes).
 13. Phase 2 for slice 3: second-class borrows `&τ`/`&~τ`, `view struct`,
     payload origins `∈`, well-formedness (`[W5a]`, `[W6]`, `[W8]`, `[W9]`,
     `[T1]`, `[T4]`, `[T6]`, `[F5]`, `[F6]`), instrumented borrow tag semantics

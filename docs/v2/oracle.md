@@ -465,9 +465,14 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   is compared as one that ends in an outcome. The runs of a program share a
   process, which has 60 seconds; where it fails, each run is compiled and
   run alone, and the finding names the runs that fail with the answers of
-  their hosts. With `VN2_KEEP_IR=DIR` in the environment the text of every
+  their hosts. The harness counts the allocations of each run, and a run
+  that ends with one live, or with more released than made, ends
+  `undefined` and so differs from the oracle ([R4]); the report says how
+  many allocations the compiled runs made. With
+  `VN2_KEEP_IR=DIR` in the environment the text of every
   compiled module is kept in `DIR`. For slice 2 on 23 November 2026:
-  300 programs, 23,520 runs of compiled programs with no difference.
+  300 programs, 23,520 runs of compiled programs with no difference, which
+  make 24,862 allocations.
   `--mutants` tries every mutant too, where a
   mutant that the checker accepts must have no stuck run. A run of a mutant
   has 20,000 steps (`--mutant-fuel`), a tenth of the steps of a run of a
@@ -919,7 +924,10 @@ and Rails surface reader, elaborator, and formatter (`surface.rs`):
   those selectors alone. Since 23 November 2026 (review finding RO5) the
   formulas of a body take what the bodies inside it do to its names: after a
   boundary a name is as the work left it at its end, and after a loop as the
-  `□` that ended the loop left it. For the second the interpreter keeps one
+  `□` that ended the loop left it; on a history on which the boundary or
+  the loop did not run, as it was before (RB12: the atom of the boundary's
+  alternative, or none of the bits of the loop's `□`, says so). For the
+  second the interpreter keeps one
   more bit of the history for each `□` of a loop that leaves some name
   otherwise than the loop found it; [O6](b) makes the `□` of one alternative
   agree, so in a checked program such a bit says no more than the atom of
@@ -1214,6 +1222,23 @@ paired native-performance suite (`v2/tests/backend_slice2.rs`):
   lowering pass (`plan_structured_flow`) chains mutually exclusive `Decide` and
   two-sided `Test` arm spans directly into their arm statements, eliminating
   redundant history-bit checks and speculative arm branches in hot loops.
+- **The allocation count of the native harness.** `emit_native_harness_llvm`
+  ends by `count_allocations`: every call of `malloc`, `realloc` and `free`
+  in the text of the module goes through `@vn2_h_malloc`, `@vn2_h_realloc`
+  and `@vn2_h_free`, which keep the number of live allocations in
+  `@vn2_h_live` and the number made in `@vn2_h_made`. Where a run has
+  ended, `main` frees what the harness kept: the value behind each
+  reference it gave the entry control, and the places its hosts lent, which
+  are globals (`@h_lent_<n>`) written when the answer is given. A host
+  frees what it was given by value. `main` then writes `LIVE n` if the
+  number is not zero and sets it to zero for the next run, and
+  `run_native_batch` gives that run the end `undefined`; at its end `main`
+  writes `MADE n`, which `run_native_counted` returns with the runs.
+  Freeing here is the destruction of memory only: no resource is released
+  by it. `run_native_ir` compiles and runs a text, so that a test can
+  change what was compiled:
+  `a_run_of_compiled_code_that_leaves_an_allocation_live_is_seen` takes the
+  release of a string out and requires the count to see it.
 - **Checked files of the suite in compiled code.** `script::native_runs`
   gives the runs of the directives of a core text file as a compiled program
   takes them, and
@@ -1221,10 +1246,13 @@ paired native-performance suite (`v2/tests/backend_slice2.rs`):
   compiles every file of `v2/tests/slice2/` that the checker accepts whole
   and compares each run with the oracle at `-O0` and `-O2`. Most files of
   the suite hold a control that is there to be stuck, so the checker
-  refuses them; the two it accepts are `erased_nested_ownership.core` and
-  `checked_faults_and_boundaries.core`, which is written for this: the ends
+  refuses them; the three it accepts are `erased_nested_ownership.core`,
+  `checked_faults_and_boundaries.core`, which is written for this (the ends
   of a contingency with messages that own memory, care lists, a boundary in
-  the work of another, a named boundary.
+  the work of another, a named boundary), and `checked_skipped_bodies.core`
+  (RB12: a boundary or a loop that does not run, and what the names around
+  it still own). Where a batch of runs fails, the test runs each run alone
+  and names those that differ.
 - **Verification (`v2/tests/backend_slice2.rs`).** Verifies Theorem 4 expansion
   plus `check::check` and `kernel::validate` across all 4 Slice 2 `.rails`
   files and a dedicated `&τ`/`&~τ`/`old(y)`/resource/fault/boundary test;

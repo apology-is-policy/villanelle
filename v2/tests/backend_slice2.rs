@@ -5,7 +5,10 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
-use villanelle_v2::codegen::{NativeRunSpec, emit_c_header, emit_llvm, run_native_batch};
+use villanelle_v2::codegen::{
+    NativeRunSpec, emit_c_header, emit_llvm, emit_native_harness_llvm, run_native_batch,
+    run_native_ir,
+};
 use villanelle_v2::host::{Answer, Script};
 use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{Config, End, Value, run};
@@ -988,36 +991,58 @@ fn checked_core_programs_of_slice_two_run_natively_as_the_oracle_does() {
     let mut failures = Vec::new();
     for (name, program, specs) in &files {
         let expected = oracle_ends(program, specs);
+        // What run `index` says where it does not end as the oracle's does.
+        let differs = |level: u8, index: usize, native: &(erased::End, Vec<_>)| {
+            let (end, trace) = &expected[index];
+            let entry = &specs[index].entry;
+            if native.0.to_string() != *end {
+                Some(format!(
+                    "{name} -O{level} run {index} of `{entry}`: `{}`, and the oracle `{end}`",
+                    native.0
+                ))
+            } else if native.1 != *trace {
+                Some(format!(
+                    "{name} -O{level} run {index} of `{entry}`: the trace is not the oracle's"
+                ))
+            } else {
+                None
+            }
+        };
         for level in [0, 2] {
             let native = match run_native_batch(program, specs, 64, level) {
-                Ok(native) => native,
-                Err(error) => {
-                    let error: String = error.chars().take(400).collect();
-                    failures.push(format!("{name} -O{level}: {error}"));
+                Ok(native) if native.len() == expected.len() => native,
+                Ok(native) => {
+                    failures.push(format!(
+                        "{name} -O{level}: {} runs of {}",
+                        native.len(),
+                        expected.len()
+                    ));
+                    continue;
+                }
+                Err(_) => {
+                    // The runs of a batch share a process. Each one alone
+                    // says which of them ended it.
+                    for (index, spec) in specs.iter().enumerate() {
+                        let entry = &spec.entry;
+                        match run_native_batch(program, std::slice::from_ref(spec), 64, level) {
+                            Ok(one) if one.len() == 1 => {
+                                failures.extend(differs(level, index, &one[0]))
+                            }
+                            Ok(_) => failures
+                                .push(format!("{name} -O{level} run {index} of `{entry}`: no end")),
+                            Err(error) => {
+                                let error: String = error.chars().take(200).collect();
+                                failures.push(format!(
+                                    "{name} -O{level} run {index} of `{entry}`: {error}"
+                                ));
+                            }
+                        }
+                    }
                     continue;
                 }
             };
-            if native.len() != expected.len() {
-                failures.push(format!(
-                    "{name} -O{level}: {} runs of {}",
-                    native.len(),
-                    expected.len()
-                ));
-                continue;
-            }
-            for (index, ((end, trace), (native_end, native_trace))) in
-                expected.iter().zip(&native).enumerate()
-            {
-                let entry = &specs[index].entry;
-                if native_end.to_string() != *end {
-                    failures.push(format!(
-                        "{name} -O{level} run {index} of `{entry}`: `{native_end}`, and the oracle `{end}`"
-                    ));
-                } else if native_trace != trace {
-                    failures.push(format!(
-                        "{name} -O{level} run {index} of `{entry}`: the trace is not the oracle's"
-                    ));
-                }
+            for (index, run) in native.iter().enumerate() {
+                failures.extend(differs(level, index, run));
             }
         }
         runs += specs.len();
@@ -1030,10 +1055,68 @@ fn checked_core_programs_of_slice_two_run_natively_as_the_oracle_does() {
         names,
         [
             "checked_faults_and_boundaries.core",
+            "checked_skipped_bodies.core",
             "erased_nested_ownership.core"
         ]
     );
-    assert_eq!(runs, 36);
+    assert_eq!(runs, 46);
+}
+
+/// `ir` with no string freed by the program: the calls that release a
+/// string are taken out of every function but `main` and the hosts, which
+/// are the harness.
+fn without_string_releases(ir: &str) -> String {
+    let mut out = String::new();
+    let mut harness = false;
+    for line in ir.lines() {
+        if line.starts_with("define ") {
+            harness = line.contains("@main(") || line.contains("@vn2_ext_");
+        }
+        if harness || !line.contains("call fastcc void @vn2_str_drop(") {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// [R4] is observed: the harness counts the allocations of a run, and a run
+/// of compiled code that leaves one live does not end as the oracle's run
+/// does. The programs here are the checked files of the suite with the
+/// release of a string taken out of what was compiled.
+#[test]
+fn a_run_of_compiled_code_that_leaves_an_allocation_live_is_seen() {
+    let mut seen = 0;
+    let mut runs = 0;
+    let mut made = Vec::new();
+    for (name, program, specs) in &checked_core_files() {
+        let ir = emit_native_harness_llvm(program, specs, 64);
+        let leaking = without_string_releases(&ir);
+        assert_ne!(ir, leaking, "{name} releases no string");
+        for level in [0, 2] {
+            let whole = run_native_ir(program, specs, &ir, level).unwrap();
+            let leaked = run_native_ir(program, specs, &leaking, level).unwrap();
+            assert_eq!(whole.runs.len(), specs.len());
+            assert_eq!(leaked.runs.len(), specs.len());
+            // Taking a release out makes no allocation more or fewer.
+            assert_eq!(whole.allocations, leaked.allocations);
+            made.push(whole.allocations);
+            for ((end, _), (leaked_end, _)) in whole.runs.iter().zip(&leaked.runs) {
+                assert!(
+                    !matches!(end, erased::End::Undefined(_)),
+                    "{name} -O{level}: `{end}`"
+                );
+                runs += 1;
+                if let erased::End::Undefined(message) = leaked_end {
+                    assert!(message.contains("allocations live"), "{message}");
+                    seen += 1;
+                }
+            }
+        }
+    }
+    assert_eq!((runs, seen), (92, 22));
+    // The allocations of the three files, at `-O0` and at `-O2`.
+    assert_eq!(made, [21, 21, 7, 7, 0, 0]);
 }
 
 #[test]
