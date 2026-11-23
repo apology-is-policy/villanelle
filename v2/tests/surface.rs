@@ -883,3 +883,19 @@ control label(x: bool) ■ done
     let no_last_arm = source.replace("│ └ no → done\n", "");
     assert_eq!(surface::format(&no_last_arm).unwrap_err().clause, "Y7");
 }
+
+#[test]
+fn hidden_payload_names_are_inaccessible_and_auto_needs_type_evidence() {
+    let source = "extern control ask() ■ ok {value: u32}\ncontrol f(_v0: u32) ■ result {n: u32}\n│ Δ ask(): ok\n│ ■ result {_v0}\n╵\n//! run f(7) with [ask -> ok {41}] => done result {7}\n";
+    assert!(script::check_surface(source).failures.is_empty());
+    assert!(villanelle_v2::load_surface(&source.replace("f(_v0: u32)", "f()")).is_err());
+
+    let vector = "control f() ■ auto\n│ xs := [1, 2]\n│ ■ ok {xs}\n╵\n";
+    assert!(villanelle_v2::load_surface(vector).is_ok());
+    for payload in ["[]", "∅", "4294967296"] {
+        let s = format!("control sample() ■ auto\n│ ■ ok {{{payload}}}\n╵\n");
+        assert_eq!(surface::elaborate(&s).unwrap_err().clause, "G3");
+    }
+    let inferred = "control sample(x: u64) ■ auto\n│ ? x = 0 → ■ ok {4294967296}\n│ ■ ok {x}\n╵\n//! run sample(0) => done ok {4294967296}\n";
+    assert!(script::check_surface(inferred).failures.is_empty());
+}

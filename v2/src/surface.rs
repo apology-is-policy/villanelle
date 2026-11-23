@@ -14,6 +14,7 @@ use crate::syntax::{
 use crate::typed::{BorrowMode, IntType, Type};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::rc::Rc;
 
 #[derive(Clone, Debug)]
 pub struct Error {
@@ -4089,11 +4090,34 @@ struct AutoExit {
     line: u32,
     alternative: String,
     field_names: Vec<String>,
-    field_types: Vec<Option<Type>>,
+    field_types: Vec<AutoField>,
     field_origins: Vec<Vec<String>>,
 }
 
+#[derive(Clone, Debug)]
+enum AutoField {
+    Typed(Type),
+    Literal(Int),
+    NeedsContext,
+}
+
+impl AutoField {
+    fn from_exit(ty: Option<Type>, expr: &Expr) -> Self {
+        if let Some(ty) = ty {
+            return Self::Typed(ty);
+        }
+        match expr {
+            Expr::Integer(n) => Self::Literal(n.clone()),
+            Expr::Unary(Unary::Negate, inner) if let Expr::Integer(n) = &**inner => {
+                Self::Literal(n.negate())
+            }
+            _ => Self::NeedsContext,
+        }
+    }
+}
+
 struct Elaborator {
+    source_names: Rc<HashSet<String>>,
     structs: HashMap<String, StructDecl>,
     variants: HashMap<String, Vec<VariantConstructor>>,
     resources: HashSet<String>,
@@ -5210,6 +5234,7 @@ impl Elaborator {
         }
 
         let mut ctx = ControlElab {
+            source_names: Rc::clone(&self.source_names),
             control_name: control.name.clone(),
             is_auto,
             used_core_sites: HashSet::new(),
@@ -5289,6 +5314,7 @@ impl Elaborator {
             body_scope.vars.insert(param.name.clone(), param.ty.clone());
         }
         let mut body_ctx = ControlElab {
+            source_names: Rc::clone(&self.source_names),
             control_name: boundary.name.clone(),
             is_auto: false,
             used_core_sites: HashSet::new(),
@@ -5327,6 +5353,7 @@ impl Elaborator {
             .vars
             .insert(boundary.message.name.clone(), boundary.message.ty.clone());
         let mut cont_ctx = ControlElab {
+            source_names: Rc::clone(&self.source_names),
             control_name: format!("{}.contingency", boundary.name),
             is_auto: false,
             used_core_sites: HashSet::new(),
@@ -5401,7 +5428,7 @@ impl Elaborator {
                 let mut decided: Option<Type> = None;
                 for item in group {
                     match (&decided, &item.field_types[field_idx]) {
-                        (Some(a), Some(b)) if a != b => {
+                        (Some(a), AutoField::Typed(b)) if a != b => {
                             return fail(
                                 item.line,
                                 "G3",
@@ -5410,11 +5437,46 @@ impl Elaborator {
                                 ),
                             );
                         }
-                        (None, Some(b)) => decided = Some(b.clone()),
+                        (None, AutoField::Typed(b)) => decided = Some(b.clone()),
                         _ => {}
                     }
                 }
-                let ty = decided.unwrap_or(Type::Int(IntType::U32));
+                let ty = match decided {
+                    Some(ty) => ty,
+                    None if group.iter().all(|item| {
+                        matches!(item.field_types[field_idx], AutoField::Literal(_))
+                    }) =>
+                    {
+                        Type::Int(IntType::U32)
+                    }
+                    None => {
+                        return fail(
+                            group[0].line,
+                            "G3",
+                            format!(
+                                "cannot infer payload field {} of `{alt_name}`",
+                                field_idx + 1
+                            ),
+                        );
+                    }
+                };
+                for item in group {
+                    if let AutoField::Literal(n) = &item.field_types[field_idx] {
+                        let fits = matches!(&ty, Type::Int(t) if {
+                            let (min, max) = t.literal_bounds();
+                            &min <= n && n <= &max
+                        });
+                        if !fits {
+                            return fail(
+                                item.line,
+                                "G3",
+                                format!(
+                                    "integer literal {n} does not fit the inferred payload type `{ty}`"
+                                ),
+                            );
+                        }
+                    }
+                }
                 let name = group[0]
                     .field_names
                     .get(field_idx)
@@ -5495,7 +5557,11 @@ impl Elaborator {
                 line,
                 alternative: alternative.to_string(),
                 field_names: names,
-                field_types: types,
+                field_types: types
+                    .into_iter()
+                    .zip(payload)
+                    .map(|(ty, expr)| AutoField::from_exit(ty, expr))
+                    .collect(),
                 field_origins,
             });
             return Ok(());
@@ -5759,9 +5825,19 @@ impl Elaborator {
                             }
                         })
                     })
-                    .unwrap_or(Type::Int(IntType::U32));
+                    .or_else(|| match &checked_value {
+                        Expr::Integer(_)
+                        | Expr::Unary(Unary::Negate, _)
+                        | Expr::Binary(_, _, _) => Some(Type::Int(IntType::U32)),
+                        Expr::Vector(items) if !items.is_empty() => {
+                            Some(Type::Vector(Box::new(Type::Int(IntType::U32))))
+                        }
+                        _ => None,
+                    });
                 let origins = self.expr_origins(&checked_value, &ctx.scopes);
-                ctx.current_scope_mut().vars.insert(name.clone(), inferred);
+                if let Some(inferred) = inferred {
+                    ctx.current_scope_mut().vars.insert(name.clone(), inferred);
+                }
                 if !origins.is_empty() {
                     ctx.current_scope_mut()
                         .var_origins
@@ -7351,7 +7427,11 @@ impl Elaborator {
         let mut exported_names = std::collections::BTreeSet::new();
         let mut core_arms = Vec::new();
         if bare_count > 0 {
-            let hidden_alt = "_done".to_string();
+            let hidden_alt = if ctx.source_names.contains("_done") {
+                ctx.fresh_name("_done_")
+            } else {
+                "_done".to_string()
+            };
             replace_bare_leaves(&mut core_body, &hidden_alt);
             core_arms.push(Arm {
                 alternative: hidden_alt,
@@ -7485,8 +7565,7 @@ impl Elaborator {
         let core_site = ctx.allocate_site(None, &loop_name, line)?;
         let idx_var = ctx.fresh_hidden_var();
         let end_site = ctx.fresh_test_site();
-        let done_alt = format!("_done_{}", ctx.next_hidden);
-        ctx.next_hidden += 1;
+        let done_alt = ctx.fresh_name("_done_");
 
         // Collect user `□` leaves in `body` so `B` may leave with named alternatives ([U10]).
         let mut leaves = Vec::new();
@@ -7660,6 +7739,7 @@ impl Elaborator {
 }
 
 struct ControlElab {
+    source_names: Rc<HashSet<String>>,
     control_name: String,
     is_auto: bool,
     used_core_sites: HashSet<String>,
@@ -7704,7 +7784,9 @@ impl ControlElab {
         loop {
             self.next_hidden += 1;
             let candidate = format!("{base}_{}", self.next_hidden);
-            if self.used_core_sites.insert(candidate.clone()) {
+            if !self.source_names.contains(&candidate)
+                && self.used_core_sites.insert(candidate.clone())
+            {
                 return Ok(candidate);
             }
         }
@@ -7712,24 +7794,29 @@ impl ControlElab {
 
     fn fresh_test_site(&mut self) -> String {
         loop {
-            let candidate = format!("_t{}", self.next_hidden);
-            self.next_hidden += 1;
+            let candidate = self.fresh_name("_t");
             if self.used_core_sites.insert(candidate.clone()) {
                 return candidate;
             }
         }
     }
 
+    fn fresh_name(&mut self, prefix: &str) -> String {
+        loop {
+            let name = format!("{prefix}{}", self.next_hidden);
+            self.next_hidden += 1;
+            if !self.source_names.contains(&name) {
+                return name;
+            }
+        }
+    }
+
     fn fresh_hidden_var(&mut self) -> String {
-        let name = format!("_v{}", self.next_hidden);
-        self.next_hidden += 1;
-        name
+        self.fresh_name("_v")
     }
 
     fn fresh_renamed_var(&mut self, original: &str) -> String {
-        let name = format!("_inner_{original}_{}", self.next_hidden);
-        self.next_hidden += 1;
-        name
+        self.fresh_name(&format!("_inner_{original}_"))
     }
 }
 
@@ -8059,6 +8146,27 @@ fn rename_statements(statements: &mut [Statement], renames: &HashMap<String, Str
     }
 }
 
+// Include free occurrences too: a source read of a compiler temporary must
+// stay unbound. Quoted text and comments have no names in scope.
+fn source_identifiers(source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for raw in source.lines() {
+        let line = strip_comment(raw);
+        let mut end = 0;
+        for (i, ch) in unquoted(line) {
+            if i >= end && (ch == '_' || ch.is_ascii_alphabetic()) {
+                let tail = &line[i..];
+                let len = tail
+                    .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+                    .unwrap_or(tail.len());
+                names.insert(tail[..len].to_owned());
+                end = i + len;
+            }
+        }
+    }
+    names
+}
+
 /// Reads a Rails (or plain-form) surface program, elaborates it into the
 /// core text tree ([`syntax::Program`]), and collects surface warnings
 /// (`[U5]`, `[U17]`, `[U18]`).
@@ -8124,6 +8232,7 @@ pub fn elaborate_with_warnings(source: &str) -> Result<Elaborated, Error> {
     }
 
     let mut elaborator = Elaborator {
+        source_names: Rc::new(source_identifiers(source)),
         structs,
         variants,
         resources,
