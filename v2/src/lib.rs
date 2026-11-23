@@ -13,6 +13,7 @@
 //! | `bdd`, `facts`, `kernel` | The ROBDD engine, the fact logic `Th_Z` with its search, and the certificate kernel, which is told the query by the checker and trusts nothing of the search |
 //! | `certificate` | The text of certificates ([V5]): a writer, and a reader that gives what a text states to the kernel |
 //! | `terms`, `lia`, `rational` | Terms, rows and proofs; the theory check on integers; the rationals of its simplex method |
+//! | `counts` | The work of the search as counts, so that it is measured without a clock |
 //! | `check` | The Phase 3 checker: coverage, acknowledgement, availability, obligations and effects |
 //! | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls |
 //! | `codegen` | The Phase 4 typed LLVM IR and C ABI backend under the erased semantics ([R1] to [R3]) |
@@ -29,6 +30,7 @@ pub mod bdd;
 pub mod certificate;
 pub mod check;
 pub mod codegen;
+pub mod counts;
 pub mod differential;
 pub mod erased;
 pub mod expand;

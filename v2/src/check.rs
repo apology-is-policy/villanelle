@@ -41,7 +41,7 @@ use crate::typed::{
     Control, ControlBody, ControlId, Expr, Function, FunctionId, IntType, Kind, Operation, Place,
     PlaceStep, Program, Selector, SiteId, StructId, Type, VarId, VarRef,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 #[derive(Clone, Debug)]
@@ -224,11 +224,11 @@ pub fn check(program: &Program) -> Result<CheckedProgram, Error> {
 
 #[derive(Clone)]
 struct Env {
-    locals: HashMap<VarId, LinearTerm>,
+    locals: BTreeMap<VarId, LinearTerm>,
     parameters: Vec<LinearTerm>,
     old_parameters: Vec<LinearTerm>,
     fields: Vec<LinearTerm>,
-    constants: HashMap<VarId, Int>,
+    constants: BTreeMap<VarId, Int>,
 }
 
 impl Env {
@@ -447,12 +447,12 @@ fn subst_parameters(expr: &Expr, args: &[Expr]) -> Expr {
 }
 
 /// Evaluates a constant integer expression ([I3]).
-fn eval_const(program: &Program, expr: &Expr, constants: &HashMap<VarId, Int>) -> Option<Int> {
+fn eval_const(program: &Program, expr: &Expr, constants: &BTreeMap<VarId, Int>) -> Option<Int> {
     let unfolded = unfold_functions(program, expr);
     eval_const_unfolded(&unfolded, constants)
 }
 
-fn eval_const_unfolded(expr: &Expr, constants: &HashMap<VarId, Int>) -> Option<Int> {
+fn eval_const_unfolded(expr: &Expr, constants: &BTreeMap<VarId, Int>) -> Option<Int> {
     match expr {
         Expr::Integer(n, _) => Some(n.clone()),
         Expr::Var(VarRef::Local(id), _) => constants.get(id).cloned(),
@@ -485,7 +485,7 @@ fn int_bounds_for_type(ty: &Type) -> (Option<Int>, Option<Int>) {
 
 /// Computes the declared interval `[low, high]` of an unfolded integer
 /// expression for `[A9]`.
-fn interval_unfolded(expr: &Expr, constants: &HashMap<VarId, Int>) -> (Option<Int>, Option<Int>) {
+fn interval_unfolded(expr: &Expr, constants: &BTreeMap<VarId, Int>) -> (Option<Int>, Option<Int>) {
     if let Some(c) = eval_const_unfolded(expr, constants) {
         return (Some(c.clone()), Some(c));
     }
@@ -1531,11 +1531,11 @@ fn check_expr_obligations(
                     .map(|a| translate_term(program, solver, a, env))
                     .collect();
                 let call_env = Env {
-                    locals: HashMap::new(),
+                    locals: BTreeMap::new(),
                     parameters: arg_terms.clone(),
                     old_parameters: arg_terms,
                     fields: Vec::new(),
-                    constants: HashMap::new(),
+                    constants: BTreeMap::new(),
                 };
                 let pre_formula = translate_formula(program, solver, pre, &call_env);
                 require_formula(
@@ -1755,11 +1755,11 @@ fn check_function(
     }
 
     let env = Env {
-        locals: HashMap::new(),
+        locals: BTreeMap::new(),
         parameters: param_terms.clone(),
         old_parameters: param_terms,
         fields: Vec::new(),
-        constants: HashMap::new(),
+        constants: BTreeMap::new(),
     };
 
     if let Some(pre) = &function.precondition {
@@ -1843,7 +1843,7 @@ fn collect_read_vars(expr: &Expr, out: &mut Vec<VarId>) {
     }
 }
 
-fn collect_operand_modified(program: &Program, arg: &Expr, out: &mut HashSet<VarId>) {
+fn collect_operand_modified(program: &Program, arg: &Expr, out: &mut BTreeSet<VarId>) {
     match arg {
         Expr::Borrow(BorrowMode::Exclusive, place, _) => {
             out.insert(place.root);
@@ -1865,7 +1865,7 @@ fn collect_modified_vars(
     program: &Program,
     body: &ControlBody,
     body_id: BodyId,
-    out: &mut HashSet<VarId>,
+    out: &mut BTreeSet<VarId>,
 ) {
     for stmt in &body.bodies[body_id].statements {
         match &stmt.command {
@@ -1926,9 +1926,9 @@ fn find_constant_locals(
     program: &Program,
     body: &ControlBody,
     param_count: usize,
-) -> HashMap<VarId, Int> {
-    let mut bind_counts: HashMap<VarId, usize> = HashMap::new();
-    let mut bind_exprs: HashMap<VarId, Expr> = HashMap::new();
+) -> BTreeMap<VarId, Int> {
+    let mut bind_counts: BTreeMap<VarId, usize> = BTreeMap::new();
+    let mut bind_exprs: BTreeMap<VarId, Expr> = BTreeMap::new();
     for (idx, _) in body.vars.iter().enumerate() {
         bind_counts.insert(idx, 0);
     }
@@ -1990,7 +1990,7 @@ fn find_constant_locals(
         }
     }
 
-    let mut constants = HashMap::new();
+    let mut constants = BTreeMap::new();
     let mut changed = true;
     while changed {
         changed = false;
@@ -2070,21 +2070,21 @@ struct BodyChecker<'a> {
     /// Entry logical terms for the control/boundary parameters ([P4]).
     entry_parameters: Vec<LinearTerm>,
     /// Constant local map ([I3]).
-    constants: HashMap<VarId, Int>,
+    constants: BTreeMap<VarId, Int>,
     /// Captured operation metadata for outcome variables ([I12]).
-    captured: HashMap<VarId, Vec<(Formula, CapturedInfo)>>,
+    captured: BTreeMap<VarId, Vec<(Formula, CapturedInfo)>>,
     /// Frozen place(s) abbreviated by a local borrow variable ([I7], [I9]).
-    local_borrows: HashMap<VarId, Vec<(Formula, FrozenPlace)>>,
+    local_borrows: BTreeMap<VarId, Vec<(Formula, FrozenPlace)>>,
     /// Underlying loan root variables held by each borrow/view variable ([I9]).
     var_loan_roots: Vec<Vec<(Formula, VarId)>>,
     /// Recorded `Rᵢ` for each `(BodyId, stmt_idx)` for Pass 2 loan checking.
-    stmt_r: HashMap<(BodyId, usize), Formula>,
+    stmt_r: BTreeMap<(BodyId, usize), Formula>,
     /// Recorded visible variables at `(BodyId, stmt_idx)` for Pass 2 counterexamples.
-    stmt_visible: HashMap<(BodyId, usize), VisibleVars>,
+    stmt_visible: BTreeMap<(BodyId, usize), VisibleVars>,
     /// Recorded fallthrough `live` at end of lexical boundary `B₁` for Pass 2.
-    boundary_fallthrough_live: HashMap<BodyId, Formula>,
+    boundary_fallthrough_live: BTreeMap<BodyId, Formula>,
     /// Entry availability snapshot `D(v) ∧ ¬M(v)` per loop body ([O6]).
-    loop_entry_avail: HashMap<BodyId, Vec<Formula>>,
+    loop_entry_avail: BTreeMap<BodyId, Vec<Formula>>,
     /// Stack of enclosing active body scopes (outermost first).
     active_scopes: Vec<BodyId>,
     /// Whether this scope permits faults (`faults` signature or inside `B₁`).
@@ -2245,7 +2245,7 @@ impl<'a> BodyChecker<'a> {
     /// logical term (introducing a multiplexer variable when a variable has
     /// more than one version across histories, [I1]).
     fn current_env(&mut self) -> (Env, Vec<(String, TermId, bool)>) {
-        let mut locals = HashMap::new();
+        let mut locals = BTreeMap::new();
         let mut visible = Vec::new();
         for var in 0..self.body.vars.len() {
             if self.versions[var].is_empty() {
@@ -2980,7 +2980,7 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    fn close_modified_with_borrows(&self, vars: &mut HashSet<VarId>) {
+    fn close_modified_with_borrows(&self, vars: &mut BTreeSet<VarId>) {
         let mut stack: Vec<VarId> = vars.iter().copied().collect();
         while let Some(v) = stack.pop() {
             if let Some(entries) = self.local_borrows.get(&v) {
@@ -3011,7 +3011,7 @@ impl<'a> BodyChecker<'a> {
             {
                 continue;
             }
-            let mut root_set: HashSet<VarId> = raw_roots.into_iter().collect();
+            let mut root_set: BTreeSet<VarId> = raw_roots.into_iter().collect();
             self.close_modified_with_borrows(&mut root_set);
             for rv in root_set {
                 if !self.var_in_body_tree(rv, loop_body) {
@@ -3454,7 +3454,7 @@ impl<'a> BodyChecker<'a> {
         body_id: BodyId,
         live: Formula,
         in_loop: bool,
-        loop_leaves: &mut HashMap<BodyId, Vec<LeaveRecord>>,
+        loop_leaves: &mut BTreeMap<BodyId, Vec<LeaveRecord>>,
     ) -> Result<(), Error> {
         self.check_body_inner(body_id, live, in_loop, loop_leaves, false)
             .map(|_| ())
@@ -3465,7 +3465,7 @@ impl<'a> BodyChecker<'a> {
         body_id: BodyId,
         mut live: Formula,
         in_loop: bool,
-        loop_leaves: &mut HashMap<BodyId, Vec<LeaveRecord>>,
+        loop_leaves: &mut BTreeMap<BodyId, Vec<LeaveRecord>>,
         allow_fallthrough: bool,
     ) -> Result<Formula, Error> {
         let statements = self.body.bodies[body_id].statements.clone();
@@ -3832,11 +3832,11 @@ impl<'a> BodyChecker<'a> {
 
                             if let Some(pre) = &self.program.controls[*cid].precondition.clone() {
                                 let call_env = Env {
-                                    locals: HashMap::new(),
+                                    locals: BTreeMap::new(),
                                     parameters: old_args.clone(),
                                     old_parameters: old_args.clone(),
                                     fields: Vec::new(),
-                                    constants: HashMap::new(),
+                                    constants: BTreeMap::new(),
                                 };
                                 let pre_formula = translate_formula(
                                     self.program,
@@ -3992,11 +3992,11 @@ impl<'a> BodyChecker<'a> {
 
                             if let Some(pre) = &self.program.controls[*cid].precondition.clone() {
                                 let call_env = Env {
-                                    locals: HashMap::new(),
+                                    locals: BTreeMap::new(),
                                     parameters: old_arg_terms.clone(),
                                     old_parameters: old_arg_terms.clone(),
                                     fields: Vec::new(),
-                                    constants: HashMap::new(),
+                                    constants: BTreeMap::new(),
                                 };
                                 let pre_formula = translate_formula(
                                     self.program,
@@ -4192,11 +4192,11 @@ impl<'a> BodyChecker<'a> {
                             Operation::Control(_) => {
                                 if let Some(cond) = &contract_alt.condition {
                                     let cond_env = Env {
-                                        locals: HashMap::new(),
+                                        locals: BTreeMap::new(),
                                         parameters: post_arg_terms.clone(),
                                         old_parameters: old_arg_terms.clone(),
                                         fields: field_terms,
-                                        constants: HashMap::new(),
+                                        constants: BTreeMap::new(),
                                     };
                                     let cond_formula = translate_formula(
                                         self.program,
@@ -4248,11 +4248,11 @@ impl<'a> BodyChecker<'a> {
                                                     .condition
                                                 {
                                                     let cond_env = Env {
-                                                        locals: HashMap::new(),
+                                                        locals: BTreeMap::new(),
                                                         parameters: info.post_args.clone(),
                                                         old_parameters: info.old_args.clone(),
                                                         fields: field_terms.clone(),
-                                                        constants: HashMap::new(),
+                                                        constants: BTreeMap::new(),
                                                     };
                                                     let cf = translate_formula(
                                                         self.program,
@@ -4289,11 +4289,11 @@ impl<'a> BodyChecker<'a> {
                                         fresh_params.push(LinearTerm::var(tid));
                                     }
                                     let cond_env = Env {
-                                        locals: HashMap::new(),
+                                        locals: BTreeMap::new(),
                                         parameters: fresh_params.clone(),
                                         old_parameters: fresh_params,
                                         fields: field_terms,
-                                        constants: HashMap::new(),
+                                        constants: BTreeMap::new(),
                                     };
                                     let cf = translate_formula(
                                         self.program,
@@ -4393,7 +4393,7 @@ impl<'a> BodyChecker<'a> {
 
                     // [N5], [I9]: Give fresh logical names to loop parameters
                     // and to outer names that the loop body can change.
-                    let mut modified_outer = HashSet::new();
+                    let mut modified_outer = BTreeSet::new();
                     collect_modified_vars(self.program, self.body, *loop_body, &mut modified_outer);
                     self.close_modified_with_borrows(&mut modified_outer);
                     for &var in &modified_outer {
@@ -4669,7 +4669,7 @@ impl<'a> BodyChecker<'a> {
                     self.defined = outer_defined.clone();
                     self.moved = outer_moved.clone();
                     self.versions = outer_versions.clone();
-                    let mut b1_modified = HashSet::new();
+                    let mut b1_modified = BTreeSet::new();
                     collect_modified_vars(self.program, self.body, *b1_body, &mut b1_modified);
                     self.close_modified_with_borrows(&mut b1_modified);
                     for &var in &b1_modified {
@@ -4882,11 +4882,11 @@ impl<'a> BodyChecker<'a> {
                             })
                             .collect();
                         let exit_env = Env {
-                            locals: HashMap::new(),
+                            locals: BTreeMap::new(),
                             parameters: exit_parameters,
                             old_parameters: self.entry_parameters.clone(),
                             fields: payload_terms,
-                            constants: HashMap::new(),
+                            constants: BTreeMap::new(),
                         };
                         let cond_formula =
                             translate_formula(self.program, &mut self.solver, cond, &exit_env);
@@ -5187,13 +5187,13 @@ fn check_boundary(
         versions: vec![Vec::new(); var_count1],
         entry_parameters: Vec::new(),
         constants: constants1,
-        captured: HashMap::new(),
-        local_borrows: HashMap::new(),
+        captured: BTreeMap::new(),
+        local_borrows: BTreeMap::new(),
         var_loan_roots: vec![Vec::new(); var_count1],
-        stmt_r: HashMap::new(),
-        stmt_visible: HashMap::new(),
-        boundary_fallthrough_live: HashMap::new(),
-        loop_entry_avail: HashMap::new(),
+        stmt_r: BTreeMap::new(),
+        stmt_visible: BTreeMap::new(),
+        boundary_fallthrough_live: BTreeMap::new(),
+        loop_entry_avail: BTreeMap::new(),
         active_scopes: vec![0],
         permits_faults: true,
         in_contingency: false,
@@ -5210,7 +5210,7 @@ fn check_boundary(
         checker1.versions[param_idx] = vec![(bdd::TRUE, tid)];
         checker1.entry_parameters.push(LinearTerm::var(tid));
     }
-    let mut loop_leaves1 = HashMap::new();
+    let mut loop_leaves1 = BTreeMap::new();
     let result = checker1
         .check_body(0, bdd::TRUE, false, &mut loop_leaves1)
         .and_then(|()| checker1.check_loans());
@@ -5243,13 +5243,13 @@ fn check_boundary(
         versions: vec![Vec::new(); var_count2],
         entry_parameters: Vec::new(),
         constants: constants2,
-        captured: HashMap::new(),
-        local_borrows: HashMap::new(),
+        captured: BTreeMap::new(),
+        local_borrows: BTreeMap::new(),
         var_loan_roots: vec![Vec::new(); var_count2],
-        stmt_r: HashMap::new(),
-        stmt_visible: HashMap::new(),
-        boundary_fallthrough_live: HashMap::new(),
-        loop_entry_avail: HashMap::new(),
+        stmt_r: BTreeMap::new(),
+        stmt_visible: BTreeMap::new(),
+        boundary_fallthrough_live: BTreeMap::new(),
+        loop_entry_avail: BTreeMap::new(),
         active_scopes: vec![0],
         permits_faults: true,
         in_contingency: true,
@@ -5266,7 +5266,7 @@ fn check_boundary(
         checker2.versions[param_idx] = vec![(bdd::TRUE, tid)];
         checker2.entry_parameters.push(LinearTerm::var(tid));
     }
-    let mut loop_leaves2 = HashMap::new();
+    let mut loop_leaves2 = BTreeMap::new();
     let result = checker2
         .check_body(0, bdd::TRUE, false, &mut loop_leaves2)
         .and_then(|()| checker2.check_loans());
@@ -5304,13 +5304,13 @@ fn check_control(
         versions: vec![Vec::new(); var_count],
         entry_parameters: Vec::new(),
         constants,
-        captured: HashMap::new(),
-        local_borrows: HashMap::new(),
+        captured: BTreeMap::new(),
+        local_borrows: BTreeMap::new(),
         var_loan_roots: vec![Vec::new(); var_count],
-        stmt_r: HashMap::new(),
-        stmt_visible: HashMap::new(),
-        boundary_fallthrough_live: HashMap::new(),
-        loop_entry_avail: HashMap::new(),
+        stmt_r: BTreeMap::new(),
+        stmt_visible: BTreeMap::new(),
+        boundary_fallthrough_live: BTreeMap::new(),
+        loop_entry_avail: BTreeMap::new(),
         active_scopes: vec![0],
         permits_faults: control.faults,
         in_contingency: false,
@@ -5335,7 +5335,7 @@ fn check_control(
         checker.solver.add_fact(bdd::TRUE, pre_formula);
     }
 
-    let mut loop_leaves = HashMap::new();
+    let mut loop_leaves = BTreeMap::new();
     let result = checker
         .check_body(0, bdd::TRUE, false, &mut loop_leaves)
         .and_then(|()| checker.check_loans());
@@ -5392,14 +5392,14 @@ type LeaveLoanRecord = (BodyId, usize, Formula, Vec<Vec<(usize, Formula)>>);
 
 struct EvalCtx<'c> {
     r_i: Formula,
-    after_live: &'c HashMap<VarId, Formula>,
-    later_in_stmt: &'c HashSet<VarId>,
+    after_live: &'c BTreeMap<VarId, Formula>,
+    later_in_stmt: &'c BTreeSet<VarId>,
     in_loop: bool,
     visible: &'c [(String, TermId, bool)],
 }
 
 impl<'c> EvalCtx<'c> {
-    fn with_later<'n>(&self, later: &'n HashSet<VarId>) -> EvalCtx<'n>
+    fn with_later<'n>(&self, later: &'n BTreeSet<VarId>) -> EvalCtx<'n>
     where
         'c: 'n,
     {
@@ -5578,7 +5578,7 @@ fn decompose_place_expr<'e>(
     })
 }
 
-fn collect_expr_mentions(expr: &Expr, out: &mut HashSet<VarId>) {
+fn collect_expr_mentions(expr: &Expr, out: &mut BTreeSet<VarId>) {
     match expr {
         Expr::Boolean(_)
         | Expr::Integer(_, _)
@@ -5631,8 +5631,8 @@ fn stmt_direct_mentions(
     program: &Program,
     body: &ControlBody,
     stmt: &crate::typed::Statement,
-) -> HashSet<VarId> {
-    let mut out = HashSet::new();
+) -> BTreeSet<VarId> {
+    let mut out = BTreeSet::new();
     match &stmt.command {
         Command::Bind { value, .. } | Command::Unpack { value, .. } => {
             collect_expr_mentions(value, &mut out);
@@ -5705,7 +5705,7 @@ fn stmt_direct_mentions(
     out
 }
 
-fn or_guard_map(map: &mut HashMap<VarId, Formula>, var: VarId, guard: Formula, bdd: &mut Bdd) {
+fn or_guard_map(map: &mut BTreeMap<VarId, Formula>, var: VarId, guard: Formula, bdd: &mut Bdd) {
     if guard == bdd::FALSE {
         return;
     }
@@ -5721,10 +5721,10 @@ struct LoanChecker<'a, 'b> {
     bc: &'a mut BodyChecker<'b>,
     loans: Vec<Loan>,
     next_temp: usize,
-    mentions_in_body: HashMap<BodyId, HashMap<VarId, Formula>>,
-    feasible_mentions: HashMap<BodyId, HashSet<VarId>>,
-    live_after_stmt: HashMap<(BodyId, usize), HashMap<VarId, Formula>>,
-    boundary_after_live: HashMap<BodyId, HashMap<VarId, Formula>>,
+    mentions_in_body: BTreeMap<BodyId, BTreeMap<VarId, Formula>>,
+    feasible_mentions: BTreeMap<BodyId, BTreeSet<VarId>>,
+    live_after_stmt: BTreeMap<(BodyId, usize), BTreeMap<VarId, Formula>>,
+    boundary_after_live: BTreeMap<BodyId, BTreeMap<VarId, Formula>>,
 }
 
 impl<'a, 'b> LoanChecker<'a, 'b> {
@@ -5752,10 +5752,10 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
             bc,
             loans,
             next_temp: 0,
-            mentions_in_body: HashMap::new(),
-            feasible_mentions: HashMap::new(),
-            live_after_stmt: HashMap::new(),
-            boundary_after_live: HashMap::new(),
+            mentions_in_body: BTreeMap::new(),
+            feasible_mentions: BTreeMap::new(),
+            live_after_stmt: BTreeMap::new(),
+            boundary_after_live: BTreeMap::new(),
         }
     }
 
@@ -5792,8 +5792,12 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
         s
     }
 
-    fn collect_body_mentions(&mut self, body_id: BodyId, in_loop: bool) -> HashMap<VarId, Formula> {
-        let mut map = HashMap::new();
+    fn collect_body_mentions(
+        &mut self,
+        body_id: BodyId,
+        in_loop: bool,
+    ) -> BTreeMap<VarId, Formula> {
+        let mut map = BTreeMap::new();
         let stmts = self.bc.body.bodies[body_id].statements.clone();
         for (stmt_idx, stmt) in stmts.iter().enumerate() {
             let r_i = self
@@ -5829,7 +5833,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                 _ => {}
             }
         }
-        let mut feasible = HashSet::new();
+        let mut feasible = BTreeSet::new();
         for (&v, &g) in &map {
             if self
                 .bc
@@ -5892,9 +5896,9 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
         (rep, lv)
     }
 
-    fn collect_recover_guard(&mut self, cur_body: BodyId) -> (Formula, HashSet<BodyId>) {
+    fn collect_recover_guard(&mut self, cur_body: BodyId) -> (Formula, BTreeSet<BodyId>) {
         let mut rec_g = bdd::FALSE;
-        let mut targets = HashSet::new();
+        let mut targets = BTreeSet::new();
         for (stmt_idx, stmt) in self.bc.body.bodies[cur_body].statements.iter().enumerate() {
             let r_i = self
                 .bc
@@ -5933,7 +5937,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
     fn compute_body_liveness(
         &mut self,
         body_id: BodyId,
-        after_body_live: &HashMap<VarId, Formula>,
+        after_body_live: &BTreeMap<VarId, Formula>,
         ancestors: &[BodyId],
         loop_ancestors: &[BodyId],
     ) {
@@ -5942,7 +5946,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
             loop_targets.push(body_id);
             let (repeat_g, leave_g) =
                 self.collect_repeat_and_leave_guards(body_id, &loop_targets, false);
-            let mut seeded = HashMap::new();
+            let mut seeded = BTreeMap::new();
             for (&v, &g) in after_body_live {
                 let mut inner_g = self.bc.solver.bdd.and(g, leave_g);
                 if g != bdd::FALSE && self.bc.is_feasible(g, &[], true) {
@@ -6001,7 +6005,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                             or_guard_map(&mut running, v, g, &mut self.bc.solver.bdd);
                         }
                     }
-                    let mut head_vars = HashSet::new();
+                    let mut head_vars = BTreeSet::new();
                     for a in initial {
                         collect_expr_mentions(a, &mut head_vars);
                     }
@@ -6030,7 +6034,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                         self.collect_repeat_and_leave_guards(*b1, loop_ancestors, false);
                     let b1_rl = self.bc.solver.bdd.or(b1_rep, b1_lv);
                     let b1_cont = self.bc.solver.bdd.or(b1_exit, b1_rl);
-                    let mut b1_after = HashMap::new();
+                    let mut b1_after = BTreeMap::new();
                     for (&v, &g) in &running {
                         let fg = self.bc.solver.bdd.and(g, b1_cont);
                         or_guard_map(&mut b1_after, v, fg, &mut self.bc.solver.bdd);
@@ -6051,7 +6055,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                     }
                     self.compute_body_liveness(*b1, &b1_after, &next_anc, &next_loop_anc);
 
-                    let mut b2_after = HashMap::new();
+                    let mut b2_after = BTreeMap::new();
                     let (rec_g, rec_targets) = self.collect_recover_guard(*b2);
                     if rec_g != bdd::FALSE {
                         for &target in &rec_targets {
@@ -6551,7 +6555,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
         let Some(head) = self.bc.body.bodies[loop_body].head.clone() else {
             return;
         };
-        let mut ancestors = HashSet::new();
+        let mut ancestors = BTreeSet::new();
         let mut cur = self.bc.body.bodies[loop_body].parent;
         while let Some(p) = cur {
             ancestors.insert(p);
@@ -6566,7 +6570,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
             }
         };
 
-        let mut env_map: HashMap<VarId, Vec<(LoanPlace, BorrowMode)>> = HashMap::new();
+        let mut env_map: BTreeMap<VarId, Vec<(LoanPlace, BorrowMode)>> = BTreeMap::new();
         for loan in &self.loans {
             for &(holder, hg) in &loan.holders {
                 if let Holder::Var(v) = holder
@@ -6588,7 +6592,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
         let program = self.bc.program;
         let body = self.bc.body;
         let mut eval_struct_loans =
-            |expr: &Expr, env: &HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>| {
+            |expr: &Expr, env: &BTreeMap<VarId, Vec<(LoanPlace, BorrowMode)>>| {
                 expr_structural_external_loans(program, body, expr, env, &is_outside)
             };
 
@@ -6642,13 +6646,13 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
         cur_body: BodyId,
         target_loop: BodyId,
         target_params: &[VarId],
-        env_map: &mut HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
+        env_map: &mut BTreeMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
         eval_struct: &mut F,
     ) -> bool
     where
         F: FnMut(
             &Expr,
-            &HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
+            &BTreeMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
         ) -> Vec<(LoanPlace, BorrowMode)>,
     {
         let mut changed = false;
@@ -6768,13 +6772,13 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
         &self,
         cur_body: BodyId,
         arms: &[Vec<VarId>],
-        env_map: &mut HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
+        env_map: &mut BTreeMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
         eval_struct: &mut F,
     ) -> bool
     where
         F: FnMut(
             &Expr,
-            &HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
+            &BTreeMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
         ) -> Vec<(LoanPlace, BorrowMode)>,
     {
         let mut changed = false;
@@ -6840,13 +6844,13 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
         &mut self,
         ended_scopes: &[BodyId],
         r_i: Formula,
-        after_live: &HashMap<VarId, Formula>,
+        after_live: &BTreeMap<VarId, Formula>,
         active_temps: &[Holder],
         line: u32,
         in_loop: bool,
         visible: &[(String, TermId, bool)],
     ) -> Result<(), Error> {
-        let empty = HashSet::new();
+        let empty = BTreeSet::new();
         let ctx = EvalCtx {
             r_i,
             after_live,
@@ -6902,7 +6906,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                 .get(&(body_id, stmt_idx))
                 .cloned()
                 .unwrap_or_default();
-            let empty = HashSet::new();
+            let empty = BTreeSet::new();
             let ctx = EvalCtx {
                 r_i,
                 after_live: &after_live,
@@ -6940,7 +6944,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                 Command::Assign { var, value } => {
                     let mut temps = Vec::new();
                     let is_ref = matches!(self.bc.body.vars[*var].ty, Type::Ref(_, _));
-                    let mut later = HashSet::new();
+                    let mut later = BTreeSet::new();
                     if is_ref {
                         later.insert(*var);
                     }
@@ -6984,7 +6988,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                             PlaceStep::Field(_, _, _) => None,
                         })
                         .collect();
-                    let mut value_later = HashSet::new();
+                    let mut value_later = BTreeSet::new();
                     if target_has_ref_or_view {
                         value_later.insert(target.root);
                     }
@@ -6994,7 +6998,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                     let vctx = ctx.with_later(&value_later);
                     self.eval_loan_expr(value, true, &vctx, &mut temps, line)?;
                     for (k, ie) in idx_exprs.iter().enumerate() {
-                        let mut ilater = HashSet::new();
+                        let mut ilater = BTreeSet::new();
                         if target_has_ref_or_view {
                             ilater.insert(target.root);
                         }
@@ -7303,7 +7307,7 @@ fn expr_structural_external_loans(
     program: &Program,
     body: &ControlBody,
     expr: &Expr,
-    env: &HashMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
+    env: &BTreeMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
     is_outside: &dyn Fn(&LoanRoot) -> bool,
 ) -> Vec<(LoanPlace, BorrowMode)> {
     let mut out = Vec::new();
@@ -7351,7 +7355,7 @@ impl<'a> BodyChecker<'a> {
     fn check_loans(&mut self) -> Result<(), Error> {
         let mut checker = LoanChecker::new(self);
         checker.collect_body_mentions(0, false);
-        let empty = HashMap::new();
+        let empty = BTreeMap::new();
         checker.compute_body_liveness(0, &empty, &[], &[]);
         let _ = checker.check_body_loans(0, false)?;
         Ok(())

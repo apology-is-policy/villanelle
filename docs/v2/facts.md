@@ -529,8 +529,9 @@ the bound that the small-model property of integer programs gives is another.
 **The integrality step of the crate in `v2/`** (`lia.rs`) is not yet such a
 method. It replaces a variable that an equality defines, removes a variable
 whose coefficient is a unit on one side by adding up its bounds, rounds every
-row it derives, adds the rounded sum of two rows where rounding says more
-than the rows did, and then splits. Every answer it gives is right: a yes
+row it derives, looks once for a model along the splits it prefers, adds the
+rounded sum of two rows where rounding says more than the rows did, and then
+splits. Every answer it gives is right: a yes
 has a proof that the kernel validated, and a no has a model that was
 evaluated. On rows that have rational solutions without a bound and no
 integer one, and that the first steps do not decide, the splitting does not
@@ -937,3 +938,10 @@ it.
 5. **23 November 2026, section 8: the text of [V5] is written.** The note on
    the kernel of the crate named it as open (finding RC13 of the review). It
    now says what a text holds and where the format is described.
+6. **23 November 2026, section 7: the order of the integrality step of the
+   crate.** The note now names the search for a model that comes before the
+   rounded sums. Most candidates have a model, and the rounded sums of a
+   candidate with quotients and remainders were many times its rows
+   (finding RC16 of the review). No clause changed. The crate was also
+   brought to [J6] as it stands: a check depended on the order of a hash
+   table (finding RC19).

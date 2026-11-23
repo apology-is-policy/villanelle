@@ -30,11 +30,18 @@
 //!    something, a fixed number of times at most.
 //! 5. **Splitting.** A rational solution with a value `v` that is not an
 //!    integer splits its variable at `⌊v⌋`. The branch with the integer
-//!    nearer to `v` is preferred, and the number of times that the search
-//!    may leave the preferred branch is raised step by step. A model that
-//!    lies along the preferred branches is then found at once, and one that
-//!    lies a turn away is found before a branch that never ends is
-//!    followed to the limit of nesting.
+//!    nearer to `v` is preferred. Where it is refuted the other branch is
+//!    entered, which leaves nothing open behind; a preferred branch that is
+//!    still open may be left only a number of times, the turns, and that
+//!    number is raised step by step. A model that lies along the preferred
+//!    branches is then found at once, and one that lies a turn away is
+//!    found before a branch that never ends is followed to the limit of
+//!    nesting.
+//!
+//! Splitting without a turn is tried once before part 4. Most candidates
+//! have a model, and it is found in the tableau of the rows as they are:
+//! part 4 can add many times the rows it was given, and every exchange
+//! after that pays for them.
 //!
 //! Splitting ends when the solutions are bounded. On rows that have rational
 //! solutions without a bound and no integer one, and that the first four
@@ -42,6 +49,7 @@
 //! it, and the caller reports the limit. See the note on step 5 in
 //! `docs/v2/facts.md`.
 
+use crate::counts;
 use crate::int::Int;
 use crate::rational::{Rat, gcd_u128, lcm};
 use crate::terms::{End, LinearTerm, Proof, Row, Step, TermId, div_floor};
@@ -503,6 +511,7 @@ struct Simplex {
 
 impl Simplex {
     fn new(active: &[(Row, usize)]) -> Simplex {
+        counts::count(|counts| counts.tableaus += 1);
         let mut terms: Vec<TermId> = active
             .iter()
             .flat_map(|(row, _)| row.coeffs.keys().copied())
@@ -650,6 +659,7 @@ impl Simplex {
         let inverse = Rat::one()
             .over(&coeff)
             .expect("the coefficient is not zero");
+        let mut written = row.len() as u64;
         let mut solved: BTreeMap<usize, Rat> = BTreeMap::new();
         solved.insert(leaving, inverse.clone());
         for (variable, other) in &row {
@@ -664,6 +674,7 @@ impl Simplex {
             let Some(factor) = other.remove(&entering) else {
                 continue;
             };
+            written += solved.len() as u64;
             for (variable, part) in &solved {
                 let sum = other
                     .get(variable)
@@ -678,6 +689,10 @@ impl Simplex {
             }
         }
         self.rows[entering] = Some(solved);
+        counts::count(|counts| {
+            counts.exchanges += 1;
+            counts.entries += written;
+        });
     }
 
     /// The multipliers of a contradiction, as integers.
@@ -860,6 +875,7 @@ impl Simplex {
         if depth == 0 {
             return Ok(Found::Open);
         }
+        counts::count(|counts| counts.splits += 1);
         let bound = self.value[variable].floor();
         let floor = Rat::from_int(&bound);
         // The branch with the nearer integer is preferred.
@@ -868,13 +884,16 @@ impl Simplex {
         let mut high = Found::Open;
         // With a turn to spend, the other branch is tried first: a model is
         // often one turn away near the root, and a preferred branch can be
-        // long.
-        let order = if turns > 0 {
-            vec![(!prefers_low, turns - 1), (prefers_low, turns)]
+        // long. Without one, the preferred branch is tried, and the other
+        // only when the preferred one is refuted: that costs no turn, since
+        // nothing is left open behind.
+        let spends = turns > 0;
+        let mut order = if spends {
+            vec![(prefers_low, turns), (!prefers_low, turns - 1)]
         } else {
-            vec![(prefers_low, 0)]
+            vec![(!prefers_low, 0), (prefers_low, 0)]
         };
-        for (is_low, turns) in order {
+        while let Some((is_low, turns)) = order.pop() {
             // The row of the split has the number `next` in both branches.
             let saved = if is_low {
                 self.upper[variable].clone()
@@ -900,6 +919,9 @@ impl Simplex {
             }
             if let Found::Model(model) = found {
                 return Ok(Found::Model(model));
+            }
+            if !spends && !matches!(found, Found::Refuted(_)) {
+                order.clear();
             }
             if is_low {
                 low = found;
@@ -1154,6 +1176,16 @@ pub fn solve(rows: &[Row], budget: &mut u64) -> Outcome {
             Ok(Found::Model(model)) => return finish(model, &removed),
             Ok(Found::Open) => {}
         }
+        // Part 5 without a turn, before part 4 adds rows: most candidates
+        // have a model, and it is found in the small tableau.
+        if round == 0 {
+            match simplex.search(steps.len(), SPLIT_DEPTH, 0, budget) {
+                Err(Limit) => return Outcome::Limit,
+                Ok(Found::Refuted(found)) => return refuted(steps, found),
+                Ok(Found::Model(model)) => return finish(model, &removed),
+                Ok(Found::Open) => {}
+            }
+        }
         if round == ROUNDS {
             break;
         }
@@ -1276,6 +1308,160 @@ mod tests {
     }
 
     /// The count of steps ends a search, and that is the third answer.
+    /// The rows of a candidate of the data kernel of slice 2, as parts 1
+    /// and 3 leave them: quotients and remainders by 1,000,000, and a sum
+    /// that is asked to pass the greatest `u64`. The rational solution is
+    /// not whole, the branch that the first split prefers is refuted at
+    /// once, and the model lies in the other. Part 4 made 10,149 rows of
+    /// these 25 before that branch was entered.
+    #[test]
+    fn a_model_behind_a_refuted_branch_is_found_in_the_first_tableau() {
+        let rows = [
+            row(&[(37, -4), (54, 1000000), (76, 1)], 1),
+            row(&[(37, -4), (56, 1000000), (79, 1)], 3),
+            row(&[(37, 4), (54, -1000000), (76, -1)], 4998),
+            row(&[(37, 4), (56, -1000000), (79, -1)], 18446744073709551612),
+            row(
+                &[
+                    (54, -7000000),
+                    (56, 7000000),
+                    (74, 1000000),
+                    (76, -7),
+                    (79, 7),
+                ],
+                25,
+            ),
+            row(
+                &[
+                    (54, -7000000),
+                    (56, 7000000),
+                    (74, 1000000),
+                    (76, -6),
+                    (79, 7),
+                ],
+                24,
+            ),
+            row(
+                &[
+                    (54, -3000000),
+                    (56, 2000000),
+                    (68, 1000000),
+                    (76, -3),
+                    (79, 2),
+                ],
+                3,
+            ),
+            row(&[(54, -3000000), (56, 2000000), (76, -3), (79, 2)], 2),
+            row(
+                &[
+                    (54, -1000000),
+                    (56, -1000000),
+                    (76, -1),
+                    (77, 1000000),
+                    (79, -1),
+                ],
+                -4,
+            ),
+            row(&[(54, -1000000), (56, -1000000), (76, -1), (79, -1)], -5),
+            row(
+                &[
+                    (54, -1000000),
+                    (56, 1000000),
+                    (65, 1000000),
+                    (76, -1),
+                    (79, 1),
+                ],
+                7,
+            ),
+            row(&[(54, -1000000), (56, 1000000), (76, -1), (79, 1)], 2),
+            row(&[(54, -1000000), (56, 2000000), (76, -1), (79, 2)], 5),
+            row(
+                &[
+                    (54, 1000000),
+                    (56, -1000000),
+                    (65, -1000000),
+                    (76, 1),
+                    (79, -1),
+                ],
+                999992,
+            ),
+            row(&[(54, 1000000), (56, -1000000), (76, 1), (79, -1)], 999997),
+            row(
+                &[
+                    (54, 1000000),
+                    (56, 1000000),
+                    (76, 1),
+                    (77, -1000000),
+                    (79, 1),
+                ],
+                1000003,
+            ),
+            row(
+                &[
+                    (54, 3000000),
+                    (56, -2000000),
+                    (68, -1000000),
+                    (76, 3),
+                    (79, -2),
+                ],
+                999996,
+            ),
+            row(
+                &[
+                    (54, 7000000),
+                    (56, -7000000),
+                    (74, -1000000),
+                    (76, 7),
+                    (79, -7),
+                ],
+                999974,
+            ),
+            row(&[(56, -1000000), (71, 200000), (79, -1)], -2),
+            row(&[(56, -1000000), (79, -1)], -3),
+            row(&[(56, 1000000), (71, -200000), (79, 1)], 200001),
+            row(&[(56, 1000000), (79, 1)], 1000002),
+            row(&[(76, -1)], 1000000006),
+            row(&[(76, -1), (79, -1)], -18446744072709551610),
+            row(&[(79, -1)], -1),
+        ];
+        let before = counts::now();
+        let mut budget = 100_000;
+        let Outcome::Sat(model) = solve(&rows, &mut budget) else {
+            panic!("the rows have a model");
+        };
+        assert!(rows.iter().all(|row| row.holds(&model)));
+        let done = counts::now().since(&before);
+        assert_eq!(done.tableaus, 1, "{done}");
+        assert!(done.entries <= 5_000, "{done}");
+    }
+
+    /// Without a turn the search enters the other branch only where the
+    /// preferred one is refuted, so it follows one path: its splits are at
+    /// most as many as may nest, whatever the rows are.
+    #[test]
+    fn a_search_without_a_turn_follows_one_path() {
+        // `3·x - 3·y = 1` with bounds: no integer solution, and every split
+        // leaves a rational one until the bounds close in.
+        let rows = [
+            row(&[(0, 3), (1, -3)], 2),
+            row(&[(0, -3), (1, 3)], -1),
+            row(&[(0, 1)], 40),
+            row(&[(0, -1)], 0),
+            row(&[(1, 1)], 40),
+            row(&[(1, -1)], 0),
+        ];
+        let active: Vec<(Row, usize)> = rows.iter().cloned().zip(0..).collect();
+        let mut simplex = Simplex::new(&active);
+        let before = counts::now();
+        let mut budget = 100_000;
+        let found = simplex.search(rows.len(), SPLIT_DEPTH, 0, &mut budget);
+        assert!(matches!(found, Ok(Found::Open | Found::Refuted(_))));
+        let done = counts::now().since(&before);
+        assert!(done.splits <= SPLIT_DEPTH as u64, "{done}");
+        // The answer of the whole method is a proof.
+        assert_eq!(decided(&rows), Some(false));
+    }
+
     #[test]
     fn the_count_of_steps_ends_a_search() {
         let rows = [

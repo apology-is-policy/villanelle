@@ -883,68 +883,7 @@ fn paired_native_performance_matches_optimized_rust_on_slice_two_data_kernel() {
     //      place, and accumulating a checksum mod 1_000_000_007.
     //   3. Pop all `2000` points back out (`pts.pop()`) into the checksum and
     //      drop the vector cleanly via `[R4]`.
-    let v2_source = r#"
-copy struct point {x: u64, y: u64}
-
-copy variant op: add │ sub │ mix │ scale
-
-control choose_op(k: u64) ■ picked {kind: op}
-│ ? k = 0 → ■ picked {op.add}
-│ ? k = 1 → ■ picked {op.sub}
-│ ? k = 2 → ■ picked {op.mix}
-│ ■ picked {op.scale}
-╵
-
-pub control data_bench(n: usize, passes: u64)
-    ⊢ n ≤ 4096 ∧ passes ≤ 5000
-    ■ result {checksum: u64}
-│ ~pts: [point] := []
-│ ↻ build(i: usize := 0)
-│ ║ ⊢ i ≤ n ∧ len(pts) = i
-│ ║ ? i = n → □ built
-│ ║ pts.push(point {17, 29})
-│ ║ ↑ build(i + 1)
-│ ↻ outer(p: u64 := 0, ~acc: u64 := 0)
-│ ║ ⊢ p ≤ passes ∧ len(pts) = n ∧ acc < 1000000007
-│ ║ ? p = passes → □ swept {acc}
-│ ║ ↻ inner(j: usize := 0, ~sub_acc: u64 := acc)
-│ ║ ║ ⊢ j ≤ n ∧ len(pts) = n ∧ sub_acc < 1000000007
-│ ║ ║ ? j = n → □ pass_done {sub_acc}
-│ ║ ║ cur: point := pts[j]
-│ ║ ║ x0: u64 := cur.x mod 1000000
-│ ║ ║ y0: u64 := cur.y mod 1000000
-│ ║ ║ Δ choose_op((p + x0 + y0) mod 4): picked {kind}
-│ ║ ║ Δ kind
-│ ║ ║ ├ add →
-│ ║ ║ │ ┆ nx: u64 := (x0 + y0 + 1) mod 1000000
-│ ║ ║ │ ┆ ny: u64 := (y0 + 3) mod 1000000
-│ ║ ║ ├ sub →
-│ ║ ║ │ ┆ ~nx_s: u64 := 0
-│ ║ ║ │ ┆ ? x0 ≥ y0 → nx_s ← x0 - y0
-│ ║ ║ │ ┆ ? x0 < y0 → nx_s ← y0 - x0
-│ ║ ║ │ ┆ nx: u64 := nx_s
-│ ║ ║ │ ┆ ny: u64 := (x0 + 5) mod 1000000
-│ ║ ║ ├ mix →
-│ ║ ║ │ ┆ nx: u64 := (x0 * 3 + y0) mod 1000000
-│ ║ ║ │ ┆ ny: u64 := (y0 * 5 + 7) mod 1000000
-│ ║ ║ └ scale →
-│ ║ ║   ┆ nx: u64 := (x0 * 7 + 11) mod 1000000
-│ ║ ║   ┆ ny: u64 := (y0 * 2 + x0) mod 1000000
-│ ║ ║ pts[j] ← point {nx, ny}
-│ ║ ║ sub_acc ← (sub_acc + nx + ny) mod 1000000007
-│ ║ ║ ↑ inner(j + 1, sub_acc)
-│ ║ acc ← sub_acc
-│ ║ ↑ outer(p + 1, acc)
-│ ~final_acc: u64 := acc
-│ ↻ drain(k: usize := 0)
-│ ║ ⊢ k ≤ n ∧ len(pts) = n - k ∧ final_acc < 1000000007
-│ ║ ? k = n → □ drained
-│ ║ Δ pts.pop(): item {pt} │ empty → ⊥
-│ ║ final_acc ← (final_acc + (pt.x mod 1000000) + (pt.y mod 1000000)) mod 1000000007
-│ ║ ↑ drain(k + 1)
-│ ■ result {final_acc}
-╵
-"#;
+    let v2_source = include_str!("kernels/slice2_data.rails");
 
     let tree = surface::elaborate(v2_source).unwrap();
     let expanded = expand::expand(&tree).unwrap();

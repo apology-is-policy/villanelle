@@ -11,6 +11,7 @@
 //! statement of the axioms.
 
 use crate::bdd::{self, Bdd, Formula};
+use crate::counts;
 use crate::int::Int;
 use crate::kernel::Query;
 use crate::lia;
@@ -123,6 +124,29 @@ pub fn with_step_limit<T>(steps: u64, work: impl FnOnce() -> T) -> T {
 pub enum DefRhs {
     Linear(LinearTerm),
     BoolFormula(Formula),
+}
+
+/// The truth of the diagram variables in a model: the history atoms as the
+/// candidate has them, and each row as the integers make it, worked out when
+/// it is first asked for.
+struct Truth<'a> {
+    assignment: &'a BTreeMap<usize, bool>,
+    int_model: &'a BTreeMap<TermId, Int>,
+    atoms: Vec<Option<bool>>,
+}
+
+impl<'a> Truth<'a> {
+    fn new(
+        assignment: &'a BTreeMap<usize, bool>,
+        int_model: &'a BTreeMap<TermId, Int>,
+        atoms: usize,
+    ) -> Truth<'a> {
+        Truth {
+            assignment,
+            int_model,
+            atoms: vec![None; atoms],
+        }
+    }
 }
 
 /// The solver state for one control body.
@@ -1211,15 +1235,18 @@ impl Solver {
                 }
             }
 
-            let full = self.complete_bool_model(assignment, int_model);
+            // The guards are read in the values as they are here, whatever
+            // the definitions below then change.
+            let values = int_model.clone();
+            let mut truth = Truth::new(assignment, &values, self.theory_atoms.len());
             for (guard, var_id, rhs) in &self.definitions {
-                if constrained.contains(var_id) || !self.bdd.evaluate(*guard, &full) {
+                if constrained.contains(var_id) || !self.holds_in(*guard, &mut truth) {
                     continue;
                 }
                 let v = match rhs {
                     DefRhs::Linear(term) => term.eval(int_model),
                     DefRhs::BoolFormula(phi) => {
-                        let b = self.bdd.evaluate(*phi, &full);
+                        let b = self.holds_in(*phi, &mut truth);
                         Int::from_u64(u64::from(b))
                     }
                 };
@@ -1232,6 +1259,21 @@ impl Solver {
                 break;
             }
         }
+    }
+
+    /// Whether `formula` holds in a model. The truth of a row is worked out
+    /// when the formula first asks for it: a formula reads the variables of
+    /// one path, and a body has many more rows than that.
+    fn holds_in(&self, formula: Formula, truth: &mut Truth) -> bool {
+        self.bdd.evaluate_with(formula, |var| {
+            if var < self.first_theory_var {
+                truth.assignment.get(&var).copied().unwrap_or(false)
+            } else {
+                let atom = var - self.first_theory_var;
+                *truth.atoms[atom]
+                    .get_or_insert_with(|| self.theory_atoms[atom].holds(truth.int_model))
+            }
+        })
     }
 
     fn complete_bool_model(
@@ -1260,7 +1302,7 @@ impl Solver {
         in_loop: bool,
     ) -> Decision {
         self.instantiate_all();
-        let mut query = negated_goal;
+        counts::count(|counts| counts.queries += 1);
         let mut working = negated_goal;
         let mut added_structure = vec![false; self.structure.len()];
         let mut added_facts = vec![false; self.facts.len()];
@@ -1271,7 +1313,6 @@ impl Solver {
         let mut budget = self.step_limit;
 
         for (idx, &s) in self.structure.iter().enumerate() {
-            query = self.bdd.and(query, s);
             working = self.bdd.and(working, s);
             added_structure[idx] = true;
             parts.push(Part::Structure(idx));
@@ -1284,6 +1325,7 @@ impl Solver {
                 };
             }
             budget -= 1;
+            counts::count(|counts| counts.candidates += 1);
             for (idx, added) in added_lemmas.iter_mut().enumerate() {
                 if *added {
                     continue;
@@ -1293,6 +1335,7 @@ impl Solver {
                 });
                 if matches_all {
                     *added = true;
+                    counts::count(|counts| counts.lemmas_reused += 1);
                     let lemma = self.lemmas[idx].clone();
                     let lf = self.lemma_formula(&lemma);
                     working = self.bdd.and(working, lf);
@@ -1319,6 +1362,10 @@ impl Solver {
                     }
                 })
                 .collect();
+            counts::count(|counts| {
+                counts.theory_checks += 1;
+                counts.rows += rows.len() as u64;
+            });
             match lia::solve(&rows, &mut budget) {
                 lia::Outcome::Limit => {
                     return Decision::Limit {
@@ -1326,6 +1373,7 @@ impl Solver {
                     };
                 }
                 lia::Outcome::Unsat { proof, literals } => {
+                    counts::count(|counts| counts.refuted += 1);
                     let lemma = TheoryLemma {
                         literals: literals
                             .iter()
@@ -1340,50 +1388,69 @@ impl Solver {
                     parts.push(Part::Lemma(lemma));
                 }
                 lia::Outcome::Sat(mut int_model) => {
+                    counts::count(|counts| counts.models += 1);
                     if let Some(row) = rows.iter().find(|row| !row.holds(&int_model)) {
                         return Decision::Fault(format!(
                             "the theory check gave a model that fails the row {row:?}"
                         ));
                     }
                     self.complete_int_model(&candidate_literals, &assignment, &mut int_model);
-                    let full_bool_model = self.complete_bool_model(&assignment, &int_model);
+                    let mut truth = Truth::new(&assignment, &int_model, self.theory_atoms.len());
 
+                    // Every premise that the model fails is added, not the
+                    // first alone: a model that fails one fails several,
+                    // and each would cost a candidate. Instances are added
+                    // only for a model that fails no premise. A model that
+                    // fails a fact is far from the program, and the
+                    // instances it fails are mostly beside the point; they
+                    // bring the rows of quotients and products, which are
+                    // the hard ones for the theory check.
+                    let before = parts.len();
                     for (idx, &s) in self.structure.iter().enumerate() {
-                        if !added_structure[idx] && !self.bdd.evaluate(s, &full_bool_model) {
+                        if !added_structure[idx] && !self.holds_in(s, &mut truth) {
                             added_structure[idx] = true;
-                            query = self.bdd.and(query, s);
                             working = self.bdd.and(working, s);
                             parts.push(Part::Structure(idx));
-                            continue 'search;
                         }
                     }
-
                     for (idx, &f) in self.facts.iter().enumerate() {
-                        if !added_facts[idx] && !self.bdd.evaluate(f, &full_bool_model) {
+                        if !added_facts[idx] && !self.holds_in(f, &mut truth) {
                             added_facts[idx] = true;
-                            query = self.bdd.and(query, f);
                             working = self.bdd.and(working, f);
                             parts.push(Part::Fact(idx));
-                            continue 'search;
                         }
                     }
-
-                    for (idx, added) in added_instances.iter_mut().enumerate() {
-                        if !*added
-                            && !self
-                                .bdd
-                                .evaluate(self.instances[idx].formula, &full_bool_model)
-                        {
-                            *added = true;
-                            let inst = self.instances[idx].clone();
-                            working = self.bdd.and(working, inst.formula);
-                            parts.push(Part::Instance(inst.name));
-                            continue 'search;
+                    if parts.len() == before {
+                        for (idx, added) in added_instances.iter_mut().enumerate() {
+                            if !*added && !self.holds_in(self.instances[idx].formula, &mut truth) {
+                                *added = true;
+                                working = self.bdd.and(working, self.instances[idx].formula);
+                                parts.push(Part::Instance(self.instances[idx].name.clone()));
+                            }
                         }
                     }
+                    if parts.len() > before {
+                        let added = (parts.len() - before) as u64;
+                        counts::count(|counts| counts.premises += added);
+                        continue 'search;
+                    }
 
+                    // [M1]: the query is evaluated in the model before it
+                    // is shown: the goal, and every premise, whether the
+                    // search added it or not.
+                    let holds = self.holds_in(negated_goal, &mut truth)
+                        && self
+                            .structure
+                            .iter()
+                            .chain(&self.facts)
+                            .all(|premise| self.holds_in(*premise, &mut truth));
+                    if !holds {
+                        return Decision::Fault(
+                            "the model of a counterexample fails the query".to_string(),
+                        );
+                    }
+                    let full_bool_model = self.complete_bool_model(&assignment, &int_model);
                     return match self.build_counterexample(
-                        query,
                         full_bool_model,
                         int_model,
                         visible_vars,
@@ -1401,16 +1468,11 @@ impl Solver {
 
     fn build_counterexample(
         &self,
-        query: Formula,
         bool_model: BTreeMap<usize, bool>,
         int_model: BTreeMap<TermId, Int>,
         visible_vars: &[(String, TermId, bool)],
         in_loop: bool,
     ) -> Result<Counterexample, String> {
-        // [M1]: the query is evaluated in the model before it is shown.
-        if !self.bdd.evaluate(query, &bool_model) {
-            return Err("the model of a counterexample fails the query".to_string());
-        }
         for (&bdd_var, &polarity) in &bool_model {
             if bdd_var >= self.first_theory_var {
                 let atom = &self.theory_atoms[bdd_var - self.first_theory_var];

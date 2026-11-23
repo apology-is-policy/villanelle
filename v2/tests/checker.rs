@@ -8,6 +8,7 @@
 //! `[M1]`–`[M6]`).
 
 use villanelle_v2::check::{self, CheckedProgram};
+use villanelle_v2::counts::{self, Counts};
 use villanelle_v2::facts;
 use villanelle_v2::generate;
 use villanelle_v2::int::Int;
@@ -16,7 +17,7 @@ use villanelle_v2::mutate::{self, Class};
 use villanelle_v2::oracle::Config;
 use villanelle_v2::rng::Rng;
 use villanelle_v2::terms::{Certificate, End, Instance, Part, Proof, Step};
-use villanelle_v2::{fuzz, load, load_surface, resolve, text};
+use villanelle_v2::{expand, fuzz, load, load_surface, resolve, surface, syntax, text, typed};
 
 fn check_core(source: &str) -> Result<CheckedProgram, check::Error> {
     let program = load(source).unwrap_or_else(|error| panic!("resolve failed: {error}\n{source}"));
@@ -1273,4 +1274,137 @@ pub control twice(x: u32) ■ same │ diff
         "expected U16 warning on second pure call, got failures: {:?}",
         report2.failures
     );
+}
+
+/// The certificate text of a check, and the work of the search as counts.
+fn text_and_counts(program: &typed::Program) -> (String, Counts) {
+    let before = counts::now();
+    let report = check::check(program).expect("the program is accepted");
+    let done = counts::now().since(&before);
+    (report.certificate_text().expect("a text"), done)
+}
+
+/// The surface programs of the three slices and the kernel program, and
+/// generated programs, each with its expansion.
+fn trees_for_repetition() -> Vec<(String, syntax::Program)> {
+    let mut trees = Vec::new();
+    for directory in [
+        "slice1_surface",
+        "slice2_surface",
+        "slice3_surface",
+        "kernels",
+    ] {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(directory);
+        let mut paths: Vec<_> = std::fs::read_dir(&root)
+            .expect("a directory of programs")
+            .map(|entry| entry.expect("an entry").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "rails")
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let source = std::fs::read_to_string(&path).expect("a readable program");
+            let tree = surface::elaborate(&source)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            trees.push((path.display().to_string(), tree));
+        }
+    }
+    for seed in 1..=4 {
+        trees.push((format!("seed {seed}"), fuzz::program_of(seed)));
+    }
+    let expanded: Vec<_> = trees
+        .iter()
+        .map(|(name, tree)| {
+            let expansion = expand::expand(tree).unwrap_or_else(|error| panic!("{name}: {error}"));
+            (format!("the expansion of {name}"), expansion)
+        })
+        .collect();
+    trees.extend(expanded);
+    trees
+}
+
+/// [J6] makes the limit a count so that an answer does not depend on the
+/// machine. It must not depend on the run either: a program that is checked
+/// again, on another thread, gives the same certificate text and the same
+/// counts. The checker once numbered the terms of a loop in the
+/// order of a hash table, which differs from table to table.
+#[test]
+fn a_check_is_the_same_every_time() {
+    let trees = trees_for_repetition();
+    assert!(trees.len() >= 30, "{} programs", trees.len());
+    let mut certificates = 0;
+    for (name, tree) in &trees {
+        let first = {
+            let program = resolve::resolve(tree).unwrap_or_else(|error| panic!("{name}: {error}"));
+            text_and_counts(&program)
+        };
+        let elsewhere = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let program = resolve::resolve(tree).expect("resolved before");
+                    text_and_counts(&program)
+                })
+                .join()
+                .expect("the thread ends")
+        });
+        assert!(
+            first.0 == elsewhere.0,
+            "{name}: the text differs on the second check"
+        );
+        assert_eq!(first.1, elsewhere.1, "{name}");
+        certificates += first
+            .0
+            .lines()
+            .filter(|line| line.starts_with("goal "))
+            .count();
+    }
+    assert!(certificates >= 2_000, "{certificates} certificates");
+}
+
+/// Review finding RC16, held by counts: the data kernel of slice 2 and its
+/// expansion are checked with a search that stays small. Before the search
+/// looked for a model ahead of the rounded sums, the expansion took 2,538
+/// theory checks and its exchanges wrote 29.7 million entries of tableaus.
+#[test]
+fn the_search_stays_small_on_the_kernel_program_of_slice_two() {
+    let tree = surface::elaborate(include_str!("kernels/slice2_data.rails")).expect("elaborated");
+    let expansion = expand::expand(&tree).expect("expanded");
+    for (name, tree) in [("the program", &tree), ("its expansion", &expansion)] {
+        let program = resolve::resolve(tree).expect("resolved");
+        let before = counts::now();
+        let report = check::check(&program).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let done = counts::now().since(&before);
+        report.revalidate().expect("the kernel validates again");
+        assert!(report.certificates.len() >= 170, "{name}");
+        assert!(done.theory_checks <= 1_200, "{name}: {done}");
+        assert!(done.entries <= 600_000, "{name}: {done}");
+        assert!(done.tableaus <= done.theory_checks, "{name}: {done}");
+    }
+}
+
+/// The exit condition `7 ≥ r0` holds of
+/// `v17 * 5 mod 4 + v17 mod 4 * (v17 mod 8) mod 6` for `-18 ≤ v17 ≤ 18`,
+/// and it takes the remainders case by case to see it. The program is a
+/// mutant of a generated one (seed 18, a literal 3 shifted to 4). When the
+/// search added every instance that a model failed, whether or not the
+/// model failed a premise too, the candidates of this question had rows that
+/// the splits did not decide, and the question reached the limit of [J6].
+#[test]
+fn a_condition_on_remainders_and_products_is_decided() {
+    let program = load(include_str!("kernels/remainders_and_products.core")).expect("resolved");
+    let before = counts::now();
+    let report = check::check(&program).unwrap_or_else(|error| panic!("{error}"));
+    let done = counts::now().since(&before);
+    report.revalidate().expect("the kernel validates again");
+    assert!(
+        report.certificates.len() >= 300,
+        "{}",
+        report.certificates.len()
+    );
+    assert!(done.theory_checks <= 1_400, "{done}");
+    assert!(done.entries <= 300_000, "{done}");
 }

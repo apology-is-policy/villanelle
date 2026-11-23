@@ -34,6 +34,7 @@ can be read on its own. Nothing in it is built for speed.
 | `typed`, `resolve` | The typed core, and what is checked on the way to it (section 4) |
 | `bdd`, `facts`, `kernel` | The ROBDD engine; the `Th_Z` fact logic with its search and its counterexamples ([M1] to [M6]); and the certificate kernel, which is given the query by the checker, makes the formula of every instance from its name with its own matcher for the axiom list, checks the proof of every lemma (a tree of the steps of [V3], with Split) and recomputes the Boolean step in a diagram of its own ([V1] to [V4]) (section 10) |
 | `certificate` | The text of certificates ([V5]): the writer, and a reader that makes the tables, the goals and the premises from a text alone and gives them to the kernel (section 10) |
+| `counts` | The work of the search as counts for each thread, which `vn2 check --counts` prints; nothing reads them to decide anything (section 10) |
 | `terms`, `lia`, `rational` | The terms, rows, proofs, names of instances and certificates that the search and the kernel both read; the theory check for the rows of a candidate, which answers with a model, a proof or the counted limit of [J6] (section 7 of the [fact logic](facts.md) has a note on what it does not decide); and the rationals of its simplex method |
 | `check` | The phase 3 checker: coverage ([K1] to [K8]), conditional facts and SSA renaming ([N1] to [N5]), acknowledgement ([C2]), availability ([O1], [O2], [O4], [O6]), obligations ([P1] to [P8]), effects ([F3]) and impossible-arm warnings ([U16]) (section 10) |
 | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls, lifting loop exits and preserving checking and observations (section 11) |
@@ -60,6 +61,7 @@ cargo run --bin vn2 -- test tests/slice1/*.core tests/slice1_surface/*.rails
 cargo run --bin vn2 -- check tests/slice1_surface/*.rails
 cargo run --bin vn2 -- check tests/slice1_surface/*.rails --certificates > certificates.txt
 cargo run --bin vn2 -- validate certificates.txt   # the kernel, from the text alone
+cargo run --bin vn2 -- check tests/slice1_surface/*.rails --counts   # the work of the search
 cargo run --bin vn2 -- format tests/slice1_surface/show_file.rails --check
 cargo run --bin vn2 -- expand tests/slice1_surface/groups_and_auto.rails
 cargo run --bin vn2 -- emit-llvm tests/slice1_surface/spend.rails
@@ -429,8 +431,17 @@ of slice 1:
   product envelopes from declared intervals ([A9]), lazy CEGAR refinement over
   `Ω`, `Ψ` and `[J3]`, and the theory check of `lia`: equalities replaced,
   variables with a unit coefficient projected out, the simplex method over
-  the rationals, rounded sums, and splits, with a proof as a tree of the
-  steps of [V3] that is pruned to what its ends rely on. A query has three
+  the rationals, a first search for a model along the splits, rounded sums,
+  and splits, with a proof as a tree of the
+  steps of [V3] that is pruned to what its ends rely on. The refinement
+  starts from the goal and the structure. A candidate that has a model is
+  completed to one of every term. Every premise that this model fails is
+  conjoined before the next candidate is taken, and where it fails none,
+  every instance that it fails: the instances bring the rows of quotients
+  and products, and those that a model far from the program fails are
+  mostly beside the point. A model that fails nothing is the counterexample, and the goal and every premise are
+  evaluated in it before it is shown ([M1]). The truth of a row in a model
+  is worked out when a formula reads it. A query has three
   answers besides a fault of the procedure itself: proved, refuted with a
   model, and the counted limit of [J6], which is reported with the clause
   `J6` and is not a verdict. Checked obligations cover
@@ -456,6 +467,21 @@ of slice 1:
   [M2], [M6]), with nonlinear operator remarks ([M3]) and generic loop
   iteration notes ([M4]).
 
+**The work of the search is measured by counts** (`counts`): queries,
+candidates, theory checks and their rows, premises added, tableaus,
+exchanges of the simplex method with the entries they write, and splits.
+`vn2 check --counts` prints them. A count is the same on every machine and
+under every load, and by [J6] the same in every run: the checker keeps
+names and terms in ordered tables, and a hash table is used only where
+nothing reads its order (the tables of the diagram, the tables that give
+a term or a row its number, and sets that are only asked whether they hold
+a thing). The counts of 23 November 2026, for the
+ten surface programs of the three slices: 552 queries, 689 candidates, 639
+theory checks of 8,397 rows, 1,476 premises added, and no exchange. For the
+data kernel of slice 2 (`v2/tests/kernels/slice2_data.rails`): 212 queries,
+1,125 candidates, 786 theory checks of 45,172 rows, 1,454 exchanges that
+write 67,200 entries, and 689 splits.
+
 `v2/tests/kernel.rs` tests the kernel's matcher: every instance of [A1],
 [A2] and [A7] to [A9] that it grants is evaluated with the values that the
 real operations give, on operands at the ends of every type and beyond them;
@@ -472,7 +498,16 @@ all four `.rails` programs in `v2/tests/slice1_surface/`, the template with
 80 sets of numbers (over 1,000 kernel-validated certificates) and ten
 generated programs, and verifies that every stuck mutant of four generated
 programs, and every stuck mutant and every `DropInvariant` mutant of the
-template, is rejected by `resolve` or `check::check`.
+template, is rejected by `resolve` or `check::check`. Two tests hold the
+search itself: a program that is checked a second time, on another thread,
+gives the same certificate text and the same counts (30 programs with 2,136
+certificates: the surface programs, the data kernel, four generated
+programs, and the expansion of each); and the data kernel, its expansion,
+and a program whose exit condition rests on remainders and a product
+(`v2/tests/kernels/remainders_and_products.core`) are checked within a
+stated number of theory checks and of entries written. The last is a mutant
+that a campaign found: it is valid, and a search that added every failed
+instance at once did not decide it.
 
 ### The certificate text ([V5])
 

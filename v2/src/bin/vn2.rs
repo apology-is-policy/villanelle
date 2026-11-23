@@ -5,13 +5,16 @@ use villanelle_v2::host::{Arithmetic, Host, Script};
 use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{Config, End, Value, run};
 use villanelle_v2::{
-    certificate, check, codegen, erased, expand, fuzz, load, load_surface, script, surface, text,
+    certificate, check, codegen, counts, erased, expand, fuzz, load, load_surface, script, surface,
+    text,
 };
 
 const USAGE: &str = "\
 vn2 test FILE...                          carry out the directives of core or Rails files
-vn2 check FILE... [--certificates]        check core or Rails files in the Phase 3 checker;
-                                          with --certificates, print the certificate text
+vn2 check FILE... [--certificates] [--counts]
+                                          check core or Rails files in the Phase 3 checker;
+                                          with --certificates, print the certificate text;
+                                          with --counts, the work of the search as counts
 vn2 validate FILE...                      read certificate texts and validate them in the kernel
 vn2 format FILE... [--write | --check]    format Rails files into canonical Rails glyph form
 vn2 expand FILE                           expand decisions on defined controls (Theorem 4)
@@ -137,12 +140,13 @@ fn run_one(arguments: &[String]) -> Result<bool, String> {
 
 fn check_files(arguments: &[String]) -> Result<bool, String> {
     let mut show_certificates = false;
+    let mut show_counts = false;
     let mut files = Vec::new();
     for argument in arguments {
-        if argument == "--certificates" {
-            show_certificates = true;
-        } else {
-            files.push(argument);
+        match argument.as_str() {
+            "--certificates" => show_certificates = true,
+            "--counts" => show_counts = true,
+            _ => files.push(argument),
         }
     }
     if files.is_empty() {
@@ -156,6 +160,7 @@ fn check_files(arguments: &[String]) -> Result<bool, String> {
     }
     let mut failed = 0usize;
     let mut total_certificates = 0usize;
+    let counts_before = counts::now();
     for path in &files {
         let source = read(path)?;
         let program = if is_core_file(path) {
@@ -185,6 +190,9 @@ fn check_files(arguments: &[String]) -> Result<bool, String> {
                 failed += 1;
             }
         }
+    }
+    if show_counts {
+        println!("{note}{}", counts::now().since(&counts_before));
     }
     println!(
         "{note}{} files checked, {total_certificates} certificates validated, {failed} failures",

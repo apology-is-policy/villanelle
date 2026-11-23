@@ -81,14 +81,17 @@ Items 9 to 16 were written on 21 and 22 November. The [review](review.md) of
 
 9. Phase 2 in slices: the oracle, erased semantics, generator, differential
    harness, mutation tests and Rails surface reader with elaboration for
-   scalars and decisions (the oracle and its conformance suite done; the
-   generator is one fixed program, so the harness and the mutations are
-   draft).
+   scalars and decisions (the oracle and its conformance suite done; since
+   23 November the generator writes programs from their histories, and the
+   harness and the mutations run on them: review, RG1).
 10. Phase 3 for slice 1: the checker on the typed core with ROBDD histories,
     the `Th_Z` fact logic, the independent certificate kernel, counterexample
     models, the canonical Rails formatter and compiler warnings (draft: the
-    kernel does not validate axiom instances, the procedure panics where it
-    cannot decide, the formatter loses comments).
+    decision procedure is not complete without bounds, and the formatter
+    loses comments; since 23 November the kernel makes every axiom instance
+    itself, a certificate text is validated without the checker, and the
+    procedure gives a proof, a model or a counted limit: review, RC9 to
+    RC13, RC16).
 11. Phase 4 for slice 1: Theorem 4 call expansion and the typed LLVM IR and C
     ABI backend under the erased semantics ([R1] to [R3]), verified against the
     oracle and the erased interpreter at `-O0` and `-O2` (original and expanded)

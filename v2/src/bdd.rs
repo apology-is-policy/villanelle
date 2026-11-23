@@ -5,8 +5,43 @@
 //! in a [`Bdd`]. `FALSE` is `0` and `TRUE` is `1`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
 
 pub type Formula = usize;
+
+/// The hasher of the two tables: a rotation and a multiplication for each
+/// word of a key. A key is a few small numbers, the tables are read for
+/// every node that an operation meets, and the hasher of the standard
+/// library, which is made to resist chosen keys, took most of that time.
+/// A hasher decides where an entry lies and never what a table answers.
+#[derive(Clone, Copy, Default)]
+pub struct WordHasher(u64);
+
+impl Hasher for WordHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u64(u64::from(*byte));
+        }
+    }
+
+    fn write_u8(&mut self, word: u8) {
+        self.write_u64(u64::from(word));
+    }
+
+    fn write_usize(&mut self, word: usize) {
+        self.write_u64(word as u64);
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+type Words = BuildHasherDefault<WordHasher>;
 
 pub const FALSE: Formula = 0;
 pub const TRUE: Formula = 1;
@@ -21,8 +56,8 @@ pub struct Node {
 #[derive(Clone, Debug, Default)]
 pub struct Bdd {
     nodes: Vec<Node>,
-    unique: HashMap<Node, Formula>,
-    cache: HashMap<(u8, Formula, Formula), Formula>,
+    unique: HashMap<Node, Formula, Words>,
+    cache: HashMap<(u8, Formula, Formula), Formula, Words>,
 }
 
 impl Bdd {
@@ -169,6 +204,20 @@ impl Bdd {
             out.insert(node.var, value);
         }
         Some(out)
+    }
+
+    /// The value of `formula` where `value` gives that of a variable. Only
+    /// the variables on one path are asked for.
+    pub fn evaluate_with(
+        &self,
+        mut formula: Formula,
+        mut value: impl FnMut(usize) -> bool,
+    ) -> bool {
+        while formula >= 2 {
+            let node = self.node(formula);
+            formula = if value(node.var) { node.high } else { node.low };
+        }
+        formula == TRUE
     }
 
     pub fn evaluate(&self, mut formula: Formula, assignment: &BTreeMap<usize, bool>) -> bool {
