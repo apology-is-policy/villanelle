@@ -74,6 +74,19 @@ const SLICE2_STUCK: [&str; 12] = [
 
 const SLICE2_REFUSALS: [&str; 10] = ["T1", "W5a", "W6", "W7", "W8", "F5", "F6", "W2", "W3", "C1"];
 
+/// Review finding RO5: under a fault the erased semantics releases what is
+/// available at the statement that faulted, and what a loop or the work of
+/// a boundary did to a name of the body around it holds after it ([R4],
+/// [R5], [O6](b), [E-Boundary], [F5]). Every run of the file is compared
+/// with the erased semantics, and each has the trace that the oracle gives.
+#[test]
+fn the_erased_semantics_follows_ownership_through_nested_bodies() {
+    let report = script::check(include_str!("slice2/erased_nested_ownership.core"));
+    assert!(report.failures.is_empty(), "{}", report.failures.join("\n"));
+    assert_eq!(report.runs, 12);
+    assert_eq!(report.compared, 12);
+}
+
 #[test]
 fn slice_two_core_conforms_and_matches_erased() {
     let mut failures = Vec::new();

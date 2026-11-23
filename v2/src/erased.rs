@@ -349,6 +349,46 @@ struct Plan {
     /// have moved, used to decide resource release on fault unwind with zero
     /// runtime moved flags.
     avail_at: Vec<Vec<Vec<Option<Selector>>>>,
+    /// For a `□` whose loop leaves a name of the bodies around it in another
+    /// state than it found it, by body and position: the bit that says the
+    /// loop ended there ([O6](b)).
+    leave_bit: BTreeMap<(BodyId, usize), usize>,
+}
+
+/// A `□` of the loop being laid out: where it stands, and the names that are
+/// moved where it leaves.
+struct LeavePoint {
+    body: BodyId,
+    pc: usize,
+    moved: Vec<Option<Selector>>,
+}
+
+/// What the layout of a body takes from the bodies inside it.
+struct Nest {
+    /// Whether what a nested body does to the names around it reaches the
+    /// statements after it. The backend lays a body out without it (RB1).
+    carry: bool,
+    /// The `□` statements of the innermost loop around the body being laid
+    /// out.
+    leaves: Vec<LeavePoint>,
+    /// For each `□` that an availability formula names: its body and
+    /// position, the site of its loop, and the index of its atom there,
+    /// which follows the alternatives of the site.
+    marks: Vec<(BodyId, usize, SiteId, usize)>,
+    /// The formulas of each body that has been laid out, by statement and
+    /// by name.
+    avail_at: Vec<Vec<Vec<Option<Selector>>>>,
+}
+
+impl Nest {
+    fn new(carry: bool, bodies: usize) -> Nest {
+        Nest {
+            carry,
+            leaves: Vec::new(),
+            marks: Vec::new(),
+            avail_at: vec![Vec::new(); bodies],
+        }
+    }
 }
 
 fn sel_or(a: Option<Selector>, b: Selector) -> Option<Selector> {
@@ -450,6 +490,9 @@ fn mention(selector: &Selector, plan: &mut Plan) {
     match selector {
         Selector::Top => {}
         Selector::Atom(site, alternative) => {
+            if plan.bit[*site].len() <= *alternative {
+                plan.bit[*site].resize(*alternative + 1, None);
+            }
             if plan.bit[*site][*alternative].is_none() {
                 plan.bit[*site][*alternative] = Some(plan.bits);
                 plan.bits += 1;
@@ -470,7 +513,7 @@ fn compute_body_availability(
     param_count: usize,
     mut defined: Vec<Option<Selector>>,
     mut moved: Vec<Option<Selector>>,
-    avail_at: &mut [Vec<Vec<Option<Selector>>>],
+    nest: &mut Nest,
 ) -> (Vec<Option<Selector>>, Vec<Option<Selector>>) {
     if body_id == 0 {
         for slot in defined.iter_mut().take(param_count.min(body.vars.len())) {
@@ -486,7 +529,7 @@ fn compute_body_availability(
     let stmts = &body.bodies[body_id].statements;
     let mut body_avail = Vec::with_capacity(stmts.len());
 
-    for stmt in stmts {
+    for (pc, stmt) in stmts.iter().enumerate() {
         let g = &stmt.selector;
         // 1. Move variables consumed by `stmt.command`'s arguments.
         let mut consumed = Vec::new();
@@ -585,6 +628,13 @@ fn compute_body_availability(
         for var in consumed {
             moved[var] = sel_or(moved[var].take(), g.clone());
         }
+        if nest.carry && matches!(stmt.command, Command::Leave { .. }) {
+            nest.leaves.push(LeavePoint {
+                body: body_id,
+                pc,
+                moved: moved.clone(),
+            });
+        }
 
         // 2. Record availability `D(x) ∧ ¬M(x)` at this statement (after args moved).
         let mut snap = vec![None; body.vars.len()];
@@ -639,6 +689,7 @@ fn compute_body_availability(
                 arms,
                 ..
             } => {
+                let around = std::mem::take(&mut nest.leaves);
                 let _ = compute_body_availability(
                     program,
                     body,
@@ -646,8 +697,39 @@ fn compute_body_availability(
                     param_count,
                     defined.clone(),
                     moved.clone(),
-                    avail_at,
+                    nest,
                 );
+                let leaves = std::mem::replace(&mut nest.leaves, around);
+                // [O6](b): after the loop a name of the bodies around it is
+                // as the `□` that ended the loop left it. Which one that was
+                // is a bit of the history; where every `□` leaves the name
+                // as the loop found it, none is asked.
+                for var in 0..body.vars.len() {
+                    if defined[var].is_none()
+                        || leaves.iter().all(|leave| leave.moved[var] == moved[var])
+                    {
+                        continue;
+                    }
+                    let mut after = None;
+                    for (index, leave) in leaves.iter().enumerate() {
+                        let mark = Selector::Atom(*site, arms.len() + index);
+                        match &leave.moved[var] {
+                            None => {}
+                            Some(Selector::Top) => after = sel_or(after, mark),
+                            Some(inside) => {
+                                after = sel_or(
+                                    after,
+                                    Selector::And(Box::new(mark), Box::new(inside.clone())),
+                                );
+                            }
+                        }
+                    }
+                    moved[var] = after;
+                }
+                for (index, leave) in leaves.iter().enumerate() {
+                    nest.marks
+                        .push((leave.body, leave.pc, *site, arms.len() + index));
+                }
                 for (pos, arm_vars) in arms.iter().enumerate() {
                     let atom = Selector::Atom(*site, pos);
                     for &var in arm_vars {
@@ -662,15 +744,27 @@ fn compute_body_availability(
                 contingency: b2,
                 ..
             } => {
-                let _ = compute_body_availability(
+                // A `□` in the work is one of the loop around the boundary.
+                let (_, after) = compute_body_availability(
                     program,
                     body,
                     *b1,
                     param_count,
                     defined.clone(),
                     moved.clone(),
-                    avail_at,
+                    nest,
                 );
+                // The histories that fall off the end of the work go on
+                // after the boundary: a name of the bodies around it is as
+                // the work left it ([E-Boundary]).
+                if nest.carry {
+                    for var in 0..body.vars.len() {
+                        if defined[var].is_some() {
+                            moved[var] = after[var].clone();
+                        }
+                    }
+                }
+                let around = std::mem::take(&mut nest.leaves);
                 let mut b2_def = vec![None; body.vars.len()];
                 let b2_mov = vec![None; body.vars.len()];
                 for &cv in contingency_vars {
@@ -686,8 +780,9 @@ fn compute_body_availability(
                     param_count,
                     b2_def,
                     b2_mov,
-                    avail_at,
+                    nest,
                 );
+                nest.leaves = around;
             }
             _ => {}
         }
@@ -710,7 +805,7 @@ fn compute_body_availability(
     }
     body_avail.push(end_snap);
 
-    avail_at[body_id] = body_avail;
+    nest.avail_at[body_id] = body_avail;
     (defined, moved)
 }
 
@@ -721,9 +816,9 @@ pub(crate) fn compute_availability(
 ) -> Vec<Vec<Vec<Option<Selector>>>> {
     let defined = vec![None; body.vars.len()];
     let moved = vec![None; body.vars.len()];
-    let mut avail_at = vec![Vec::new(); body.bodies.len()];
-    let _ = compute_body_availability(program, body, 0, param_count, defined, moved, &mut avail_at);
-    avail_at
+    let mut nest = Nest::new(false, body.bodies.len());
+    let _ = compute_body_availability(program, body, 0, param_count, defined, moved, &mut nest);
+    nest.avail_at
 }
 
 fn plan(program: &Program, body: &ControlBody, param_count: usize) -> Plan {
@@ -736,18 +831,13 @@ fn plan(program: &Program, body: &ControlBody, param_count: usize) -> Plan {
         bits: 0,
         own: vec![Vec::new(); body.bodies.len()],
         avail_at: vec![Vec::new(); body.bodies.len()],
+        leave_bit: BTreeMap::new(),
     };
     let defined = vec![None; body.vars.len()];
     let moved = vec![None; body.vars.len()];
-    let _ = compute_body_availability(
-        program,
-        body,
-        0,
-        param_count,
-        defined,
-        moved,
-        &mut plan.avail_at,
-    );
+    let mut nest = Nest::new(true, body.bodies.len());
+    let _ = compute_body_availability(program, body, 0, param_count, defined, moved, &mut nest);
+    plan.avail_at = std::mem::take(&mut nest.avail_at);
 
     for inner in &body.bodies {
         for statement in &inner.statements {
@@ -772,6 +862,11 @@ fn plan(program: &Program, body: &ControlBody, param_count: usize) -> Plan {
     for s in &avail_selectors {
         mention(s, &mut plan);
     }
+    for (leave_body, pc, site, index) in nest.marks {
+        if let Some(Some(bit)) = plan.bit[site].get(index) {
+            plan.leave_bit.insert((leave_body, pc), *bit);
+        }
+    }
     for (site, bits) in body.sites.iter().zip(&plan.bit) {
         plan.own[site.body].extend(bits.iter().flatten());
     }
@@ -781,9 +876,11 @@ fn plan(program: &Program, body: &ControlBody, param_count: usize) -> Plan {
 fn selects(selector: &Selector, plan: &Plan, bits: &[bool]) -> bool {
     match selector {
         Selector::Top => true,
-        Selector::Atom(site, alternative) => {
-            plan.bit[*site][*alternative].is_some_and(|bit| bits[bit])
-        }
+        Selector::Atom(site, alternative) => plan.bit[*site]
+            .get(*alternative)
+            .copied()
+            .flatten()
+            .is_some_and(|bit| bits[bit]),
         Selector::Not(inner) => !selects(inner, plan, bits),
         Selector::And(left, right) => selects(left, plan, bits) && selects(right, plan, bits),
         Selector::Or(left, right) => selects(left, plan, bits) || selects(right, plan, bits),
@@ -807,6 +904,10 @@ enum FrameKind {
         parent_body: BodyId,
         parent_pc: usize,
         fault_message: String,
+        /// The body and the position of the statement of the work that
+        /// faulted: the names around the boundary are as they were there
+        /// ([F5]).
+        origin: (BodyId, usize),
     },
 }
 
@@ -1602,12 +1703,19 @@ impl<'a> Machine<'a> {
 
     fn stop_activation(&mut self, mut act: Activation) {
         self.stack.push(act);
+        let mut point = self.fault_point();
         while let Some(frame) = self.stack.last_mut().expect("act").frames.pop() {
-            self.unwind_frame(frame.body, &[]);
-            if let FrameKind::LexicalBoundary { captures, .. } = frame.kind {
-                for cap in &captures {
-                    self.release_value_resources(cap);
+            if let Some(point) = point {
+                self.unwind_frame(frame.body, point, &[]);
+            }
+            match frame.kind {
+                FrameKind::LexicalBoundary { captures, .. } => {
+                    for cap in &captures {
+                        self.release_value_resources(cap);
+                    }
                 }
+                FrameKind::LexicalContingency { origin, .. } => point = Some(origin),
+                FrameKind::Normal | FrameKind::Loop => {}
             }
         }
         act = self.stack.pop().expect("act");
@@ -1709,15 +1817,25 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    /// The body and the position of the statement at which the activation
+    /// on top stands: where a fault that reaches it occurs.
+    fn fault_point(&self) -> Option<(BodyId, usize)> {
+        let act = self.stack.last()?;
+        let frame = act.frames.last()?;
+        Some((frame.body, act.positions[frame.body]))
+    }
+
     /// [R4], [R5]: unwinds one body frame using only static history-bit
-    /// availability formulas (`plan.avail_at[frame_body][pc][var]`), without
-    /// any runtime moved flags.
-    fn unwind_frame(&mut self, frame_body: BodyId, exclude: &[VarId]) {
+    /// availability formulas, without any runtime moved flags. The formulas
+    /// are those of the statement at `point`, where the fault occurred:
+    /// they say of every name in scope there, of this body and of those
+    /// around it, whether it is available on the current history.
+    fn unwind_frame(&mut self, frame_body: BodyId, point: (BodyId, usize), exclude: &[VarId]) {
         let (body, plan) = self.laid_out();
         let act = self.stack.last().expect("an activation");
-        let pc = act.positions[frame_body].min(plan.avail_at[frame_body].len().saturating_sub(1));
+        let pc = point.1.min(plan.avail_at[point.0].len().saturating_sub(1));
         let mut to_release = Vec::new();
-        if let Some(snap) = plan.avail_at[frame_body].get(pc) {
+        if let Some(snap) = plan.avail_at[point.0].get(pc) {
             for (var_id, var) in body.vars.iter().enumerate().rev() {
                 if var.body != frame_body || exclude.contains(&var_id) {
                     continue;
@@ -1737,7 +1855,12 @@ impl<'a> Machine<'a> {
         }
     }
 
-    fn enter_named_contingency(&mut self, id: BoundaryId, message: String) {
+    fn enter_named_contingency(
+        &mut self,
+        id: BoundaryId,
+        message: String,
+        point: Option<(BodyId, usize)>,
+    ) {
         let retains = self.program.boundaries[id].retains.clone();
         let root_frame = self
             .stack
@@ -1750,7 +1873,9 @@ impl<'a> Machine<'a> {
             .iter()
             .map(|&v| self.stack.last().unwrap().slots[v].clone())
             .collect();
-        self.unwind_frame(root_frame.body, &retains);
+        if let Some(point) = point {
+            self.unwind_frame(root_frame.body, point, &retains);
+        }
 
         let b2_body = &self.program.boundaries[id].contingency;
         let b2_plan = &self.boundary_plans[id].1;
@@ -1777,7 +1902,13 @@ impl<'a> Machine<'a> {
     /// A fault goes outward: the frames end innermost first, until a
     /// boundary takes it or the last activation is popped.
     fn trigger_unwind(&mut self, message: String) -> Result<Option<End>, String> {
+        // Where the fault occurred in the activation on top, for the
+        // availability of its names. `None` asks for it anew.
+        let mut point = None;
         loop {
+            if point.is_none() {
+                point = self.fault_point();
+            }
             let act = self.stack.last().expect("an activation");
             // The body of a named boundary takes the fault when only its
             // own frame is left: a lexical boundary inside it comes first.
@@ -1788,7 +1919,7 @@ impl<'a> Machine<'a> {
                 && act.frames.len() == 1
             {
                 let id = *id;
-                self.enter_named_contingency(id, message);
+                self.enter_named_contingency(id, message, point);
                 return Ok(None);
             }
 
@@ -1800,7 +1931,8 @@ impl<'a> Machine<'a> {
                     .frames
                     .pop()
                     .unwrap();
-                self.unwind_frame(frame.body, &[]);
+                let at = point.expect("the position of the frame");
+                self.unwind_frame(frame.body, at, &[]);
                 match frame.kind {
                     FrameKind::LexicalBoundary {
                         parent_body,
@@ -1829,6 +1961,7 @@ impl<'a> Machine<'a> {
                                 parent_body,
                                 parent_pc,
                                 fault_message: message,
+                                origin: at,
                             },
                         });
                         return Ok(None);
@@ -1836,11 +1969,15 @@ impl<'a> Machine<'a> {
                     FrameKind::LexicalContingency {
                         parent_body,
                         parent_pc,
+                        origin,
                         ..
                     } => {
                         // The boundary statement has moved what it took
                         // into its care: the frame around it is past it.
                         self.top().positions[parent_body] = parent_pc + 1;
+                        // The names around the boundary are as they were
+                        // where its work faulted.
+                        point = Some(origin);
                     }
                     FrameKind::Normal | FrameKind::Loop => {}
                 }
@@ -1848,6 +1985,7 @@ impl<'a> Machine<'a> {
             }
 
             let _popped = self.stack.pop().expect("an activation");
+            point = None;
             if self.stack.is_empty() {
                 let cur = self.current_task;
                 if let Some(set_id) = self.tasks[cur].member_of {
@@ -2540,6 +2678,9 @@ impl<'a> Machine<'a> {
                 payload,
             } => {
                 let values = self.eval_operands(payload)?;
+                if let Some(&bit) = plan.leave_bit.get(&(current, position)) {
+                    self.top().bits[bit] = true;
+                }
                 while let Some(frame) = self.top().frames.pop() {
                     if matches!(frame.kind, FrameKind::Loop) {
                         break;

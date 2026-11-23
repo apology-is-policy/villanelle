@@ -59,12 +59,12 @@ for every clause implemented.
 
 | Requirement | 1. Scalars and decisions | 2. Data | 3. Borrows | 4. Tasks |
 | --- | --- | --- | --- | --- |
-| Oracle: accepting and rejecting test for each clause | Met: 41 files, 126 runs, 12 rules, 15 stuck states, 9 refusals | Partly: 42 files, 68 runs, 12 stuck labels. Requalified since 23 November: the fault-boundary rules (RO1, RO3, RO4), pure operations (RO8) and the operands and contracts of the built-in operations (RO9, RO10). Open: a test for each clause of the data rules, as the fault boundaries have | No: 5 files, 55 runs. Three of the files are of 23 November, with the findings they close (RO2, RO6, RO10); the two before them reach one stuck label, `X4 B1`, which the oracle raises in 17 places, and the test asserts counts of runs. A host cannot write through an `&~` argument (RO11) | No: 2 files; the test asserts no stuck state; one run varies the order of turns |
+| Oracle: accepting and rejecting test for each clause | Met: 41 files, 126 runs, 12 rules, 15 stuck states, 9 refusals | Partly: 43 files, 80 runs, 12 stuck labels. Requalified since 23 November: the fault-boundary rules (RO1, RO3, RO4), pure operations (RO8) and the operands and contracts of the built-in operations (RO9, RO10). Open: a test for each clause of the data rules, as the fault boundaries have | No: 5 files, 55 runs. Three of the files are of 23 November, with the findings they close (RO2, RO6, RO10); the two before them reach one stuck label, `X4 B1`, which the oracle raises in 17 places, and the test asserts counts of runs. A host cannot write through an `&~` argument (RO11) | No: 2 files; the test asserts no stuck state; one run varies the order of turns |
 | Checker: accepting and rejecting test for each clause | Met | Partly. The findings of the review in this slice are closed since 23 November (RC2 to RC8, RC20, RC21, RC23), with tests that run each program in the oracle as well; the clauses of the data rules have the tests of before, which the review found thin | Partly: the worked examples of the reference model; unsound (RC1); the loan checker was tested from outside only | No checker |
-| Generator reaches every construct of the slice (phase 2 exit) | Met since 23 November (section 9, RG1) | Partly since 23 November: `generate::valid_data` (`vn2 fuzz --slice 2`) writes the data of the slice and the operations on it, resources with the obligations they bring and captured outcomes, valid by construction as slice 1 is, and reaches 41 of the 52 constructs that `generate::DATA_CONSTRUCTS` lists, beside the 61 of slice 1. Not written yet: faults and boundaries (11 constructs). No value of an outcome type crosses a contract in what it writes (RG7) | No generator | No generator |
-| Oracle against erased semantics | 62 runs of the suite and 11,728 runs of 300 generated programs | The erased interpreter is a transcription of the oracle (RO7) and wrong under faults (RO5). 37,340 runs of 900 generated programs with data, resources and captured outcomes give the same observation | As slice 2 | As slice 2 |
+| Generator reaches every construct of the slice (phase 2 exit) | Met since 23 November (section 9, RG1) | Met since 23 November for the constructs: `generate::valid_data` (`vn2 fuzz --slice 2`) writes the data of the slice and the operations on it, resources with the obligations they bring, captured outcomes, faults, and lexical and named boundaries, valid by construction as slice 1 is, and reaches all 52 constructs that `generate::DATA_CONSTRUCTS` lists, beside the 61 of slice 1. Shapes it does not write: a boundary in the work of another, `recover ↑ ℓ` of a loop further out than the one the boundary stands in, and a value of an outcome type that crosses a contract (RG7) | No generator | No generator |
+| Oracle against erased semantics | 62 runs of the suite and 11,728 runs of 300 generated programs | The erased interpreter is a transcription of the oracle (RO7). Since 23 November it releases under a fault as the oracle does where one task runs (RO5; the part with tasks is open for slice 4). 35,984 runs of 900 generated programs with data, resources, captured outcomes, faults and boundaries give the same observation; 3,526 of them end in a fault that leaves the entry and 977 with `terminate n` | As slice 2 | As slice 2 |
 | Mutations rejected at the rate the author sets (phase 3 exit) | Seven kinds on generated programs since 23 November. Every mutant for which a stuck run was found is rejected: 761 of 5,403 mutants of 25 programs, and 72 in the suite. The checker accepts 4,066 for which none was found. The rate is not set | None | None | None |
-| No generated checked program is stuck over a long campaign (phase 3 exit) | No long campaign yet. The checker accepts all of 300 generated programs, none of which is stuck in 11,728 runs, and 5,403 mutants of 25 of them gave none that was accepted and stuck | The checker accepts 897 of 900 generated programs with data, resources and captured outcomes, none of which is stuck in 37,340 runs. It gives no answer in ten seconds on the other three (RC22). No mutants yet | None | None |
+| No generated checked program is stuck over a long campaign (phase 3 exit) | No long campaign yet. The checker accepts all of 300 generated programs, none of which is stuck in 11,728 runs, and 5,403 mutants of 25 of them gave none that was accepted and stuck | The checker accepts 899 of 900 generated programs with data, resources, captured outcomes, faults and boundaries, none of which is stuck in 35,984 runs. It gives no answer in ten seconds on the other one (RC22). No mutants yet | None | None |
 | Compiled code agrees with the oracle on generated programs (phase 4 exit) | Since 23 November: 300 generated programs at both widths of `usize`, at `-O0` and `-O2`, 23,456 runs with no difference (`vn2 fuzz --native`); six of them with their expansions in the suite. No longer campaign yet | None; double free (RB1) | None | No backend; `emit-llvm` panics (RB9) |
 | Every kernel under `experiments/` within 1.2× of optimized Rust (phase 4 exit) | None measured (RB6) | None measured | None measured | |
 
@@ -91,8 +91,9 @@ in the first statements.
 **RG3.** The generator, the differential fuzzing and the mutations cover
 slice 1 only. Since 23 November the generator writes the data of slice 2 as
 well, with resources and captured outcomes (`generate::valid_data`,
-`v2/src/generate/valid/data.rs`); section 3 says what of the slice it does
-not write yet. The mutations are those of slice 1.
+`v2/src/generate/valid/data.rs`), and faults and boundaries
+(`v2/src/generate/valid/faults.rs`); section 3 says which shapes of the
+slice it does not write. The mutations are those of slice 1.
 
 **RG4.** Found on 23 November by `vn2 fuzz --slice 2`: writing the program
 of one seed did not end. The arguments of a call of a function were written
@@ -293,7 +294,10 @@ gets no answer in two minutes either and whose check took 800 megabytes of
 memory in its first five seconds, and `rc22_exchanges.core`, which the
 checker accepts after 27 seconds in which 136 theory checks write
 81,786,060 entries of tableaus. The second may be another defect than the
-first.
+first. With faults and boundaries one program of 900 gets no answer in 90
+seconds (`rc22_faults_and_boundaries.core`); the three before it are
+programs of an earlier generator, which gives other programs for their seeds
+now.
 
 **RC23.** Found on 23 November by probes for the generator of captured
 outcomes. [I12] of the fact logic gives a decision on a captured outcome the
@@ -360,6 +364,22 @@ released twice. Under another schedule, a release is missed on the
 repository's own `tests/slice4/tasks_faults_and_cancel.core`, and the two
 traces differ **(reproduced)**.
 
+The first of the two is closed on 23 November, when generated programs began
+to fault and showed it in two of 900. The layout of a body took nothing from
+the bodies inside it: after a loop or a boundary, a name of the body around
+was as it had been before, and a fault in the work of a boundary released
+the names around the boundary as they were at the boundary statement. Now
+the work of a boundary leaves a name as it is at its end ([E-Boundary]); a
+loop leaves it as the `□` that ended the loop left it, for which the erased
+interpreter keeps one bit for each such `□`, and only where some `□` leaves
+the name otherwise than the loop found it ([O6](b) makes the answers of one
+alternative agree, so for a checked program the bit says no more than the
+atom of the alternative); and a fault releases by the formulas of the
+statement that faulted, which a contingency remembers for the names around
+its boundary ([F5]). The backend still lays a body out the old way (RB1).
+The second, the release that is missed under another schedule of tasks, is
+open for slice 4.
+
 **RO6.** No host can answer an extern control whose payload is borrowed.
 Every such call ends in `violation`.
 
@@ -393,7 +413,7 @@ The suites:
 | Slice | Files | Runs | Stuck labels reached | What the test asserts |
 | --- | ---: | ---: | --- | --- |
 | 1 | 41 | 126 | 15 | 12 rules, 15 stuck states, 9 refusals |
-| 2 | 13 | 33 | 10 | 9 rules, 10 labels, 6 refusals. Since 23 November: 42 files, 68 runs, 9 rules, 12 labels, 10 refusals |
+| 2 | 13 | 33 | 10 | 9 rules, 10 labels, 6 refusals. Since 23 November: 43 files, 80 runs, 9 rules, 12 labels, 10 refusals |
 | 3 | 2 | 22 | 1 | at least 20 runs, at least 12 compared. Since 23 November: 5 files, 55 runs, and the seeded host on the controls of one file |
 | 4 | 2 | 16 | 5 | 10 rules; no stuck state |
 
@@ -555,11 +575,13 @@ A finding is closed here with the date and the test that holds it.
 | RC8 | Closed 23 November 2026. A component has the declared interval of its type only as a component of a value term, as [A9] of the [fact logic](facts.md) has it; read out of a constructor at any depth it is the term written there and has none. `a_component_read_out_of_a_constructor_has_no_declared_interval_a9`: a formula that holds for every `u32` and fails for `a + 1` at the end of the range is stuck in the oracle and refused, and the same formula of a component of a name is accepted |
 | RC20 | Closed 23 November 2026. The effects of a named boundary include those of the boundaries its `B₁` supervises (`resolve.rs`), as [F6] says of what supervises. `the_effects_of_a_supervised_boundary_count_toward_what_supervises_f3_f6`: a boundary that supervises one that writes is accepted, and the control that supervises it must allow the effect |
 | RC21 | Closed 23 November 2026. The statements of `B₂` have the histories of the statements of `B₁` that may fault: for a lexical boundary the disjunction of their reach, and for a named boundary, whose `B₂` is checked in a diagram of its own, all or none by whether one of them can happen. [F5] of the [core](core.md) says so now (section 12). `a_contingency_runs_on_the_histories_that_fault_f5_f6_p6` (`v2/tests/checker_slice2.rs`): five programs, each run in the oracle as well. |
-| RC22 | Open. Three programs are in `v2/tests/open/` (`rc22_structs_in_loops.core`, `rc22_structs_of_bools.core`, `rc22_exchanges.core`); no test reads them. `the_checker_accepts_generated_programs_with_data` (`v2/tests/harness.rs`) leaves out the two seeds of its 30 that give the last two (`NO_ANSWER`) |
+| RC22 | Open. Four programs are in `v2/tests/open/` (`rc22_structs_in_loops.core`, `rc22_structs_of_bools.core`, `rc22_exchanges.core`, `rc22_faults_and_boundaries.core`); no test reads them. `the_checker_accepts_generated_programs_with_data` (`v2/tests/harness.rs`) asks the checker about the first 30 seeds, none of which is one of them now (`NO_ANSWER` is empty) |
 | RC23 | Closed 23 November 2026. On the histories that did not see the capture, a decision on a captured outcome adds the conditions of the captured operation over fresh names, each of the type of its parameter; `old(p)` is another name than `p` for an `&~` parameter alone ([I12], section 14 of the [fact logic](facts.md)). `a_captured_outcome_keeps_its_conditions_where_the_capture_is_not_visible_i12` (`v2/tests/checker_slice2.rs`): through the payload of a loop, as the parameter of a loop, with one fresh name in two conjuncts of a condition; a condition that says less than the exit claims is stuck in the oracle and refused, and what a condition says of an argument is not known of the name that was the argument |
+| RO5 | Closed 23 November 2026 for one task; open for tasks (slice 4). `the_erased_semantics_follows_ownership_through_nested_bodies` (`v2/tests/slice2.rs`) runs `v2/tests/slice2/erased_nested_ownership.core`: nine controls in which a loop, the work of a boundary or a loop inside the work consumes or assigns a name of the body around it before a fault, 12 runs, each with the trace of the oracle and each compared with the erased semantics; the checker accepts the file. Ten of the 12 runs differed before. The campaigns of `vn2 fuzz --slice 2` hold it on generated programs |
+| RG3 | Closed 23 November 2026 for the generator and the differential fuzzing of slice 2 (section 3); the mutations of slice 2 are open. `generated_programs_with_data_run_to_an_end_and_reach_the_data_constructs` (`v2/tests/harness.rs`) requires every construct of the slice in 240 programs, and runs that end in a fault and with `terminate n` |
 | RG4 | Closed 23 November 2026. Calls nest eight deep in one expression and no deeper (`MAX_CALLS`, `v2/src/generate/valid.rs`). `a_generated_expression_ends_where_calls_nest` (`v2/tests/harness.rs`) writes the program of the seed, which without the bound overflows the stack. Of the first 600 programs of slice 1, 599 are what they were; seed 511, whose expressions had nested deeper while they were written, gives another program |
 | RG5 | Closed 23 November 2026. An operand is written over the names as the operands before it left them (`Generator::arguments`, the initial values of `make_loop`, the arguments of `↑`). `generated_programs_with_data_run_to_an_end_and_reach_the_data_constructs` (`v2/tests/harness.rs`), whose 160 seeds have no stuck run, holds it with the campaigns of section 3 |
-| RG6 | Closed 23 November 2026. The resources of an entry are numbered from 1,000,000 (`ENTRY_RESOURCES`, `v2/src/generate.rs`). The same test holds it: among its 160 programs are controls that take a resource and call an operation that opens one |
+| RG6 | Closed 23 November 2026. The resources of an entry are numbered from 1,000,000 (`ENTRY_RESOURCES`, `v2/src/generate.rs`). The same test holds it: among its 240 programs are controls that take a resource and call an operation that opens one |
 | RG7 | Open. See section 4 |
 | RS2 | Closed 23 November 2026. The renaming of [U9] reaches the name of a capture, the names of an unpacking, the root and the indexes of an assigned place, the parameters of an inner loop, the set of `await next`, and what a boundary captures. `u9_renames_inner_binders_and_the_places_that_use_them` (`v2/tests/surface.rs`) runs the three files of `v2/tests/loop_names/` in both semantics and refuses a free name that is spelled like a renamed one |
 | RS4 | Closed 23 November 2026. The formatter prints from a tree that holds no comment at the end of a line, so it now notes the source line of each thing it prints and puts the comments of the source back between those lines (`FormatLines` in `surface.rs`); a comment between the two bodies of a named boundary in the plain form goes to the end of the first, since [Y12] makes the bodies touch. `g10_keeps_comments_in_order_through_layout_changes` (the 24 comments of `v2/tests/format/comments.rails` and the 9 of `plain_comments.rails`, which changes from braces to rails), `g10_keeps_comments_on_folded_lines_and_delimiters`, `g10_keeps_plain_boundary_comments_next_to_the_work_body`, and `g10_keeps_a_comment_in_every_position`, which puts a comment after every line and before every line of every Rails file of the suite, one at a time, and requires that the text is refused or every comment is kept in order by a formatter that is the identity on its output |

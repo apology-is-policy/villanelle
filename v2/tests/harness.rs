@@ -60,35 +60,20 @@ fn generated_valid_programs_run_to_an_end_and_reach_every_construct() {
     assert!(report.runs >= 2_000, "runs = {}", report.runs);
 }
 
-/// The constructs of slice 2 that the generator does not write yet: faults
-/// and boundaries (`docs/v2/review.md`, section 3).
-const DATA_NOT_WRITTEN: [&str; 11] = [
-    "named-boundary",
-    "retains",
-    "faults",
-    "boundary",
-    "boundary-care",
-    "supervise",
-    "fault",
-    "escalate",
-    "recover",
-    "terminate-status",
-    "terminate",
-];
-
 /// The generator with the data of slice 2
 /// ([`villanelle_v2::generate::valid_data`]): as for slice 1, what it writes
 /// reads back, resolves, runs to an end and gives the same observation under
-/// the erased semantics. It reaches every construct of slice 1 and the
-/// constructs of slice 2 that are data, operations on data, resources and
-/// captured outcomes.
+/// the erased semantics. An end is an outcome, a fault that leaves the entry
+/// or `terminate n`, and each of the three occurs. It reaches every
+/// construct of slice 1 and every construct of slice 2: data, operations on
+/// data, resources, captured outcomes, faults and boundaries.
 #[test]
 fn generated_programs_with_data_run_to_an_end_and_reach_the_data_constructs() {
     let options = fuzz::Options {
         slice: 2,
         ..fuzz::Options::default()
     };
-    let report = fuzz::campaign_without_checker(1, 160, &options);
+    let report = fuzz::campaign_without_checker(1, 240, &options);
     let failures: Vec<String> = report
         .findings
         .iter()
@@ -100,8 +85,18 @@ fn generated_programs_with_data_run_to_an_end_and_reach_the_data_constructs() {
         "constructs not reached: {:?}",
         report.coverage.missing()
     );
-    assert_eq!(report.coverage.missing_data(), DATA_NOT_WRITTEN);
+    assert!(
+        report.coverage.missing_data().is_empty(),
+        "constructs of slice 2 not reached: {:?}",
+        report.coverage.missing_data()
+    );
     assert!(report.runs >= 4_000, "runs = {}", report.runs);
+    assert!(report.faulted >= 100, "faulted = {}", report.faulted);
+    assert!(
+        report.terminated >= 20,
+        "terminated = {}",
+        report.terminated
+    );
     assert_eq!(
         fuzz::program_in(7, 2).print(),
         fuzz::program_in(7, 2).print()
@@ -111,7 +106,7 @@ fn generated_programs_with_data_run_to_an_end_and_reach_the_data_constructs() {
 
 /// The seeds, of the first 30, whose programs the checker does not answer
 /// in a time that a test can wait for (`docs/v2/review.md`, RC22).
-const NO_ANSWER: [u64; 2] = [11, 23];
+const NO_ANSWER: [u64; 0] = [];
 
 /// The checker accepts the programs with data that the generator calls
 /// valid, the ones of [`NO_ANSWER`] apart. `vn2 fuzz --slice 2` tries more

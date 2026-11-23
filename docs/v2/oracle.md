@@ -374,14 +374,14 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   index in range; preconditions on the length of a vector; and `&τ` and
   `&~τ` parameters of extern controls. A program of slice 1 is unchanged by
   this: the generator draws nothing more for it, and the programs of 600
-  seeds were compared text for text. It does not write faults or
-  boundaries yet. `generate::DATA_CONSTRUCTS` lists the 52 constructs of
-  the slice, and a campaign names those it did not reach.
-  `v2/tests/harness.rs` runs 160 seeds in the two semantics and asks the
-  checker about 28; over 900 seeds `vn2 fuzz --slice 2` gives
-  37,340 runs with no stuck run and no difference, and the
-  checker accepts 897 programs and does not answer on
-  three in ten seconds (review finding RC22).
+  seeds were compared text for text. `generate::DATA_CONSTRUCTS` lists the
+  52 constructs of the slice, and a campaign names those it did not reach.
+  `v2/tests/harness.rs` runs 240 seeds in the two semantics and asks the
+  checker about 30; over 900 seeds `vn2 fuzz --slice 2` gives
+  35,984 runs with no stuck run and no difference, of which 3,526 end in a
+  fault and 977 with `terminate n`, and the
+  checker accepts 899 programs and does not answer on
+  one in ten seconds (review finding RC22).
 - **Obligations in generated programs.** A program with data declares up to
   two resources, and for each a contingent extern control that takes a
   value of it and ends it. A value of kind `must` ([T1]) is a resource, a
@@ -412,6 +412,50 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   names of which nothing is known once the outcome has passed through a
   loop. No value of an outcome type crosses a contract (review finding
   RG7).
+- **Faults and boundaries in generated programs
+  (`v2/src/generate/valid/faults.rs`).** A control of a program with data
+  may say `faults`, may be `contingent`, and may be an entry control, which
+  nothing invokes. A statement that may fault ([F1]) is `fault e`, a
+  decision or a capture on an operation that says `faults`, or `supervise`
+  of a boundary whose contingency lets a fault out. It is written where a
+  fault is permitted, and before it the histories that run it give up what
+  may not be held there: every obligation that is not fault-releasable
+  ([F2], [T3]), and what the end of the contingency asks of the bodies
+  around the boundary. A statement that goes on consumes only names of the
+  loop body it is in ([O6]) and is not written where another name would have
+  to go; `fault e` ends its histories and may consume any name that the
+  fault and the contingency end. The operands of such a statement read no
+  name that holds an obligation and lend none.
+  A lexical boundary is written with the end of its contingency chosen
+  first: none (no statement of the work may fault, and the contingency is
+  `⊥`), `escalate` or a new `fault` (where a fault is permitted around the
+  boundary), `terminate n` (in an entry control), or `recover ↑ ℓ` for the
+  loop whose body the boundary stands in. For `recover` the counter of the
+  loop is declared `~` and an assignment moves it just before the boundary,
+  so that a fault that comes again does not come for ever; the parameters of
+  the loop are available and within the invariant there, none holds what a
+  fault does not release, and the work does not see them ([F5](c)). The work
+  is a body that sees the names around it and may consume them; it may end
+  with the terminators of the bodies around it, with `fault`, or by falling
+  off its end, before which it ends its own obligations and makes those of
+  the bodies around it even. After the boundary a name that the work may
+  have assigned is known by what the histories that fell off know of it.
+  The boundary takes names into its care: values that may be dropped, and an
+  obligation only where every history of the work ends in a fault
+  ([E-Boundary], [O5]). The contingency is written as a body that nothing
+  encloses, with the names in care as they were at the boundary and the
+  message; it calls contingent operations and built-in ones, and each of its
+  histories ends as chosen, after what [O5] or [F2] asks of its names.
+  A named boundary takes owned parameters, retains some of them, and is
+  written as a control that permits faults and ends with `terminate`; a
+  retained name is consumed nowhere before that ([F6]). Its contingency
+  sees the retained names and the message and ends with `terminate`, or
+  with `escalate` or a new `fault` when it is drawn to let faults out, which
+  makes `supervise` a statement that may fault. A campaign counts the runs
+  that end in a fault that leaves the entry and with `terminate n`: both
+  are ends, compared with the erased semantics as an outcome is. Not
+  written: a boundary in the work of another, and `recover ↑ ℓ` of a loop
+  further out.
 - **Fuzzing (`fuzz`, `vn2 fuzz`).** `vn2 fuzz --seed N --count N` takes the
   program of each seed through the reader, the oracle and the erased
   semantics on entries that satisfy its precondition, and asks the checker.
@@ -865,7 +909,20 @@ and Rails surface reader, elaborator, and formatter (`surface.rs`):
   availability formulas `avail_at[body][pc][var] = D(var) ∧ ¬M(var)` as
   history-bit selectors during planning (`plan()`) with zero runtime moved
   flags, and releases `on fault release` resources during fault unwinding using
-  those selectors alone. Differential tests verify exact outcome and trace
+  those selectors alone. Since 23 November 2026 (review finding RO5) the
+  formulas of a body take what the bodies inside it do to its names: after a
+  boundary a name is as the work left it at its end, and after a loop as the
+  `□` that ended the loop left it. For the second the interpreter keeps one
+  more bit of the history for each `□` of a loop that leaves some name
+  otherwise than the loop found it; [O6](b) makes the `□` of one alternative
+  agree, so in a checked program such a bit says no more than the atom of
+  the alternative, and the interpreter is spared deciding which of the three
+  answers of [O6](b) holds. A fault releases by the formulas of the
+  statement at which it occurred, for every body of the activation; a
+  contingency keeps the place of the statement of the work that faulted,
+  and the names around its boundary are released by the formulas of that
+  statement when the contingency lets the fault out ([F5]). The backend
+  lays a body out without any of this (RB1). Differential tests verify exact outcome and trace
   agreement (including `conn.release(...)` events and `faulted "..."` ends)
   between `oracle` and `erased`.
 - **Rails surface & formatter (`surface.rs`).** Adds layout (`[Y12]`),

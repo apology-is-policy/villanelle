@@ -27,6 +27,7 @@
 //! the histories hold a name, the statement stands under a selector that
 //! picks those.
 
+use super::faults::Route;
 use super::{
     AltSig, Arm, BTreeSet, BorrowMode, CallMode, Command, Control, Declaration, Env, Expr,
     Generator, IntType, Know, POS, ParamInfo, Path, Range, Selector, Sig, SiteInfo, Slot, Tri,
@@ -66,6 +67,8 @@ pub(super) struct ResourceInfo {
     /// The contingent operation that takes a value of the resource and
     /// ends it.
     pub(super) closer: String,
+    /// Whether it is declared `on fault release` ([T3]).
+    pub(super) releasable: bool,
 }
 
 /// The types that the program declares.
@@ -266,6 +269,21 @@ fn parameter(name: &str, ty: &Type) -> Parameter {
     }
 }
 
+/// Which obligations a statement asks to be discharged before it.
+#[derive(Clone)]
+pub(super) enum Due {
+    /// Those of the bodies from the index inward ([O5]).
+    From(usize),
+    /// Those that some of the histories hold and others do not.
+    Uneven,
+    /// Those that may not be held where a fault can occur ([F2], and what
+    /// the end of the contingency asks of the bodies around the boundary).
+    Fault(Route),
+    /// In a contingency, before `escalate` or a new `fault`: those that are
+    /// not fault-releasable.
+    Escape,
+}
+
 fn arm(alternative: &str, names: &[&String]) -> Arm {
     Arm {
         alternative: alternative.to_string(),
@@ -325,9 +343,46 @@ impl Generator<'_> {
             .unwrap_or(0)
     }
 
-    /// Whether the value of the name may be consumed here.
-    fn consumable(&self, slot: &Slot) -> bool {
-        !slot.gone && (self.types.kind(&slot.ty) == Kind::Copy || slot.home >= self.floor())
+    /// Whether the value of the name may be consumed here. A name that a
+    /// named boundary retains stays whole while a statement of its work may
+    /// still fault ([F6]).
+    pub(super) fn consumable(&self, name: &str, slot: &Slot) -> bool {
+        !slot.gone
+            && (self.types.kind(&slot.ty) == Kind::Copy
+                || slot.home >= self.floor() && !self.retained.contains(name))
+    }
+
+    /// Whether the type is fault-releasable ([T3]).
+    pub(super) fn releasable(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Vector(item) => self.releasable(item),
+            Type::Map(key, value) => self.releasable(key) && self.releasable(value),
+            Type::Named(named) => {
+                if let Some(info) = self.types.resource(named) {
+                    info.releasable
+                } else if let Some(info) = self.types.structure(named) {
+                    info.fields.iter().all(|(_, ty)| self.releasable(ty))
+                } else if let Some(info) = self.types.variant(named) {
+                    info.constructors
+                        .iter()
+                        .flat_map(|(_, fields)| fields)
+                        .all(|(_, ty)| self.releasable(ty))
+                } else {
+                    false
+                }
+            }
+            Type::OutcomeNamed(captured) => self
+                .callables
+                .iter()
+                .find(|sig| &sig.name == captured)
+                .is_some_and(|sig| {
+                    sig.alts
+                        .iter()
+                        .flat_map(|alternative| &alternative.fields)
+                        .all(|field| self.releasable(&field.ty))
+                }),
+            _ => true,
+        }
     }
 
     fn bind_name(&mut self, running: &[usize], bound: &str, slot: &Slot) {
@@ -398,7 +453,7 @@ impl Generator<'_> {
             .iter()
             .filter(|(name, slot)| {
                 self.types.kind(&slot.ty) == Kind::Must
-                    && self.consumable(slot)
+                    && self.consumable(name, slot)
                     && !ctx.lent.contains(*name)
             })
             .map(|(_, slot)| slot.ty.clone())
@@ -473,9 +528,10 @@ impl Generator<'_> {
         let mut out = Vec::new();
         for index in 0..self.rng.index(3) {
             let name = format!("rs{index}");
+            let releasable = self.rng.chance(1, 2);
             out.push(Declaration::Resource(ResourceDecl {
                 name: name.clone(),
-                on_fault_release: self.rng.chance(1, 2),
+                on_fault_release: releasable,
                 line: 1,
             }));
             let sig = Sig {
@@ -489,6 +545,8 @@ impl Generator<'_> {
                     params: vec![None],
                 }],
                 uses: Vec::new(),
+                faults: false,
+                contingent: true,
             };
             let (parameters, precondition, contract) = self.signature(&sig);
             out.push(Declaration::Control(Control {
@@ -508,6 +566,7 @@ impl Generator<'_> {
             self.types.resources.push(ResourceInfo {
                 name,
                 closer: sig.name.clone(),
+                releasable,
             });
             self.callables.push(sig);
         }
@@ -690,7 +749,7 @@ impl Generator<'_> {
         ctx.env
             .iter()
             .filter(|(name, slot)| {
-                &slot.ty == ty && self.consumable(slot) && !ctx.lent.contains(*name)
+                &slot.ty == ty && self.consumable(name, slot) && !ctx.lent.contains(*name)
             })
             .map(|(name, _)| name.clone())
             .collect()
@@ -822,6 +881,9 @@ impl Generator<'_> {
         };
         match ty {
             Type::Ref(BorrowMode::Exclusive, inner) => {
+                if self.ending && self.types.kind(inner) == Kind::Must {
+                    return None;
+                }
                 let names: Vec<String> = ctx
                     .env
                     .iter()
@@ -847,6 +909,9 @@ impl Generator<'_> {
                 // An obligation is lent by the name that holds it, and is
                 // no temporary ([O3a]).
                 let must = self.types.kind(inner) == Kind::Must;
+                if self.ending && must {
+                    return None;
+                }
                 let names: Vec<String> = ctx
                     .env
                     .iter()
@@ -930,9 +995,9 @@ impl Generator<'_> {
         let candidates: Vec<String> = ctx
             .env
             .iter()
-            .filter(|(_, slot)| {
+            .filter(|(name, slot)| {
                 matches!(&slot.ty, Type::Named(ty) if self.types.structure(ty).is_some())
-                    && self.consumable(slot)
+                    && self.consumable(name, slot)
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -1166,9 +1231,9 @@ impl Generator<'_> {
         let candidates: Vec<String> = ctx
             .env
             .iter()
-            .filter(|(_, slot)| {
+            .filter(|(name, slot)| {
                 matches!(&slot.ty, Type::Named(ty) if self.types.variant(ty).is_some())
-                    && self.consumable(slot)
+                    && self.consumable(name, slot)
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -1314,7 +1379,9 @@ impl Generator<'_> {
         let candidates: Vec<String> = ctx
             .env
             .iter()
-            .filter(|(_, slot)| matches!(slot.ty, Type::Vector(_)) && self.consumable(slot))
+            .filter(|(name, slot)| {
+                matches!(slot.ty, Type::Vector(_)) && self.consumable(name, slot)
+            })
             .map(|(name, _)| name.clone())
             .collect();
         if candidates.is_empty() {
@@ -1610,14 +1677,13 @@ impl Generator<'_> {
         // An `&~` argument has two terms in the record of a capture; the
         // generator keeps one interval for each argument.
         let callables: Vec<Sig> = self
-            .callables
-            .iter()
+            .callees()
+            .into_iter()
             .filter(|sig| {
                 sig.params
                     .iter()
                     .all(|(_, ty)| !matches!(ty, Type::Ref(BorrowMode::Exclusive, _)))
             })
-            .cloned()
             .collect();
         if callables.is_empty() {
             return false;
@@ -1626,6 +1692,18 @@ impl Generator<'_> {
         let mut ctx = self.ctx(running);
         let Some(arguments) = self.arguments(&mut ctx, &callee) else {
             return false;
+        };
+        // The operation runs here, so a fault of it occurs here ([F1]).
+        let exposed;
+        let running = if callee.faults {
+            if !self.expose(selector, running, &ctx, false) {
+                return false;
+            }
+            exposed = self.running(selector);
+            &exposed[..]
+        } else {
+            self.apply(running, &ctx);
+            running
         };
         let recorded: Vec<Vec<Range>> = running
             .iter()
@@ -1645,7 +1723,6 @@ impl Generator<'_> {
                     .collect()
             })
             .collect();
-        self.apply(running, &ctx);
         let bound = self.fresh("v");
         let mutable = self.rng.chance(1, 4);
         let ty = Type::OutcomeNamed(callee.name.clone());
@@ -1677,7 +1754,9 @@ impl Generator<'_> {
         let env = self.running_env(running);
         let candidates: Vec<String> = env
             .iter()
-            .filter(|(_, slot)| matches!(slot.ty, Type::OutcomeNamed(_)) && self.consumable(slot))
+            .filter(|(name, slot)| {
+                matches!(slot.ty, Type::OutcomeNamed(_)) && self.consumable(name, slot)
+            })
             .map(|(name, _)| name.clone())
             .collect();
         if candidates.is_empty() {
@@ -1783,10 +1862,23 @@ impl Generator<'_> {
         self.split(selector, running, &site, &["done"], outcomes);
     }
 
-    /// An obligation that a history of `running` holds in a body from
-    /// `floor` inward, and the histories that hold it. With `uneven`, only
-    /// one that some of the histories hold and others do not.
-    fn owed(&self, running: &[usize], floor: usize, uneven: bool) -> Option<(String, Vec<usize>)> {
+    /// Whether the statement asks that the name be gone.
+    fn due(&self, due: &Due, name: &str, slot: &Slot) -> bool {
+        if slot.gone || self.types.kind(&slot.ty) != Kind::Must {
+            return false;
+        }
+        match due {
+            Due::From(floor) => slot.home >= *floor,
+            Due::Uneven => true,
+            Due::Fault(route) => self.must_go(route, name, slot),
+            Due::Escape => !self.releasable(&slot.ty),
+        }
+    }
+
+    /// An obligation that a history of `running` holds and that `due` asks
+    /// for, and the histories that hold it.
+    fn owed(&self, running: &[usize], due: &Due) -> Option<(String, Vec<usize>)> {
+        let uneven = matches!(due, Due::Uneven);
         let scope = self.scope();
         let holds = |index: usize, name: &str| {
             scope.live[index]
@@ -1796,7 +1888,7 @@ impl Generator<'_> {
         };
         for &index in running {
             for (name, slot) in &scope.live[index].env {
-                if slot.gone || slot.home < floor || self.types.kind(&slot.ty) != Kind::Must {
+                if !self.due(due, name, slot) {
                     continue;
                 }
                 let holders: Vec<usize> = running
@@ -1856,10 +1948,10 @@ impl Generator<'_> {
         (under, picked)
     }
 
-    fn discharge(&mut self, selector: &Selector, floor: usize, uneven: bool) {
+    pub(super) fn discharge(&mut self, selector: &Selector, due: &Due) {
         loop {
             let running = self.running(selector);
-            let Some((owed, holders)) = self.owed(&running, floor, uneven) else {
+            let Some((owed, holders)) = self.owed(&running, due) else {
                 return;
             };
             let (under, picked) = self.selector_of(selector, &running, &holders);
@@ -1882,12 +1974,12 @@ impl Generator<'_> {
     /// statements that discharge them stand before the terminator, and the
     /// histories of `selector` are other ones afterwards.
     pub(super) fn settle(&mut self, selector: &Selector, floor: usize) {
-        self.discharge(selector, floor, false);
+        self.discharge(selector, &Due::From(floor));
     }
 
     /// Before a loop: every obligation is held by all the histories of
     /// `selector` or by none of them.
     pub(super) fn level(&mut self, selector: &Selector) {
-        self.discharge(selector, 0, true);
+        self.discharge(selector, &Due::Uneven);
     }
 }

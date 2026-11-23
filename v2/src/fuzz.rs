@@ -86,6 +86,10 @@ pub struct Finding {
 pub struct Report {
     pub programs: u64,
     pub runs: u64,
+    /// The runs that ended in a fault that left the entry, and those that
+    /// ended with `terminate n`.
+    pub faulted: u64,
+    pub terminated: u64,
     pub accepted: u64,
     /// Runs of compiled programs that ended as the oracle's did.
     pub native_runs: u64,
@@ -302,6 +306,19 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
                             continue;
                         }
                     },
+                    // A fault that leaves the entry and `terminate n` end a
+                    // run as an outcome does ([E-Root], [E-Contingency]).
+                    End::Faulted(_) | End::Terminated(_) => {
+                        if matches!(outcome.oracle.end, End::Faulted(_)) {
+                            report.faulted += 1;
+                        } else {
+                            report.terminated += 1;
+                        }
+                        if let Verdict::Differ(difference) = &outcome.verdict {
+                            find(report, "erased", format!("{run}: {difference}"), &printed);
+                        }
+                        continue;
+                    }
                     End::Stuck(_) => "stuck",
                     End::OutOfFuel => "fuel",
                     _ => "host",
@@ -494,6 +511,12 @@ impl Report {
             "{} programs, {} runs, {} accepted by the checker\n",
             self.programs, self.runs, self.accepted
         );
+        if self.faulted + self.terminated > 0 {
+            out.push_str(&format!(
+                "{} of the runs end in a fault and {} with `terminate n`\n",
+                self.faulted, self.terminated
+            ));
+        }
         if self.native_runs > 0 {
             out.push_str(&format!(
                 "{} runs of compiled programs end as the oracle's do\n",

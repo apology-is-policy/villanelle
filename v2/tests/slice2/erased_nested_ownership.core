@@ -1,0 +1,170 @@
+// Slice 2 core conformance: the erased semantics under a fault ([R4], [R5]).
+// A resource declared `on fault release` is released exactly when its
+// availability formula holds on the current history, and the formula of a
+// name follows what the bodies inside its scope do to it: a loop leaves it
+// as the `□` that ended the loop left it ([O6](b)), the work of a boundary
+// as it was at its end ([E-Boundary]), and a fault in the work finds the
+// names around the boundary as they were at the statement that faulted
+// ([F5]). Every run is compared with the erased semantics.
+
+extern resource conn on fault release
+
+extern control open_conn()
+    ■ { opened {c : conn} }
+    uses net
+
+extern control close_conn(c : conn)
+    ■ { closed {} }
+    uses net
+
+contingent extern control note(n : u32)
+    ■ { done {} }
+    uses net
+
+// The loop consumes a name of the body around it and is left.
+control moved_in_loop()
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ lp : ↻ l() {
+           1  ⊤ ▷ cl : Δ close_conn(c) ▸ closed {}
+           2  ⊤ ▷ □ done {}
+       } ▸ done {}
+    3  ⊤ ▷ fault "after"
+
+// The name leaves the loop in the payload of `□`, under another name.
+control moved_by_leave_payload()
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ lp : ↻ l() {
+           1  ⊤ ▷ □ done {c}
+       } ▸ done {c2}
+    3  ⊤ ▷ fault "after"
+
+// One alternative of the loop leaves the name as it was and the other
+// consumes it: after the loop the alternative says which.
+control moved_on_one_alternative(n : u32)
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ lp : ↻ l() {
+           1  ⊤ ▷ t : ? n = 0
+           2  t.true ▷ □ kept {}
+           3  ⊤ ▷ cl : Δ close_conn(c) ▸ closed {}
+           4  ⊤ ▷ □ taken {}
+       } ▸ kept {} │ taken {}
+    3  ⊤ ▷ fault "after"
+
+// Two `□` of one alternative, and both consume the name, each in its way.
+control moved_at_both_leaves(n : u32)
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ lp : ↻ l() {
+           1  ⊤ ▷ t : ? n = 0
+           2  t.true ▷ cl : Δ close_conn(c) ▸ closed {}
+           3  t.true ▷ □ done {}
+           4  ⊤ ▷ c3 : conn := c
+           5  ⊤ ▷ cl2 : Δ close_conn(c3) ▸ closed {}
+           6  ⊤ ▷ □ done {}
+       } ▸ done {}
+    3  ⊤ ▷ fault "after"
+
+// The loop gives the name a value again: it is available after the loop.
+control assigned_in_loop()
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {first}
+    2  ⊤ ▷ ~c : conn := first
+    3  ⊤ ▷ cl : Δ close_conn(c) ▸ closed {}
+    4  ⊤ ▷ lp : ↻ l() {
+           1  ⊤ ▷ o2 : Δ open_conn() ▸ opened {second}
+           2  ⊤ ▷ c ← second
+           3  ⊤ ▷ □ done {}
+       } ▸ done {}
+    5  ⊤ ▷ fault "after"
+
+// The work of a boundary consumes a name of the body around it and falls
+// off its end.
+control moved_in_boundary()
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ cl : Δ close_conn(c) ▸ closed {}
+       } contingency (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ fault "after"
+
+// The work consumes one name and faults while the body around it holds
+// another: the contingency lets the fault out, and the one that is left is
+// released.
+control fault_after_move_in_work()
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ o2 : Δ open_conn() ▸ opened {kept}
+    3  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ cl : Δ close_conn(c) ▸ closed {}
+           2  ⊤ ▷ fault "in the work"
+       } contingency (m : string) {
+           1  ⊤ ▷ a : Δ note(1) ▸ done {}
+           2  ⊤ ▷ escalate
+       }
+    4  ⊤ ▷ ⊥
+
+// The work faults before it consumes the name, or after: the statement that
+// faulted says whether the body around it still has the name.
+control fault_before_or_after_move(n : u32)
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ t : ? n = 0
+           2  t.true ▷ fault "before"
+           3  ⊤ ▷ cl : Δ close_conn(c) ▸ closed {}
+           4  ⊤ ▷ fault "after"
+       } contingency (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ⊥
+
+// A loop inside the work consumes the name, and the work faults later.
+control fault_after_loop_in_work()
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ lp : ↻ l() {
+                  1  ⊤ ▷ cl : Δ close_conn(c) ▸ closed {}
+                  2  ⊤ ▷ □ done {}
+              } ▸ done {}
+           2  ⊤ ▷ fault "in the work"
+       } contingency (m : string) {
+           1  ⊤ ▷ fault "again"
+       }
+    3  ⊤ ▷ ⊥
+
+//! run moved_in_loop() with [open_conn -> opened {conn#1}; close_conn -> closed] => faulted "after" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run moved_by_leave_payload() with [open_conn -> opened {conn#1}] => faulted "after" trace [open_conn() -> opened {conn#1}; conn.release(conn#1) -> released]
+//! run moved_on_one_alternative(0) with [open_conn -> opened {conn#1}] => faulted "after" trace [open_conn() -> opened {conn#1}; conn.release(conn#1) -> released]
+//! run moved_on_one_alternative(1) with [open_conn -> opened {conn#1}; close_conn -> closed] => faulted "after" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run moved_at_both_leaves(0) with [open_conn -> opened {conn#1}; close_conn -> closed] => faulted "after" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run moved_at_both_leaves(1) with [open_conn -> opened {conn#1}; close_conn -> closed] => faulted "after" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run assigned_in_loop() with [open_conn -> opened {conn#1}; close_conn -> closed; open_conn -> opened {conn#2}] => faulted "after" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed; open_conn() -> opened {conn#2}; conn.release(conn#2) -> released]
+//! run moved_in_boundary() with [open_conn -> opened {conn#1}; close_conn -> closed] => faulted "after" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run fault_after_move_in_work() with [open_conn -> opened {conn#1}; open_conn -> opened {conn#2}; close_conn -> closed; note -> done] => faulted "in the work" trace [open_conn() -> opened {conn#1}; open_conn() -> opened {conn#2}; close_conn(conn#1) -> closed; note(1) -> done; conn.release(conn#2) -> released]
+//! run fault_before_or_after_move(0) with [open_conn -> opened {conn#1}] => faulted "before" trace [open_conn() -> opened {conn#1}; conn.release(conn#1) -> released]
+//! run fault_before_or_after_move(1) with [open_conn -> opened {conn#1}; close_conn -> closed] => faulted "after" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run fault_after_loop_in_work() with [open_conn -> opened {conn#1}; close_conn -> closed] => faulted "again" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]

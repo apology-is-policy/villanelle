@@ -42,8 +42,10 @@ use crate::typed::{BorrowMode, IntType, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod data;
+mod faults;
 
 use data::{Ctx, Kind, Types};
+use faults::{BoundarySig, Unit, Work};
 
 const ALTERNATIVES: [&str; 12] = [
     "done", "ok", "low", "high", "none", "some", "left", "right", "stop", "more", "hit", "miss",
@@ -297,6 +299,9 @@ struct Sig {
     order: Option<(usize, usize)>,
     alts: Vec<AltSig>,
     uses: Vec<String>,
+    /// Whether the signature says `faults` ([F1]) and `contingent` ([F5]).
+    faults: bool,
+    contingent: bool,
 }
 
 fn opposite(operator: Binary) -> Binary {
@@ -897,6 +902,8 @@ struct Scope {
     live: Vec<Path>,
     statements: Vec<Statement>,
     looping: Option<LoopInfo>,
+    /// For the work of a lexical boundary, how it and its contingency end.
+    work: Option<Work>,
     /// Atoms of the bodies around that hold on every history that runs this
     /// loop ([H4]).
     outer_atoms: Vec<(String, String)>,
@@ -919,6 +926,8 @@ enum Step {
     Loop,
     Terminate,
     Data,
+    Boundary,
+    Supervise,
 }
 
 struct Generator<'r> {
@@ -940,10 +949,25 @@ struct Generator<'r> {
     types: Types,
     /// How many calls of functions the expression being written is inside.
     calls: usize,
-    /// Whether the expressions of a terminator are being written. What the
-    /// scopes it ends still hold is discharged before it, so its
-    /// expressions read nothing of a name that holds an obligation.
+    /// Whether the expressions of a terminator are being written, or those
+    /// of a statement that may fault. What may not be held there is
+    /// discharged before it, so its expressions read nothing of a name that
+    /// holds an obligation.
     ending: bool,
+    /// What the bodies being written are the bodies of.
+    unit: Unit,
+    /// Whether what is being written permits faults ([F1]), and whether it
+    /// is an entry control, which no operation names ([F5](e)).
+    faults: bool,
+    entry: bool,
+    /// The named boundaries declared so far.
+    boundaries: Vec<BoundarySig>,
+    /// The names that the named boundary being written retains ([F6]).
+    retained: BTreeSet<String>,
+    /// Whether a statement was written from which a fault leaves what is
+    /// being written, and whether a contingency lets one out.
+    faulted: bool,
+    escaped: bool,
 }
 
 fn conjunction(parts: Vec<Expr>) -> Option<Expr> {
@@ -1649,7 +1673,12 @@ impl Generator<'_> {
             last = Some(selector.clone());
             self.step(&selector, &running);
         }
-        // [K7]: no history is left running.
+        // [K7]: no history is left running. The work of a boundary is the
+        // one body that may fall off its end ([E-Boundary]).
+        if let Some(ends) = self.scope().work.as_ref().map(|work| work.ends) {
+            self.close_work(ends);
+            return;
+        }
         let mut rounds = 0;
         while !self.scope().live.is_empty() {
             rounds += 1;
@@ -1671,7 +1700,12 @@ impl Generator<'_> {
         let mut choices = vec![(5u64, Step::Bind), (3, Step::Assign), (2, Step::Oblige)];
         if room {
             choices.push((4, Step::Test));
-            if !self.callables.is_empty() {
+            let callable = if self.data {
+                !self.callees().is_empty()
+            } else {
+                !self.callables.is_empty()
+            };
+            if callable {
                 choices.push((4, Step::Decide));
             }
             if self.scopes.len() < MAX_BODIES && self.loops < MAX_LOOPS {
@@ -1683,6 +1717,12 @@ impl Generator<'_> {
         }
         if self.data {
             choices.push((9, Step::Data));
+            if room && self.boundary_fits() {
+                choices.push((2, Step::Boundary));
+            }
+            if !self.boundaries.is_empty() {
+                choices.push((2, Step::Supervise));
+            }
         }
         let total: u64 = choices.iter().map(|(weight, _)| weight).sum();
         let mut drawn = self.rng.below(total);
@@ -1719,6 +1759,8 @@ impl Generator<'_> {
                 true
             }
             Step::Data => self.data_step(selector, running, room),
+            Step::Boundary => self.make_boundary(selector),
+            Step::Supervise => self.supervise(selector, running),
         };
         if !done {
             self.bind(selector, running);
@@ -1803,11 +1845,21 @@ impl Generator<'_> {
         }
     }
 
+    /// The counters of the loops around.
+    fn counters(&self) -> BTreeSet<String> {
+        self.scopes
+            .iter()
+            .filter_map(|scope| scope.looping.as_ref())
+            .map(|info| info.counter.clone())
+            .collect()
+    }
+
     fn assign(&mut self, selector: &Selector, running: &[usize]) -> bool {
         let env = self.running_env(running);
+        let counters = self.counters();
         let candidates: Vec<String> = env
             .iter()
-            .filter(|(_, slot)| slot.mutable && slot.ty.is_scalar())
+            .filter(|(name, slot)| slot.mutable && slot.ty.is_scalar() && !counters.contains(*name))
             .map(|(name, _)| name.clone())
             .collect();
         if candidates.is_empty() {
@@ -1983,8 +2035,18 @@ impl Generator<'_> {
     }
 
     /// The operands of a decision or of a capture on `callee`, or `None`
-    /// where one of them cannot be written here.
+    /// where one of them cannot be written here. Where the operation may
+    /// fault, what the histories may not hold there is discharged before
+    /// the statement ([F2]), so its operands read no name that holds an
+    /// obligation.
     fn arguments(&mut self, ctx: &mut Ctx, callee: &Sig) -> Option<Vec<Expr>> {
+        self.ending = callee.faults;
+        let arguments = self.operands(ctx, callee);
+        self.ending = false;
+        arguments
+    }
+
+    fn operands(&mut self, ctx: &mut Ctx, callee: &Sig) -> Option<Vec<Expr>> {
         let mut arguments: Vec<Expr> = Vec::new();
         for (position, (_, ty)) in callee.params.iter().enumerate() {
             // An operand sees the names as the operands before it left
@@ -2021,11 +2083,30 @@ impl Generator<'_> {
 
     fn decide(&mut self, selector: &Selector, running: &[usize]) -> bool {
         let mut ctx = self.ctx(running);
-        let callee = self.rng.pick(&self.callables).clone();
+        let callee = if self.data {
+            let callees = self.callees();
+            if callees.is_empty() {
+                return false;
+            }
+            self.rng.pick(&callees).clone()
+        } else {
+            self.rng.pick(&self.callables).clone()
+        };
         let Some(arguments) = self.arguments(&mut ctx, &callee) else {
             return false;
         };
-        self.apply(running, &ctx);
+        // A fault of the operation occurs at the decision ([F1]).
+        let exposed;
+        let running = if callee.faults {
+            if !self.expose(selector, running, &ctx, false) {
+                return false;
+            }
+            exposed = self.running(selector);
+            &exposed[..]
+        } else {
+            self.apply(running, &ctx);
+            running
+        };
         let site = self.fresh("d");
         let arms: Vec<Arm> = callee
             .alts
@@ -2071,8 +2152,11 @@ impl Generator<'_> {
         let bound = self.rng.range(1, 4);
         let up = self.rng.chance(3, 4);
         let counter_invariant = self.rng.chance(1, 2).then(|| Range::new(0, bound));
+        // `recover ↑ ℓ` goes round with the counter as it is, so a body
+        // with such a boundary moves it by an assignment.
+        let turning = self.data && self.rng.chance(1, 2);
         let mut parameters = vec![LoopParameter {
-            mutable: false,
+            mutable: turning,
             name: counter.clone(),
             ty: Type::Int(counter_ty),
             initial: int(if up { 0 } else { bound }),
@@ -2148,7 +2232,11 @@ impl Generator<'_> {
             env.clone()
         };
         let mut assignable = BTreeSet::new();
+        let counters = self.counters();
         for (outer, slot) in inner.iter_mut() {
+            if slot.mutable && counters.contains(outer) {
+                slot.mutable = false;
+            }
             if slot.mutable {
                 if self.rng.chance(1, 2) {
                     slot.know = self.types.top(&slot.ty);
@@ -2235,6 +2323,7 @@ impl Generator<'_> {
                 leaves,
                 assignable,
             }),
+            work: None,
             outer_atoms,
         });
 
@@ -2361,28 +2450,41 @@ impl Generator<'_> {
     }
 
     fn terminate(&mut self, selector: &Selector, running: &[usize]) {
-        if self.scope().looping.is_none() {
-            self.exit(selector, running);
+        if self.data
+            && self.route().is_some()
+            && self.rng.chance(1, 6)
+            && self.fault(selector, running)
+        {
             return;
         }
-        let innermost = self.scopes.len() - 1;
-        let outer: Vec<usize> = (0..innermost)
+        // The loops that a terminator here may end or go round: all of
+        // those around, or those inside a work that no terminator leaves.
+        let reach = if self.data { self.reach() } else { 0 };
+        let loops: Vec<usize> = (reach..self.scopes.len())
             .filter(|&index| self.scopes[index].looping.is_some())
             .collect();
+        let Some((&innermost, outer)) = loops.split_last() else {
+            if reach == 0 {
+                self.finish(selector, running);
+            } else {
+                self.fault(selector, running);
+            }
+            return;
+        };
         let done = match self.rng.below(10) {
             0..=4 => self.again(selector, running, innermost),
             5 if !outer.is_empty() => {
-                let target = *self.rng.pick(&outer);
+                let target = *self.rng.pick(outer);
                 self.again(selector, running, target)
             }
-            6 => {
-                self.exit(selector, running);
+            6 if reach == 0 => {
+                self.finish(selector, running);
                 true
             }
             _ => false,
         };
         if !done {
-            self.leave(selector, running);
+            self.leave(selector, running, innermost);
         }
     }
 
@@ -2474,9 +2576,14 @@ impl Generator<'_> {
         self.end(selector, running, &ctx, 0, command);
     }
 
-    fn leave(&mut self, selector: &Selector, running: &[usize]) {
+    /// `□` for the loop whose body is the scope `target`, the innermost
+    /// one around.
+    fn leave(&mut self, selector: &Selector, running: &[usize], target: usize) {
         let env = self.running_env(running);
-        let info = self.scope().looping.clone().expect("a loop to leave");
+        let info = self.scopes[target]
+            .looping
+            .clone()
+            .expect("a loop to leave");
         let payloads: Vec<Vec<Type>> = info
             .planned
             .iter()
@@ -2528,7 +2635,7 @@ impl Generator<'_> {
             .iter()
             .filter_map(|outer| Some((outer.clone(), env.get(outer)?.know.clone())))
             .collect();
-        if let Some(looping) = &mut self.scope_mut().looping {
+        if let Some(looping) = &mut self.scopes[target].looping {
             looping.leaves[which].push(LeaveRecord {
                 payload: knows,
                 assigned,
@@ -2538,8 +2645,7 @@ impl Generator<'_> {
             alternative,
             payload,
         };
-        let floor = self.floor();
-        self.end(selector, running, &ctx, floor, command);
+        self.end(selector, running, &ctx, target, command);
     }
 
     /// `↑ ℓ` for the loop whose body is the scope `target`. It needs room
@@ -2890,6 +2996,11 @@ impl Generator<'_> {
         } else {
             Vec::new()
         };
+        // A contingency calls what is declared `contingent` ([F5]). No
+        // host faults, so `faults` on an extern control asks of its callers
+        // what [F2] asks and nothing happens.
+        let contingent = self.data && self.rng.chance(1, 3);
+        let faults = self.data && !contingent && self.rng.chance(1, 6);
         let sig = Sig {
             name: format!("e{index}"),
             params,
@@ -2897,6 +3008,8 @@ impl Generator<'_> {
             order: None,
             alts,
             uses,
+            faults,
+            contingent,
         };
         let (parameters, precondition, contract) = self.signature(&sig);
         let control = Control {
@@ -2904,8 +3017,8 @@ impl Generator<'_> {
             public: false,
             external: true,
             is_async: false,
-            contingent: false,
-            faults: false,
+            contingent,
+            faults,
             parameters,
             precondition,
             contract,
@@ -2921,6 +3034,14 @@ impl Generator<'_> {
         self.fresh = 0;
         self.loops = 0;
         self.effects.clear();
+        // An entry control may end the execution with `terminate n`, and
+        // nothing invokes it ([F5](e)).
+        let faults = self.data && self.rng.chance(1, 3);
+        let contingent = self.data && !faults && self.rng.chance(1, 4);
+        let entry = self.data && self.rng.chance(1, 5);
+        self.unit = Unit::Control;
+        self.faults = faults;
+        self.entry = entry;
         let count = self.rng.index(5);
         let (params, pre) = self.parameters_and_precondition("p", count, 2, true);
         let order = self.order(&params, &pre);
@@ -2986,6 +3107,7 @@ impl Generator<'_> {
             }],
             statements: Vec::new(),
             looping: None,
+            work: None,
             outer_atoms: Vec::new(),
         });
         let budget = 3 + self.rng.index(10);
@@ -3056,6 +3178,8 @@ impl Generator<'_> {
             order,
             alts,
             uses,
+            faults,
+            contingent,
         };
         let (parameters, precondition, contract) = self.signature(&sig);
         let control = Control {
@@ -3063,8 +3187,8 @@ impl Generator<'_> {
             public: self.rng.chance(1, 3),
             external: false,
             is_async: false,
-            contingent: false,
-            faults: false,
+            contingent,
+            faults,
             parameters,
             precondition,
             contract,
@@ -3072,7 +3196,9 @@ impl Generator<'_> {
             body: body.statements,
             line: 1,
         };
-        self.callables.push(sig);
+        if !entry {
+            self.callables.push(sig);
+        }
         control
     }
 
@@ -3109,6 +3235,13 @@ pub fn valid(rng: &mut Rng) -> Program {
         types: Types::default(),
         calls: 0,
         ending: false,
+        unit: Unit::Control,
+        faults: false,
+        entry: false,
+        boundaries: Vec::new(),
+        retained: BTreeSet::new(),
+        faulted: false,
+        escaped: false,
     };
     let mut declarations = Vec::new();
     for index in 0..generator.rng.index(3) {
@@ -3124,8 +3257,10 @@ pub fn valid(rng: &mut Rng) -> Program {
 }
 
 /// As [`valid`], with the data of slice 2: structs, variants, vectors, maps
-/// and strings, moved, taken apart and changed in place, and the built-in
-/// operations on them.
+/// and strings, moved, taken apart and changed in place, the built-in
+/// operations on them, resources and captured outcomes, and faults with
+/// their lexical and named boundaries. A run of such a program ends with an
+/// outcome, with a fault that leaves the entry, or with `terminate n`.
 pub fn valid_data(rng: &mut Rng) -> Program {
     let palette = (0..3).map(|_| *rng.pick(&IntType::ALL)).collect();
     let mut generator = Generator {
@@ -3144,6 +3279,13 @@ pub fn valid_data(rng: &mut Rng) -> Program {
         types: Types::default(),
         calls: 0,
         ending: false,
+        unit: Unit::Control,
+        faults: false,
+        entry: false,
+        boundaries: Vec::new(),
+        retained: BTreeSet::new(),
+        faulted: false,
+        escaped: false,
     };
     let mut declarations = generator.declare_types();
     for index in 0..generator.rng.index(3) {
@@ -3152,7 +3294,13 @@ pub fn valid_data(rng: &mut Rng) -> Program {
     for index in 0..1 + generator.rng.index(3) {
         declarations.push(Declaration::Control(generator.external(index)));
     }
+    // A named boundary stands before the controls that supervise it.
+    let mut boundaries = 0;
     for index in 0..1 + generator.rng.index(3) {
+        if generator.rng.chance(1, 3) {
+            declarations.push(Declaration::Boundary(generator.boundary(boundaries)));
+            boundaries += 1;
+        }
         declarations.push(Declaration::Control(generator.control(index)));
     }
     Program { declarations }
