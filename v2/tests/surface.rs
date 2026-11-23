@@ -851,3 +851,35 @@ control direct() ■ done
     let bad_arity = builtin.replace("xs.push(1)", "xs.push()");
     assert_eq!(surface::elaborate(&bad_arity).unwrap_err().clause, "C1");
 }
+
+#[test]
+fn layout_reads_decision_tokens_and_leaves_string_contents_alone() {
+    let source = r#"extern control ask() ■ yes │ no
+
+control plain() exits done {
+    emit("}")
+    exit done
+}
+
+control on_rails() exits done
+│ exits    delta ask()
+│ ├ yes → done
+│ └ no → done
+╵
+
+control label(x: bool) ■ done
+│ Δ x: true → selected │ false → ■ done
+╞═ selected: emit("a; \"b\" {"); ■ done
+╵
+//! run plain() => done done trace [emit("}") -> done]
+//! run on_rails() with [ask -> yes] => done done
+"#;
+    let formatted = surface::format(source).unwrap();
+    assert_eq!(surface::format(&formatted).unwrap(), formatted);
+    assert!(formatted.contains(r#"emit("a; \"b\" {")"#));
+    let report = script::check_surface(&formatted);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.runs, 2);
+    let no_last_arm = source.replace("│ └ no → done\n", "");
+    assert_eq!(surface::format(&no_last_arm).unwrap_err().clause, "Y7");
+}

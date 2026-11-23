@@ -112,35 +112,60 @@ struct RailLine {
     comment: Option<String>,
 }
 
-fn split_comment(text: &str) -> (&str, Option<&str>) {
-    let mut chars = text.char_indices().peekable();
-    let mut in_string = false;
+/// Byte positions of punctuation outside string literals. Layout and the
+/// lexer agree that a backslash quotes the next character in a string.
+fn unquoted(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    let mut quoted = false;
     let mut escaped = false;
-    while let Some((byte_pos, ch)) = chars.next() {
-        if in_string {
+    text.char_indices().filter(move |&(_, ch)| {
+        if quoted {
             if escaped {
                 escaped = false;
             } else if ch == '\\' {
                 escaped = true;
             } else if ch == '"' {
-                in_string = false;
+                quoted = false;
             }
-            continue;
+            false
+        } else if ch == '"' {
+            quoted = true;
+            false
+        } else {
+            true
         }
-        if ch == '"' {
-            in_string = true;
-            continue;
-        }
-        if ch == '┄' {
-            let after = text[byte_pos + '┄'.len_utf8()..].trim_end();
-            return (&text[..byte_pos], Some(after));
-        }
-        if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
-            let after = text[byte_pos + 2..].trim_end();
-            return (&text[..byte_pos], Some(after));
+    })
+}
+
+fn split_comment(text: &str) -> (&str, Option<&str>) {
+    for (pos, _) in unquoted(text) {
+        let tail = &text[pos..];
+        if let Some(comment) = tail.strip_prefix('┄').or_else(|| tail.strip_prefix("//")) {
+            return (&text[..pos], Some(comment.trim_end()));
         }
     }
     (text, None)
+}
+
+fn brace_balance(text: &str) -> i32 {
+    unquoted(text)
+        .map(|(_, ch)| match ch {
+            '{' => 1,
+            '}' => -1,
+            _ => 0,
+        })
+        .sum()
+}
+
+fn short_statements(text: &str) -> impl Iterator<Item = &str> {
+    let mut start = 0;
+    unquoted(text)
+        .filter_map(|(i, ch)| (ch == ';').then_some(i))
+        .chain([text.len()])
+        .map(move |end| {
+            let stmt = &text[start..end];
+            start = end + 1;
+            stmt
+        })
 }
 
 fn strip_comment(text: &str) -> &str {
@@ -408,48 +433,34 @@ fn starts_test(text: &str) -> Option<&str> {
 
 /// Whether `text` is a decision header without horizontal `: arms`.
 fn is_vertical_decision(text: &str) -> bool {
-    // Either `Δ ...`, `delta ...`, `■ Δ ...`, `exit delta ...`, or `name : Δ ...`.
-    let has_delta = text.starts_with('Δ')
-        || text.starts_with("delta ")
-        || text.starts_with("■ Δ")
-        || text.starts_with("exit Δ")
-        || text.starts_with("exit delta ")
-        || text.find(':').is_some_and(|colon| {
-            let before = text[..colon].trim();
-            let after = text[colon + 1..].trim_start();
-            !before.is_empty()
-                && before
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && (after.starts_with('Δ') || after.starts_with("delta "))
-        });
-    if !has_delta {
-        return false;
+    fn word<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+        s.strip_prefix(name)
+            .filter(|rest| !rest.starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_'))
     }
-    // Check whether there is a `:` after the `Δ` / `delta` token (outside parens/strings).
-    let after_delta = if let Some(pos) = text.find('Δ') {
-        &text[pos + 'Δ'.len_utf8()..]
-    } else if let Some(pos) = text.find("delta ") {
-        &text[pos + 6..]
+    let operand = if let Some(rest) = text
+        .strip_prefix('■')
+        .or_else(|| word(text, "exit"))
+        .or_else(|| word(text, "exits"))
+    {
+        rest.trim_start()
+    } else if let Some((site, rest)) = text.split_once(':')
+        && !site.trim().is_empty()
+        && site
+            .trim()
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && site.trim() != "delta"
+    {
+        rest.trim_start()
     } else {
+        text
+    };
+    let Some(after_delta) = operand.strip_prefix('Δ').or_else(|| word(operand, "delta")) else {
         return false;
     };
     let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for ch in after_delta.chars() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
+    for (_, ch) in unquoted(after_delta) {
         match ch {
-            '"' => in_string = true,
             '(' | '{' | '[' => depth += 1,
             ')' | '}' | ']' => depth -= 1,
             ':' if depth == 0 => return false,
@@ -716,7 +727,7 @@ fn build_rails_body(raw_lines: &[RailLine]) -> Result<Vec<RawItem>, Error> {
                 }
                 if let Some((mask, inline)) = split_short_label(&line.content) {
                     let mut body = Vec::new();
-                    for part in inline.split(';') {
+                    for part in short_statements(inline) {
                         let trimmed = part.trim();
                         if !trimmed.is_empty() {
                             if is_vertical_decision(trimmed)
@@ -919,21 +930,8 @@ fn parse_inline_test_chain(line: u32, text: &str) -> Result<Vec<RawItem>, Error>
 /// Splits `mask : statements` at the first top-level `:`.
 fn split_short_label(text: &str) -> Option<(&str, &str)> {
     let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (idx, ch) in text.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
+    for (idx, ch) in unquoted(text) {
         match ch {
-            '"' => in_string = true,
             '(' | '{' | '[' => depth += 1,
             ')' | '}' | ']' => depth -= 1,
             ':' if depth == 0 => {
@@ -950,23 +948,9 @@ fn split_short_label(text: &str) -> Option<(&str, &str)> {
 
 /// Splits `left → right` (or `=>` / `->`) at top-level.
 fn split_top_arrow(text: &str) -> Option<(&str, &str)> {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, &(byte_pos, ch)) in chars.iter().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
+    for (byte_pos, ch) in unquoted(text) {
         match ch {
-            '"' => in_string = true,
             '(' | '{' | '[' => depth += 1,
             ')' | '}' | ']' => depth -= 1,
             '→' if depth == 0 => {
@@ -975,7 +959,7 @@ fn split_top_arrow(text: &str) -> Option<(&str, &str)> {
                     text[byte_pos + '→'.len_utf8()..].trim(),
                 ));
             }
-            '=' | '-' if depth == 0 && chars.get(i + 1).is_some_and(|(_, next)| *next == '>') => {
+            '=' | '-' if depth == 0 && text[byte_pos + 1..].starts_with('>') => {
                 return Some((text[..byte_pos].trim(), text[byte_pos + 2..].trim()));
             }
             _ => {}
@@ -3440,36 +3424,15 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
             }
         }
 
-        // Plain braced form ([G9]): if the header opens `{` without closing it,
-        // or if the next line starts with `{`, read until matching `}`!
-        let mut brace_balance = 0i32;
-        let mut saw_open_brace = false;
-        let mut in_contract_braces = false;
-        // Check whether `{` after the contract (or in `outcome name { ... }`) opens a plain body.
-        for ch in header.chars() {
-            if ch == '{' {
-                brace_balance += 1;
-                saw_open_brace = true;
-            } else if ch == '}' {
-                brace_balance -= 1;
-            }
-        }
-        if brace_balance > 0 || (header.trim_end().ends_with('{')) {
-            let _ = (saw_open_brace, &mut in_contract_braces);
-            while index < lines.len() && brace_balance > 0 {
-                let (_, next_raw) = lines[index];
-                let next_stripped = strip_comment(next_raw);
-                for ch in next_stripped.chars() {
-                    if ch == '{' {
-                        brace_balance += 1;
-                    } else if ch == '}' {
-                        brace_balance -= 1;
-                    }
-                }
-                header.push('\n');
-                header.push_str(next_stripped);
-                index += 1;
-            }
+        // Plain declarations may continue through the matching closing brace.
+        let mut balance = brace_balance(&header);
+        while index < lines.len() && balance > 0 {
+            let (_, next_raw) = lines[index];
+            let next_stripped = strip_comment(next_raw);
+            balance += brace_balance(next_stripped);
+            header.push('\n');
+            header.push_str(next_stripped);
+            index += 1;
         }
 
         let mut parser = Parser::new(lex_fragment(&header, line_no)?);
@@ -3670,25 +3633,12 @@ fn parse_surface_file(source: &str) -> Result<Vec<TopDecl>, Error> {
                         );
                     }
                     let mut cont_src = cont_stripped.to_string();
-                    let mut balance: i32 = cont_src
-                        .chars()
-                        .map(|c| match c {
-                            '{' => 1,
-                            '}' => -1,
-                            _ => 0,
-                        })
-                        .sum();
+                    let mut balance = brace_balance(&cont_src);
                     index += 1;
                     while index < lines.len() && balance > 0 {
                         let (_, nr) = lines[index];
                         let ns = strip_comment(nr);
-                        for c in ns.chars() {
-                            if c == '{' {
-                                balance += 1;
-                            } else if c == '}' {
-                                balance -= 1;
-                            }
-                        }
+                        balance += brace_balance(ns);
                         cont_src.push('\n');
                         cont_src.push_str(ns);
                         index += 1;
