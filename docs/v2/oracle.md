@@ -1,20 +1,18 @@
 # Villanelle v2 oracle, checker and typed backend
 
-Status: **slice 2, first checkpoint (slice 1 complete across phases 2–4; slice 2
-phase 2 complete)**, 21 November 2026. Phases 2, 3 and 4 of the
-[redesign plan](../redesign-plan.md). Slice 1 runs end-to-end across the oracle,
-erased interpreter, certificate-producing checker, Theorem 4 expander, and typed
-LLVM IR backend (`0.991x` optimized Rust on Apple M2, 0 allocations). Slice 2
-Phase 2 adds structs, variants, vectors, maps, strings, usage kinds (`copy <
-drop < must`), moves (`▾`), `extern resource` (`on fault release`), captured
-outcomes, `fault`/`assume ⊥`, lexical and named boundaries (`boundary` /
-`contingency` / `supervise`), erased history-bit fault release (`[R4]`, `[R5]`),
-and the Slice 2 Rails surface syntax and canonical formatter (section 12). Slice
-2 Phase 3 (checker ownership `[O0]`–`[O6]`, faults `[F1]`–`[F6]`, and data
-axioms `[A3]`–`[A6]`) is next.
+Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
+the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
+3 through oracle, erased interpreter, checker, call expansion and typed LLVM
+IR backend, and for slice 4 in the oracle. The oracle of slice 1 and its
+conformance suite (sections 1 to 7) are qualified. Everything described from
+section 8 on was written on 21 and 22 November and is **draft**: the
+[review](review.md) of 23 November found that no slice meets its exit, and
+lists the defects. Sections 8 to 18 describe what the code does and which
+tests exist; where they say "verified", "complete" or "parity", read it as
+"on the programs of the test suite". Section 19 lists what is owed.
 
-[Index of the v2 design](README.md) · [Core calculus](core.md) ·
-[Fact logic](facts.md) · [Surface](surface.md)
+[Index of the v2 design](README.md) · [Review](review.md) ·
+[Core calculus](core.md) · [Fact logic](facts.md) · [Surface](surface.md)
 
 ## 1. What it is
 
@@ -34,7 +32,7 @@ can be read on its own. Nothing in it is built for speed.
 | `syntax`, `text` | The core text form (section 3): its tree, printer and reader |
 | `surface` | The Rails surface syntax ([surface](surface.md)): layout ([Y1] to [Y10]), grammar ([G1] to [G10]), elaboration ([U1] to [U15]) into `syntax::Program` and surface warnings ([U5], [U17], [U18]) (section 9) |
 | `typed`, `resolve` | The typed core, and what is checked on the way to it (section 4) |
-| `bdd`, `facts`, `kernel` | The ROBDD engine, the `Th_Z` fact logic, the certificate format and the independent certificate validator ([V1] to [V5], [M1] to [M6]) (section 10) |
+| `bdd`, `facts`, `kernel` | The ROBDD engine, the `Th_Z` fact logic, the certificate format and the certificate validator, which checks lemma steps and the Boolean step and does not yet check axiom instances ([V1] to [V5] are not met: [review](review.md), RC9 to RC12), and counterexamples ([M1] to [M6]) (section 10) |
 | `check` | The phase 3 checker: coverage ([K1] to [K8]), conditional facts and SSA renaming ([N1] to [N5]), acknowledgement ([C2]), availability ([O1], [O2], [O4], [O6]), obligations ([P1] to [P8]), effects ([F3]) and impossible-arm warnings ([U16]) (section 10) |
 | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls, lifting loop exits and preserving checking and observations (section 11) |
 | `codegen` | The phase 4 typed LLVM IR and C ABI backend under the erased semantics ([R1] to [R3]), with native `-O0`/`-O2`/`-O3` compilation and differential execution (section 11) |
@@ -44,7 +42,7 @@ can be read on its own. Nothing in it is built for speed.
 | `host` | Hosts for extern controls (section 5): `Script`, `Arithmetic` and `Seeded` |
 | `script` | The directives that state runs beside a program (section 6) |
 | `rng` | A seeded SplitMix64 generator and stateless word mixer |
-| `generate` | Random core programs (`valid` and `free`) as `syntax::Program` trees, and a counter for the 61 constructs of the slice (section 8) |
+| `generate` | Core programs as `syntax::Program` trees (`valid`, one fixed program with seeded choices, and `free`, random), and a counter for the 61 constructs of the slice (section 8) |
 | `mutate` | Single-step mutations of valid programs, classified by the oracle (section 8) |
 
 Slice 1 is the scalar language: `bool`, the integer types, functions, tests,
@@ -279,21 +277,28 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   the oracle.
 - **Program generator (`generate`, `v2/tests/harness.rs`).** Every generated
   program is built as a `syntax::Program`, printed as core text, parsed back
-  and resolved. `generate::valid` builds programs whose expressions, selectors,
-  contracts, effects and loops are valid by construction; across 80 seeds and
-  both 32-bit and 64-bit `usize`, every run ends in `done`, applies all 12
-  statement rules, reaches all 61 syntactic constructs of the slice, and
-  yields `Verdict::Same` against the erased semantics. `generate::free` builds
-  unconstrained well-resolved programs; across 250 seeds it reaches all 61
-  constructs, and every run that is not stuck in the oracle agrees with the
-  erased semantics.
+  and resolved. `generate::valid` is **one fixed program** of 53 lines
+  (three functions, two extern controls and two controls) in which the seed picks the integer
+  types, two comparison operators and a few small subexpressions; it holds
+  statements that can never run and are there to reach a construct. Across 80
+  seeds and both 32-bit and 64-bit `usize`, every run of it ends in `done`,
+  applies all 12 statement rules, reaches all 61 syntactic constructs of the
+  slice, and yields `Verdict::Same` against the erased semantics. That is
+  one program shape, so it is not the generator the plan asks for and the
+  exit of phase 2 is not met ([review](review.md), RG1); a generator that
+  builds programs from random trees replaces it. `generate::free` builds
+  unconstrained well-resolved programs of 10 to 20 lines; across 250 seeds it
+  reaches all 61 constructs, and every run that is not stuck in the oracle
+  agrees with the erased semantics. Most of its runs are stuck in the first
+  statements.
 - **Mutations (`mutate`, `v2/tests/harness.rs`).** `mutate::mutate` produces
   all single-step mutants of a valid program across five kinds: `RemoveArm`
   ([C2], X10), `RemoveDisposition` ([K7], X1), `DropGuard` ([O2] to [O4], [P1]
   to [P8], X2, X3, X6, X7), `DropInvariant` ([K4], [P4]) and `DropEffect`
   ([F3], X9). `mutate::classify` runs each mutant in the oracle; across 16
   seeds of `generate::valid`, the stuck mutants reach all 15 stuck states of
-  slice 1. They are the target rejection set for the phase 3 checker.
+  slice 1. They are the target rejection set for the phase 3 checker. Since
+  `valid` is one program, they are the mutants of one program.
 
 ## 9. The Rails surface reader and elaborator
 
@@ -439,9 +444,12 @@ rejected by `resolve` or `check::check`.
   Euclidean `gcd`, `spend_step` with `over → ⊥` erased, and modular accumulation,
   measured separately from launch and output with `clock_gettime`), compiled v2
   runs in **12.99 ms** against optimized Rust in **13.11 ms** (**0.991×** of
-  optimized Rust, well within the 1.2× Phase 4 exit target), with identical
-  checksum (`432,500,000`) and zero heap allocations (`0` allocations, `0`
-  requested bytes).
+  optimized Rust), with identical checksum (`432,500,000`). The kernel is
+  written inside the test and is scalar code, which allocates nothing by
+  construction; allocations were not measured, and the test asserts nothing
+  about the ratio. This is not the measurement of the phase 4 exit, which is
+  every kernel under `experiments/` for time, allocations and peak memory
+  ([review](review.md), RB6).
 
 ## 12. Slice 2 Phase 2: Data, Resources, Captured Outcomes, Faults, and Boundaries
 
@@ -591,8 +599,11 @@ paired native-performance suite (`v2/tests/backend_slice2.rs`):
     `27.056 ms` (`2.418×` Rust) because flat history-bit dispatch kept extra
     conditional branches inside the inner loop. After structured arm-chain
     lowering, v2 runs in `10.863 ms` (`10,863,000 ns`) vs. Rust `10.600 ms`
-    (`10,599,584 ns`), ratio **`1.025×`** (gap `+0.26 ms` / `+2.5%`, within the
-    `≤ 1.20×` target; Slice 1 scalar `hot_bench` remains `0.997×`).
+    (`10,599,584 ns`), ratio **`1.025×`** (gap `+0.26 ms` / `+2.5%`; Slice 1
+    scalar `hot_bench` remains `0.997×`). This is one synthetic kernel
+    written inside the test, not the measurement of the phase 4 exit. A map
+    is a sorted array: inserting 20,000 keys in descending order takes 55 ms
+    against 0.52 ms for Rust's `BTreeMap` ([review](review.md), RB6).
   - **Next experiment:** Emit natural alignment hints (`align 8` for `i64`/`ptr`
     loads and stores) and evaluate pre-sized vector growth in Phase 7 to close
     the remaining `2.5%` gap.
@@ -740,7 +751,9 @@ consumption (`erased.rs`), and direct typed LLVM IR and C ABI code generation
   vs. **23.932 ms** (Rust) = **1.021×** (0.508 ms / 2.1% remaining gap from
   loop induction and `urem`/modulo lowering across `scale_tail` and
   `sum_window`; next experiment: inspect generated arm64 assembly and align
-  unsigned `mod` constant strength-reduction).
+  unsigned `mod` constant strength-reduction). This is one synthetic kernel
+  written inside the test, not the measurement of the phase 4 exit
+  ([review](review.md), RB6).
 
 ## 18. Slice 4 Phase 2: Second Review of Task Rules, Instrumented/Erased Task Scheduler, and Rails Task Surface
 
@@ -813,12 +826,21 @@ Rails surface:
   `[I10]` supervised-`run` impurity, `[G3]` `■ auto`, `[G10]` canonical
   formatting, and oracle-vs-erased differential parity.
 
-## 19. What this checkpoint leaves open
+## 19. What is open
 
-- **Later slices.** Slices 1, 2, and 3 are complete across Phases 2, 3, and 4,
-  and Slice 4 (tasks) is complete for Phase 2; Slice 4 Phase 3 (static checker
-  `[TK1]`–`[TK7]`, `count(x)` facts, and kernel certificates) and Phase 4
-  (Theorem 4 expansion and LLVM IR/C ABI backend for tasks) are next.
+- **Requalification.** No slice meets its exit. The [review](review.md)
+  lists the defects and, in its section 3, what each slice owes: a generator
+  that is not one program, a kernel that validates axiom instances and every
+  proof the checker relies on, a counted limit where the decision procedure
+  panics, the fault-boundary rules of the oracle, the unsound cases of the
+  checker in slices 2 and 3, the double free in compiled code, a reader that
+  reads the corpus, and a formatter that keeps comments. The work follows
+  section 10 of the review, slice 1 first.
+- **Later work.** For slice 4, the checker ([TK1] to [TK7], `count(x)`
+  facts) and the backend are not written.
+- **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
+  of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
+  Each is brought up to date when its slice is requalified.
 - **Operators that the surface does not have yet.** The wrapping and
   saturating operators and the numeric conversions are named in the core and
   the fact logic and have no spelling. They belong to phase 5.

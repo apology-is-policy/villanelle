@@ -57,7 +57,7 @@ state, then `docs/language-revision.md`. Older handoff notes lose to newer facts
 | Source | Holds |
 | --- | --- |
 | `docs/redesign-plan.md` | The roadmap: the accepted v2 redesign, its decisions, phases and design sketches. Section 5.5 is the adopted Rails surface syntax. |
-| `docs/v2/` | The v2 specification: core calculus first, then fact logic, surface, reference model and the corpus. `README.md` there lists the state of each. Accepted on 20 November 2026; corrected when the oracle, the checker or a review finds an error, with the change recorded in the document. `oracle.md` describes the v2 crate, the core text form and the conformance suite. |
+| `docs/v2/` | The v2 specification: core calculus first, then fact logic, surface, reference model and the corpus. `README.md` there lists the state of each. Accepted on 20 November 2026; corrected when the oracle, the checker or a review finds an error, with the change recorded in the document. `oracle.md` describes the v2 crate, the core text form and the conformance suite. `review.md` says what of the crate is verified, lists the open findings and what each slice still owes, and governs every status statement about v2. |
 | `docs/language-revision.md` | The v1 record. "Active checkpoint queue" is newest-first; later sections hold history, decisions and the six language milestones. |
 | `experiments/syntax_lab/` | Reference programs in Rails form, their word-form sources and the transpiler. Nothing in it compiles yet. |
 | `docs/collections-and-algorithms.md`, `library/COLLECTIONS.md` | Standard-library design, contracts and the measured performance table. |
@@ -81,9 +81,9 @@ plan's phase sections are authoritative for scope and exit conditions.
 | --- | --- | --- |
 | 0 | Close out v1 | Done; tagged `v1-final` |
 | 1 | Design on paper: core specification, fact logic, reference model, surface, the corpus rewritten by hand, a reading and repair test. No compiler code. | Done; accepted 20 November 2026 |
-| 2 | Oracle interpreter, program generator, differential harness, mutation tests | Active: slice 1, scalars and decisions |
-| 3 | Checker on a typed core, with the formatter that owns the rails | |
-| 4 | Typed backend; exit is 1.2× optimized Rust on every kernel under `experiments/` | |
+| 2 | Oracle interpreter, program generator, differential harness, mutation tests | Active: requalifying slice 1 (`docs/v2/review.md`). The oracle of slice 1 is qualified; code for slices 2 to 4 is draft |
+| 3 | Checker on a typed core, with the formatter that owns the rails | Draft code for slices 1 to 3, unqualified |
+| 4 | Typed backend; exit is 1.2× optimized Rust on every kernel under `experiments/` | Draft code for slices 1 to 3, unqualified; no kernel under `experiments/` measured |
 | 5 | Language breadth: numbers, functions, loops as decisions, recursion, closures, recursive data, views | |
 | 6 | Algebra at compile time: symbolic automata, policies, resource protocols, behavioral contracts | |
 | 7 | Editor and migration | |
@@ -91,7 +91,12 @@ plan's phase sections are authoritative for scope and exit conditions.
 
 Phases 2 to 4 are built as vertical slices (scalars and decisions, then data,
 then borrows, then tasks); each slice passes specification, oracle, checker,
-backend and differential fuzzing before the next begins.
+backend and differential fuzzing before the next begins. Code for all four
+was written ahead of that rule on 21 and 22 November 2026 and is being
+requalified slice by slice, in the order of section 10 of
+`docs/v2/review.md`. A slice is called complete only when its row in section
+3 of the review is met; a finding is closed there with the test that holds
+it.
 
 v2 source is written in **Rails** (plan section 5.5): glyphs and box-drawing
 rails are the canonical text, and the word form is the input spelling. New
@@ -122,12 +127,21 @@ python3 -B ci/check-collections.py --vnc /absolute/path/to/vnc   # library adopt
 (cd editors/vscode && npm test)                   # grammar and configuration tests
 ```
 
-The v2 crate builds on its own, in seconds, and needs no LLVM:
+The v2 crate builds on its own, in seconds, and needs no LLVM install. Its
+backend tests compile the emitted IR with `clang` and their reference kernels
+with `rustc`, so both must be on the path; the whole suite takes about two
+minutes:
 
 ```sh
 (cd v2 && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test)
-(cd v2 && cargo run --bin vn2 -- test tests/slice1/*.core)   # or: run FILE ENTRY VALUES, print FILE
+(cd v2 && cargo run --bin vn2 -- test tests/slice1/*.core tests/slice1_surface/*.rails)
+(cd v2 && cargo run --bin vn2 -- check --certificates tests/slice1_surface/*.rails)
 ```
+
+`vn2` with no arguments lists its commands (`test`, `check`, `format`,
+`expand`, `emit-llvm`, `emit-c`, `run`, `print`). Inputs are `.core` (the
+core text form) or `.rails`. Do not use `vn2 format --write` on source that
+matters until review finding RS4 is closed.
 
 Set `TELLUR_NATIVE_TARGET_DIR` to share the native dependency cache between
 builds. `./bin/vnc` is the installed release compiler when present; otherwise use
@@ -244,5 +258,5 @@ Adapted from the Thylacine operational contract.
 | `applications/settings/` | The one maintained real application (settings service); also the style reference |
 | `examples/`, `playground/`, `experiments/` | Runnable examples, small live programs, performance and representation experiments |
 | `tests/` | About 115 integration suites: conformance, differential, native and live host tests |
-| `v2/` | The v2 crate (`villanelle-v2`, binary `vn2`), with no dependencies: mathematical integers, the core text form, `resolve` to the typed core, the oracle and its hosts, and the conformance suite under `v2/tests/` |
+| `v2/` | The v2 crate (`villanelle-v2`, binary `vn2`), with no dependencies: mathematical integers (`int`), the core text form (`syntax`, `text`), the Rails reader and formatter (`surface`), `resolve` to the typed core (`typed`), the oracle and its hosts (`oracle`, `host`, `script`), the erased interpreter and the comparison with it (`erased`, `differential`), generator and mutations (`generate`, `mutate`, `rng`), the checker (`check`, `facts`, `kernel`, `bdd`), call expansion (`expand`), the LLVM IR backend (`codegen`), and the conformance suite under `v2/tests/`. `docs/v2/oracle.md` section 1 has the module table |
 | `ci/`, `.github/workflows/` | Release qualification, Windows, Linux and Thylacine pack scripts |

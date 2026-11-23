@@ -2,8 +2,8 @@
 
 Status: **draft 2**, 19 November 2026. Phase 1, deliverable 1 of the
 [redesign plan](../redesign-plan.md). Accepted by the author on 20 November
-2026 as the working specification ([index](README.md)). Nothing here is
-implemented.
+2026 as the working specification ([index](README.md)). An implementation
+is in progress; the [review](review.md) states what of it is verified.
 
 Two independent reviews have been folded in. The first found seven programs
 that the checking rules accepted and the semantics left stuck, most of them in
@@ -19,10 +19,13 @@ phase 1 documents together, read the tasks for the first time and found four
 programs that the task rules accepted and the semantics left stuck or with a
 lost resource, and that the named boundaries which the corpus added had no
 checking rule. The repairs are in [TK3] to [TK6], [E-Await], [E-AwaitHost],
-[E-Stop], [N5], [F5] and [F6] (choices 25 to 28 of section 11); a second review
-before the task slice checked all of them and folded three further repairs into
-[W11], [E-AwaitHost], [TK6] and [I10] (section 12). The author has answered the
-five questions that draft 1 raised (section 11).
+[E-Stop], [N5], [F5] and [F6] (choices 25 to 28 of section 11). The
+implementation of the task slice folded three further repairs into [W11],
+[E-AwaitHost], [TK6] and [I10] (section 12); the entries there call their
+source a second review, but it was made by the implementation and left no
+written record, so an independent second review of the task rules is still
+owed ([review](review.md), RD2). The author has answered the five questions
+that draft 1 raised (section 11).
 
 [Index of the v2 design](README.md) · [Fact logic](facts.md) ·
 [Reference model](references.md) · [Surface](surface.md) ·
