@@ -1,0 +1,13 @@
+// [F6]: `terminate` ends a body of a named boundary. It is no terminator of
+// a control, inside `B₁` of a lexical boundary or outside.
+control c()
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ terminate
+       } contingency (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F6

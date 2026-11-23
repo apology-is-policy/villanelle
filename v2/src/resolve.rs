@@ -15,6 +15,7 @@ use crate::typed::{
     ResourceDef, ResourceId, Selector, Site, SiteId, Statement, StructDef, StructId, Type, Var,
     VarId, VarRef, VariantConstructor, VariantDef, VariantId,
 };
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -1124,10 +1125,16 @@ impl Typer<'_> {
 }
 
 struct PendingLeave {
+    /// The body that holds the statement: that of the loop, or `B₁` of a
+    /// boundary in it ([E-Boundary]: it may end with any terminator).
+    body: BodyId,
     statement: usize,
     alternative: usize,
     kinds: Vec<Option<Type>>,
     payload: Vec<syntax::Expr>,
+    /// The operands whose type is known where the statement stands, built
+    /// there, where their names are in scope.
+    built: Vec<Option<Expr>>,
     line: u32,
 }
 
@@ -1139,6 +1146,28 @@ struct LoopFrame {
     leaves: Vec<PendingLeave>,
 }
 
+/// What a frame is the body of, where the rules of a fault boundary ask
+/// ([F5], [F6]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// The body of a control, of a loop, or of a named boundary.
+    Plain,
+    /// `B₁` of a lexical boundary.
+    Work,
+    /// `B₂` of a lexical boundary. The names and the sites around it are not
+    /// in scope ([E-Contingency]: it runs with `x̄` and the message).
+    Contingency,
+}
+
+/// What a builder builds: the body of a control, or one of the two bodies of
+/// a named boundary ([F6]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    Control,
+    NamedWork,
+    NamedContingency,
+}
+
 struct Frame {
     body: BodyId,
     names: HashMap<String, VarId>,
@@ -1147,6 +1176,20 @@ struct Frame {
     /// The sites a selector of this body may mention so far ([W2]).
     sites: HashMap<String, SiteId>,
     looping: Option<LoopFrame>,
+    part: Part,
+}
+
+impl Frame {
+    fn new(body: BodyId, part: Part) -> Frame {
+        Frame {
+            body,
+            names: HashMap::new(),
+            nested: HashSet::new(),
+            sites: HashMap::new(),
+            looping: None,
+            part,
+        }
+    }
 }
 
 struct Builder<'g, 'a> {
@@ -1155,8 +1198,15 @@ struct Builder<'g, 'a> {
     control_is_external: &'g [bool],
     boundaries: &'g [(String, Vec<Parameter>, bool, Vec<String>)],
     control: Option<ControlId>,
-    in_boundary: bool,
-    in_contingency: bool,
+    unit: Unit,
+    /// For each control, whether its body holds `terminate n` ([F5]): it is
+    /// then an entry control, and nothing invokes it.
+    entry_only: &'g [bool],
+    /// The parameters of the loops that a `recover` of the contingency names,
+    /// while `B₁` of its boundary is built: `B₁` does not mention them ([F5]).
+    protected: Vec<VarId>,
+    /// A protected parameter that the statement being built mentioned.
+    touched: Cell<Option<VarId>>,
     vars: Vec<Var>,
     sites: Vec<Site>,
     bodies: Vec<Body>,
@@ -1166,17 +1216,46 @@ struct Builder<'g, 'a> {
 
 impl Builder<'_, '_> {
     fn in_async_body(&self) -> bool {
-        !self.in_contingency && self.control.is_some_and(|cid| self.controls[cid].is_async)
+        !self.in_contingency() && self.control.is_some_and(|cid| self.controls[cid].is_async)
+    }
+
+    /// The frame of the innermost lexical contingency around this point.
+    fn lexical_contingency(&self) -> Option<usize> {
+        self.frames
+            .iter()
+            .rposition(|frame| frame.part == Part::Contingency)
+    }
+
+    /// Whether this point is in a contingency, lexical or named.
+    fn in_contingency(&self) -> bool {
+        self.unit == Unit::NamedContingency || self.lexical_contingency().is_some()
+    }
+
+    /// The frames in which a name or a site is looked up, innermost first:
+    /// those of a lexical contingency end with its own.
+    fn visible(&self) -> impl Iterator<Item = &Frame> {
+        let first = self.lexical_contingency().unwrap_or(0);
+        self.frames[first..].iter().rev()
+    }
+
+    /// The frame of the loop named `name` among `frames`, innermost first.
+    fn loop_frame<'f>(frames: impl Iterator<Item = &'f Frame>, name: &str) -> Option<&'f Frame> {
+        let mut frames = frames;
+        frames.find(|frame| {
+            frame
+                .looping
+                .as_ref()
+                .is_some_and(|looping| looping.name == name)
+        })
     }
 }
 
 impl Scope for Builder<'_, '_> {
     fn find(&self, name: &str) -> Option<(VarRef, Type)> {
-        let id = self
-            .frames
-            .iter()
-            .rev()
-            .find_map(|frame| frame.names.get(name))?;
+        let id = self.visible().find_map(|frame| frame.names.get(name))?;
+        if self.protected.contains(id) {
+            self.touched.set(Some(*id));
+        }
         Some((VarRef::Local(*id), self.vars[*id].ty.clone()))
     }
 
@@ -1287,12 +1366,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                 Box::new(self.selector(right, line)?),
             ),
             syntax::Selector::Atom(site, alternative) => {
-                let Some(id) = self
-                    .frames
-                    .iter()
-                    .rev()
-                    .find_map(|frame| frame.sites.get(site))
-                else {
+                let Some(id) = self.visible().find_map(|frame| frame.sites.get(site)) else {
                     return fail(
                         line,
                         "W2",
@@ -1331,6 +1405,16 @@ impl<'g, 'a> Builder<'g, 'a> {
             let line = statement.line;
             let selector = self.selector(&statement.selector, line)?;
             let command = self.command(&statement.command, line)?;
+            if let Some(var) = self.touched.take() {
+                return fail(
+                    line,
+                    "F5",
+                    format!(
+                        "`{}` is a parameter of a loop that the contingency restarts with `recover`, and the body of the boundary does not mention it",
+                        self.vars[var].name
+                    ),
+                );
+            }
             self.push(command, selector, line);
         }
         Ok(())
@@ -1408,6 +1492,22 @@ impl<'g, 'a> Builder<'g, 'a> {
         Ok(built)
     }
 
+    /// [F5]: a control that holds `terminate n` is an entry control, and no
+    /// operation names it.
+    fn invocable(&self, callee: ControlId, line: u32) -> Result<(), Error> {
+        if self.entry_only[callee] {
+            return fail(
+                line,
+                "F5",
+                format!(
+                    "`{}` ends an execution with `terminate n`: it is an entry control, and nothing invokes it",
+                    self.controls[callee].name
+                ),
+            );
+        }
+        Ok(())
+    }
+
     fn resolve_operation(
         &mut self,
         mode: syntax::CallMode,
@@ -1479,6 +1579,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                         ),
                     );
                 }
+                self.invocable(callee, line)?;
                 let types: Vec<Type> = self.controls[callee]
                     .parameters
                     .iter()
@@ -1519,7 +1620,8 @@ impl<'g, 'a> Builder<'g, 'a> {
                         ),
                     );
                 }
-                if self.in_contingency && !self.controls[callee].contingent {
+                self.invocable(callee, line)?;
+                if self.in_contingency() && !self.controls[callee].contingent {
                     return fail(
                         line,
                         "F6",
@@ -1556,7 +1658,8 @@ impl<'g, 'a> Builder<'g, 'a> {
                     ),
                 );
             }
-            if self.in_contingency && !self.controls[callee].contingent {
+            self.invocable(callee, line)?;
+            if self.in_contingency() && !self.controls[callee].contingent {
                 return fail(
                     line,
                     "F6",
@@ -2403,11 +2506,35 @@ impl<'g, 'a> Builder<'g, 'a> {
                 captures,
                 message,
                 contingency,
-            } => self.lexical_boundary(site, body, captures, message.as_deref(), contingency, line),
+            } => {
+                if self.in_contingency() {
+                    return fail(
+                        line,
+                        if self.lexical_contingency().is_some() {
+                            "F5"
+                        } else {
+                            "F6"
+                        },
+                        "a contingency protects no new work: a boundary does not occur in it",
+                    );
+                }
+                self.lexical_boundary(site, body, captures, message.as_deref(), contingency, line)
+            }
             syntax::Command::Supervise {
                 boundary,
                 arguments,
             } => {
+                if self.in_contingency() {
+                    return fail(
+                        line,
+                        if self.lexical_contingency().is_some() {
+                            "F5"
+                        } else {
+                            "F6"
+                        },
+                        "a contingency supervises nothing",
+                    );
+                }
                 let Some(&bid) = self.globals.boundary_ids.get(boundary.as_str()) else {
                     return fail(line, "C1", format!("`{boundary}` is not a named boundary"));
                 };
@@ -2450,6 +2577,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                         format!("`spawn {control}` requires a defined `async control`"),
                     );
                 }
+                self.invocable(callee, line)?;
                 let Some((VarRef::Local(set_var), set_ty)) = self.find(set) else {
                     return fail(line, "TK1", format!("`{set}` is not a task set in scope"));
                 };
@@ -2508,12 +2636,16 @@ impl<'g, 'a> Builder<'g, 'a> {
                 Ok(Command::Cancel { set: set_var })
             }
             syntax::Command::Again { name, arguments } => {
-                let Some(frame) = self.frames.iter().rev().find(|frame| {
-                    frame
-                        .looping
-                        .as_ref()
-                        .is_some_and(|looping| looping.name == *name)
-                }) else {
+                let Some(frame) = Self::loop_frame(self.visible(), name) else {
+                    if Self::loop_frame(self.frames.iter().rev(), name).is_some() {
+                        return fail(
+                            line,
+                            "F5",
+                            format!(
+                                "a contingency does not go round the loop `{name}` again as its body does; `recover ↑ {name}` restarts it"
+                            ),
+                        );
+                    }
                     return fail(
                         line,
                         "W3",
@@ -2540,10 +2672,33 @@ impl<'g, 'a> Builder<'g, 'a> {
                 for operand in payload {
                     kinds.push(typer.leave_kind(operand)?);
                 }
-                let statement = self.bodies[self.frames.last().expect("a frame").body]
-                    .statements
-                    .len();
-                let Some(looping) = self.frame().looping.as_mut() else {
+                let mut built = Vec::new();
+                for (operand, kind) in payload.iter().zip(&kinds) {
+                    built.push(match kind {
+                        Some(ty) => self
+                            .arguments(
+                                "the alternative",
+                                std::slice::from_ref(operand),
+                                std::slice::from_ref(ty),
+                                "C3",
+                                line,
+                            )?
+                            .pop(),
+                        None => None,
+                    });
+                }
+                let body = self.frames.last().expect("a frame").body;
+                let statement = self.bodies[body].statements.len();
+                // [W3]: the innermost loop, through `B₁` of the boundaries
+                // in its body. A contingency does not leave the loop of its
+                // boundary ([E-Contingency]).
+                let innermost = self
+                    .frames
+                    .iter()
+                    .rposition(|frame| frame.looping.is_some() || frame.part != Part::Work)
+                    .filter(|index| self.frames[*index].looping.is_some());
+                let Some(looping) = innermost.and_then(|index| self.frames[index].looping.as_mut())
+                else {
                     return fail(line, "W3", "`□` is not inside a loop body");
                 };
                 let Some(index) = looping
@@ -2569,10 +2724,12 @@ impl<'g, 'a> Builder<'g, 'a> {
                     );
                 }
                 looping.leaves.push(PendingLeave {
+                    body,
                     statement,
                     alternative: index,
                     kinds,
                     payload: payload.clone(),
+                    built,
                     line,
                 });
                 Ok(Command::Leave {
@@ -2587,6 +2744,13 @@ impl<'g, 'a> Builder<'g, 'a> {
                 let Some(control_id) = self.control else {
                     return fail(line, "F6", "`■` is not allowed inside a named boundary");
                 };
+                if self.lexical_contingency().is_some() {
+                    return fail(
+                        line,
+                        "F5",
+                        "a contingency does not exit: it ends with `recover ↑ ℓ`, `escalate`, `fault` or `terminate n`",
+                    );
+                }
                 let contract = &self.controls[control_id].contract;
                 let Some(index) = contract.iter().position(|entry| entry.name == *alternative)
                 else {
@@ -2623,22 +2787,50 @@ impl<'g, 'a> Builder<'g, 'a> {
                 })
             }
             syntax::Command::Impossible => Ok(Command::Impossible),
-            syntax::Command::Terminate(status) => {
-                if !self.in_boundary && !self.in_contingency {
+            syntax::Command::Terminate(None) => {
+                if self.lexical_contingency().is_some() {
+                    return fail(
+                        line,
+                        "F5",
+                        "the contingency of a lexical boundary does not let its control go on: it ends with `recover ↑ ℓ`, `escalate`, `fault` or `terminate n`",
+                    );
+                }
+                if self.unit == Unit::Control {
                     return fail(
                         line,
                         "F6",
-                        "`terminate` is only allowed inside a fault boundary",
+                        "`terminate` ends a body of a named boundary and occurs nowhere else",
                     );
                 }
-                let built = match status {
-                    Some(expr) => Some(self.typer(Mode::Expression, line).infer(expr)?),
-                    None => None,
+                Ok(Command::Terminate(None))
+            }
+            syntax::Command::Terminate(Some(status)) => {
+                let outermost = !self.frames.iter().any(|frame| frame.part == Part::Work);
+                if self.unit != Unit::Control || self.lexical_contingency().is_none() || !outermost
+                {
+                    return fail(
+                        line,
+                        "F5",
+                        "`terminate n` occurs only in the contingency of a lexical boundary of an entry control, and that boundary is inside no other",
+                    );
+                }
+                let status = match status {
+                    syntax::Expr::Integer(value) => {
+                        value.to_i128().filter(|n| (0..=255).contains(n))
+                    }
+                    _ => None,
                 };
-                Ok(Command::Terminate(built))
+                let Some(status) = status else {
+                    return fail(
+                        line,
+                        "F5",
+                        "the status of `terminate` is a literal from 0 to 255",
+                    );
+                };
+                Ok(Command::Terminate(Some(status as u8)))
             }
             syntax::Command::Escalate => {
-                if !self.in_contingency {
+                if !self.in_contingency() {
                     return fail(
                         line,
                         "F5",
@@ -2648,23 +2840,21 @@ impl<'g, 'a> Builder<'g, 'a> {
                 Ok(Command::Escalate)
             }
             syntax::Command::Recover { loop_name } => {
-                if !self.in_contingency {
+                let Some(contingency) = self.lexical_contingency() else {
                     return fail(
                         line,
                         "F5",
                         "`recover` is only allowed inside a lexical contingency body",
                     );
-                }
-                let Some(frame) = self.frames.iter().rev().find(|frame| {
-                    frame
-                        .looping
-                        .as_ref()
-                        .is_some_and(|looping| looping.name == *loop_name)
-                }) else {
+                };
+                // The loop encloses the boundary: it is around the contingency.
+                let Some(frame) =
+                    Self::loop_frame(self.frames[..contingency].iter().rev(), loop_name)
+                else {
                     return fail(
                         line,
                         "F5",
-                        format!("`recover ↑ {loop_name}` is not inside the loop `{loop_name}`"),
+                        format!("`recover ↑ {loop_name}` names no loop that encloses its boundary"),
                     );
                 };
                 Ok(Command::Recover { body: frame.body })
@@ -2793,18 +2983,27 @@ impl<'g, 'a> Builder<'g, 'a> {
             head: None,
         });
         let b1_id = self.bodies.len() - 1;
-        let prev_in_boundary = self.in_boundary;
-        self.in_boundary = true;
-        self.frames.push(Frame {
-            body: b1_id,
-            names: HashMap::new(),
-            nested: HashSet::new(),
-            sites: HashMap::new(),
-            looping: None,
-        });
+        // [F5]: `B₁` does not mention the parameters of a loop that the
+        // contingency restarts, so that they are at `recover` what they
+        // were when the boundary was entered.
+        let mut restarted = Vec::new();
+        recovers(contingency, &mut restarted);
+        let unprotected = self.protected.len();
+        for name in &restarted {
+            if let Some(frame) = Self::loop_frame(self.frames.iter().rev(), name) {
+                let parameters = frame
+                    .looping
+                    .as_ref()
+                    .expect("a loop frame")
+                    .parameters
+                    .clone();
+                self.protected.extend(parameters);
+            }
+        }
+        self.frames.push(Frame::new(b1_id, Part::Work));
         self.statements(body)?;
         let finished_b1 = self.frames.pop().expect("boundary frame");
-        self.in_boundary = prev_in_boundary;
+        self.protected.truncate(unprotected);
         self.frame().nested.extend(finished_b1.names.into_keys());
         self.frame().nested.extend(finished_b1.nested);
 
@@ -2815,15 +3014,7 @@ impl<'g, 'a> Builder<'g, 'a> {
             head: None,
         });
         let b2_id = self.bodies.len() - 1;
-        let prev_in_contingency = self.in_contingency;
-        self.in_contingency = true;
-        self.frames.push(Frame {
-            body: b2_id,
-            names: HashMap::new(),
-            nested: HashSet::new(),
-            sites: HashMap::new(),
-            looping: None,
-        });
+        self.frames.push(Frame::new(b2_id, Part::Contingency));
         let mut contingency_vars = Vec::with_capacity(capture_types.len());
         for (cap_name, cap_ty) in capture_types {
             let var = self.vars.len();
@@ -2851,7 +3042,6 @@ impl<'g, 'a> Builder<'g, 'a> {
         };
         self.statements(contingency)?;
         let _finished_b2 = self.frames.pop().expect("contingency frame");
-        self.in_contingency = prev_in_contingency;
 
         self.frame().sites.insert(site.to_string(), site_id);
         Ok(Command::Boundary {
@@ -2906,19 +3096,15 @@ impl<'g, 'a> Builder<'g, 'a> {
             head: None,
         });
         let inner = self.bodies.len() - 1;
-        self.frames.push(Frame {
-            body: inner,
-            names: HashMap::new(),
-            nested: HashSet::new(),
-            sites: HashMap::new(),
-            looping: Some(LoopFrame {
-                name: name.to_string(),
-                parameters: Vec::new(),
-                alternatives,
-                arity: arms.iter().map(|arm| arm.names.len()).collect(),
-                leaves: Vec::new(),
-            }),
+        let mut frame = Frame::new(inner, Part::Plain);
+        frame.looping = Some(LoopFrame {
+            name: name.to_string(),
+            parameters: Vec::new(),
+            alternatives,
+            arity: arms.iter().map(|arm| arm.names.len()).collect(),
+            leaves: Vec::new(),
         });
+        self.frames.push(frame);
         let mut vars = Vec::new();
         for (pname, pty, pmut) in resolved_params {
             if vars.iter().any(|var: &VarId| self.vars[*var].name == pname) {
@@ -2992,15 +3178,27 @@ impl<'g, 'a> Builder<'g, 'a> {
             }
             types.push(row);
         }
-        for leave in &looping.leaves {
-            let payload = self.arguments(
-                "the alternative",
-                &leave.payload,
-                &types[leave.alternative],
-                "C3",
-                leave.line,
-            )?;
-            self.bodies[inner].statements[leave.statement].command = Command::Leave {
+        for leave in looping.leaves {
+            let mut payload = Vec::new();
+            let operands = leave.payload.iter().zip(leave.built);
+            for (place, (operand, built)) in operands.enumerate() {
+                payload.push(match built {
+                    Some(expr) => expr,
+                    // An operand without a type of its own is a literal,
+                    // and takes the type that the others decided.
+                    None => self
+                        .arguments(
+                            "the alternative",
+                            std::slice::from_ref(operand),
+                            std::slice::from_ref(&types[leave.alternative][place]),
+                            "C3",
+                            leave.line,
+                        )?
+                        .pop()
+                        .expect("one operand"),
+                });
+            }
+            self.bodies[leave.body].statements[leave.statement].command = Command::Leave {
                 alternative: leave.alternative,
                 payload,
             };
@@ -3026,6 +3224,39 @@ impl<'g, 'a> Builder<'g, 'a> {
             arms: bound,
         })
     }
+}
+
+/// The loops that the `recover` statements of a body name, at any depth.
+fn recovers(statements: &[syntax::Statement], out: &mut Vec<String>) {
+    for statement in statements {
+        match &statement.command {
+            syntax::Command::Recover { loop_name } => {
+                if !out.contains(loop_name) {
+                    out.push(loop_name.clone());
+                }
+            }
+            syntax::Command::Loop { body, .. } => recovers(body, out),
+            syntax::Command::Boundary {
+                body, contingency, ..
+            } => {
+                recovers(body, out);
+                recovers(contingency, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether a body holds `terminate n` at any depth ([F5]).
+fn ends_an_execution(statements: &[syntax::Statement]) -> bool {
+    statements.iter().any(|statement| match &statement.command {
+        syntax::Command::Terminate(Some(_)) => true,
+        syntax::Command::Loop { body, .. } => ends_an_execution(body),
+        syntax::Command::Boundary {
+            body, contingency, ..
+        } => ends_an_execution(body) || ends_an_execution(contingency),
+        _ => false,
+    })
 }
 
 fn resolve_parameters(
@@ -3841,6 +4072,10 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
     }
 
     let control_is_external: Vec<bool> = source_controls.iter().map(|c| c.external).collect();
+    let entry_only: Vec<bool> = source_controls
+        .iter()
+        .map(|c| ends_an_execution(&c.body))
+        .collect();
 
     // Resolve named boundaries first so `supervise` knows their effects and fault behavior.
     let mut boundaries: Vec<BoundaryDef> = Vec::with_capacity(source_boundaries.len());
@@ -3857,8 +4092,10 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
             control_is_external: &control_is_external,
             boundaries: &summary_for_builder,
             control: None,
-            in_boundary: true,
-            in_contingency: false,
+            unit: Unit::NamedWork,
+            entry_only: &entry_only,
+            protected: Vec::new(),
+            touched: Cell::new(None),
             vars: Vec::new(),
             sites: Vec::new(),
             bodies: vec![Body {
@@ -3867,13 +4104,7 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
                 head: None,
             }],
             site_names: HashSet::new(),
-            frames: vec![Frame {
-                body: 0,
-                names: HashMap::new(),
-                nested: HashSet::new(),
-                sites: HashMap::new(),
-                looping: None,
-            }],
+            frames: vec![Frame::new(0, Part::Plain)],
         };
         for param in params {
             b1_builder.declare(&param.name, param.ty.clone(), false, b.line)?;
@@ -3892,8 +4123,10 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
             control_is_external: &control_is_external,
             boundaries: &summary_for_builder,
             control: None,
-            in_boundary: true,
-            in_contingency: true,
+            unit: Unit::NamedContingency,
+            entry_only: &entry_only,
+            protected: Vec::new(),
+            touched: Cell::new(None),
             vars: Vec::new(),
             sites: Vec::new(),
             bodies: vec![Body {
@@ -3902,13 +4135,7 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
                 head: None,
             }],
             site_names: HashSet::new(),
-            frames: vec![Frame {
-                body: 0,
-                names: HashMap::new(),
-                nested: HashSet::new(),
-                sites: HashMap::new(),
-                looping: None,
-            }],
+            frames: vec![Frame::new(0, Part::Plain)],
         };
         for &ridx in retains_idx {
             let p = &params[ridx];
@@ -4014,8 +4241,10 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
             control_is_external: &control_is_external,
             boundaries: &boundary_summary,
             control: Some(id),
-            in_boundary: false,
-            in_contingency: false,
+            unit: Unit::Control,
+            entry_only: &entry_only,
+            protected: Vec::new(),
+            touched: Cell::new(None),
             vars: Vec::new(),
             sites: Vec::new(),
             bodies: vec![Body {
@@ -4024,13 +4253,7 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
                 head: None,
             }],
             site_names: HashSet::new(),
-            frames: vec![Frame {
-                body: 0,
-                names: HashMap::new(),
-                nested: HashSet::new(),
-                sites: HashMap::new(),
-                looping: None,
-            }],
+            frames: vec![Frame::new(0, Part::Plain)],
         };
         for parameter in &controls[id].parameters {
             builder.declare(&parameter.name, parameter.ty.clone(), false, control.line)?;

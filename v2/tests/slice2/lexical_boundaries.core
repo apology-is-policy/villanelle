@@ -1,0 +1,258 @@
+// Slice 2 core conformance: the lexical fault boundary ([E-Boundary],
+// [E-Contingency], [F5]) in the runs that end. The stuck runs are in
+// lexical_boundaries_stuck.core and the refusals in reject_f5_*.core.
+
+extern resource conn on fault release
+extern resource lock
+
+extern control open_conn()
+    ■ { opened {c : conn} }
+    uses net
+
+extern control close_conn(c : conn)
+    ■ { closed {} }
+    uses net
+
+extern control open_lock()
+    ■ { opened {l : lock} }
+    uses lock.io
+
+contingent extern control close_lock(l : lock)
+    ■ { closed {} }
+    uses lock.io
+
+extern control attempt(n : u32)
+    ■ { ok {} │ failed {} }
+    uses net
+
+contingent control note(msg : &string)
+    ■ { done {} }
+    uses console.write
+    1  ⊤ ▷ e : Δ emit(msg) ▸ done {}
+    2  ⊤ ▷ ■ done {}
+
+control faulting(tag : string)
+    ■ { done {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ fault "below"
+
+// [E-Boundary]: `B₁` falls off its end, which completes the site with its one
+// alternative. Its names do not escape; the control goes on.
+control falls_off(n : u32)
+    ■ { ok {v : u32} }
+    uses console.write
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ inside : u32 := n
+           2  ⊤ ▷ e : Δ emit("work") ▸ done {}
+       } contingency (m : string) {
+           1  ⊤ ▷ ⊥
+       }
+    2  b.done ▷ ■ ok {n}
+
+// [E-Boundary]: `B₁` ends with a terminator. `■` leaves the control from
+// inside it, and `↑` goes round the loop that encloses the boundary.
+control ends_inside(n : u32)
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ lp : ↻ count(i : u32 := 0) {
+           1  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ t : ? i < n
+                  2  t.true ▷ ↑ count(i + 1)
+                  3  t.false ▷ ■ ok {i}
+              } contingency (m : string) {
+                  1  ⊤ ▷ ⊥
+              }
+       }
+    2  ⊤ ▷ ⊥
+
+// [E-Boundary]: `□` in `B₁` leaves the loop around the boundary, and a value
+// bound in `B₁` leaves with it.
+control leaves_inside(n : u32)
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ lp : ↻ find(i : u32 := 0) {
+           1  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ found : u32 := i
+                  2  ⊤ ▷ t : ? i < n
+                  3  t.false ▷ □ done {found}
+              } contingency (m : string) {
+                  1  ⊤ ▷ ⊥
+              }
+           2  ⊤ ▷ ↑ find(i + 1)
+       } ▸ done {v}
+    2  ⊤ ▷ ■ ok {v}
+
+// [E-Contingency]: a fault in `B₁` ends its scope by [E-Unwind] and `B₂`
+// runs with the values that the boundary took into its care and with the
+// message. `B₂` completes what it was given.
+control cares(tag : string)
+    ■ { ok {} }
+    faults
+    uses lock.io, net, console.write
+    1  ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ c : Δ open_conn() ▸ opened {inner}
+           2  ⊤ ▷ fault "stop"
+       } contingency [l, tag] (m : string) {
+           1  ⊤ ▷ a : Δ note(&tag) ▸ done {}
+           2  ⊤ ▷ k : Δ close_lock(▾l) ▸ closed {}
+           3  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ■ ok {}
+
+// [E-Contingency]: a fault from below reaches the boundary: the activation
+// of the callee is unwound and popped first.
+control from_below()
+    ■ { ok {} }
+    faults
+    uses net, console.write
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ d : Δ faulting("x") ▸ done {}
+       } contingency (m : string) {
+           1  ⊤ ▷ a : Δ note(&m) ▸ done {}
+           2  ⊤ ▷ fault "above"
+       }
+    2  ⊤ ▷ ■ ok {}
+
+// [E-Contingency]: `recover ↑ ℓ` restarts the loop with the parameters it
+// had when the boundary was entered: `tries` counts the entries, and the
+// restart does not set it back to what it was when the iteration began.
+control retries(limit : u32)
+    ■ { ok {tries : u32} }
+    uses net, console.write
+    1  ⊤ ▷ lp : ↻ retry(~tries : u32 := 0) {
+           1  ⊤ ▷ tries ← tries + 1
+           2  ⊤ ▷ more : bool := tries < limit
+           3  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ c : Δ open_conn() ▸ opened {inner}
+                  2  ⊤ ▷ t : ? more
+                  3  t.true ▷ fault "not yet"
+                  4  ⊤ ▷ k : Δ close_conn(▾inner) ▸ closed {}
+              } contingency (m : string) {
+                  1  ⊤ ▷ a : Δ note(&m) ▸ done {}
+                  2  ⊤ ▷ recover ↑ retry
+              }
+           4  ⊤ ▷ □ done {tries}
+       } ▸ done {v}
+    2  ⊤ ▷ ■ ok {v}
+
+// [E-Contingency]: `recover ↑ ℓ` names any loop that encloses the boundary,
+// and ends the loops between. A parameter that is not `copy` moves into the
+// new run of the loop.
+control recovers_outer(label : string)
+    ■ { ok {kept : string} }
+    uses console.write
+    1  ⊤ ▷ lp : ↻ outer(name : string := label, ~round : u32 := 0) {
+           1  ⊤ ▷ round ← round + 1
+           2  ⊤ ▷ last : bool := round = 2
+           3  ⊤ ▷ in : ↻ inner(i : u32 := 0) {
+                  1  ⊤ ▷ b : boundary {
+                         1  ⊤ ▷ t : ? last
+                         2  t.false ▷ fault "round"
+                     } contingency (m : string) {
+                         1  ⊤ ▷ a : Δ note(&m) ▸ done {}
+                         2  ⊤ ▷ recover ↑ outer
+                     }
+                  2  ⊤ ▷ □ done {}
+              } ▸ done {}
+           4  ⊤ ▷ □ done {name}
+       } ▸ done {out}
+    2  ⊤ ▷ ■ ok {out}
+
+// [E-Contingency]: `escalate` continues the original fault outward. The
+// boundary around this one takes it; its own does not take it again.
+control escalates_to_outer()
+    ■ { ok {} }
+    faults
+    uses console.write
+    1  ⊤ ▷ outer : boundary {
+           1  ⊤ ▷ inner : boundary {
+                  1  ⊤ ▷ fault "first"
+              } contingency (m : string) {
+                  1  ⊤ ▷ a : Δ note(&m) ▸ done {}
+                  2  ⊤ ▷ escalate
+              }
+           2  ⊤ ▷ ⊥
+       } contingency (m2 : string) {
+           1  ⊤ ▷ a2 : Δ note(&m2) ▸ done {}
+           2  ⊤ ▷ fault "second"
+       }
+    2  ⊤ ▷ ⊥
+
+// [E-Contingency]: a contingency has loops of its own, which it leaves and
+// goes round as any body does; `escalate` inside one is still its end.
+control loops_in_contingency(n : u32)
+    ■ { ok {} }
+    faults
+    uses console.write
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "loop"
+       } contingency [n] (m : string) {
+           1  ⊤ ▷ lp : ↻ say(i : u32 := 0) {
+                  1  ⊤ ▷ t : ? i < n
+                  2  t.false ▷ □ done {}
+                  3  ⊤ ▷ a : Δ note(&m) ▸ done {}
+                  4  ⊤ ▷ ↑ say(i + 1)
+              } ▸ done {}
+           2  ⊤ ▷ fin : ↻ once() {
+                  1  ⊤ ▷ escalate
+              }
+           3  ⊤ ▷ ⊥
+       }
+    2  ⊤ ▷ ■ ok {}
+
+// [E-Contingency]: `terminate n`, in the entry control only, ends the
+// execution with the status. It is not an outcome.
+control ends_execution(code : u32)
+    ■ { ok {} }
+    uses console.write
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ t : ? code = 0
+           2  t.false ▷ fault "startup"
+       } contingency (m : string) {
+           1  ⊤ ▷ a : Δ note(&m) ▸ done {}
+           2  ⊤ ▷ lp : ↻ once() {
+                  1  ⊤ ▷ terminate 23
+              }
+           3  ⊤ ▷ ⊥
+       }
+    2  ⊤ ▷ ■ ok {}
+
+// [E-Contingency], [E-Supervise]: a lexical boundary inside the body of a
+// named boundary takes the fault first; what its contingency lets out
+// reaches the named one.
+boundary worker(tag : string) retains tag {
+    1  ⊤ ▷ lp : ↻ once(n : u32 := 0) {
+           1  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ z : ? n = 0
+                  2  z.true ▷ fault "inner"
+              } contingency (m : string) {
+                  1  ⊤ ▷ e : Δ emit(&m) ▸ done {}
+                  2  ⊤ ▷ escalate
+              }
+           2  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ terminate
+} contingency (m : string) {
+    1  ⊤ ▷ e2 : Δ emit(&tag) ▸ done {}
+    2  ⊤ ▷ terminate
+}
+
+control supervises()
+    ■ { done {} }
+    uses console.write
+    1  ⊤ ▷ supervise worker("outer")
+    2  ⊤ ▷ ■ done {}
+
+//! run falls_off(4) => done ok {4} trace [emit("work") -> done]
+//! run ends_inside(3) => done ok {3}
+//! run leaves_inside(2) => done ok {2}
+//! run cares("t") with [open_lock -> opened {lock#1}; open_conn -> opened {conn#1}; close_lock -> closed] => faulted "stop" trace [open_lock() -> opened {lock#1}; open_conn() -> opened {conn#1}; conn.release(conn#1) -> released; emit("t") -> done; close_lock(lock#1) -> closed]
+//! run from_below() with [open_conn -> opened {conn#1}] => faulted "above" trace [open_conn() -> opened {conn#1}; conn.release(conn#1) -> released; emit("below") -> done]
+//! run retries(3) with [open_conn -> opened {conn#1}; open_conn -> opened {conn#2}; open_conn -> opened {conn#3}; close_conn -> closed] => done ok {3} trace [open_conn() -> opened {conn#1}; conn.release(conn#1) -> released; emit("not yet") -> done; open_conn() -> opened {conn#2}; conn.release(conn#2) -> released; emit("not yet") -> done; open_conn() -> opened {conn#3}; close_conn(conn#3) -> closed]
+//! run recovers_outer("kept") => done ok {"kept"} trace [emit("round") -> done]
+//! run escalates_to_outer() => faulted "second" trace [emit("first") -> done; emit("first") -> done]
+//! run loops_in_contingency(2) => faulted "loop" trace [emit("loop") -> done; emit("loop") -> done]
+//! run ends_execution(0) => done ok
+//! run ends_execution(1) => terminated 23 trace [emit("startup") -> done]
+//! run supervises() => done done trace [emit("inner") -> done; emit("outer") -> done]

@@ -104,8 +104,10 @@ Items 9 to 16 were written on 21 and 22 November. The [review](review.md) of
     faults and boundaries (`[F1]`–`[F6]`), data axioms (`[A3]`–`[A6]`, `[I9]`,
     `[I11]`, `[I12]`, `[M7]`) with kernel certificate validation, and Phase 4
     Theorem 4 call expansion + typed LLVM IR and C ABI backend (`[R1]`–`[R5]`)
-    run natively at `-O0`/`-O2` across 32/64-bit `usize` (draft: the oracle
-    is wrong for fault boundaries, the checker accepts stuck programs, and
+    run natively at `-O0`/`-O2` across 32/64-bit `usize` (draft: the fault
+    boundaries of the oracle are requalified since 23 November 2026, sections
+    6.9 and 7.7 of the core say how each end of a contingency runs, the
+    checker accepts stuck programs, and
     compiled code can free a value twice).
 13. Phase 2 for slice 3: second-class borrows `&τ`/`&~τ`, `view struct`,
     payload origins `∈`, well-formedness (`[W5a]`, `[W6]`, `[W8]`, `[W9]`,

@@ -474,7 +474,7 @@ fn faults_effects_and_boundaries_clauses_f1_to_f6() {
             ⊤ ▷ b : boundary {
                 1 ⊤ ▷ o : Δ open_h() ▸ ok {h}
             } contingency (m : string) {
-                1 ⊤ ▷ terminate
+                1 ⊤ ▷ terminate 1
             }
             ⊤ ▷ ■ ok {}
         ",
@@ -502,7 +502,7 @@ fn faults_effects_and_boundaries_clauses_f1_to_f6() {
                 1 ⊤ ▷ fault \"inner\"
             } contingency (m : string) {
                 1 ⊤ ▷ s : Δ side_step() ▸ ok {}
-                2 ⊤ ▷ terminate
+                2 ⊤ ▷ terminate 1
             }
             ⊤ ▷ ■ ok {}
         ",
@@ -513,8 +513,7 @@ fn faults_effects_and_boundaries_clauses_f1_to_f6() {
         "expected [F6], got: {resolve_f6_err}"
     );
 
-    reject_core(
-        "F5",
+    let resolve_f5_err = load(
         "
         boundary inner() {
             1 ⊤ ▷ terminate
@@ -527,10 +526,15 @@ fn faults_effects_and_boundaries_clauses_f1_to_f6() {
                 1 ⊤ ▷ fault \"inner\"
             } contingency (m : string) {
                 1 ⊤ ▷ supervise inner()
-                2 ⊤ ▷ terminate
+                2 ⊤ ▷ terminate 1
             }
             ⊤ ▷ ■ ok {}
         ",
+    )
+    .expect_err("a contingency supervises nothing");
+    assert!(
+        resolve_f5_err.contains("[F5]"),
+        "expected [F5], got: {resolve_f5_err}"
     );
 
     // [F6] rejections and acceptances on named boundaries.

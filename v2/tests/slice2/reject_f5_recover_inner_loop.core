@@ -1,0 +1,14 @@
+// [F5]: `recover ↑ ℓ` names a loop that encloses the boundary, not a loop of
+// the contingency.
+control c()
+    ■ { ok {} }
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ lp : ↻ l() {
+                  1  ⊤ ▷ recover ↑ l
+              }
+       }
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

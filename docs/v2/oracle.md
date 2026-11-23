@@ -228,13 +228,14 @@ must yield.
 `run` names an entry control and its arguments. The options follow: `with
 arithmetic`, `with [...]` for a scripted host, `usize 32`, `fuel N`. After
 `=>` comes the expected end: `done` with the alternative and its payload,
+`faulted` with the message, `terminated` with the status of `terminate n`,
 `stuck` with the state and the clause, `violation`, `host-failed`, `fuel`, or
 `not-an-execution` (the arguments are not values of the parameter types, or
 the precondition of the entry is false; section 8 of the core does not count
 such a run as an execution). `trace [...]` states the events. `reject` names
 the clause by which `resolve` must refuse the program.
 
-Every `run` that ends in `done` or `fuel` is also carried out under the erased
+Every `run` that ends in `done`, `faulted`, `terminated` or `fuel` is also carried out under the erased
 semantics with the host's answers replayed, and the two observations must agree
 (Theorem 3). `erased` in the place of `run` states a run of the erased
 semantics alone; it may also end in `undefined` (`⊥`, the end of a body, an
@@ -776,10 +777,55 @@ and Rails surface reader, elaborator, and formatter (`surface.rs`):
   module-control rejection, `[U14]` `■ ▾x`), and canonical Rails formatting
   (`[G10]`).
 - **Conformance suite (`v2/tests/slice2.rs`, `tests/slice2/*.core`,
-  `tests/slice2_surface/*.rails`).** 13 core files and 4 canonical Rails files
+  `tests/slice2_surface/*.rails`).** 37 core files (13 before section 12.1) and 4 canonical Rails files
   (including `show_file_resource.rails` from section 2 of `surface.md`) with
   accepting, rejecting, stuck-state, core round-trip, formatter idempotence,
   and oracle-vs-erased differential checks.
+
+### 12.1 Fault boundaries, as requalified on 23 November 2026
+
+The rules of fault boundaries were wrong in three ways (review findings RO1,
+RO3, RO4). They now follow sections 6.9 and 7.7 of the core, which say since
+that day how each end of a contingency runs.
+
+- **What `resolve` refuses.** The requirements of form of [F5] and [F6]. In
+  a contingency there is no `■`, no boundary, no `supervise`, and `↑` and `□`
+  only of a loop of the contingency itself. The contingency of a lexical
+  boundary mentions the names it retains, the message and its own: a name or
+  a site of the body around it is not found (`C1`, `W2`). `terminate`
+  without a status ends a body of a named boundary and occurs nowhere else.
+  `terminate n` occurs in the contingency of a boundary of a control that is
+  inside no other boundary, with a literal from 0 to 255, and a control that
+  holds one is invoked by nothing. `recover ↑ ℓ` names a loop around its
+  boundary, and the body of the boundary does not mention a parameter of
+  that loop. `□` in the body of a boundary leaves the loop around the
+  boundary; its operands are built where the statement stands, where the
+  names of that body are in scope.
+- **Unwinding** is one function, `unwind`. The scopes of the current
+  activation end innermost first. The scope of a lexical boundary starts its
+  contingency; the body of a named boundary starts its own when only its
+  scope is left; an activation with no scope left is popped, and the caller
+  permits `faults` or has a boundary around the waiting statement. The
+  erased interpreter has the same order, and moves the frame around a
+  boundary past the boundary statement when a fault leaves the contingency,
+  so that what the boundary had taken is not released a second time.
+- **The ends of a contingency.** `recover ↑ ℓ` reads the parameters of the
+  loop as operands, ends the scopes up to the loop by [E-Scope] and enters
+  it again; no copy of the parameters is kept. `escalate` finds the message
+  of the innermost contingency, from inside a loop as well. `terminate n`
+  ends every scope of the entry activation by [E-Scope] and gives the end
+  `terminated n`; `terminate` ends the scopes of a body of a named boundary
+  and lets the supervising control go on.
+- **The backend** follows: it kept a copy of the parameters of a restarted
+  loop, taken when the loop was first entered, and restored it at `recover`.
+  The parameters now stay in their slots. The driver prints `terminated n`.
+- **Conformance.** `lexical_boundaries.core` (12 runs that end, each also
+  compiled and compared at `-O0` and `-O2` in
+  `slice_two_core_programs_agree_natively`), `lexical_boundaries_stuck.core`
+  (12 stuck runs: X1, X2, X5, X7 and X8 in the ways a boundary can reach
+  them), 22 files `reject_*.core` for the requirements of form, and seven
+  more runs of named boundaries in `faults_and_boundaries.core`. The suite
+  of slice 2 has 37 files and 64 runs.
 
 ## 13. Slice 2 Phase 3: Ownership, Faults, Boundaries, and Data Fact Logic
 

@@ -1,0 +1,7 @@
+// [F5]: `escalate` is an end of a contingency.
+control c()
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ escalate
+
+//! reject F5

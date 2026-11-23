@@ -1,0 +1,12 @@
+// [F5], [E-Contingency]: `B₂` of a lexical boundary does not complete the
+// site, so it does not end with the `terminate` of a named boundary.
+control c()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ terminate
+       }
+    2  ⊤ ▷ ■ ok {7}
+
+//! reject F5

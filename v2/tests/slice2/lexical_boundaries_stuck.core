@@ -1,0 +1,197 @@
+// Slice 2 core conformance: the stuck states of the lexical fault boundary
+// ([E-Boundary], [E-Contingency], [E-Unwind]). Each control is stuck in the
+// way its comment names; the checker excludes it by the clause given there.
+
+extern resource conn on fault release
+extern resource lock
+
+extern control open_conn()
+    ■ { opened {c : conn} }
+    uses net
+
+extern control open_lock()
+    ■ { opened {l : lock} }
+    uses lock.io
+
+extern control keep(s : string)
+    ■ { kept {} }
+    uses net
+
+// X5 [E-Scope]: what the boundary took into its care ends with the scope of
+// `B₁`. A value that holds an obligation is not destroyed ([O5]).
+control care_ends_with_work()
+    ■ { ok {} }
+    faults
+    uses lock.io
+    1  ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ x : u32 := 1
+       } contingency [l] (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ■ ok {}
+
+// X5 [E-Scope]: the same when `B₁` ends with a terminator.
+control care_ends_with_exit()
+    ■ { ok {} }
+    faults
+    uses lock.io
+    1  ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ ■ ok {}
+       } contingency [l] (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ⊥
+
+// X1 [E-End]: `B₂` does not complete the site, so its end is an end with the
+// history undisposed ([K7]).
+control contingency_falls_off()
+    ■ { ok {} }
+    uses console.write
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ e : Δ emit(&m) ▸ done {}
+       }
+    2  ⊤ ▷ ■ ok {}
+
+// X2 [E-Var]: `recover ↑ ℓ` reads the parameters of the loop. One that the
+// body moved before the boundary is not there ([O2]).
+control recover_without_parameter(start : string)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(s : string := start) {
+           1  ⊤ ▷ k : Δ keep(s) ▸ kept {}
+           2  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ fault "again"
+              } contingency (m : string) {
+                  1  ⊤ ▷ recover ↑ retry
+              }
+           3  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+// X7 [E-Again]: the restart is an entry of the loop, and the invariant holds
+// for the parameters as they are then ([P2]).
+control recover_breaks_invariant()
+    ■ { ok {} }
+    1  ⊤ ▷ lp : ↻ retry(~tries : u32 := 0) {
+           ⊢ tries < 2
+           1  ⊤ ▷ tries ← tries + 1
+           2  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ fault "again"
+              } contingency (m : string) {
+                  1  ⊤ ▷ recover ↑ retry
+              }
+           3  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+// X5 [E-Scope]: `recover ↑ ℓ` ends the scopes up to the loop as `↑` does, and
+// no fault disposition applies to them ([O5]).
+control recover_abandons()
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(first : bool := true) {
+           1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+           2  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ fault "again"
+              } contingency (m : string) {
+                  1  ⊤ ▷ recover ↑ retry
+              }
+           3  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+// X5 [E-Scope]: `terminate n` ends every scope of the entry control as `■`
+// does ([O5]).
+control terminate_abandons()
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ terminate 1
+       }
+    3  ⊤ ▷ ⊥
+
+// X8 [E-Unwind]: `escalate` continues the fault outward, and the boundary it
+// came from no longer encloses it ([F1], [F5]).
+control escalate_not_permitted()
+    ■ { ok {} }
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ■ ok {}
+
+// X8 [E-Fault]: a new `fault` in `B₂` is a fault of the control ([F1], [F5]).
+control fault_not_permitted()
+    ■ { ok {} }
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ fault "more"
+       }
+    2  ⊤ ▷ ■ ok {}
+
+// X8 [E-Unwind]: the scope of `B₁` ends by [E-Unwind], which does not release
+// a resource that is not declared `on fault release` ([F2]).
+control work_holds_lock()
+    ■ { ok {} }
+    faults
+    uses lock.io
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+           2  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ■ ok {}
+
+// X8 [E-Unwind]: `escalate` ends the scope of `B₂` by [E-Unwind] as well, with
+// what the boundary had taken into its care ([F2]).
+control escalate_holds_lock()
+    ■ { ok {} }
+    faults
+    uses lock.io
+    1  ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency [l] (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ■ ok {}
+
+// X8 [E-Unwind]: a fault from a call in `B₂` is not taken by the boundary of
+// `B₂` either.
+contingent control faulting_helper()
+    ■ { done {} }
+    faults
+    1  ⊤ ▷ fault "helper"
+
+control call_in_contingency_faults()
+    ■ { ok {} }
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ h : Δ faulting_helper() ▸ done {}
+           2  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ■ ok {}
+
+//! run care_ends_with_work() with [open_lock -> opened {lock#1}] => stuck X5 E-Scope
+//! run care_ends_with_exit() with [open_lock -> opened {lock#1}] => stuck X5 E-Scope
+//! run contingency_falls_off() => stuck X1 E-End trace [emit("stop") -> done]
+//! run recover_without_parameter("a") with [keep -> kept] => stuck X2 E-Var trace [keep("a") -> kept]
+//! run recover_breaks_invariant() => stuck X7 E-Again
+//! run recover_abandons() with [open_conn -> opened {conn#1}] => stuck X5 E-Scope
+//! run terminate_abandons() with [open_conn -> opened {conn#1}] => stuck X5 E-Scope
+//! run escalate_not_permitted() => stuck X8 E-Unwind
+//! run fault_not_permitted() => stuck X8 E-Fault
+//! run work_holds_lock() with [open_lock -> opened {lock#1}] => stuck X8 E-Unwind
+//! run escalate_holds_lock() with [open_lock -> opened {lock#1}] => stuck X8 E-Unwind
+//! run call_in_contingency_faults() => stuck X8 E-Unwind

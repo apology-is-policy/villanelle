@@ -91,7 +91,7 @@ control lexical_terminate()
     1  ⊤ ▷ b : boundary {
            1  ⊤ ▷ fault "stop"
        } contingency (m : string) {
-           1  ⊤ ▷ terminate "stopped"
+           1  ⊤ ▷ terminate 3
        }
     2  ⊤ ▷ ■ ok {}
 
@@ -123,6 +123,94 @@ control run_moved_retained()
     1  ⊤ ▷ supervise moved_retained("w1")
     2  ⊤ ▷ ■ done {}
 
+// [E-Supervise]: `escalate` and a new `fault` are the other ends of the
+// contingency of a named boundary. The fault leaves the boundary and reaches
+// the control that supervises, which permits it or has a boundary around the
+// `supervise`.
+boundary escalating(tag : string) retains tag {
+    1  ⊤ ▷ fault "work"
+} contingency (m : string) {
+    1  ⊤ ▷ lg : Δ log_fault(&tag) ▸ done {}
+    2  ⊤ ▷ escalate
+}
+
+boundary refaulting() {
+    1  ⊤ ▷ fault "work"
+} contingency (m : string) {
+    1  ⊤ ▷ fault "again"
+}
+
+control run_escalating()
+    ■ { done {} }
+    faults
+    uses console.write
+    1  ⊤ ▷ supervise escalating("e")
+    2  ⊤ ▷ ■ done {}
+
+control run_refaulting()
+    ■ { done {} }
+    faults
+    1  ⊤ ▷ supervise refaulting()
+    2  ⊤ ▷ ■ done {}
+
+control run_refaulting_unpermitted()
+    ■ { done {} }
+    1  ⊤ ▷ supervise refaulting()
+    2  ⊤ ▷ ■ done {}
+
+control run_escalating_in_boundary()
+    ■ { done {} }
+    uses console.write
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ supervise escalating("e")
+       } contingency (m : string) {
+           1  ⊤ ▷ lg : Δ log_fault(&m) ▸ done {}
+           2  ⊤ ▷ terminate 5
+       }
+    2  ⊤ ▷ ■ done {}
+
+// [E-Supervise]: nothing encloses a statement of the contingency, so a call
+// in it that faults is stuck ([F1], [F6]).
+contingent control helper_faults()
+    ■ { done {} }
+    faults
+    1  ⊤ ▷ fault "helper"
+
+boundary calls_faulting() {
+    1  ⊤ ▷ fault "work"
+} contingency (m : string) {
+    1  ⊤ ▷ h : Δ helper_faults() ▸ done {}
+    2  ⊤ ▷ terminate
+}
+
+control run_calls_faulting()
+    ■ { done {} }
+    faults
+    1  ⊤ ▷ supervise calls_faulting()
+    2  ⊤ ▷ ■ done {}
+
+// [E-Supervise]: `terminate` ends the body it is in from inside a loop too.
+boundary looping(n : u32, fail_now : bool) {
+    1  ⊤ ▷ lp : ↻ count(i : u32 := 0) {
+           1  ⊤ ▷ t : ? i < n
+           2  t.true ▷ ↑ count(i + 1)
+           3  ⊤ ▷ f : ? fail_now
+           4  f.true ▷ fault "looped"
+           5  ⊤ ▷ terminate
+       }
+} contingency (m : string) {
+    1  ⊤ ▷ lp2 : ↻ once() {
+           1  ⊤ ▷ lg : Δ log_fault(&m) ▸ done {}
+           2  ⊤ ▷ terminate
+       }
+}
+
+control run_looping(fail_now : bool)
+    ■ { done {} }
+    uses console.write
+    1  ⊤ ▷ supervise looping(2, fail_now)
+    2  ⊤ ▷ ■ done {}
+
 //! run root_fault_with_release(false) with [open_conn -> opened {conn#1}; close_conn -> closed] => done ok trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
 //! run root_fault_with_release(true) with [open_conn -> opened {conn#1}] => faulted "boom" trace [open_conn() -> opened {conn#1}; conn.release(conn#1) -> released]
 //! run assumed_fault() => faulted "unreachable branch"
@@ -130,7 +218,14 @@ control run_moved_retained()
 //! run unwind_non_releasable() with [open_lock -> opened {lock#1}] => stuck X8 E-Unwind
 //! run lexical_recover(7) with [open_conn -> opened {conn#1}; check_ready -> not_ready; open_conn -> opened {conn#2}; check_ready -> ready {1}; close_conn -> closed] => done ok {7} trace [open_conn() -> opened {conn#1}; check_ready() -> not_ready; conn.release(conn#1) -> released; emit("not ready") -> done; open_conn() -> opened {conn#2}; check_ready() -> ready {1}; close_conn(conn#2) -> closed]
 //! run lexical_escalate() => faulted "inner" trace [emit("inner") -> done]
-//! run lexical_terminate() => done terminated {"stopped"}
+//! run lexical_terminate() => terminated 3
 //! run run_supervised(false) => done done
 //! run run_supervised(true) => done done trace [emit("w1") -> done; emit("worker failed") -> done]
 //! run run_moved_retained() => stuck X2 E-Supervise
+//! run run_escalating() => faulted "work" trace [emit("e") -> done]
+//! run run_refaulting() => faulted "again"
+//! run run_refaulting_unpermitted() => stuck X8 E-Unwind
+//! run run_escalating_in_boundary() => terminated 5 trace [emit("e") -> done; emit("work") -> done]
+//! run run_calls_faulting() => stuck X8 E-Unwind
+//! run run_looping(false) => done done
+//! run run_looping(true) => done done trace [emit("looped") -> done]

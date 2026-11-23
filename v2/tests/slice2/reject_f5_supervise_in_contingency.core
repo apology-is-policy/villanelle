@@ -1,0 +1,19 @@
+// [F5]: a contingency supervises nothing.
+boundary w() {
+    1  ⊤ ▷ terminate
+} contingency (m : string) {
+    1  ⊤ ▷ terminate
+}
+
+control c()
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ supervise w()
+           2  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

@@ -186,6 +186,7 @@ Command       c ::= [~]x [: τ] := o                     bind
                   | fault e                              fault        (terminator)
                   | ⊥                                    impossible   (terminator)
                   | terminate | escalate | recover ↑ ℓ   in a boundary (terminators, [F5], [F6])
+                  | terminate n                           end the execution (terminator, [F5])
 Operation     ω ::= f⟨τ̄⟩ | α.m | op | outcome | V
                   | await f⟨τ̄⟩ | await next | run f⟨τ̄⟩
 Operand       o ::= e | &p | &~p
@@ -380,7 +381,9 @@ body, the index of the next statement, the slots of the names bound so far, and
 the history.
 
 An **activation** is one call of a control: a nonempty stack of scopes, the
-control body first and one scope for each loop currently entered, together with
+control body first and one scope for each loop currently entered and for the
+body of each lexical boundary currently entered, or for its contingency in its
+place (section 6.9), together with
 the control's declared effects and fault permission. Variables are looked up
 from the innermost scope outward. `Φ*` is the union of the histories of the
 activation's scopes.
@@ -615,6 +618,10 @@ not an outcome and cannot be converted into one.
 - **[E-Root]** When the last activation is popped, the configuration is final
   with result `faulted(message)`.
 
+The scopes of an activation end innermost first, so a fault reaches the
+nearest boundary: a lexical boundary inside the body of a named boundary
+takes it before the named one does.
+
 Fault boundaries and contingency are carried over from v1 without change of
 meaning ([reference](../reference/contingency.md)). In core terms:
 
@@ -622,14 +629,36 @@ meaning ([reference](../reference/contingency.md)). In core terms:
   owned values `x̄` into the boundary's care and runs `B₁` in a scope of its own.
   `B₁` may fall off its end, which completes site `d` with its single
   alternative; this is the one exception to [E-End]. Its names and atoms do not
-  escape. It may also end with any terminator.
+  escape. It may also end with any terminator: `↑ ℓ` and `□` in it are those
+  of the loops around the boundary. What the boundary has in its care ends
+  with the scope of `B₁`: when `B₁` ends otherwise than by a fault, `x̄` are
+  ended by [E-Scope] after the names of `B₁`, so a value among them that
+  contains an obligation is stuck.
 - **[E-Contingency]** When a fault unwinds to the boundary, the scope of `B₁` is
-  ended by [E-Unwind] and `B₂` runs with `x̄` and the fault's message. `B₂` cannot
-  complete site `d`, exit, leave, or go again normally. Every history of `B₂`
-  ends with `recover ↑ ℓ`, which restarts the enclosing supervised loop with
-  the parameters it had when the boundary was entered; with `escalate`, which
-  continues the original fault outward; with a new `fault`, which carries the
-  original as its cause; or, in the entry control only, with `terminate n`.
+  ended by [E-Unwind] and `B₂` runs with `x̄` and the fault's message, in a
+  scope of its own that takes the place of the scope of `B₁`. The mode is
+  `run` again. `B₂` sees `x̄`, the message and its own names, and no name or
+  atom of the bodies around the boundary. `B₂` cannot
+  complete site `d`, exit, leave, or go again normally; reaching its end is
+  stuck by [E-End]. Every history of `B₂` ends in one of four ways:
+  - `recover ↑ ℓ` restarts the loop `ℓ`, which encloses the boundary, with
+    the parameters it had when the boundary was entered. It is `↑ ℓ(x̄ℓ)` for
+    the parameters `x̄ℓ` of `ℓ` themselves ([E-Again]): each is read as an
+    operand is ([E-Var]), every scope up to and including that of `ℓ` ends by
+    [E-Scope], and the invariant is evaluated for the new run. `B₁` does not
+    mention `x̄ℓ` ([F5]) and `B₂` does not see them, so they are what they
+    were when the boundary was entered.
+  - `escalate` continues the original fault outward: the mode is `fault`
+    with the original message, and [E-Unwind] goes on from the scope of `B₂`.
+  - A new `fault e`, which carries the original as its cause, does the same
+    with its own message ([E-Fault]).
+  - `terminate n`, in the entry control only, ends the execution. Every
+    scope of the activation ends by [E-Scope] and the configuration is final
+    with result `terminated(n)`, which is not an outcome.
+
+  For `escalate` and `fault` the boundary no longer encloses the statement,
+  since its scope has ended: the control permits `faults` or another
+  boundary of the activation is around this one, as [E-Fault] says.
 - **[E-Supervise]** A **named boundary** is a declaration
   `boundary b(x̄ : τ̄) retains ȳ {B₁} contingency(m : string) {B₂}`, with `ȳ`
   among `x̄`. Its parameters own what they hold: no borrow and no view crosses
@@ -640,7 +669,10 @@ meaning ([reference](../reference/contingency.md)). In core terms:
   and the message, which is stuck if a retained name is not available then;
   [F6] requires it to be available at every statement of `B₁` that may
   fault. Every history of `B₂` ends with `terminate`, with
-  `escalate` or with a new `fault`. After `terminate` in either body the
+  `escalate` or with a new `fault`, which leave the boundary: the fault
+  reaches the supervising control as a fault from a call does ([E-Unwind]).
+  Nothing encloses a statement of `B₂`, so a call in it that faults is
+  stuck. After `terminate` in either body the
   supervising control continues with its next statement. It learns nothing:
   `supervise` has no alternatives, no payload and no fact, and it may not
   fault unless `B₂` can end otherwise than by `terminate`. This is the one
@@ -671,7 +703,7 @@ Running forever is not stuck. `host-violation` is not stuck.
 ### 6.11 Observations
 
 The observation of an execution is its event trace together with how it ends:
-`done(a, v̄)`, `faulted(message)`, or divergence. Scope identities, tags, slot
+`done(a, v̄)`, `faulted(message)`, `terminated(n)`, or divergence. Scope identities, tags, slot
 states and histories are not observable. Given the host's choices, which
 include the order of turns ([E-Turn]), execution is deterministic.
 
@@ -940,7 +972,13 @@ has been bound, and `M(x)`, on which it has been moved. `x` is **available** on
   place whose type is not of kind `must`.
 - **[O5] Obligations.** A terminator at statement `i` ends scopes: `■` and
   `fault` end all scopes of the control, `□` the innermost loop, `↑ ℓ` the loops
-  up to and including `ℓ`. For every name `x` of those scopes whose type has
+  up to and including `ℓ`. Of the terminators of a boundary, `terminate n`
+  ends all scopes of the control as `■` does, `escalate` as `fault` does,
+  `recover ↑ ℓ` the scopes up to and including `ℓ` as `↑ ℓ` does, and
+  `terminate` all scopes of the body of the named boundary it is in. The
+  scope of `B₁` or `B₂` of a lexical boundary is among the scopes that a
+  terminator inside it ends, and with the scope of `B₁` what the boundary
+  has in its care. For every name `x` of those scopes whose type has
   kind `must`, after the terminator's own expressions have been checked:
   `Θ ⊨ ¬(Rᵢ ∧ D(x) ∧ ¬M(x))`. For `fault`, names of fault-releasable type are
   exempt.
@@ -1087,7 +1125,25 @@ Each of these is an entailment by [N2], on the histories that run the statement.
   with one of the terminators that [E-Contingency] lists; [O5] applies there
   to `x̄` as to any other name. `escalate` and a
   `fault` in `B₂` may fault in the sense of [F1], and their own boundary does
-  not count as enclosing them.
+  not count as enclosing them; the same holds for a call in `B₂` that may
+  fault.
+
+  The requirements of form, which a reader of programs refuses:
+  (a) In `B₂`, at any depth, there is no `■`, no boundary, no `supervise`
+  and no `terminate` without a status; `↑` and `□` there are those of a
+  loop of `B₂` itself. ([W3] counts `B₁` as part of the body around the
+  boundary, and `B₂` as a body that nothing encloses.)
+  (b) `B₂` mentions `x̄`, the message and its own names, and its selectors
+  mention its own sites ([W2], [W4]).
+  (c) `recover ↑ ℓ` occurs only in `B₂`, and `ℓ` is a loop that encloses the
+  boundary. `B₁` does not mention a parameter of a loop that a `recover` of
+  its `B₂` names; this is v1's rule that supervisor state stays outside
+  protected work.
+  (d) `escalate` occurs only in a contingency.
+  (e) `terminate n` occurs only in `B₂` of a boundary in the body of a
+  control, and that boundary is inside the `B₁` of no other. `n` is a
+  literal from 0 to 255. A control that holds one is an **entry control**:
+  no decision, capture, `spawn`, `await` or `run` names it.
 - **[F6] Named boundaries.** For
   `boundary b(x̄ : τ̄) retains ȳ {B₁} contingency(m : string) {B₂}`, no `τ` is or
   contains a borrow or a view, and `ȳ` are distinct names among `x̄`. `B₁` is
@@ -1103,7 +1159,12 @@ Each of these is an entailment by [N2], on the histories that run the statement.
   with no alternative, and its operands move. It may fault exactly when a
   history of `B₂` ends with `escalate` or `fault`. The effects of both bodies
   count toward the control that supervises ([F3]). A boundary is invoked only
-  by `supervise`, and not from a contingency.
+  by `supervise`, and not from a contingency. As requirements of form:
+  `terminate` without a status occurs only in the two bodies of a named
+  boundary, and not in the contingency of a lexical boundary inside them;
+  neither body has `■` or `terminate n`; `B₂` has no boundary and no
+  `recover`. A call in `B₂` that may fault is not permitted by [F1], since
+  `B₂` has no signature and nothing encloses it.
 
 ### 7.8 Tasks
 
@@ -1413,3 +1474,4 @@ and what asked for it:
 | 22 November 2026 | [TK6] gives `old(y)` of each `&~` parameter a separate fresh name from `y` in `φₐ` at `await next(x)`. | Second review of the task rules before slice 4: sharing one fresh name turned `y = old(y) + 1` into `u = u + 1` (false), letting a checked program prove `⊥` and stick (`X6`). |
 | 22 November 2026 | [W11] restricts `await next(x)` to decisions (`Δ`), not `capture`. | Second review of the task rules: `capture` records no `d.empty` atom to track `[TK2]` consumption of `x` (the surface grammar already restricted `capture` to calls). |
 | 22 November 2026 | [E-AwaitHost] checks precondition and effect allowance before the `cancelled` shortcut and passes the turn (`ready`) when completing immediately with `cancelled`. | Second review of the task rules: prevents cancellation from bypassing `X7`/`X9` in unchecked programs and aligns immediate `cancelled` completion with choice 22 ("Every `await` passes the turn"). |
+| 23 November 2026 | [E-Contingency] says how each of the four ends of `B₂` runs, and that `B₂` has a scope of its own and sees only `x̄` and the message. `terminate n` is in the grammar, with the final result `terminated(n)` (sections 6.9 and 6.11). [E-Boundary] says that what the boundary has in its care ends with the scope of `B₁`. [E-Supervise] says that a fault leaves `B₂` as a fault from a call does. [O5] lists the scopes that the terminators of a boundary end. [F5] and [F6] list their requirements of form. | The oracle of slice 2 (review findings RO1, RO3, RO4, and the questions of RC5, RC6 and RC14): the rules were carried over from v1 by reference, and the code had read them five ways. The answers are v1's, where the text above does not say otherwise: the status is a literal from 0 to 255 and belongs to the outermost contingency of an entry control, which nothing invokes; a contingency sees only what it retains; the body of the boundary leaves the parameters of the restarted loop alone, which is what "the parameters it had when the boundary was entered" rests on. Two readings are stricter than v1: `recover` and `terminate n` end the scopes around the boundary by [E-Scope], where v1 released by fault disposition; and a contingency does not let its control go on (corpus finding O10 stays open). |

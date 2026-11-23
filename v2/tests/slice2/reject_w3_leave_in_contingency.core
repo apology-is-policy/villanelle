@@ -1,0 +1,15 @@
+// [W3], [E-Contingency]: `B₂` does not leave the loop of its boundary: `□`
+// leaves the innermost loop, and that is one of `B₂` itself or none.
+control c()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ lp : ↻ retry() {
+           1  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ fault "stop"
+              } contingency (m : string) {
+                  1  ⊤ ▷ □ done {3}
+              }
+           2  ⊤ ▷ □ done {4}
+       } ▸ done {v}
+    2  ⊤ ▷ ■ ok {v}
+
+//! reject W3

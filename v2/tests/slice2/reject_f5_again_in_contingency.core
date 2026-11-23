@@ -1,0 +1,15 @@
+// [F5], [E-Contingency]: `B₂` does not go round the loop of its boundary
+// again as the body does; `recover ↑ ℓ` restarts it.
+control c()
+    ■ { ok {} }
+    1  ⊤ ▷ lp : ↻ l(i : u32 := 0) {
+           1  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ fault "stop"
+              } contingency (m : string) {
+                  1  ⊤ ▷ ↑ l(1)
+              }
+           2  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

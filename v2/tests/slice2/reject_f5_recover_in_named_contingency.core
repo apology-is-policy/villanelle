@@ -1,0 +1,17 @@
+// [F5], [F6]: the contingency of a named boundary ends with `terminate`,
+// `escalate` or `fault`: `recover ↑ ℓ` belongs to the lexical form.
+boundary w() {
+    1  ⊤ ▷ fault "x"
+} contingency (m : string) {
+    1  ⊤ ▷ lp : ↻ l() {
+           1  ⊤ ▷ recover ↑ l
+       }
+    2  ⊤ ▷ terminate
+}
+
+control c()
+    ■ { ok {} }
+    1  ⊤ ▷ supervise w()
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

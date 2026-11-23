@@ -1,0 +1,14 @@
+// [E-Contingency], [W2]: a selector of `B₂` mentions the sites of `B₂` only.
+control c(n : u32)
+    ■ { ok {v : u32} }
+    faults
+    1  ⊤ ▷ t : ? n = 0
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  t.true ▷ escalate
+           2  t.false ▷ fault "other"
+       }
+    3  ⊤ ▷ ■ ok {n}
+
+//! reject W2

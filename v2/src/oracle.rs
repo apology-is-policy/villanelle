@@ -327,6 +327,9 @@ pub enum End {
     },
     /// A fault unwound out of the entry control ([E-Root]).
     Faulted(String),
+    /// The entry control ended the execution with a status
+    /// ([E-Contingency], `terminate n`).
+    Terminated(u8),
     Stuck(Stuck),
     /// The host broke a contract ([E-Host]). Not a stuck state.
     HostViolation(String),
@@ -351,6 +354,7 @@ impl fmt::Display for End {
             End::Faulted(message) => {
                 write!(formatter, "faulted \"{}\"", escape_string(message))
             }
+            End::Terminated(status) => write!(formatter, "terminated {status}"),
             End::Stuck(stuck) => write!(
                 formatter,
                 "stuck X{} {} at {}:{}: {}",
@@ -587,9 +591,7 @@ impl TagTable {
 #[derive(Clone, Debug)]
 enum ScopeKind {
     Normal,
-    Loop {
-        entry_parameters: Vec<Value>,
-    },
+    Loop,
     LexicalBoundary {
         site: SiteId,
         parent_pc: usize,
@@ -599,7 +601,6 @@ enum ScopeKind {
         message_var: Option<VarId>,
     },
     LexicalContingency {
-        parent_pc: usize,
         fault_message: String,
     },
 }
@@ -2523,6 +2524,18 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    /// Whether the current activation runs the contingency of a named
+    /// boundary ([E-Supervise]).
+    fn in_named_contingency(&self) -> bool {
+        matches!(
+            self.stack.last().expect("an activation").kind,
+            ActivationKind::Boundary {
+                in_contingency: Some(_),
+                ..
+            }
+        )
+    }
+
     /// Whether the current position in the top activation is permitted to fault
     /// ([E-Fault], [E-Unwind]).
     fn current_permits_faults(&self) -> bool {
@@ -2547,22 +2560,39 @@ impl<'a> Machine<'a> {
         }
     }
 
-    /// [E-Fault], [E-Unwind], [E-Root], [E-Contingency], [E-Supervise]: unwinds
-    /// a fault with `message` until a boundary catches it or the root pops.
-    fn unwind_fault(&mut self, message: String) -> Result<Option<End>, Fail> {
+    /// [E-Unwind], [E-Contingency], [E-Supervise], [E-Root]: the mode is
+    /// `fault(message)`. The scopes end innermost first, until a boundary
+    /// takes the fault or the last activation is popped.
+    fn unwind(&mut self, message: String) -> Result<Option<End>, Fail> {
         loop {
-            while let Some(top_scope) = self.stack.last_mut().expect("an activation").scopes.pop() {
-                self.unwind_scope(&top_scope)?;
+            // The scopes of the current activation, innermost first. A
+            // lexical boundary takes the fault before anything around it,
+            // and the body of a named boundary when only its own scope is
+            // left.
+            loop {
+                let activation = self.stack.last().expect("an activation");
+                if let ActivationKind::Boundary {
+                    id,
+                    in_contingency: None,
+                } = activation.kind
+                    && activation.scopes.len() == 1
+                {
+                    return self.enter_named_contingency(id, message);
+                }
+                let Some(scope) = self.stack.last_mut().expect("an activation").scopes.pop() else {
+                    break;
+                };
+                self.unwind_scope(&scope)?;
                 if let ScopeKind::LexicalBoundary {
-                    parent_pc,
                     captures,
                     contingency_body,
                     contingency_vars,
                     message_var,
                     ..
-                } = top_scope.kind
+                } = scope.kind
                 {
-                    // [E-Contingency]: enter lexical contingency `B₂`.
+                    // [E-Contingency]: `B₂` runs with `x̄` and the message, in
+                    // the place of `B₁`.
                     let scope_id = self.alloc_scope_id();
                     let mut slots = Vec::with_capacity(contingency_vars.len() + 1);
                     for (var, val) in contingency_vars.into_iter().zip(captures) {
@@ -2584,7 +2614,6 @@ impl<'a> Machine<'a> {
                             slots,
                             history: Vec::new(),
                             kind: ScopeKind::LexicalContingency {
-                                parent_pc,
                                 fault_message: message,
                             },
                         });
@@ -2593,8 +2622,10 @@ impl<'a> Machine<'a> {
                 }
             }
 
-            // Pop activation.
+            // The activation has no scopes left: it is popped, and the
+            // unwinding continues where it was called from.
             let _popped = self.stack.pop().expect("an activation");
+            let mut arrival = "a fault";
             if self.stack.is_empty() {
                 let cur = self.current_task;
                 if let Some(set_id) = self.tasks[cur].member_of {
@@ -2640,154 +2671,32 @@ impl<'a> Machine<'a> {
                         let above = self.stack.pop().expect("activation above owner");
                         self.stop_activation(above)?;
                     }
-                    self.locate();
-                    if !self.current_permits_faults() {
-                        let owner_name = self.current_name();
-                        return fail(
-                            8,
-                            "E-Unwind",
-                            format!(
-                                "a member fault reached `{owner_name}`, which does not permit `faults` and has no enclosing boundary"
-                            ),
-                        );
-                    }
-                    return self.trigger_unwind(message);
-                }
-
-                // Root of a nested `run`: propagate the fault to the caller waiting at `run` ([E-Run]).
-                if self.runs.len() > 1 {
+                    arrival = "a member fault";
+                } else if self.runs.len() > 1 {
+                    // Root of a nested `run`: the fault reaches the caller waiting at `run` ([E-Run]).
                     let finished_run = self.runs.pop().expect("nested run");
                     self.tasks[cur].state = TaskState::Stopped;
                     let caller = finished_run.caller_task.expect("nested run has caller");
                     self.activate_task(caller);
-                    self.locate();
-                    if let ActivationKind::Boundary {
-                        id,
-                        in_contingency: None,
-                    } = self.stack.last().expect("an activation").kind
-                    {
-                        return self.enter_named_contingency(id, message);
-                    }
-                    if !self.current_permits_faults() {
-                        let caller_name = self.current_name();
-                        return fail(
-                            8,
-                            "E-Unwind",
-                            format!(
-                                "a fault from `run` reached `{caller_name}`, which does not permit `faults` and has no enclosing boundary"
-                            ),
-                        );
-                    }
-                    return self.trigger_unwind(message);
+                    arrival = "a fault from `run`";
+                } else {
+                    self.count("E-Root");
+                    return Ok(Some(End::Faulted(message)));
                 }
-
-                self.count("E-Root");
-                return Ok(Some(End::Faulted(message)));
             }
             self.locate();
-
-            // Check if the caller activation is a named boundary in `B₁`!
-            if let ActivationKind::Boundary {
-                id,
-                in_contingency: None,
-            } = self.stack.last().expect("an activation").kind
-            {
-                return self.enter_named_contingency(id, message);
-            }
-
-            // Otherwise the caller is a control (or a named boundary contingency)
-            // waiting at a decision/capture/supervise.
+            // [E-Unwind]: the activation the fault reaches permits `faults`,
+            // or a boundary encloses the waiting statement.
             if !self.current_permits_faults() {
-                let caller_name = self.current_name();
+                let name = self.current_name();
                 return fail(
                     8,
                     "E-Unwind",
                     format!(
-                        "a fault reached `{caller_name}`, which does not permit `faults` and has no enclosing boundary"
+                        "{arrival} reached `{name}`, which does not permit `faults` and has no enclosing boundary"
                     ),
                 );
             }
-            if let ActivationKind::Boundary {
-                id,
-                in_contingency: None,
-            } = self.stack.last().expect("an activation").kind
-            {
-                return self.enter_named_contingency(id, message);
-            }
-        }
-    }
-
-    /// Unwinds the current activation up to the nearest boundary (lexical or
-    /// named) or root.
-    fn trigger_unwind(&mut self, message: String) -> Result<Option<End>, Fail> {
-        loop {
-            let is_named_b1 = matches!(
-                self.stack.last().expect("an activation").kind,
-                ActivationKind::Boundary {
-                    in_contingency: None,
-                    ..
-                }
-            );
-            if is_named_b1 {
-                let ActivationKind::Boundary { id, .. } =
-                    self.stack.last().expect("an activation").kind
-                else {
-                    unreachable!();
-                };
-                return self.enter_named_contingency(id, message);
-            }
-
-            let has_scopes = !self.stack.last().expect("an activation").scopes.is_empty();
-            if has_scopes {
-                let top_scope = self
-                    .stack
-                    .last_mut()
-                    .expect("an activation")
-                    .scopes
-                    .pop()
-                    .unwrap();
-                self.unwind_scope(&top_scope)?;
-                if let ScopeKind::LexicalBoundary {
-                    parent_pc,
-                    captures,
-                    contingency_body,
-                    contingency_vars,
-                    message_var,
-                    ..
-                } = top_scope.kind
-                {
-                    let scope_id = self.alloc_scope_id();
-                    let mut slots = Vec::with_capacity(contingency_vars.len() + 1);
-                    for (var, val) in contingency_vars.into_iter().zip(captures) {
-                        let tag = self.tags.new_owner(scope_id, var);
-                        slots.push((var, Slot::Available(val), tag));
-                    }
-                    if let Some(mvar) = message_var {
-                        let tag = self.tags.new_owner(scope_id, mvar);
-                        slots.push((mvar, Slot::Available(Value::String(message.clone())), tag));
-                    }
-                    self.stack
-                        .last_mut()
-                        .expect("an activation")
-                        .scopes
-                        .push(Scope {
-                            id: scope_id,
-                            body: contingency_body,
-                            pc: 0,
-                            slots,
-                            history: Vec::new(),
-                            kind: ScopeKind::LexicalContingency {
-                                parent_pc,
-                                fault_message: message,
-                            },
-                        });
-                    self.count("E-Contingency");
-                    return Ok(None);
-                }
-                continue;
-            }
-
-            return self.unwind_fault(message);
         }
     }
 
@@ -2799,17 +2708,7 @@ impl<'a> Machine<'a> {
         message: String,
     ) -> Result<Option<End>, Fail> {
         let retains = self.program.boundaries[id].retains.clone();
-        // Unwind any inner loop scopes of `B₁` first.
-        while self.stack.last().expect("an activation").scopes.len() > 1 {
-            let inner = self
-                .stack
-                .last_mut()
-                .expect("an activation")
-                .scopes
-                .pop()
-                .unwrap();
-            self.unwind_scope(&inner)?;
-        }
+        // The scopes inside `B₁` have ended ([E-Unwind]); its own is left.
         let mut root_scope = self
             .stack
             .last_mut()
@@ -2921,9 +2820,9 @@ impl<'a> Machine<'a> {
             .clone();
         let scope_id = self.alloc_scope_id();
         let mut slots = Vec::with_capacity(params.len());
-        for (&var, val) in params.iter().zip(&values) {
+        for (&var, val) in params.iter().zip(values) {
             let tag = self.tags.new_owner(scope_id, var);
-            slots.push((var, Slot::Available(val.clone()), tag));
+            slots.push((var, Slot::Available(val), tag));
         }
         let activation = self.stack.last_mut().expect("an activation");
         activation.scopes.push(Scope {
@@ -2932,9 +2831,7 @@ impl<'a> Machine<'a> {
             pc: 0,
             slots,
             history: Vec::new(),
-            kind: ScopeKind::Loop {
-                entry_parameters: values,
-            },
+            kind: ScopeKind::Loop,
         });
         let head = self.body().bodies[body].head.as_ref().expect("a loop body");
         if let Some(invariant) = &head.invariant
@@ -4096,7 +3993,7 @@ impl<'a> Machine<'a> {
                         .scopes
                         .pop()
                         .expect("a loop scope");
-                    let is_loop = matches!(scope.kind, ScopeKind::Loop { .. });
+                    let is_loop = matches!(scope.kind, ScopeKind::Loop);
                     self.end_scope(&scope)?;
                     if is_loop {
                         break;
@@ -4221,46 +4118,12 @@ impl<'a> Machine<'a> {
                     return fail(10, "E-Fault", "fault message is not a string");
                 };
                 self.count("E-Fault");
-                // If inside a contingency body `B₂`, a new `fault` ends `B₂` and
-                // propagates outward.
-                if let Some(ScopeKind::LexicalContingency { parent_pc, .. }) = self
-                    .stack
-                    .last()
-                    .and_then(|a| a.scopes.last())
-                    .map(|s| &s.kind)
-                {
-                    let parent_pc = *parent_pc;
-                    let b2_scope = self
-                        .stack
-                        .last_mut()
-                        .expect("an activation")
-                        .scopes
-                        .pop()
-                        .unwrap();
-                    self.unwind_scope(&b2_scope)?;
-                    self.scope().pc = parent_pc + 1;
-                    if !self.current_permits_faults() {
-                        return fail(
-                            8,
-                            "E-Fault",
-                            format!("`{}` does not permit `faults`", self.current_name()),
-                        );
-                    }
-                    return self.trigger_unwind(msg);
-                }
-                if matches!(
-                    self.stack.last().expect("an activation").kind,
-                    ActivationKind::Boundary {
-                        in_contingency: Some(_),
-                        ..
-                    }
-                ) {
-                    while let Some(s) = self.stack.last_mut().expect("an activation").scopes.pop() {
-                        self.unwind_scope(&s)?;
-                    }
-                    return self.unwind_fault(msg);
-                }
-                if !self.current_permits_faults() {
+                // [E-Supervise]: a new `fault` is one of the ends of the
+                // contingency of a named boundary, and leaves it. Anywhere
+                // else the control permits `faults` or a boundary of the
+                // activation encloses the statement; the boundary of a
+                // contingency no longer does ([F5]).
+                if !self.in_named_contingency() && !self.current_permits_faults() {
                     return fail(
                         8,
                         "E-Fault",
@@ -4270,116 +4133,127 @@ impl<'a> Machine<'a> {
                         ),
                     );
                 }
-                return self.trigger_unwind(msg);
+                return self.unwind(msg);
             }
             Command::Impossible => return fail(6, "E-Impossible", "`⊥` runs"),
-            Command::Terminate(status) => {
-                let status_val = match status {
-                    Some(expr) => Some(self.eval_expr(expr, false)?),
-                    None => None,
-                };
-                // Case 1: inside a lexical contingency body `B₂`.
-                if matches!(self.scope().kind, ScopeKind::LexicalContingency { .. }) {
-                    let b2_scope = self
-                        .stack
-                        .last_mut()
-                        .expect("an activation")
-                        .scopes
-                        .pop()
-                        .unwrap();
-                    self.end_scope(&b2_scope)?;
-                    let ScopeKind::LexicalContingency { parent_pc, .. } = b2_scope.kind else {
-                        unreachable!();
-                    };
-                    if let Some(v) = status_val {
-                        let mut scopes = std::mem::take(
-                            &mut self.stack.last_mut().expect("an activation").scopes,
-                        );
-                        while let Some(s) = scopes.pop() {
-                            self.end_scope(&s)?;
-                        }
-                        self.stack.pop();
-                        return Ok(Some(End::Done {
-                            alternative: "terminated".to_string(),
-                            payload: vec![v],
-                        }));
-                    }
-                    self.scope().pc = parent_pc + 1;
-                    return Ok(None);
+            Command::Terminate(None) => {
+                // [E-Supervise]: the body of a named boundary ends, and the
+                // supervising control goes on with its next statement.
+                if !matches!(
+                    self.stack.last().expect("an activation").kind,
+                    ActivationKind::Boundary { .. }
+                ) || self.stack.len() < 2
+                {
+                    return fail(
+                        10,
+                        "E-Supervise",
+                        "`terminate` outside a body of a named boundary",
+                    );
                 }
-                // Case 2: inside a named boundary (`B₁` or `B₂`).
                 let mut scopes =
                     std::mem::take(&mut self.stack.last_mut().expect("an activation").scopes);
-                while let Some(s) = scopes.pop() {
-                    self.end_scope(&s)?;
+                while let Some(scope) = scopes.pop() {
+                    self.end_scope(&scope)?;
                 }
                 self.stack.pop();
                 self.scope().pc += 1;
                 self.count("E-Supervise");
             }
-            Command::Escalate => {
-                // Case 1: inside a lexical contingency `B₂`.
-                if matches!(self.scope().kind, ScopeKind::LexicalContingency { .. }) {
-                    let b2_scope = self
-                        .stack
-                        .last_mut()
-                        .expect("an activation")
-                        .scopes
-                        .pop()
-                        .unwrap();
-                    self.unwind_scope(&b2_scope)?;
-                    let ScopeKind::LexicalContingency {
-                        parent_pc,
-                        fault_message,
-                    } = b2_scope.kind
-                    else {
-                        unreachable!();
-                    };
-                    self.scope().pc = parent_pc + 1;
-                    if !self.current_permits_faults() {
-                        return fail(
-                            8,
-                            "E-Unwind",
-                            format!("`{}` does not permit `faults`", self.current_name()),
-                        );
-                    }
-                    return self.trigger_unwind(fault_message);
+            Command::Terminate(Some(status)) => {
+                // [E-Contingency]: in the entry control only. Every scope of
+                // the activation ends by [E-Scope], and the execution is
+                // final with the status.
+                let entry = self.stack.len() == 1
+                    && self.runs.len() == 1
+                    && self.tasks[self.current_task].member_of.is_none()
+                    && matches!(
+                        self.stack.last().expect("an activation").kind,
+                        ActivationKind::Control(_)
+                    );
+                if !entry {
+                    return fail(
+                        10,
+                        "E-Contingency",
+                        "`terminate n` outside the entry control",
+                    );
                 }
-                // Case 2: inside a named boundary contingency `B₂`.
-                let ActivationKind::Boundary {
-                    in_contingency: Some(msg),
-                    ..
-                } = self.stack.last().expect("an activation").kind.clone()
-                else {
-                    return fail(10, "E-Contingency", "`escalate` outside contingency");
-                };
-                while let Some(s) = self.stack.last_mut().expect("an activation").scopes.pop() {
-                    self.unwind_scope(&s)?;
-                }
-                return self.unwind_fault(msg);
-            }
-            Command::Recover { body: target_loop } => {
-                // Ends scopes up to and including `target_loop` by [E-Scope] and
-                // restarts `target_loop` with the parameters it had at entry.
-                let mut entry_params = None;
-                while let Some(scope) = self.stack.last_mut().expect("an activation").scopes.pop() {
-                    let is_target = scope.body == *target_loop;
-                    if is_target
-                        && let ScopeKind::Loop {
-                            ref entry_parameters,
-                        } = scope.kind
-                    {
-                        entry_params = Some(entry_parameters.clone());
-                    }
+                let mut scopes =
+                    std::mem::take(&mut self.stack.last_mut().expect("an activation").scopes);
+                while let Some(scope) = scopes.pop() {
                     self.end_scope(&scope)?;
-                    if is_target {
+                }
+                self.stack.pop();
+                self.count("E-Contingency");
+                return Ok(Some(End::Terminated(*status)));
+            }
+            Command::Escalate => {
+                // [E-Contingency], [E-Supervise]: the original fault goes on
+                // outward from the contingency.
+                let lexical = self
+                    .stack
+                    .last()
+                    .expect("an activation")
+                    .scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| match &scope.kind {
+                        ScopeKind::LexicalContingency { fault_message } => {
+                            Some(fault_message.clone())
+                        }
+                        _ => None,
+                    });
+                let message = match lexical {
+                    Some(message) => {
+                        if !self.current_permits_faults() {
+                            return fail(
+                                8,
+                                "E-Unwind",
+                                format!(
+                                    "`{}` does not permit `faults` and no boundary encloses the one that escalates",
+                                    self.current_name()
+                                ),
+                            );
+                        }
+                        message
+                    }
+                    None => {
+                        let ActivationKind::Boundary {
+                            in_contingency: Some(message),
+                            ..
+                        } = self.stack.last().expect("an activation").kind.clone()
+                        else {
+                            return fail(10, "E-Contingency", "`escalate` outside contingency");
+                        };
+                        message
+                    }
+                };
+                return self.unwind(message);
+            }
+            Command::Recover { body: target } => {
+                // [E-Contingency]: the loop starts again with its own
+                // parameters, read as operands are ([E-Var]): [F5] keeps
+                // them as they were when the boundary was entered.
+                let operands: Vec<Expr> = body.bodies[*target]
+                    .head
+                    .as_ref()
+                    .expect("a loop body")
+                    .parameters
+                    .iter()
+                    .map(|var| Expr::Var(VarRef::Local(*var), body.vars[*var].ty.clone()))
+                    .collect();
+                let values = self.eval_operands(&operands)?;
+                let activation = self.stack.last_mut().expect("an activation");
+                if !activation.scopes.iter().any(|scope| scope.body == *target) {
+                    return fail(10, "E-Contingency", "`recover` names no loop that runs");
+                }
+                while let Some(scope) = self.stack.last_mut().expect("an activation").scopes.pop() {
+                    let done = scope.body == *target;
+                    self.end_scope(&scope)?;
+                    if done {
                         break;
                     }
                 }
-                let Some(params) = entry_params else {
-                    return fail(10, "E-Contingency", "`recover` target loop not found");
-                };
-                self.enter(*target_loop, params, "E-Again")?;
+                self.enter(*target, values, "E-Again")?;
                 self.count("E-Contingency");
             }
         }

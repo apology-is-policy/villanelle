@@ -1,0 +1,17 @@
+// [F5]: `terminate n` belongs to the outermost boundary of the entry
+// control: its boundary is inside `B₁` of no other.
+control c()
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ outer : boundary {
+           1  ⊤ ▷ inner : boundary {
+                  1  ⊤ ▷ fault "stop"
+              } contingency (m : string) {
+                  1  ⊤ ▷ terminate 1
+              }
+       } contingency (m2 : string) {
+           1  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

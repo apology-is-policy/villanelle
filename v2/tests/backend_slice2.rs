@@ -115,6 +115,7 @@ fn verify_native_specs(
                 payload: payload.clone(),
             },
             End::Faulted(msg) => erased::End::Faulted(msg.clone()),
+            End::Terminated(status) => erased::End::Terminated(*status),
             other => panic!(
                 "{label} run {idx} ({}, usize={usize_bits}) did not finish cleanly in oracle: {other}",
                 spec.entry
@@ -871,6 +872,60 @@ fn slice_two_core_programs_agree_natively() {
         },
     ];
     verify_native_specs("faults_and_boundaries.core", &flt_core, &flt_specs, 64);
+
+    // 6. lexical_boundaries.core: every run of the file that ends.
+    let lex_core = villanelle_v2::load(include_str!("slice2/lexical_boundaries.core")).unwrap();
+    let spec = |entry: &str, arguments: Vec<Value>, answers: Vec<(&str, Answer)>| NativeRunSpec {
+        entry: entry.to_string(),
+        arguments,
+        arithmetic: false,
+        answers: answers
+            .into_iter()
+            .map(|(control, answer)| (control.to_string(), answer))
+            .collect(),
+    };
+    // `conn` is the first resource type of the file and `lock` the second.
+    let opened = |name: &str, id: u64| {
+        let ty = usize::from(name == "lock");
+        let name = name.to_string();
+        ans("opened", vec![Value::Resource { ty, name, id }])
+    };
+    let lex_specs = vec![
+        spec("falls_off", vec![u32_val(4)], vec![]),
+        spec("ends_inside", vec![u32_val(3)], vec![]),
+        spec("leaves_inside", vec![u32_val(2)], vec![]),
+        spec(
+            "cares",
+            vec![Value::String("t".to_string())],
+            vec![
+                ("open_lock", opened("lock", 1)),
+                ("open_conn", opened("conn", 1)),
+                ("close_lock", ans("closed", vec![])),
+            ],
+        ),
+        spec("from_below", vec![], vec![("open_conn", opened("conn", 1))]),
+        spec(
+            "retries",
+            vec![u32_val(3)],
+            vec![
+                ("open_conn", opened("conn", 1)),
+                ("open_conn", opened("conn", 2)),
+                ("open_conn", opened("conn", 3)),
+                ("close_conn", ans("closed", vec![])),
+            ],
+        ),
+        spec(
+            "recovers_outer",
+            vec![Value::String("kept".to_string())],
+            vec![],
+        ),
+        spec("escalates_to_outer", vec![], vec![]),
+        spec("loops_in_contingency", vec![u32_val(2)], vec![]),
+        spec("ends_execution", vec![u32_val(0)], vec![]),
+        spec("ends_execution", vec![u32_val(1)], vec![]),
+        spec("supervises", vec![], vec![]),
+    ];
+    verify_native_specs("lexical_boundaries.core", &lex_core, &lex_specs, 64);
 }
 
 #[test]

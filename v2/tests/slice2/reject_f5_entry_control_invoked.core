@@ -1,0 +1,17 @@
+// [F5], [E-Contingency]: a control that holds `terminate n` is an entry
+// control, and nothing invokes it.
+control entry()
+    ■ { ok {} }
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ terminate 1
+       }
+    2  ⊤ ▷ ■ ok {}
+
+control c()
+    ■ { ok {} }
+    1  ⊤ ▷ d : Δ entry() ▸ ok {}
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

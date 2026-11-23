@@ -1,0 +1,15 @@
+// [E-Contingency], [F5]: `B₂` runs with `x̄` and the message. A name of the
+// body around the boundary is not in scope in it.
+control c(n : u32)
+    ■ { ok {v : u32} }
+    faults
+    1  ⊤ ▷ k : u32 := n + 1
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ j : u32 := k
+           2  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ■ ok {k}
+
+//! reject C1

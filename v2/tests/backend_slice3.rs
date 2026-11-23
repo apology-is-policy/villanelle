@@ -115,6 +115,7 @@ fn verify_native_specs(
                 payload: payload.clone(),
             },
             End::Faulted(msg) => erased::End::Faulted(msg.clone()),
+            End::Terminated(status) => erased::End::Terminated(*status),
             other => panic!(
                 "{label} run {idx} ({}, usize={usize_bits}) did not finish cleanly in oracle: {other}",
                 spec.entry

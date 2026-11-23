@@ -324,7 +324,7 @@ control bad() ■ { ok {} }
     3 ⊤ ▷ b : boundary {
         1 ⊤ ▷ fault "boom"
     } contingency [r] (m : string) {
-        1 ⊤ ▷ terminate
+        1 ⊤ ▷ terminate 1
     }
     4 ⊤ ▷ ■ ok {}
 "#,

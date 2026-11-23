@@ -59,7 +59,7 @@ for every clause implemented.
 
 | Requirement | 1. Scalars and decisions | 2. Data | 3. Borrows | 4. Tasks |
 | --- | --- | --- | --- | --- |
-| Oracle: accepting and rejecting test for each clause | Met: 41 files, 126 runs, 12 rules, 15 stuck states, 9 refusals | Partly: 13 files, 33 runs, 10 stuck labels; the fault-boundary rules are wrong (RO1, RO3, RO4) | No: 2 files; one stuck label, `X4 B1`, which the oracle raises in 17 places; the test asserts counts of runs | No: 2 files; the test asserts no stuck state; one run varies the order of turns |
+| Oracle: accepting and rejecting test for each clause | Met: 41 files, 126 runs, 12 rules, 15 stuck states, 9 refusals | Partly: 37 files, 64 runs, 12 stuck labels. The fault-boundary rules are requalified since 23 November (RO1, RO3, RO4 closed); RO2, RO6 and RO8 to RO10 are open | No: 2 files; one stuck label, `X4 B1`, which the oracle raises in 17 places; the test asserts counts of runs | No: 2 files; the test asserts no stuck state; one run varies the order of turns |
 | Checker: accepting and rejecting test for each clause | Met | Partly; unsound (RC2 to RC6) | Partly: the worked examples of the reference model; unsound (RC1); the loan checker was tested from outside only | No checker |
 | Generator reaches every construct of the slice (phase 2 exit) | Met since 23 November (section 9, RG1) | No generator | No generator | No generator |
 | Oracle against erased semantics | 62 runs of the suite and 11,728 runs of 300 generated programs | The erased interpreter is a transcription of the oracle (RO7) and wrong under faults (RO5) | As slice 2 | As slice 2 |
@@ -238,6 +238,11 @@ and effects; in slice 2, leaks at `↑`, `□` and `■`, overwriting a `must`
 value, [F1] and [F2]; in slice 3, the loan rules, where 25 programs that are
 stuck with X4 were all rejected.
 
+**RC20.** Found on 23 November while the fault boundaries of the oracle
+were requalified: the checker refuses by [F3] a named boundary that
+supervises another whose body has an effect. A boundary declares no effects;
+those of both bodies count toward the control that supervises.
+
 ## 6. Oracle and erased interpreter, slices 2 to 4
 
 Each probe states what the core requires as a run directive. 21 of 56 fail.
@@ -320,7 +325,7 @@ The suites:
 | Slice | Files | Runs | Stuck labels reached | What the test asserts |
 | --- | ---: | ---: | --- | --- |
 | 1 | 41 | 126 | 15 | 12 rules, 15 stuck states, 9 refusals |
-| 2 | 13 | 33 | 10 | 9 rules, 10 labels, 6 refusals |
+| 2 | 13 | 33 | 10 | 9 rules, 10 labels, 6 refusals. Since 23 November: 37 files, 64 runs, 9 rules, 12 labels, 10 refusals |
 | 3 | 2 | 22 | 1 | at least 20 runs, at least 12 compared |
 | 4 | 2 | 16 | 5 | 10 rules; no stuck state |
 
@@ -457,6 +462,13 @@ A finding is closed here with the date and the test that holds it.
 | RC17 | Closed 23 November 2026 for soundness: the kernel grants a range, the planes of a product and the constructor of a variant value only for a term that the checker wrote, and the search gives a term that it adds no range either. `a_term_that_the_search_added_has_no_range` (`v2/tests/kernel.rs`) holds it. Open: the element has the range by [A1], so a proof that needs it fails until the solver knows the sort of every vector term (the note in section 8 of the [fact logic](facts.md)); for slice 2 |
 | RC18 | Closed 23 November 2026: the search pairs constructor terms only when they have one number of arguments, and the kernel refuses the pair otherwise. `the_kernel_grants_every_instance_that_the_search_makes` and `the_kernel_refuses_what_is_not_an_instance` hold it |
 | RC19 | Closed 23 November 2026: the checker keeps its names in ordered tables. `a_check_is_the_same_every_time` (`v2/tests/checker.rs`) checks 30 programs twice, the second time on another thread, and requires one certificate text (2,136 certificates) and one set of counts |
+| RO1 | Closed 23 November 2026. A fault ends the scopes of an activation innermost first (`Machine::unwind` in `oracle.rs`, `trigger_unwind` in `erased.rs`), so a lexical boundary inside the body of a named boundary takes it first. The run `supervises` of `v2/tests/slice2/lexical_boundaries.core` holds it, with the trace of the finding |
+| RO3 | Closed 23 November 2026. `resolve` refuses the ends that [E-Contingency] forbids, by [F5] and [F6] as the [core](core.md) lists them since that day: 22 files `v2/tests/slice2/reject_*.core`, one for each requirement. `terminate n` has a literal status, belongs to the entry control, which nothing invokes, ends its scopes by [E-Scope], and gives the end `terminated n` and no outcome; inside a loop of the contingency it ends the execution where it panicked (`ends_execution`, and `terminate_abandons` in `lexical_boundaries_stuck.core`). `□` in the body of a boundary, which `resolve` refused, leaves the loop around it (`leaves_inside`) |
+| RO4 | Closed 23 November 2026. `recover ↑ ℓ` restarts the loop with its own parameters, read as operands, and no copy of them is kept; the body of the boundary does not mention them ([F5], `reject_f5_recover_parameter_in_work.core`). The runs `retries` and `recovers_outer` hold it, with `recover_without_parameter`, `recover_breaks_invariant` and `recover_abandons` for its stuck states. The backend restored a copy taken when the loop was first entered; its parameters stay in their slots now, and the twelve runs of `lexical_boundaries.core` agree with the oracle in compiled code |
+| RC14 | Closed 23 November 2026 with RO3: the terminators of a contingency are requirements of form, and its end without one is `X1` by coverage ([K7]). The `reject` files hold it |
+| RC5 | Open. The question is answered in [E-Boundary]: what the boundary has in its care ends with the scope of `B₁`, so the oracle is right (`care_ends_with_work`, `care_ends_with_exit`) and the checker owes [O5] there |
+| RC6 | Open. The question is answered in [E-Supervise] and [F6]: nothing encloses a statement of the contingency of a named boundary, so the oracle is right (`run_calls_faulting` in `faults_and_boundaries.core`) and the checker owes [F1] there |
+| RC20 | Open, found on 23 November 2026: the checker refuses by [F3] a named boundary that supervises another whose body has an effect, since a boundary declares none. It refuses a valid program and accepts no stuck one |
 | All others | Open |
 
 ## 10. The course

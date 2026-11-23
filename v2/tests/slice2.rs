@@ -57,7 +57,10 @@ const SLICE2_RULES: [&str; 9] = [
     "E-Assign",
 ];
 
-const SLICE2_STUCK: [&str; 9] = [
+const SLICE2_STUCK: [&str; 12] = [
+    "X1 E-End",
+    "X7 E-Again",
+    "X8 E-Unwind",
     "X2 E-Var",
     "X2 E-Field",
     "X2 E-Index",
@@ -69,7 +72,7 @@ const SLICE2_STUCK: [&str; 9] = [
     "X8 E-Fault",
 ];
 
-const SLICE2_REFUSALS: [&str; 6] = ["T1", "W5a", "W6", "W7", "W8", "F6"];
+const SLICE2_REFUSALS: [&str; 10] = ["T1", "W5a", "W6", "W7", "W8", "F5", "F6", "W2", "W3", "C1"];
 
 #[test]
 fn slice_two_core_conforms_and_matches_erased() {
@@ -106,9 +109,6 @@ fn slice_two_core_conforms_and_matches_erased() {
         if !stuck.contains(state) {
             failures.push(format!("no slice 2 run reached stuck state {state}"));
         }
-    }
-    if !stuck.contains("X8 E-Unwind") {
-        failures.push("no slice 2 run reached stuck state X8 E-Unwind".to_string());
     }
     for clause in SLICE2_REFUSALS {
         if !refusals.contains(clause) {

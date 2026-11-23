@@ -4943,22 +4943,7 @@ impl<'a> BodyChecker<'a> {
                     // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
                     live = self.solver.bdd.minus(live, g_i);
                 }
-                Command::Terminate(opt_expr) => {
-                    if let Some(expr) = opt_expr {
-                        check_expr_obligations(
-                            self.program,
-                            &mut self.solver,
-                            expr,
-                            r_i,
-                            &env,
-                            &self.owner_name,
-                            line,
-                            &visible_vars,
-                            in_loop,
-                            self.certificates,
-                        )?;
-                        self.check_consume_expr(expr, r_i, line, &visible_vars, in_loop)?;
-                    }
+                Command::Terminate(_) => {
                     let all_scopes = self.active_scopes.clone();
                     self.check_scope_obligations(&all_scopes, r_i, line, &visible_vars, in_loop)?;
                     // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
@@ -5687,7 +5672,6 @@ fn stmt_direct_mentions(
             }
         }
         Command::Fault { message, .. } => collect_expr_mentions(message, &mut out),
-        Command::Terminate(Some(expr)) => collect_expr_mentions(expr, &mut out),
         Command::Spawn { arguments, set, .. } => {
             out.insert(*set);
             for a in arguments {
@@ -5697,7 +5681,7 @@ fn stmt_direct_mentions(
         Command::Cancel { set } => {
             out.insert(*set);
         }
-        Command::Terminate(None)
+        Command::Terminate(_)
         | Command::Escalate
         | Command::Recover { .. }
         | Command::Impossible => {}
@@ -7245,11 +7229,8 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                     let mut temps = Vec::new();
                     self.eval_loan_expr(message, true, &ctx, &mut temps, line)?;
                 }
-                Command::Terminate(opt_expr) => {
-                    let mut temps = Vec::new();
-                    if let Some(e) = opt_expr {
-                        self.eval_loan_expr(e, true, &ctx, &mut temps, line)?;
-                    }
+                Command::Terminate(_) => {
+                    let temps = Vec::new();
                     let ended = self.scopes_down_to(0, body_id);
                     self.check_scope_end_loans(
                         &ended,

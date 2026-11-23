@@ -1,0 +1,14 @@
+// [F5], [E-Contingency]: `terminate n` occurs in the entry control only, and
+// a body of a named boundary is not one.
+boundary w() {
+    1  ⊤ ▷ terminate 1
+} contingency (m : string) {
+    1  ⊤ ▷ terminate
+}
+
+control c()
+    ■ { ok {} }
+    1  ⊤ ▷ supervise w()
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

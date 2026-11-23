@@ -1,0 +1,11 @@
+// [F5], [E-Contingency]: `B₂` does not exit.
+control c()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ ■ ok {1}
+       }
+    2  ⊤ ▷ ■ ok {7}
+
+//! reject F5

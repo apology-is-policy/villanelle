@@ -413,8 +413,21 @@ pub(crate) fn parse_native_end(
             }
             Ok(erased::End::Faulted(msg))
         }
+        "terminated" => {
+            let status = status(&reader.word("a status from 0 to 255")?)?;
+            if reader.at != reader.pieces.len() {
+                return Err("trailing tokens in native terminated status".to_string());
+            }
+            Ok(erased::End::Terminated(status))
+        }
         other => Err(format!("unexpected native end kind `{other}`")),
     }
+}
+
+/// The status of `terminated n`.
+fn status(word: &str) -> Result<u8, String> {
+    word.parse()
+        .map_err(|_| format!("`{word}` is not a status from 0 to 255"))
 }
 
 struct Reader {
@@ -586,6 +599,8 @@ enum RawExpect {
         payload: Vec<RawValue>,
     },
     Faulted(String),
+    /// `terminated n`: the entry control ended the execution with a status.
+    Terminated(u8),
     Stuck {
         state: String,
         clause: String,
@@ -600,6 +615,8 @@ enum Expect {
         payload: Vec<Value>,
     },
     Faulted(String),
+    /// `terminated n`: the entry control ended the execution with a status.
+    Terminated(u8),
     Stuck {
         state: String,
         clause: String,
@@ -621,6 +638,7 @@ impl std::fmt::Display for Expect {
                 )
             }
             Expect::Faulted(msg) => write!(formatter, "faulted \"{msg}\""),
+            Expect::Terminated(status) => write!(formatter, "terminated {status}"),
             Expect::Stuck { state, clause } => write!(formatter, "stuck {state} {clause}"),
             Expect::Other(kind) => formatter.write_str(kind),
         }
@@ -761,6 +779,7 @@ fn directive(line: usize, text: &str) -> Result<Directive, String> {
             }
         }
         "faulted" => RawExpect::Faulted(reader.string_lit("a fault message string")?),
+        "terminated" => RawExpect::Terminated(status(&reader.word("a status from 0 to 255")?)?),
         "stuck" if !spec.erased => RawExpect::Stuck {
             state: reader.word("a stuck state, X1 to X10")?,
             clause: reader.word("a clause")?,
@@ -840,6 +859,7 @@ fn kind(end: &End) -> &'static str {
     match end {
         End::Done { .. } => "done",
         End::Faulted(_) => "faulted",
+        End::Terminated(_) => "terminated",
         End::Stuck(_) => "stuck",
         End::HostViolation(_) => "violation",
         End::HostFailed(_) => "host-failed",
@@ -1065,6 +1085,7 @@ fn check_with(source: &str, is_surface: bool) -> Report {
                 }
             },
             RawExpect::Faulted(m) => Expect::Faulted(m.clone()),
+            RawExpect::Terminated(status) => Expect::Terminated(*status),
             RawExpect::Stuck { state, clause } => Expect::Stuck {
                 state: state.clone(),
                 clause: clause.clone(),
@@ -1145,11 +1166,13 @@ fn check_with(source: &str, is_surface: bool) -> Report {
                     },
                 ) => alternative == a && payload == p,
                 (Expect::Faulted(m1), erased::End::Faulted(m2)) => m1 == m2,
+                (Expect::Terminated(n1), erased::End::Terminated(n2)) => n1 == n2,
                 (Expect::Other(expected), end) => {
                     *expected
                         == match end {
                             erased::End::Done { .. } => "done",
                             erased::End::Faulted(_) => "faulted",
+                            erased::End::Terminated(_) => "terminated",
                             erased::End::Undefined(_) => "undefined",
                             erased::End::HostFailed(_) => "host-failed",
                             erased::End::OutOfFuel => "fuel",
@@ -1200,6 +1223,7 @@ fn check_with(source: &str, is_surface: bool) -> Report {
                 },
             ) => alternative == a && payload == p,
             (Expect::Faulted(m1), End::Faulted(m2)) => m1 == m2,
+            (Expect::Terminated(n1), End::Terminated(n2)) => n1 == n2,
             (Expect::Stuck { state, clause }, End::Stuck(stuck)) => {
                 report
                     .stuck

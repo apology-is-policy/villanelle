@@ -1,0 +1,11 @@
+// [F5]: the status of `terminate n` is a literal from 0 to 255.
+control c()
+    ■ { ok {} }
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ terminate 256
+       }
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

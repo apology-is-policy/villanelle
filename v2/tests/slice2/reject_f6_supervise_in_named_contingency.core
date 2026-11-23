@@ -1,0 +1,20 @@
+// [F6]: a boundary is not invoked from a contingency.
+boundary w() {
+    1  ⊤ ▷ terminate
+} contingency (m : string) {
+    1  ⊤ ▷ terminate
+}
+
+boundary v() {
+    1  ⊤ ▷ fault "stop"
+} contingency (m : string) {
+    1  ⊤ ▷ supervise w()
+    2  ⊤ ▷ terminate
+}
+
+control c()
+    ■ { ok {} }
+    1  ⊤ ▷ supervise v()
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F6

@@ -1,0 +1,17 @@
+// [F5]: a contingency protects no new work.
+control c()
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ b2 : boundary {
+                  1  ⊤ ▷ fault "again"
+              } contingency (m2 : string) {
+                  1  ⊤ ▷ escalate
+              }
+           2  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

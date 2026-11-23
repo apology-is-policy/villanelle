@@ -81,7 +81,7 @@ plan's phase sections are authoritative for scope and exit conditions.
 | --- | --- | --- |
 | 0 | Close out v1 | Done; tagged `v1-final` |
 | 1 | Design on paper: core specification, fact logic, reference model, surface, the corpus rewritten by hand, a reading and repair test. No compiler code. | Done; accepted 20 November 2026 |
-| 2 | Oracle interpreter, program generator, differential harness, mutation tests | Active: requalifying slice 1 (`docs/v2/review.md`). The oracle of slice 1 is qualified; code for slices 2 to 4 is draft |
+| 2 | Oracle interpreter, program generator, differential harness, mutation tests | Active: slice 1 is requalified and slice 2 is being requalified (`docs/v2/review.md`). The oracle of slice 1 is qualified, and of slice 2 its fault boundaries; the rest of slices 2 to 4 is draft |
 | 3 | Checker on a typed core, with the formatter that owns the rails | Draft code for slices 1 to 3, unqualified |
 | 4 | Typed backend; exit is 1.2× optimized Rust on every kernel under `experiments/` | Draft code for slices 1 to 3, unqualified; no kernel under `experiments/` measured |
 | 5 | Language breadth: numbers, functions, loops as decisions, recursion, closures, recursive data, views | |

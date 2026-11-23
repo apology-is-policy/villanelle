@@ -688,14 +688,15 @@ fn has_emit_builtin(program: &Program) -> bool {
             .any(|b| check_body(&b.body) || check_body(&b.contingency))
 }
 
-/// Computes the type returned via `Terminate(Some(expr))` (if any) transitively
-/// for each control in `program`.
+/// The type of the status of `terminate n` (if any) for each control in
+/// `program`. A control that holds one is an entry control ([F5]), so the
+/// closure over callers below finds nothing more.
 fn compute_control_terminate_tys(program: &Program) -> Vec<Option<Type>> {
     fn scan_body(body: &ControlBody) -> Option<Type> {
         for b in &body.bodies {
             for s in &b.statements {
-                if let Command::Terminate(Some(e)) = &s.command {
-                    return Some(e.ty());
+                if let Command::Terminate(Some(_)) = &s.command {
+                    return Some(Type::Int(IntType::U8));
                 }
             }
         }
@@ -2751,7 +2752,6 @@ enum BodyRole {
         stmt_idx: usize,
         site: SiteId,
         arms: Vec<Vec<VarId>>,
-        is_recover_target: bool,
     },
     LexicalB1 {
         parent_body: BodyId,
@@ -3600,16 +3600,8 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
     }
 }
 
-fn classify_body_roles(body: &ControlBody) -> (Vec<BodyRole>, HashSet<BodyId>) {
+fn classify_body_roles(body: &ControlBody) -> Vec<BodyRole> {
     let mut roles = vec![BodyRole::Root; body.bodies.len()];
-    let mut recover_targets = HashSet::new();
-    for b in &body.bodies {
-        for s in &b.statements {
-            if let Command::Recover { body: target } = &s.command {
-                recover_targets.insert(*target);
-            }
-        }
-    }
     for (pb_id, pb) in body.bodies.iter().enumerate() {
         for (s_idx, stmt) in pb.statements.iter().enumerate() {
             match &stmt.command {
@@ -3624,7 +3616,6 @@ fn classify_body_roles(body: &ControlBody) -> (Vec<BodyRole>, HashSet<BodyId>) {
                         stmt_idx: s_idx,
                         site: *site,
                         arms: arms.clone(),
-                        is_recover_target: recover_targets.contains(inner),
                     };
                 }
                 Command::Boundary {
@@ -3652,7 +3643,7 @@ fn classify_body_roles(body: &ControlBody) -> (Vec<BodyRole>, HashSet<BodyId>) {
             }
         }
     }
-    (roles, recover_targets)
+    roles
 }
 
 fn ancestor_chain_to_root(
@@ -3756,7 +3747,7 @@ fn emit_body_unit<'a>(
     pre_bound_var_count: usize,
 ) {
     let plan = build_plan(program, body, pre_bound_var_count);
-    let (roles, recover_targets) = classify_body_roles(body);
+    let roles = classify_body_roles(body);
     let mut emitter = IrEmitter::new(program, reg);
 
     let is_control = matches!(unit, UnitKind::Control { .. });
@@ -3807,21 +3798,6 @@ fn emit_body_unit<'a>(
             emitter
                 .allocas
                 .push(format!("  %lex_fault_{bid} = alloca %vn2.string"));
-        }
-        if matches!(
-            role,
-            BodyRole::Loop {
-                is_recover_target: true,
-                ..
-            }
-        ) && let Some(head) = &body.bodies[bid].head
-        {
-            for &pv in &head.parameters {
-                let ll = emitter.llvm_ty(&body.vars[pv].ty);
-                emitter
-                    .allocas
-                    .push(format!("  %rec_param_{bid}_{pv} = alloca {ll}"));
-            }
         }
     }
 
@@ -4248,32 +4224,11 @@ fn emit_body_unit<'a>(
                     let head = body.bodies[*inner].head.as_ref().expect("a loop head");
                     let init_vals =
                         emitter.emit_exprs_ordered(initial, &VarAccess::ControlSlots(body));
-                    let save_recover = recover_targets.contains(inner);
                     for (&param_var, val) in head.parameters.iter().zip(init_vals) {
                         let pty = body.vars[param_var].ty.clone();
                         let ll_ty = emitter.llvm_ty(&pty);
                         let _ =
                             writeln!(emitter.code, "  store {ll_ty} {val}, ptr %slot_{param_var}");
-                        if save_recover {
-                            if needs_drop(program, &pty) {
-                                let tid = emitter.reg.intern_type(&pty);
-                                emitter.reg.require_clone(tid);
-                                let cv = emitter.fresh_reg();
-                                let _ = writeln!(
-                                    emitter.code,
-                                    "  {cv} = call fastcc {ll_ty} @vn2_clone_{tid}(ptr %slot_{param_var})"
-                                );
-                                let _ = writeln!(
-                                    emitter.code,
-                                    "  store {ll_ty} {cv}, ptr %rec_param_{inner}_{param_var}"
-                                );
-                            } else {
-                                let _ = writeln!(
-                                    emitter.code,
-                                    "  store {ll_ty} {val}, ptr %rec_param_{inner}_{param_var}"
-                                );
-                            }
-                        }
                     }
                     let _ = writeln!(emitter.code, "  br label %b{inner}_entry");
                 }
@@ -4383,18 +4338,8 @@ fn emit_body_unit<'a>(
                             stmt_idx,
                             site,
                             arms,
-                            is_recover_target,
                         } = &roles[fb]
                         {
-                            if *is_recover_target && let Some(head) = &body.bodies[fb].head {
-                                for &pv in &head.parameters {
-                                    let pty = body.vars[pv].ty.clone();
-                                    if needs_drop(program, &pty) {
-                                        emitter
-                                            .emit_drop_ptr(&format!("%rec_param_{fb}_{pv}"), &pty);
-                                    }
-                                }
-                            }
                             enclosing_loop = Some((*parent_body, *stmt_idx, *site, arms.clone()));
                             break;
                         }
@@ -4424,19 +4369,6 @@ fn emit_body_unit<'a>(
                     for (fb, fpc) in chain {
                         let (lb, lpc) = if fb == b_id { (b_id, s_idx) } else { (fb, fpc) };
                         emitter.emit_scope_cleanup(body, &plan, fb, lb, lpc, &[], false);
-                        if let BodyRole::Loop {
-                            is_recover_target: true,
-                            ..
-                        } = roles[fb]
-                            && let Some(head) = &body.bodies[fb].head
-                        {
-                            for &pv in &head.parameters {
-                                let pty = body.vars[pv].ty.clone();
-                                if needs_drop(program, &pty) {
-                                    emitter.emit_drop_ptr(&format!("%rec_param_{fb}_{pv}"), &pty);
-                                }
-                            }
-                        }
                     }
                     let contract_alt = &program.controls[cid].contract[*alternative];
                     for (field_idx, (field, val)) in
@@ -4478,8 +4410,8 @@ fn emit_body_unit<'a>(
                     emit_unwind(&mut emitter, b_id, s_idx, &msg_val);
                 }
                 Command::Terminate(opt_expr) => {
-                    if let Some(expr) = opt_expr {
-                        let val = emitter.emit_expr(expr, &VarAccess::ControlSlots(body));
+                    if let Some(status) = opt_expr {
+                        let val = status.to_string();
                         let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
                         for (fb, fpc) in chain {
                             let (lb, lpc) = if fb == b_id { (b_id, s_idx) } else { (fb, fpc) };
@@ -4519,35 +4451,21 @@ fn emit_body_unit<'a>(
                     }
                 }
                 Command::Recover { body: target_loop } => {
+                    // [E-Contingency]: the loop starts again with its own
+                    // parameters, which stay in their slots. Everything
+                    // else of the scopes up to the loop ends.
+                    let parameters: Vec<VarId> = body.bodies[*target_loop]
+                        .head
+                        .as_ref()
+                        .map(|head| head.parameters.clone())
+                        .unwrap_or_default();
                     let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
                     for (fb, fpc) in chain {
                         let (lb, lpc) = if fb == b_id { (b_id, s_idx) } else { (fb, fpc) };
-                        emitter.emit_scope_cleanup(body, &plan, fb, lb, lpc, &[], false);
+                        let kept: &[VarId] = if fb == *target_loop { &parameters } else { &[] };
+                        emitter.emit_scope_cleanup(body, &plan, fb, lb, lpc, kept, false);
                         if fb == *target_loop {
                             break;
-                        }
-                    }
-                    if let Some(head) = &body.bodies[*target_loop].head {
-                        for &pv in &head.parameters {
-                            let pty = body.vars[pv].ty.clone();
-                            let ll = emitter.llvm_ty(&pty);
-                            if needs_drop(program, &pty) {
-                                let tid = emitter.reg.intern_type(&pty);
-                                emitter.reg.require_clone(tid);
-                                let cv = emitter.fresh_reg();
-                                let _ = writeln!(
-                                    emitter.code,
-                                    "  {cv} = call fastcc {ll} @vn2_clone_{tid}(ptr %rec_param_{target_loop}_{pv})"
-                                );
-                                let _ = writeln!(emitter.code, "  store {ll} {cv}, ptr %slot_{pv}");
-                            } else {
-                                let rv = emitter.fresh_reg();
-                                let _ = writeln!(
-                                    emitter.code,
-                                    "  {rv} = load {ll}, ptr %rec_param_{target_loop}_{pv}"
-                                );
-                                let _ = writeln!(emitter.code, "  store {ll} {rv}, ptr %slot_{pv}");
-                            }
                         }
                     }
                     let _ = writeln!(emitter.code, "  br label %b{target_loop}_entry");
@@ -6834,14 +6752,8 @@ pub fn emit_native_harness_llvm(
                 main_out,
                 "  call i32 (ptr, ...) @printf(ptr @h_fmt_term_hdr, i32 {run_idx})"
             );
-            let _ = writeln!(main_out, "  call i32 @putchar(i32 123)");
             let ttid = reg.type_ids[tty.deref_type()];
             let _ = writeln!(main_out, "  call void @vn2_print_val_{ttid}(ptr {ts})");
-            if needs_drop(program, tty) {
-                reg.require_drop(ttid);
-                let _ = writeln!(main_out, "  call fastcc void @vn2_drop_{ttid}(ptr {ts})");
-            }
-            let _ = writeln!(main_out, "  call i32 @putchar(i32 125)");
             let _ = writeln!(main_out, "  call i32 @putchar(i32 10)");
             let _ = writeln!(main_out, "  br label %{end_lbl}");
         }
@@ -6884,7 +6796,7 @@ pub fn emit_native_harness_llvm(
     );
     let _ = writeln!(
         harness_globals,
-        "@h_fmt_term_hdr = private unnamed_addr constant [25 x i8] c\"DONE %d done terminated \\00\""
+        "@h_fmt_term_hdr = private unnamed_addr constant [20 x i8] c\"DONE %d terminated \\00\""
     );
     let _ = writeln!(
         harness_globals,

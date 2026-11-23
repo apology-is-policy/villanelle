@@ -1,0 +1,15 @@
+// [F5]: `recover ↑ ℓ` is an end of `B₂`, not of `B₁`.
+control c(n : u32)
+    ■ { ok {v : u32} }
+    faults
+    1  ⊤ ▷ lp : ↻ retry(i : u32 := n) {
+           1  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ recover ↑ retry
+              } contingency (m : string) {
+                  1  ⊤ ▷ escalate
+              }
+           2  ⊤ ▷ □ done {i}
+       } ▸ done {v}
+    2  ⊤ ▷ ■ ok {v}
+
+//! reject F5

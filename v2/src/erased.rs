@@ -35,6 +35,8 @@ pub enum End {
         payload: Vec<Value>,
     },
     Faulted(String),
+    /// The entry control ended the execution with a status (`terminate n`).
+    Terminated(u8),
     /// The run met something that erased code has no behavior for.
     Undefined(String),
     /// The host of this run had no answer.
@@ -52,6 +54,7 @@ impl fmt::Display for End {
             } => {
                 write!(formatter, "done {alternative} {{{}}}", list(payload))
             }
+            End::Terminated(status) => write!(formatter, "terminated {status}"),
             End::Faulted(message) => {
                 write!(formatter, "faulted \"{}\"", escape_string(message))
             }
@@ -787,9 +790,7 @@ fn selects(selector: &Selector, plan: &Plan, bits: &[bool]) -> bool {
 #[derive(Clone, Debug)]
 enum FrameKind {
     Normal,
-    Loop {
-        entry_parameters: Vec<Value>,
-    },
+    Loop,
     LexicalBoundary {
         site: SiteId,
         parent_body: BodyId,
@@ -1487,9 +1488,7 @@ impl<'a> Machine<'a> {
         top.positions[target] = 0;
         top.frames.push(BodyFrame {
             body: target,
-            kind: FrameKind::Loop {
-                entry_parameters: values.to_vec(),
-            },
+            kind: FrameKind::Loop,
         });
     }
 
@@ -1709,16 +1708,6 @@ impl<'a> Machine<'a> {
 
     fn enter_named_contingency(&mut self, id: BoundaryId, message: String) {
         let retains = self.program.boundaries[id].retains.clone();
-        while self.stack.last().expect("an activation").frames.len() > 1 {
-            let frame = self
-                .stack
-                .last_mut()
-                .expect("an activation")
-                .frames
-                .pop()
-                .unwrap();
-            self.unwind_frame(frame.body, &[]);
-        }
         let root_frame = self
             .stack
             .last_mut()
@@ -1754,25 +1743,25 @@ impl<'a> Machine<'a> {
         }];
     }
 
+    /// A fault goes outward: the frames end innermost first, until a
+    /// boundary takes it or the last activation is popped.
     fn trigger_unwind(&mut self, message: String) -> Result<Option<End>, String> {
         loop {
-            let is_named_b1 = matches!(
-                self.stack.last().expect("an activation").kind,
-                ActKind::Boundary {
-                    in_contingency: None,
-                    ..
-                }
-            );
-            if is_named_b1 {
-                let ActKind::Boundary { id, .. } = self.stack.last().expect("an activation").kind
-                else {
-                    unreachable!();
-                };
+            let act = self.stack.last().expect("an activation");
+            // The body of a named boundary takes the fault when only its
+            // own frame is left: a lexical boundary inside it comes first.
+            if let ActKind::Boundary {
+                id,
+                in_contingency: None,
+            } = &act.kind
+                && act.frames.len() == 1
+            {
+                let id = *id;
                 self.enter_named_contingency(id, message);
                 return Ok(None);
             }
 
-            if !self.stack.last().expect("an activation").frames.is_empty() {
+            if !act.frames.is_empty() {
                 let frame = self
                     .stack
                     .last_mut()
@@ -1781,37 +1770,48 @@ impl<'a> Machine<'a> {
                     .pop()
                     .unwrap();
                 self.unwind_frame(frame.body, &[]);
-                if let FrameKind::LexicalBoundary {
-                    parent_body,
-                    parent_pc,
-                    captures,
-                    contingency_body,
-                    contingency_vars,
-                    message_var,
-                    ..
-                } = frame.kind
-                {
-                    let own_bits = self.laid_out().1.own[contingency_body].clone();
-                    let top = self.top();
-                    for bit in own_bits {
-                        top.bits[bit] = false;
+                match frame.kind {
+                    FrameKind::LexicalBoundary {
+                        parent_body,
+                        parent_pc,
+                        captures,
+                        contingency_body,
+                        contingency_vars,
+                        message_var,
+                        ..
+                    } => {
+                        let own_bits = self.laid_out().1.own[contingency_body].clone();
+                        let top = self.top();
+                        for bit in own_bits {
+                            top.bits[bit] = false;
+                        }
+                        for (var, val) in contingency_vars.into_iter().zip(captures) {
+                            top.slots[var] = val;
+                        }
+                        if let Some(mvar) = message_var {
+                            top.slots[mvar] = Value::String(message.clone());
+                        }
+                        top.positions[contingency_body] = 0;
+                        top.frames.push(BodyFrame {
+                            body: contingency_body,
+                            kind: FrameKind::LexicalContingency {
+                                parent_body,
+                                parent_pc,
+                                fault_message: message,
+                            },
+                        });
+                        return Ok(None);
                     }
-                    for (var, val) in contingency_vars.into_iter().zip(captures) {
-                        top.slots[var] = val;
+                    FrameKind::LexicalContingency {
+                        parent_body,
+                        parent_pc,
+                        ..
+                    } => {
+                        // The boundary statement has moved what it took
+                        // into its care: the frame around it is past it.
+                        self.top().positions[parent_body] = parent_pc + 1;
                     }
-                    if let Some(mvar) = message_var {
-                        top.slots[mvar] = Value::String(message.clone());
-                    }
-                    top.positions[contingency_body] = 0;
-                    top.frames.push(BodyFrame {
-                        body: contingency_body,
-                        kind: FrameKind::LexicalContingency {
-                            parent_body,
-                            parent_pc,
-                            fault_message: message,
-                        },
-                    });
-                    return Ok(None);
+                    FrameKind::Normal | FrameKind::Loop => {}
                 }
                 continue;
             }
@@ -2508,7 +2508,7 @@ impl<'a> Machine<'a> {
             } => {
                 let values = self.eval_operands(payload)?;
                 while let Some(frame) = self.top().frames.pop() {
-                    if matches!(frame.kind, FrameKind::Loop { .. }) {
+                    if matches!(frame.kind, FrameKind::Loop) {
                         break;
                     }
                 }
@@ -2570,119 +2570,74 @@ impl<'a> Machine<'a> {
                 let Value::String(msg) = self.eval_expr(message)? else {
                     return Err("fault message is not a string".to_string());
                 };
-                if let Some(FrameKind::LexicalContingency {
-                    parent_body,
-                    parent_pc,
-                    ..
-                }) = self
-                    .stack
-                    .last()
-                    .and_then(|a| a.frames.last())
-                    .map(|f| &f.kind)
-                {
-                    let (parent_body, parent_pc) = (*parent_body, *parent_pc);
-                    let frame = self.top().frames.pop().unwrap();
-                    self.unwind_frame(frame.body, &[]);
-                    self.top().positions[parent_body] = parent_pc + 1;
-                    return self.trigger_unwind(msg);
-                }
-                if matches!(
-                    self.stack.last().expect("an activation").kind,
-                    ActKind::Boundary {
-                        in_contingency: Some(_),
-                        ..
-                    }
-                ) {
-                    while let Some(frame) = self.top().frames.pop() {
-                        self.unwind_frame(frame.body, &[]);
-                    }
-                    let _ = self.stack.pop();
-                    if self.stack.is_empty() {
-                        return Ok(Some(End::Faulted(msg)));
-                    }
-                    return self.trigger_unwind(msg);
-                }
                 return self.trigger_unwind(msg);
             }
             // [R2]: no code is generated for it.
             Command::Impossible => return Err("`⊥` has no behavior".to_string()),
-            Command::Terminate(status) => {
-                let status_val = match status {
-                    Some(expr) => Some(self.eval_expr(expr)?),
-                    None => None,
-                };
-                if let Some(FrameKind::LexicalContingency {
-                    parent_body,
-                    parent_pc,
-                    ..
-                }) = self
-                    .stack
-                    .last()
-                    .and_then(|a| a.frames.last())
-                    .map(|f| &f.kind)
-                {
-                    let (parent_body, parent_pc) = (*parent_body, *parent_pc);
-                    self.top().frames.pop();
-                    if let Some(v) = status_val {
-                        self.stack.pop();
-                        return Ok(Some(End::Done {
-                            alternative: "terminated".to_string(),
-                            payload: vec![v],
-                        }));
-                    }
-                    self.top().positions[parent_body] = parent_pc + 1;
-                    return Ok(None);
-                }
+            Command::Terminate(None) => {
+                // The body of a named boundary ends; its supervisor goes on.
                 self.stack.pop();
+                if self.stack.is_empty() {
+                    return Err("`terminate` outside a body of a named boundary".to_string());
+                }
                 let caller_body = self.current_body();
                 self.top().positions[caller_body] += 1;
             }
+            Command::Terminate(Some(status)) => {
+                self.stack.pop();
+                return Ok(Some(End::Terminated(*status)));
+            }
             Command::Escalate => {
-                if let Some(FrameKind::LexicalContingency {
-                    parent_body,
-                    parent_pc,
-                    fault_message,
-                }) = self
+                let lexical = self
                     .stack
                     .last()
-                    .and_then(|a| a.frames.last())
-                    .map(|f| f.kind.clone())
-                {
-                    let frame = self.top().frames.pop().unwrap();
-                    self.unwind_frame(frame.body, &[]);
-                    self.top().positions[parent_body] = parent_pc + 1;
-                    return self.trigger_unwind(fault_message);
-                }
-                let ActKind::Boundary {
-                    in_contingency: Some(msg),
-                    ..
-                } = self.stack.last().expect("an activation").kind.clone()
-                else {
-                    return Err("`escalate` outside contingency".to_string());
+                    .expect("an activation")
+                    .frames
+                    .iter()
+                    .rev()
+                    .find_map(|frame| match &frame.kind {
+                        FrameKind::LexicalContingency { fault_message, .. } => {
+                            Some(fault_message.clone())
+                        }
+                        _ => None,
+                    });
+                let message = match lexical {
+                    Some(message) => message,
+                    None => {
+                        let ActKind::Boundary {
+                            in_contingency: Some(message),
+                            ..
+                        } = self.stack.last().expect("an activation").kind.clone()
+                        else {
+                            return Err("`escalate` outside contingency".to_string());
+                        };
+                        message
+                    }
                 };
-                while let Some(frame) = self.top().frames.pop() {
-                    self.unwind_frame(frame.body, &[]);
-                }
-                self.stack.pop();
-                if self.stack.is_empty() {
-                    return Ok(Some(End::Faulted(msg)));
-                }
-                return self.trigger_unwind(msg);
+                return self.trigger_unwind(message);
             }
             Command::Recover { body: target_loop } => {
-                let mut entry_params = None;
+                // The loop starts again with its own parameters.
+                let operands: Vec<Expr> = body.bodies[*target_loop]
+                    .head
+                    .as_ref()
+                    .expect("a loop body")
+                    .parameters
+                    .iter()
+                    .map(|var| Expr::Var(VarRef::Local(*var), body.vars[*var].ty.clone()))
+                    .collect();
+                let values = self.eval_operands(&operands)?;
+                let mut found = false;
                 while let Some(frame) = self.top().frames.pop() {
                     if frame.body == *target_loop {
-                        if let FrameKind::Loop { entry_parameters } = frame.kind {
-                            entry_params = Some(entry_parameters);
-                        }
+                        found = true;
                         break;
                     }
                 }
-                let Some(params) = entry_params else {
+                if !found {
                     return Err("`recover` target loop not found".to_string());
-                };
-                self.enter(*target_loop, &params);
+                }
+                self.enter(*target_loop, &values);
             }
         }
         Ok(None)

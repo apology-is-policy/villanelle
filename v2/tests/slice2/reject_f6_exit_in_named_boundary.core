@@ -1,0 +1,13 @@
+// [F6]: a body of a named boundary has no exit.
+boundary w() {
+    1  ⊤ ▷ ■ ok {}
+} contingency (m : string) {
+    1  ⊤ ▷ terminate
+}
+
+control c()
+    ■ { ok {} }
+    1  ⊤ ▷ supervise w()
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F6

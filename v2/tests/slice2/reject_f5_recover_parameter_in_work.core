@@ -1,0 +1,22 @@
+// [F5]: `B₁` does not mention a parameter of a loop that its contingency
+// restarts, so that `recover ↑ ℓ` finds it as it was when the boundary was
+// entered.
+extern control keep(s : string)
+    ■ { kept {} }
+    uses net
+
+control c(start : string)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(s : string := start) {
+           1  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ k : Δ keep(s) ▸ kept {}
+                  2  ⊤ ▷ fault "not ready"
+              } contingency (m : string) {
+                  1  ⊤ ▷ recover ↑ retry
+              }
+           2  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

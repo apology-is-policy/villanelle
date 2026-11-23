@@ -1,0 +1,12 @@
+// [F5], [E-Contingency]: `terminate n` is an end of `B₂`, not of `B₁`.
+control c()
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ terminate 1
+       } contingency (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ■ ok {}
+
+//! reject F5

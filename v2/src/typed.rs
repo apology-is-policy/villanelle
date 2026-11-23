@@ -722,8 +722,10 @@ pub enum Command {
         assumed: bool,
     },
     Impossible,
-    /// `terminate` in a boundary ([E-Contingency], [E-Supervise], [F5], [F6]).
-    Terminate(Option<Expr>),
+    /// `terminate` in a body of a named boundary ([E-Supervise], [F6]), or
+    /// `terminate n` in the contingency of a lexical boundary of an entry
+    /// control, with its status ([E-Contingency], [F5]).
+    Terminate(Option<u8>),
     /// `escalate` in a boundary contingency ([E-Contingency], [E-Supervise], [F5], [F6]).
     Escalate,
     /// `recover ↑ ℓ` in a lexical boundary contingency ([E-Contingency], [F5]).
