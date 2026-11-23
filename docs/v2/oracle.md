@@ -960,6 +960,40 @@ findings RC2 and RC3), and both are refused now.
   certificates that validate again. The tests of these two findings use
   them; the earlier tests of the file ask the checker alone.
 
+### 13.2 Fault boundaries of the checker, as requalified on 23 November 2026
+
+Four findings of the review are closed (RC4, RC5, RC6, RC20). Each test
+runs its programs in the oracle too.
+
+- **A contingency begins where the work faulted** ([F5], RC4). `B₂` was
+  checked with the ownership of the names around the boundary as it was at
+  the entry of the boundary. A work that fills an outer name before it
+  faults was accepted and is stuck (`X5`); one that consumes it was
+  refused. The checker now keeps, for the `B₁` under check, the state of
+  ownership at each statement that may fault (`FaultState`, recorded by
+  `check_may_fault`), and runs the checks of a terminator of `B₂` once for
+  each state, with the names around the boundary as they were in it and on
+  the histories of both statements (`for_each_fault_state`): [O5] at
+  `terminate n`; at `recover ↑ ℓ`, [O2] for the parameters of the loop,
+  which it reads as operands and moves, then [O5] and [O6]. A statement of
+  `B₂` that may fault (`escalate`, `fault`, a call) hands each of those
+  states on to the boundary around it, and [F2] and [F6] at such a
+  statement leave out the names around the boundary, of which they were
+  required where `B₁` faulted. The values of those names in `B₂` are the
+  ones of before, forgotten where `B₁` writes them; `B₂` cannot name them.
+- **What a boundary has in its care** ([E-Boundary], RC5). While `B₁` is
+  checked the checker keeps what the boundary took, and every check of the
+  scopes that a terminator ends ([O5]) refuses a value of kind `must`
+  among it when the scope of `B₁` is one of them. The end of `B₁` is such
+  a terminator.
+- **The contingency of a named boundary** ([F6], RC6). A call there that
+  may fault is refused by [F1], since nothing encloses it.
+- **Effects through `supervise`** ([F6], RC20). `resolve` adds to the
+  effects of a named boundary those of every boundary its `B₁` supervises,
+  to a fixed point, so that they count toward whatever supervises it.
+
+Tests: the last seven of `tests/checker_slice2.rs`, 22 programs.
+
 ## 14. Slice 2 Phase 4: Call Expansion and Typed LLVM IR Backend for Data, Resources, and Boundaries
 
 Slice 2 Phase 4 completes Theorem 4 call expansion (`expand.rs`), the typed

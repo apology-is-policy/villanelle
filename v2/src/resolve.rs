@@ -4201,6 +4201,35 @@ pub fn resolve(program: &syntax::Program) -> Result<Program, Error> {
         });
     }
 
+    // [F6]: the effects of both bodies of a boundary count toward what
+    // supervises it, and the `B₁` of a named boundary may supervise another.
+    loop {
+        let mut changed = false;
+        for id in 0..boundaries.len() {
+            let supervised: Vec<usize> = boundaries[id]
+                .body
+                .bodies
+                .iter()
+                .flat_map(|inner| &inner.statements)
+                .filter_map(|s| match &s.command {
+                    Command::Supervise { boundary, .. } => Some(*boundary),
+                    _ => None,
+                })
+                .collect();
+            for other in supervised {
+                for effect in boundaries[other].uses.clone() {
+                    if !boundaries[id].uses.contains(&effect) {
+                        boundaries[id].uses.push(effect);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     let boundary_summary: Vec<(String, Vec<Parameter>, bool, Vec<String>)> = boundaries
         .iter()
         .map(|b| {

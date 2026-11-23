@@ -1132,3 +1132,589 @@ control c()
         ),
     );
 }
+
+/// The declarations that the programs of the fault boundaries share.
+const FAULT_PRELUDE: &str = r#"
+extern resource conn on fault release
+extern resource lock
+
+extern control open_conn()
+    ■ { opened {c : conn} }
+    uses net
+
+extern control close_conn(c : conn)
+    ■ { closed {} }
+    uses net
+
+extern control open_lock()
+    ■ { opened {l : lock} }
+    uses lock.io
+
+contingent extern control close_lock(l : lock)
+    ■ { closed {} }
+    uses lock.io
+
+extern control keep(s : string)
+    ■ { kept {} }
+    uses net
+
+control risky(fail_now : bool)
+    ■ { fine {} }
+    faults
+    1  ⊤ ▷ t : ? fail_now
+    2  t.true ▷ fault "risk"
+    3  ⊤ ▷ ■ fine {}
+
+contingent control helper_faults()
+    ■ { done {} }
+    faults
+    1  ⊤ ▷ fault "helper"
+
+contingent control helper()
+    ■ { done {} }
+    1  ⊤ ▷ ■ done {}
+"#;
+
+fn with_fault_prelude(program: &str) -> String {
+    format!("{FAULT_PRELUDE}{program}")
+}
+
+#[test]
+fn a_contingency_ends_in_the_state_of_the_fault_f5_o5() {
+    // Review finding RC4. `B₂` runs after a fault at a statement of `B₁`, so
+    // its terminators meet the names around the boundary as `B₁` left them
+    // there, and not as they were when the boundary was entered.
+
+    // The work consumes the connection before it faults: nothing is left
+    // for `terminate` to abandon.
+    done_and_accepted(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c()
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {x}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ k : Δ close_conn(x) ▸ closed {}
+           2  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ terminate 1
+       }
+    3  ⊤ ▷ ⊥
+
+//! run c() with [open_conn -> opened {conn#1}; close_conn -> closed] => terminated 1
+"#,
+        ),
+    );
+    // The work fills an outer name again before it faults, and `terminate`
+    // abandons what it holds.
+    stuck_and_rejected(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c()
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {x0}
+    2  ⊤ ▷ ~x : conn := x0
+    3  ⊤ ▷ k : Δ close_conn(x) ▸ closed {}
+    4  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ o2 : Δ open_conn() ▸ opened {y}
+           2  ⊤ ▷ x ← y
+           3  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ terminate 1
+       }
+    5  ⊤ ▷ ⊥
+
+//! run c() with [open_conn -> opened {conn#1}; close_conn -> closed; open_conn -> opened {conn#2}] => stuck X5 E-Scope
+"#,
+        ),
+    );
+    // Every statement that may fault counts: the first of two leaves the
+    // connection open.
+    stuck_and_rejected(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c(early : bool)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {x}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ r : Δ risky(early) ▸ fine {}
+           2  ⊤ ▷ k : Δ close_conn(x) ▸ closed {}
+           3  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ terminate 1
+       }
+    3  ⊤ ▷ ⊥
+
+//! run c(true) with [open_conn -> opened {conn#1}] => stuck X5 E-Scope
+//! run c(false) with [open_conn -> opened {conn#1}; close_conn -> closed] => terminated 1
+"#,
+        ),
+    );
+}
+
+#[test]
+fn a_fault_of_an_inner_contingency_is_a_fault_of_the_work_around_it_f5() {
+    // RC4: `escalate` in the `B₂` of an inner boundary is, for the boundary
+    // around it, a statement of its `B₁` that may fault, in the states in
+    // which the inner `B₁` faulted.
+    stuck_and_rejected(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c()
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {x0}
+    2  ⊤ ▷ ~x : conn := x0
+    3  ⊤ ▷ k : Δ close_conn(x) ▸ closed {}
+    4  ⊤ ▷ outer : boundary {
+           1  ⊤ ▷ inner : boundary {
+                  1  ⊤ ▷ o2 : Δ open_conn() ▸ opened {y}
+                  2  ⊤ ▷ x ← y
+                  3  ⊤ ▷ fault "stop"
+              } contingency (m : string) {
+                  1  ⊤ ▷ escalate
+              }
+           2  ⊤ ▷ ⊥
+       } contingency (m2 : string) {
+           1  ⊤ ▷ terminate 1
+       }
+    5  ⊤ ▷ ⊥
+
+//! run c() with [open_conn -> opened {conn#1}; close_conn -> closed; open_conn -> opened {conn#2}] => stuck X5 E-Scope
+"#,
+        ),
+    );
+    done_and_accepted(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c()
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {x}
+    2  ⊤ ▷ outer : boundary {
+           1  ⊤ ▷ inner : boundary {
+                  1  ⊤ ▷ k : Δ close_conn(x) ▸ closed {}
+                  2  ⊤ ▷ fault "stop"
+              } contingency (m : string) {
+                  1  ⊤ ▷ escalate
+              }
+           2  ⊤ ▷ ⊥
+       } contingency (m2 : string) {
+           1  ⊤ ▷ terminate 1
+       }
+    3  ⊤ ▷ ⊥
+
+//! run c() with [open_conn -> opened {conn#1}; close_conn -> closed] => terminated 1
+"#,
+        ),
+    );
+}
+
+#[test]
+fn recover_reads_the_parameters_and_ends_the_iteration_o2_o5_o6() {
+    // RC4, for `recover ↑ ℓ`: it reads the parameters of the loop as
+    // operands ([O2]), ends the scopes of the iteration ([O5]) and leaves
+    // the names around the loop as the loop found them ([O6]), all in the
+    // state of the fault.
+    stuck_and_rejected(
+        "O2",
+        &with_fault_prelude(
+            r#"
+control c(start : string)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(s : string := start) {
+           1  ⊤ ▷ k : Δ keep(s) ▸ kept {}
+           2  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ fault "again"
+              } contingency (m : string) {
+                  1  ⊤ ▷ recover ↑ retry
+              }
+           3  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! run c("a") with [keep -> kept] => stuck X2 E-Var
+"#,
+        ),
+    );
+    // The work closes what the iteration opened before it may fault.
+    done_and_accepted(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c(first : bool)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(s : string := "x") {
+           1  ⊤ ▷ o : Δ open_conn() ▸ opened {x}
+           2  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ k : Δ close_conn(x) ▸ closed {}
+                  2  ⊤ ▷ r : Δ risky(first) ▸ fine {}
+              } contingency (m : string) {
+                  1  ⊤ ▷ recover ↑ retry
+              }
+           3  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! run c(false) with [open_conn -> opened {conn#1}; close_conn -> closed] => done ok
+"#,
+        ),
+    );
+    // It may fault before it closes it.
+    stuck_and_rejected(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c(first : bool)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(s : string := "x") {
+           1  ⊤ ▷ o : Δ open_conn() ▸ opened {x}
+           2  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ r : Δ risky(first) ▸ fine {}
+                  2  ⊤ ▷ k : Δ close_conn(x) ▸ closed {}
+              } contingency (m : string) {
+                  1  ⊤ ▷ recover ↑ retry
+              }
+           3  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! run c(true) with [open_conn -> opened {conn#1}] => stuck X5 E-Scope
+"#,
+        ),
+    );
+    // The work moves a name from around the loop before it faults, and the
+    // next iteration finds it gone.
+    stuck_and_rejected(
+        "O6",
+        &with_fault_prelude(
+            r#"
+control c(start : string)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(n : u32 := 0) {
+           1  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ k : Δ keep(start) ▸ kept {}
+                  2  ⊤ ▷ fault "again"
+              } contingency (m : string) {
+                  1  ⊤ ▷ recover ↑ retry
+              }
+           2  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! run c("a") with [keep -> kept] => stuck X2 E-Var
+"#,
+        ),
+    );
+}
+
+#[test]
+fn what_a_boundary_has_in_its_care_ends_with_its_work_o5() {
+    // Review finding RC5 ([E-Boundary]): when `B₁` ends otherwise than by a
+    // fault, what the boundary took into its care ends with it.
+    stuck_and_rejected(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c()
+    ■ { ok {} }
+    faults
+    uses lock.io
+    1  ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ x : u32 := 1
+       } contingency [l] (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ■ ok {}
+
+//! run c() with [open_lock -> opened {lock#1}] => stuck X5 E-Scope
+"#,
+        ),
+    );
+    stuck_and_rejected(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c()
+    ■ { ok {} }
+    faults
+    uses lock.io
+    1  ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ ■ ok {}
+       } contingency [l] (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ⊥
+
+//! run c() with [open_lock -> opened {lock#1}] => stuck X5 E-Scope
+"#,
+        ),
+    );
+    // A work that always faults passes its care to the contingency, which
+    // consumes it.
+    done_and_accepted(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c()
+    ■ { ok {} }
+    faults
+    uses lock.io
+    1  ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency [l] (m : string) {
+           1  ⊤ ▷ k : Δ close_lock(l) ▸ closed {}
+           2  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ⊥
+
+//! run c() with [open_lock -> opened {lock#1}; close_lock -> closed] => faulted "stop"
+"#,
+        ),
+    );
+    // Something that holds no obligation may be in its care when the work
+    // ends.
+    done_and_accepted(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c(tag : string)
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ x : u32 := 1
+       } contingency [tag] (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ■ ok {}
+
+//! run c("t") => done ok
+"#,
+        ),
+    );
+}
+
+#[test]
+fn nothing_encloses_the_contingency_of_a_named_boundary_f1_f6() {
+    // Review finding RC6 ([E-Supervise]): a call that may fault in the
+    // contingency of a named boundary is stuck when it does.
+    stuck_and_rejected(
+        "F1",
+        &with_fault_prelude(
+            r#"
+boundary guarded() {
+    1  ⊤ ▷ fault "work"
+} contingency (m : string) {
+    1  ⊤ ▷ h : Δ helper_faults() ▸ done {}
+    2  ⊤ ▷ terminate
+}
+
+control c()
+    ■ { done {} }
+    faults
+    1  ⊤ ▷ supervise guarded()
+    2  ⊤ ▷ ■ done {}
+
+//! run c() => stuck X8 E-Unwind
+"#,
+        ),
+    );
+    done_and_accepted(
+        "F1",
+        &with_fault_prelude(
+            r#"
+boundary guarded() {
+    1  ⊤ ▷ fault "work"
+} contingency (m : string) {
+    1  ⊤ ▷ h : Δ helper() ▸ done {}
+    2  ⊤ ▷ terminate
+}
+
+control c()
+    ■ { done {} }
+    1  ⊤ ▷ supervise guarded()
+    2  ⊤ ▷ ■ done {}
+
+//! run c() => done done
+"#,
+        ),
+    );
+    // `fault` and `escalate` are the ends of that contingency, and the
+    // lexical one inside a control may call what faults when the control
+    // permits it.
+    done_and_accepted(
+        "F1",
+        &with_fault_prelude(
+            r#"
+control c()
+    ■ { done {} }
+    faults
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "work"
+       } contingency (m : string) {
+           1  ⊤ ▷ h : Δ helper_faults() ▸ done {}
+           2  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ⊥
+
+//! run c() => faulted "helper"
+"#,
+        ),
+    );
+}
+
+#[test]
+fn the_effects_of_a_supervised_boundary_count_toward_what_supervises_f3_f6() {
+    // Review finding RC20 ([F6]): the effects of both bodies of a boundary
+    // count toward the control that supervises, through a boundary that
+    // supervises another as well.
+    let program = r#"
+boundary inner() {
+    1  ⊤ ▷ e : Δ emit("in") ▸ done {}
+    2  ⊤ ▷ terminate
+} contingency (m : string) {
+    1  ⊤ ▷ terminate
+}
+
+boundary outer() {
+    1  ⊤ ▷ supervise inner()
+    2  ⊤ ▷ terminate
+} contingency (m : string) {
+    1  ⊤ ▷ terminate
+}
+
+control c()
+    ■ { done {} }
+    USES
+    1  ⊤ ▷ supervise outer()
+    2  ⊤ ▷ ■ done {}
+
+//! run c() => RESULT
+"#;
+    done_and_accepted(
+        "F3",
+        &program
+            .replace("USES", "uses console.write")
+            .replace("RESULT", r#"done done trace [emit("in") -> done]"#),
+    );
+    stuck_and_rejected(
+        "F3",
+        &program
+            .replace("    USES\n", "")
+            .replace("RESULT", "stuck X9 E-Effect"),
+    );
+}
+
+#[test]
+fn the_names_around_a_boundary_are_judged_where_the_work_faults_f2_f6() {
+    // RC4, for [F2] and [F6]: a statement of `B₂` that may fault leaves the
+    // names around the boundary as they were where `B₁` faulted, and that
+    // is where the two rules are required of them.
+
+    // The work closes the lock before it faults, so `escalate` unwinds
+    // nothing that a fault cannot release.
+    done_and_accepted(
+        "F2",
+        &with_fault_prelude(
+            r#"
+extern control shut(l : lock)
+    ■ { closed {} }
+    uses lock.io
+
+control c()
+    ■ { ok {} }
+    faults
+    uses lock.io
+    1  ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ k : Δ shut(l) ▸ closed {}
+           2  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ⊥
+
+//! run c() with [open_lock -> opened {lock#1}; shut -> closed] => faulted "stop"
+"#,
+        ),
+    );
+    // It faults with the lock open, and the fault that `escalate` passes on
+    // meets it.
+    stuck_and_rejected(
+        "F2",
+        &with_fault_prelude(
+            r#"
+control c()
+    ■ { ok {} }
+    faults
+    uses lock.io
+    1  ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault "stop"
+       } contingency (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ⊥
+
+//! run c() with [open_lock -> opened {lock#1}] => stuck X8 E-Unwind
+"#,
+        ),
+    );
+    // A retained name of a named boundary, with a lexical boundary inside
+    // its work whose contingency passes the fault on.
+    let program = r#"
+boundary guarded(tag : string) retains tag {
+    1  ⊤ ▷ inner : boundary {
+           WORK
+           9  ⊤ ▷ fault "work"
+       } contingency (m : string) {
+           1  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ terminate
+} contingency (m : string) {
+    1  ⊤ ▷ g : Δ note(&tag) ▸ done {}
+    2  ⊤ ▷ terminate
+}
+
+contingent control note(msg : &string)
+    ■ { done {} }
+    uses console.write
+    1  ⊤ ▷ e : Δ emit(msg) ▸ done {}
+    2  ⊤ ▷ ■ done {}
+
+control c()
+    ■ { done {} }
+    uses console.write
+    1  ⊤ ▷ supervise guarded("t")
+    2  ⊤ ▷ ■ done {}
+
+//! run c() => RESULT
+"#;
+    done_and_accepted(
+        "F6",
+        &program
+            .replace("           WORK\n", "")
+            .replace("RESULT", r#"done done trace [emit("t") -> done]"#),
+    );
+    stuck_and_rejected(
+        "F6",
+        &program
+            .replace("WORK", "1  ⊤ ▷ gone : string := tag")
+            .replace("RESULT", "stuck X2 E-Supervise"),
+    );
+}

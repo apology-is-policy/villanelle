@@ -1144,6 +1144,19 @@ Each of these is an entailment by [N2], on the histories that run the statement.
   not count as enclosing them; the same holds for a call in `B₂` that may
   fault.
 
+  `B₂` runs after a fault at a statement of `B₁`, and neither `B₂` nor the
+  unwinding of `B₁` changes a name of the bodies around the boundary. So
+  where a terminator of `B₂` asks for the availability of such a name ([O2]
+  for the parameters that `recover ↑ ℓ` reads, [O5], [O6]), it is the
+  availability at that statement of `B₁`, after the statement's own
+  arguments have moved, and the rule holds for every statement of `B₁` that
+  may fault, on the histories of both statements. [F2] at a statement of
+  `B₂` concerns `x̄`, the message and the names of `B₂`: for the names around
+  the boundary it was required at the statement of `B₁`. A statement of `B₂`
+  that may fault is, for a boundary around this one, a statement of that
+  boundary's `B₁` that may fault, with the same availability of the names
+  around it.
+
   The requirements of form, which a reader of programs refuses:
   (a) In `B₂`, at any depth, there is no `■`, no boundary, no `supervise`
   and no `terminate` without a status; `↑` and `□` there are those of a
@@ -1494,3 +1507,4 @@ and what asked for it:
 | 23 November 2026 | [E-Formula] says that the value of an `&~` parameter at completion is read through the borrow as it was passed, which the instrumented semantics keeps. | The oracle (review finding RO2): it read the parameter's slot, which is empty when the body passed the borrow on, and then took the value at entry. The checker had it right. |
 | 23 November 2026 | [E-Extern] says that the host names the place a returned borrow refers to and the step makes the reborrow. | The oracle (RO6): a host sees values and no slots, so no host could answer a borrowed payload. The directive form is `&x…` or `&~x…`, with `x` a parameter ([oracle document](oracle.md)). Not answered here: whether a host may write through an `&~` argument. The host relation has no part of the store, so by this document it does not, although [W7] reads such a parameter at completion in the contract of an extern control too (review finding RO11). |
 | 23 November 2026 | Section 6.6 names the built-in operations and gives them the contracts of the corpus prelude; an operand of one follows the rule of any operand. The row X2 of section 6.10 lists the clauses under which the oracle reports that state. | The oracle (RO9, RO10): `take`, `entry_at` and `trim` were in the prelude and not in this document; the written mode of a collection operand was ignored, so `push(&v, x)` was read as `push(&~v, x)`; and the labels `X2 E-Field`, `X2 E-Index` and `X2 E-Supervise` had no row. `X5 E-Resource` is a check of the oracle on its own table of resources, which no run of a program reaches. |
+| 23 November 2026 | [F5] says in which state the names around a lexical boundary are when its contingency ends: as they were at the statement of `B₁` that faulted, for every such statement; and that a statement of `B₂` that may fault is one of the `B₁` of a boundary around it. | The checker (RC4): it took the availability at the entry of the boundary, so it accepted a program whose `B₁` fills an outer name before it faults (stuck, `X5`) and refused one whose `B₁` consumes it. |

@@ -2060,6 +2060,16 @@ type LeaveRecord = (
     Vec<Vec<(Formula, VarId)>>,
 );
 
+/// The ownership of every name where a statement of the `B₁` of a lexical
+/// boundary may fault ([F5]).
+#[derive(Clone)]
+struct FaultState {
+    /// `Rₖ` of the statement.
+    reach: Formula,
+    defined: Vec<Formula>,
+    moved: Vec<Formula>,
+}
+
 struct BodyChecker<'a> {
     program: &'a Program,
     owner_name: String,
@@ -2106,6 +2116,18 @@ struct BodyChecker<'a> {
     /// Set to `true` when checking a named boundary's `B₂` and a feasible
     /// `escalate` or `fault` occurs ([F6]).
     boundary_can_fault: bool,
+    /// For each lexical boundary whose `B₁` is being checked, innermost
+    /// last: the states in which a statement of it may fault ([F5]).
+    fault_frames: Vec<Vec<FaultState>>,
+    /// While the `B₂` of a lexical boundary is checked: the states in which
+    /// its `B₁` may fault, and the number of scopes around the boundary.
+    after_fault: Option<(Vec<FaultState>, usize)>,
+    /// What each lexical boundary whose `B₁` is being checked has in its
+    /// care, with the body of that `B₁` ([E-Boundary]).
+    care: Vec<(BodyId, Vec<VarId>)>,
+    /// Whether the body is the contingency of a named boundary, which
+    /// nothing encloses ([F6]).
+    named_contingency: bool,
     certificates: &'a mut Proofs,
     warnings: &'a mut Vec<crate::surface::Warning>,
     /// The line of the statement being checked.
@@ -2630,7 +2652,90 @@ impl<'a> BodyChecker<'a> {
                 self.certificates,
             )?;
         }
+        // [E-Boundary]: what a boundary has in its care ends with the scope
+        // of its `B₁`, and nothing can consume it there.
+        for (work, cared) in self.care.clone() {
+            if !scope_bodies.contains(&work) {
+                continue;
+            }
+            for var in cared {
+                if self.program.kind(&self.body.vars[var].ty) != Kind::Must {
+                    continue;
+                }
+                require_entailment(
+                    &mut self.solver,
+                    r_i,
+                    &self.owner_name,
+                    line,
+                    "O5",
+                    format!(
+                        "`{}`, which the boundary has in its care, holds an unconsumed obligation when the work of the boundary ends",
+                        self.body.vars[var].name
+                    ),
+                    visible_vars,
+                    in_loop,
+                    self.certificates,
+                )?;
+            }
+        }
         Ok(())
+    }
+
+    /// Runs the check of a terminator once for each state in which the `B₁`
+    /// of the boundary may have faulted, with the names around the boundary
+    /// as they were then ([F5]). Outside the `B₂` of a lexical boundary it
+    /// runs the check once, as things are.
+    fn for_each_fault_state(
+        &mut self,
+        r_i: Formula,
+        mut check: impl FnMut(&mut Self, Formula) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let Some((states, around)) = self.after_fault.clone() else {
+            return check(self, r_i);
+        };
+        let outer: Vec<VarId> = (0..self.body.vars.len())
+            .filter(|&var| self.active_scopes[..around].contains(&self.body.vars[var].body))
+            .collect();
+        let (defined, moved) = (self.defined.clone(), self.moved.clone());
+        for state in &states {
+            for &var in &outer {
+                self.defined[var] = state.defined[var];
+                self.moved[var] = state.moved[var];
+            }
+            let reach = self.solver.bdd.and(r_i, state.reach);
+            check(self, reach)?;
+            self.defined.clone_from(&defined);
+            self.moved.clone_from(&moved);
+        }
+        Ok(())
+    }
+
+    /// [F1], [F6]: nothing encloses a statement of the contingency of a
+    /// named boundary, so a call there must not fault.
+    fn check_call_enclosed(
+        &mut self,
+        callee: &str,
+        r_i: Formula,
+        line: u32,
+        visible_vars: &[(String, TermId, bool)],
+        in_loop: bool,
+    ) -> Result<(), Error> {
+        if !self.named_contingency {
+            return Ok(());
+        }
+        require_entailment(
+            &mut self.solver,
+            r_i,
+            &self.owner_name,
+            line,
+            "F1",
+            format!(
+                "`{callee}` may fault, and nothing encloses a call in the contingency of a named boundary"
+            ),
+            visible_vars,
+            in_loop,
+            self.certificates,
+        )
     }
 
     fn check_may_fault(
@@ -2657,8 +2762,17 @@ impl<'a> BodyChecker<'a> {
                 self.certificates,
             )?;
         }
+        // In the `B₂` of a lexical boundary the names around the boundary
+        // are as they were where `B₁` faulted, and [F6] and [F2] were
+        // required of them there ([F5]).
+        let around = self.after_fault.as_ref().map_or(0, |(_, around)| *around);
+        let retained = if self.after_fault.is_some() {
+            Vec::new()
+        } else {
+            self.retained_vars.clone()
+        };
         // [F6]: In a named boundary's `B₁`, every retained parameter stays available at a fault.
-        for &ret_var in &self.retained_vars.clone() {
+        for &ret_var in &retained {
             let avail_ret = self.avail(ret_var);
             require_formula(
                 &mut self.solver,
@@ -2678,7 +2792,7 @@ impl<'a> BodyChecker<'a> {
         }
         // [F2]: Every non-fault-releasable name in scope must already be consumed.
         for var in 0..self.body.vars.len() {
-            if !self.active_scopes.contains(&self.body.vars[var].body) {
+            if !self.active_scopes[around..].contains(&self.body.vars[var].body) {
                 continue;
             }
             if self.retained_vars.contains(&var) {
@@ -2703,6 +2817,26 @@ impl<'a> BodyChecker<'a> {
                 in_loop,
                 self.certificates,
             )?;
+        }
+        // [F5]: the contingency of the boundary around this statement begins
+        // in the state of this fault. A statement of a `B₂` faults in the
+        // states in which its own `B₁` did.
+        if let Some(frame) = self.fault_frames.len().checked_sub(1) {
+            let states = match self.after_fault.clone() {
+                Some((states, _)) => states
+                    .into_iter()
+                    .map(|state| FaultState {
+                        reach: self.solver.bdd.and(r_i, state.reach),
+                        ..state
+                    })
+                    .collect(),
+                None => vec![FaultState {
+                    reach: r_i,
+                    defined: self.defined.clone(),
+                    moved: self.moved.clone(),
+                }],
+            };
+            self.fault_frames[frame].extend(states);
         }
         Ok(())
     }
@@ -3852,6 +3986,13 @@ impl<'a> BodyChecker<'a> {
                                 });
                             }
                             if callee.faults {
+                                self.check_call_enclosed(
+                                    &callee.name,
+                                    r_i,
+                                    line,
+                                    &visible_vars,
+                                    in_loop,
+                                )?;
                                 self.check_may_fault(r_i, line, &visible_vars, in_loop)?;
                             }
                             let uses = callee.uses.clone();
@@ -4035,6 +4176,13 @@ impl<'a> BodyChecker<'a> {
                                 in_loop,
                             )?;
                             if self.program.controls[*cid].faults {
+                                self.check_call_enclosed(
+                                    &op_name,
+                                    r_i,
+                                    line,
+                                    &visible_vars,
+                                    in_loop,
+                                )?;
                                 self.check_may_fault(r_i, line, &visible_vars, in_loop)?;
                             }
                             let uses = self.program.controls[*cid].uses.clone();
@@ -4704,7 +4852,11 @@ impl<'a> BodyChecker<'a> {
                     let outer_permits_faults = self.permits_faults;
                     let outer_in_contingency = self.in_contingency;
 
-                    // Check `B₁` with fault permission enabled ([F5]).
+                    // Check `B₁` with fault permission enabled ([F5]). The
+                    // boundary has `x̄` in its care while `B₁` runs, and the
+                    // states in which `B₁` may fault are where `B₂` begins.
+                    self.care.push((*b1_body, captures.clone()));
+                    self.fault_frames.push(Vec::new());
                     self.active_scopes.push(*b1_body);
                     self.permits_faults = true;
                     self.in_contingency = false;
@@ -4721,6 +4873,8 @@ impl<'a> BodyChecker<'a> {
                         in_loop,
                     )?;
                     self.active_scopes.pop();
+                    self.care.pop();
+                    let fault_states = self.fault_frames.pop().unwrap_or_default();
                     let b1_end_defined = self.defined.clone();
                     let b1_end_moved = self.moved.clone();
                     let b1_end_versions = self.versions.clone();
@@ -4754,11 +4908,15 @@ impl<'a> BodyChecker<'a> {
                         let not_ri = self.solver.bdd.not(r_i);
                         self.moved[*mvar] = self.solver.bdd.and(self.moved[*mvar], not_ri);
                     }
+                    let outer_after_fault = self
+                        .after_fault
+                        .replace((fault_states, self.active_scopes.len()));
                     self.active_scopes.push(*b2_body);
                     self.permits_faults = outer_permits_faults;
                     self.in_contingency = true;
                     self.check_body_inner(*b2_body, r_i, in_loop, loop_leaves, false)?;
                     self.active_scopes.pop();
+                    self.after_fault = outer_after_fault;
 
                     // Restore flags and merge `B₁` fallthrough state with bypassed `!g_i` histories.
                     self.permits_faults = outer_permits_faults;
@@ -5005,18 +5163,25 @@ impl<'a> BodyChecker<'a> {
                 }
                 Command::Terminate(_) => {
                     let all_scopes = self.active_scopes.clone();
-                    self.check_scope_obligations(&all_scopes, r_i, line, &visible_vars, in_loop)?;
+                    self.for_each_fault_state(r_i, |checker, reach| {
+                        checker.check_scope_obligations(
+                            &all_scopes,
+                            reach,
+                            line,
+                            &visible_vars,
+                            in_loop,
+                        )
+                    })?;
                     // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
                     live = self.solver.bdd.minus(live, g_i);
                 }
                 Command::Recover { body: target_body } => {
-                    if let Some(inv) = self.body.bodies[*target_body]
+                    let head = self.body.bodies[*target_body]
                         .head
                         .as_ref()
                         .expect("a loop head")
-                        .invariant
-                        .clone()
-                    {
+                        .clone();
+                    if let Some(inv) = head.invariant.clone() {
                         let inv_rec = translate_formula(self.program, &mut self.solver, &inv, &env);
                         require_formula(
                             &mut self.solver,
@@ -5031,14 +5196,34 @@ impl<'a> BodyChecker<'a> {
                             self.certificates,
                         )?;
                     }
-                    self.check_loop_repeat_scope(
-                        *target_body,
-                        r_i,
-                        line,
-                        "recover ↑",
-                        &visible_vars,
-                        in_loop,
-                    )?;
+                    // [E-Contingency]: the parameters of the loop are read
+                    // as operands ([O2], [O3]), and then the scopes end as
+                    // at `↑` ([O5], [O6]).
+                    let target = *target_body;
+                    self.for_each_fault_state(r_i, |checker, reach| {
+                        for &parameter in &head.parameters {
+                            checker.check_available(
+                                parameter,
+                                reach,
+                                line,
+                                &visible_vars,
+                                in_loop,
+                            )?;
+                            if checker.program.kind(&checker.body.vars[parameter].ty) != Kind::Copy
+                            {
+                                checker.moved[parameter] =
+                                    checker.solver.bdd.or(checker.moved[parameter], reach);
+                            }
+                        }
+                        checker.check_loop_repeat_scope(
+                            target,
+                            reach,
+                            line,
+                            "recover ↑",
+                            &visible_vars,
+                            in_loop,
+                        )
+                    })?;
                     // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
                     live = self.solver.bdd.minus(live, g_i);
                 }
@@ -5244,6 +5429,10 @@ fn check_boundary(
         in_contingency: false,
         retained_vars: boundary.retains.clone(),
         boundary_can_fault: false,
+        fault_frames: Vec::new(),
+        after_fault: None,
+        care: Vec::new(),
+        named_contingency: false,
         certificates,
         warnings,
         at_line: 1,
@@ -5300,6 +5489,10 @@ fn check_boundary(
         in_contingency: true,
         retained_vars: Vec::new(),
         boundary_can_fault: false,
+        fault_frames: Vec::new(),
+        after_fault: None,
+        care: Vec::new(),
+        named_contingency: true,
         certificates,
         warnings,
         at_line: 1,
@@ -5361,6 +5554,10 @@ fn check_control(
         in_contingency: false,
         retained_vars: Vec::new(),
         boundary_can_fault: false,
+        fault_frames: Vec::new(),
+        after_fault: None,
+        care: Vec::new(),
+        named_contingency: false,
         certificates,
         warnings,
         at_line: 1,
