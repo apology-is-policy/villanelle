@@ -811,3 +811,43 @@ fn u9_renames_inner_binders_and_the_places_that_use_them() {
         .replace("cells[0] ← total", "cells[0] ← missing");
     assert!(villanelle_v2::load_surface(&source).is_err());
 }
+
+#[test]
+fn u14_forwards_named_contracts_and_builtin_calls() {
+    let named = r#"outcome answer: ok {n: u32} │ missing
+control one() ■ ok {n: u32} │ missing
+│ ■ ok {1}
+╵
+control direct() ■ answer
+│ forward one()
+╵
+control captured() ■ answer
+│ r := capture one()
+│ ■ ▾r
+╵
+//! run direct() => done ok {1}
+//! run captured() => done ok {1}
+"#;
+    let builtin = r#"control method() ■ done
+│ ~xs: [u32] := [0]
+│ forward xs.push(1)
+╵
+control direct() ■ done
+│ ~xs: [u32] := [0]
+│ forward push(&~xs, 1)
+╵
+//! run method() => done done
+//! run direct() => done done
+"#;
+    for source in [named, builtin] {
+        let printed = surface::format(source).unwrap();
+        assert_eq!(surface::format(&printed).unwrap(), printed);
+        let report = script::check_surface(&printed);
+        assert_eq!(report.runs, 2, "{:?}", report.failures);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+    }
+    let wrong_type = named.replacen("n: u32", "n: bool", 1);
+    assert_eq!(surface::elaborate(&wrong_type).unwrap_err().clause, "U14");
+    let bad_arity = builtin.replace("xs.push(1)", "xs.push()");
+    assert_eq!(surface::elaborate(&bad_arity).unwrap_err().clause, "C1");
+}

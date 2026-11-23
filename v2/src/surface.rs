@@ -1530,9 +1530,7 @@ enum SurfaceStmt {
     },
     Forward {
         line: u32,
-        mode: CallMode,
-        operation: String,
-        arguments: Vec<Expr>,
+        call: SurfaceCall,
     },
     Call {
         line: u32,
@@ -2699,20 +2697,9 @@ impl Parser {
             }
             Tok::Forward => {
                 self.advance();
-                let mode = if self.eat(&Tok::Await) {
-                    CallMode::Await
-                } else if self.eat(&Tok::Run) {
-                    CallMode::Run
-                } else {
-                    CallMode::Sync
-                };
-                let operation = self.name("U14", "a control name")?;
-                let arguments = self.arguments()?;
                 Ok(SurfaceStmt::Forward {
                     line,
-                    mode,
-                    operation,
-                    arguments,
+                    call: self.parse_call("U14")?,
                 })
             }
             Tok::Await => {
@@ -4701,6 +4688,53 @@ impl Elaborator {
         }
     }
 
+    fn resolve_surface_call(
+        &mut self,
+        call: &SurfaceCall,
+        selection: &Selector,
+        ctx: &mut ControlElab,
+        out: &mut Vec<Statement>,
+        line: u32,
+    ) -> Result<(CallMode, String, Vec<Expr>, ResolvedContract), Error> {
+        let mode = match call {
+            SurfaceCall::Direct { mode, .. } => *mode,
+            SurfaceCall::Method { .. } => CallMode::Sync,
+        };
+        let (op_name, core_args, contract) = match call {
+            SurfaceCall::Direct {
+                operation,
+                arguments,
+                ..
+            } if self.controls.contains_key(operation) => {
+                let callee = self.ensure_contract(operation, line)?;
+                let param_types: Vec<Type> = self.controls[operation]
+                    .parameters
+                    .iter()
+                    .map(|p| p.ty.clone())
+                    .collect();
+                let checked = self.check_args_against_into(
+                    arguments,
+                    &param_types,
+                    selection,
+                    ctx,
+                    out,
+                    line,
+                )?;
+                (operation.clone(), checked, callee)
+            }
+            other => {
+                let Some(res) = self.resolve_builtin_call(other, selection, ctx, out, line)? else {
+                    let SurfaceCall::Direct { operation, .. } = other else {
+                        unreachable!();
+                    };
+                    return fail(line, "C1", format!("`{operation}` is not a control"));
+                };
+                res
+            }
+        };
+        Ok((mode, op_name, core_args, contract))
+    }
+
     #[allow(clippy::type_complexity)]
     fn resolve_builtin_call(
         &self,
@@ -5838,44 +5872,8 @@ impl Elaborator {
                 ty,
                 call,
             } => {
-                let call_mode = match call {
-                    SurfaceCall::Direct { mode, .. } => *mode,
-                    SurfaceCall::Method { .. } => CallMode::Sync,
-                };
-                let (op_name, core_args, contract) = match call {
-                    SurfaceCall::Direct {
-                        operation,
-                        arguments,
-                        ..
-                    } if self.controls.contains_key(operation) => {
-                        let callee = self.ensure_contract(operation, *line)?;
-                        let param_types: Vec<Type> = self.controls[operation]
-                            .parameters
-                            .iter()
-                            .map(|p| p.ty.clone())
-                            .collect();
-                        let checked = self.check_args_against_into(
-                            arguments,
-                            &param_types,
-                            selection,
-                            ctx,
-                            out,
-                            *line,
-                        )?;
-                        (operation.clone(), checked, callee)
-                    }
-                    other => {
-                        let Some(res) =
-                            self.resolve_builtin_call(other, selection, ctx, out, *line)?
-                        else {
-                            let SurfaceCall::Direct { operation, .. } = other else {
-                                unreachable!();
-                            };
-                            return fail(*line, "C1", format!("`{operation}` is not a control"));
-                        };
-                        res
-                    }
-                };
+                let (call_mode, op_name, core_args, contract) =
+                    self.resolve_surface_call(call, selection, ctx, out, *line)?;
                 let outcome_ty = ty
                     .clone()
                     .unwrap_or_else(|| Type::OutcomeNamed(op_name.clone()));
@@ -6358,29 +6356,9 @@ impl Elaborator {
                     line: *line,
                 });
             }
-            SurfaceStmt::Forward {
-                line,
-                mode,
-                operation,
-                arguments,
-            } => {
-                // [U14]: forward [await | run] ω(ā) requires every entry of the callee's
-                // contract (single alternative or group included by name) to be
-                // an entry of the caller's contract with the same payload types.
-                let callee = self.ensure_contract(operation, *line)?;
-                let param_types: Vec<Type> = self.controls[operation]
-                    .parameters
-                    .iter()
-                    .map(|p| p.ty.clone())
-                    .collect();
-                let checked_args = self.check_args_against_into(
-                    arguments,
-                    &param_types,
-                    selection,
-                    ctx,
-                    out,
-                    *line,
-                )?;
+            SurfaceStmt::Forward { line, call } => {
+                let (mode, operation, checked_args, callee) =
+                    self.resolve_surface_call(call, selection, ctx, out, *line)?;
                 self.check_forward_compatibility(
                     &format!("forward {operation}"),
                     &callee,
@@ -6388,7 +6366,7 @@ impl Elaborator {
                     *line,
                 )?;
 
-                let core_site = ctx.allocate_site(None, operation, *line)?;
+                let core_site = ctx.allocate_site(None, &operation, *line)?;
                 let mut core_arms = Vec::new();
                 let mut exits = Vec::new();
                 for alt in &callee.alternatives {
@@ -6409,8 +6387,8 @@ impl Elaborator {
                     selector: selection.clone(),
                     command: Command::Decide {
                         site: core_site.clone(),
-                        mode: *mode,
-                        operation: operation.clone(),
+                        mode,
+                        operation,
                         arguments: checked_args,
                         arms: core_arms,
                     },
@@ -6851,8 +6829,11 @@ impl Elaborator {
                 );
             }
         }
+        let named_contract = matches!(&self.controls[&ctx.control_name].contract,
+            SurfaceContract::Entries(entries) if matches!(entries.as_slice(),
+                [SurfaceContractEntry::Alt(alt, _)] if caller.groups.contains(&alt.name)));
         for own in &callee.own_alternatives {
-            if !caller.own_alternatives.contains(own) {
+            if !named_contract && !caller.own_alternatives.contains(own) {
                 return fail(
                     line,
                     "U14",
@@ -9056,23 +9037,7 @@ fn format_simple_stmt_inline(stmt: &SurfaceStmt) -> String {
             )
         }
         SurfaceStmt::Oblige { formula, .. } => format!("⊢ {}", format_surface_expr(formula)),
-        SurfaceStmt::Forward {
-            mode,
-            operation,
-            arguments,
-            ..
-        } => {
-            let prefix = match mode {
-                CallMode::Sync => "",
-                CallMode::Await => "await ",
-                CallMode::Run => "run ",
-                CallMode::AwaitNext => "await next ",
-            };
-            format!(
-                "forward {prefix}{operation}({})",
-                format_expr_list(arguments)
-            )
-        }
+        SurfaceStmt::Forward { call, .. } => format!("forward {}", format_surface_call(call)),
         SurfaceStmt::Call {
             mode,
             operation,
