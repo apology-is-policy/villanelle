@@ -20,6 +20,7 @@
 //! | `script` | Test directives written beside a program |
 //! | `rng` | A seeded source of pseudo-random numbers |
 //! | `generate` | Random core programs and construct coverage |
+//! | `fuzz` | Generated programs and their mutants against reader, semantics and checker |
 //! | `mutate` | Single-step mutations of valid programs, classified by the oracle |
 
 pub mod bdd;
@@ -29,6 +30,7 @@ pub mod differential;
 pub mod erased;
 pub mod expand;
 pub mod facts;
+pub mod fuzz;
 pub mod generate;
 pub mod host;
 pub mod int;

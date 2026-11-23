@@ -871,7 +871,7 @@ fn surface_files_and_generated_valid_programs_pass_the_checker() {
     let mut total_certificates = 0usize;
     for seed in 1..=80 {
         let mut rng = Rng::new(seed);
-        let syntax_program = generate::valid(&mut rng);
+        let syntax_program = generate::template(&mut rng);
         let program = resolve::resolve(&syntax_program).unwrap();
         let report = check::check(&program).unwrap_or_else(|error| {
             panic!(
@@ -898,7 +898,7 @@ fn every_stuck_mutation_and_dropped_invariant_is_rejected_by_the_checker() {
 
     for seed in 1..=8 {
         let mut rng = Rng::new(seed);
-        let syntax_program = generate::valid(&mut rng);
+        let syntax_program = generate::template(&mut rng);
         let typed_program = resolve::resolve(&syntax_program).unwrap();
         let runs = generate::sample_runs(&mut rng, &typed_program, &config);
 

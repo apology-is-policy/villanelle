@@ -139,7 +139,10 @@ minutes:
 ```
 
 `vn2` with no arguments lists its commands (`test`, `check`, `format`,
-`expand`, `emit-llvm`, `emit-c`, `run`, `print`). Inputs are `.core` (the
+`expand`, `emit-llvm`, `emit-c`, `run`, `print`, `fuzz`). `vn2 fuzz --seed N
+--count N [--mutants] [--out DIR]` tries generated programs in the reader,
+the two semantics and the checker; a program is a function of its seed, and
+a release build (`cargo run --release`) is some ten times faster. Inputs are `.core` (the
 core text form) or `.rails`. Do not use `vn2 format --write` on source that
 matters until review finding RS4 is closed.
 
@@ -258,5 +261,5 @@ Adapted from the Thylacine operational contract.
 | `applications/settings/` | The one maintained real application (settings service); also the style reference |
 | `examples/`, `playground/`, `experiments/` | Runnable examples, small live programs, performance and representation experiments |
 | `tests/` | About 115 integration suites: conformance, differential, native and live host tests |
-| `v2/` | The v2 crate (`villanelle-v2`, binary `vn2`), with no dependencies: mathematical integers (`int`), the core text form (`syntax`, `text`), the Rails reader and formatter (`surface`), `resolve` to the typed core (`typed`), the oracle and its hosts (`oracle`, `host`, `script`), the erased interpreter and the comparison with it (`erased`, `differential`), generator and mutations (`generate`, `mutate`, `rng`), the checker (`check`, `facts`, `kernel`, `bdd`), call expansion (`expand`), the LLVM IR backend (`codegen`), and the conformance suite under `v2/tests/`. `docs/v2/oracle.md` section 1 has the module table |
+| `v2/` | The v2 crate (`villanelle-v2`, binary `vn2`), with no dependencies: mathematical integers (`int`), the core text form (`syntax`, `text`), the Rails reader and formatter (`surface`), `resolve` to the typed core (`typed`), the oracle and its hosts (`oracle`, `host`, `script`), the erased interpreter and the comparison with it (`erased`, `differential`), generator, mutations and fuzzing (`generate`, `mutate`, `fuzz`, `rng`), the checker (`check`, `facts`, `kernel`, `bdd`), call expansion (`expand`), the LLVM IR backend (`codegen`), and the conformance suite under `v2/tests/`. `docs/v2/oracle.md` section 1 has the module table |
 | `ci/`, `.github/workflows/` | Release qualification, Windows, Linux and Thylacine pack scripts |

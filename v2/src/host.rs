@@ -8,7 +8,7 @@
 use crate::int::Int;
 use crate::oracle::{Config, Value, signature_holds};
 use crate::rng::{Rng, mix};
-use crate::typed::{Control, IntType, Program, Type};
+use crate::typed::{self, Comparison, Control, Expr, IntType, Program, Type, VarRef};
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -385,6 +385,236 @@ fn draw_int(rng: &mut Rng, ty: IntType, arguments: &[Value], config: &Config) ->
     Int::from_i128(chosen)
 }
 
+/// The integer literals that occur in `formula`. A value that satisfies a
+/// precondition or the condition of an alternative is most often at one of
+/// them or beside it.
+pub fn integer_literals(formula: &Expr, out: &mut Vec<i128>) {
+    match formula {
+        Expr::Integer(value, _) => out.extend(value.to_i128()),
+        Expr::Negate(inner, _) => {
+            if let Expr::Integer(value, _) = &**inner {
+                out.extend(value.to_i128().map(|value| -value));
+            } else {
+                integer_literals(inner, out);
+            }
+        }
+        Expr::Move(inner, _)
+        | Expr::Field(inner, _, _, _)
+        | Expr::Len(inner)
+        | Expr::Clone(inner, _)
+        | Expr::Trim(inner)
+        | Expr::Not(inner) => integer_literals(inner, out),
+        Expr::Index(left, right, _)
+        | Expr::Arithmetic(_, left, right, _)
+        | Expr::Compare(_, left, right)
+        | Expr::And(left, right)
+        | Expr::Or(left, right) => {
+            integer_literals(left, out);
+            integer_literals(right, out);
+        }
+        Expr::Struct(_, items, _)
+        | Expr::Variant(_, _, items, _)
+        | Expr::Vector(items, _)
+        | Expr::Call(_, items, _) => {
+            for item in items {
+                integer_literals(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The values near which a formula over `arguments` changes its truth: its
+/// literals, the integer arguments, and each argument a literal away.
+pub fn hints_of(formula: Option<&Expr>, arguments: &[Value]) -> Vec<i128> {
+    let mut literals = Vec::new();
+    if let Some(formula) = formula {
+        integer_literals(formula, &mut literals);
+    }
+    let given: Vec<i128> = arguments
+        .iter()
+        .filter_map(|value| match value {
+            Value::Int(number) => number.to_i128(),
+            _ => None,
+        })
+        .collect();
+    let mut out = literals.clone();
+    out.extend(&given);
+    for argument in &given {
+        for literal in &literals {
+            out.extend(argument.checked_add(*literal));
+            out.extend(argument.checked_sub(*literal));
+        }
+    }
+    out
+}
+
+/// The value of a term made of literals, of the integer `arguments` and of
+/// sums and differences of those.
+fn plain_term(term: &Expr, arguments: &[Value]) -> Option<i128> {
+    match term {
+        Expr::Integer(value, _) => value.to_i128(),
+        Expr::Negate(inner, _) => plain_term(inner, arguments)?.checked_neg(),
+        Expr::Var(VarRef::Parameter(index), _) => match arguments.get(*index)? {
+            Value::Int(number) => number.to_i128(),
+            _ => None,
+        },
+        Expr::Arithmetic(typed::Arithmetic::Add, left, right, _) => {
+            plain_term(left, arguments)?.checked_add(plain_term(right, arguments)?)
+        }
+        Expr::Arithmetic(typed::Arithmetic::Subtract, left, right, _) => {
+            plain_term(left, arguments)?.checked_sub(plain_term(right, arguments)?)
+        }
+        _ => None,
+    }
+}
+
+/// The bounds that the conjuncts of `formula` put on each of `count`
+/// subjects, where a conjunct compares a subject with a plain term. `subject`
+/// says which subject a name is. The bounds are a guide for drawing values:
+/// whether the formula holds is decided by evaluating it.
+pub fn plain_bounds(
+    formula: &Expr,
+    arguments: &[Value],
+    count: usize,
+    subject: &dyn Fn(&VarRef) -> Option<usize>,
+) -> Vec<(Option<i128>, Option<i128>)> {
+    fn visit(
+        formula: &Expr,
+        positive: bool,
+        arguments: &[Value],
+        subject: &dyn Fn(&VarRef) -> Option<usize>,
+        out: &mut [(Option<i128>, Option<i128>)],
+    ) {
+        match formula {
+            Expr::And(left, right) if positive => {
+                visit(left, true, arguments, subject, out);
+                visit(right, true, arguments, subject, out);
+            }
+            Expr::Or(left, right) if !positive => {
+                visit(left, false, arguments, subject, out);
+                visit(right, false, arguments, subject, out);
+            }
+            Expr::Not(inner) => visit(inner, !positive, arguments, subject, out),
+            Expr::Compare(comparison, left, right) => {
+                let which = |term: &Expr| match term {
+                    Expr::Var(name, _) => subject(name),
+                    _ => None,
+                };
+                // `subject ⋈ value`, with the comparison turned when the
+                // subject stands on the right.
+                let (index, value, comparison) = match (which(left), which(right)) {
+                    (Some(index), None) => match plain_term(right, arguments) {
+                        Some(value) => (index, value, *comparison),
+                        None => return,
+                    },
+                    (None, Some(index)) => match plain_term(left, arguments) {
+                        Some(value) => (
+                            index,
+                            value,
+                            match comparison {
+                                Comparison::Less => Comparison::Greater,
+                                Comparison::LessEqual => Comparison::GreaterEqual,
+                                Comparison::Greater => Comparison::Less,
+                                Comparison::GreaterEqual => Comparison::LessEqual,
+                                other => *other,
+                            },
+                        ),
+                        None => return,
+                    },
+                    _ => return,
+                };
+                let comparison = if positive {
+                    comparison
+                } else {
+                    match comparison {
+                        Comparison::Less => Comparison::GreaterEqual,
+                        Comparison::LessEqual => Comparison::Greater,
+                        Comparison::Greater => Comparison::LessEqual,
+                        Comparison::GreaterEqual => Comparison::Less,
+                        Comparison::Equal => Comparison::NotEqual,
+                        Comparison::NotEqual => Comparison::Equal,
+                    }
+                };
+                let (low, high) = &mut out[index];
+                let raise = |low: &mut Option<i128>, to: i128| {
+                    *low = Some(low.map_or(to, |seen| seen.max(to)));
+                };
+                let lower = |high: &mut Option<i128>, to: i128| {
+                    *high = Some(high.map_or(to, |seen| seen.min(to)));
+                };
+                match comparison {
+                    Comparison::GreaterEqual => raise(low, value),
+                    Comparison::Greater => raise(low, value.saturating_add(1)),
+                    Comparison::LessEqual => lower(high, value),
+                    Comparison::Less => lower(high, value.saturating_sub(1)),
+                    Comparison::Equal => {
+                        raise(low, value);
+                        lower(high, value);
+                    }
+                    Comparison::NotEqual => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = vec![(None, None); count];
+    visit(formula, true, arguments, subject, &mut out);
+    out
+}
+
+/// Draws an integer of `ty` from `low` to `high`, where an end that is
+/// absent is the end of the type, with the ends and their neighbours
+/// preferred. `None` when no value of the type lies there.
+pub fn draw_int_between(
+    rng: &mut Rng,
+    ty: IntType,
+    low: Option<i128>,
+    high: Option<i128>,
+    config: &Config,
+) -> Option<Int> {
+    let (least, greatest) = ty.bounds(&config.usize_max);
+    let least = least.to_i128().unwrap_or(i128::from(i64::MIN));
+    let greatest = greatest.to_i128().unwrap_or(i128::from(u64::MAX));
+    let low = low.map_or(least, |low| low.max(least));
+    let high = high.map_or(greatest, |high| high.min(greatest));
+    if low > high {
+        return None;
+    }
+    let chosen = match rng.below(8) {
+        0 => low,
+        1 => high,
+        2 => (low + 1).min(high),
+        3 => (high - 1).max(low),
+        4 | 5 => rng.range(low, high.min(low.saturating_add(16))),
+        6 => rng.range(low.max(high.saturating_sub(16)), high),
+        _ => rng.range(low, high),
+    };
+    Some(Int::from_i128(chosen))
+}
+
+/// Draws an integer of `ty` at, beside or between the `hints`, and otherwise
+/// as [`draw_value`] does.
+pub fn draw_int_near(rng: &mut Rng, ty: IntType, hints: &[i128], config: &Config) -> Int {
+    if hints.is_empty() || rng.chance(1, 4) {
+        return draw_int(rng, ty, &[], config);
+    }
+    let (least, greatest) = ty.bounds(&config.usize_max);
+    let low = least.to_i128().unwrap_or(i128::from(i64::MIN));
+    let high = greatest.to_i128().unwrap_or(i128::from(u64::MAX));
+    let base = *rng.pick(hints);
+    let chosen = match rng.below(5) {
+        0 | 1 => base,
+        2 => base.saturating_add(1),
+        3 => base.saturating_sub(1),
+        _ => {
+            let other = *rng.pick(hints);
+            rng.range(base.min(other), base.max(other))
+        }
+    };
+    Int::from_i128(chosen.clamp(low, high))
+}
+
 fn push_value(words: &mut Vec<u64>, value: &Value) {
     match value {
         Value::Bool(flag) => {
@@ -514,21 +744,53 @@ impl Host for Seeded<'_> {
         };
         let count = control.contract.len();
         let start = rng.index(count);
-        for attempt in 0..96 {
-            let alternative = &control.contract[(start + attempt) % count];
+        // What each condition says of each field in plain bounds. A value
+        // drawn within them most often satisfies the condition; whether it
+        // does is decided below, by the condition itself.
+        let bounds: Vec<Vec<(Option<i128>, Option<i128>)>> = control
+            .contract
+            .iter()
+            .map(|alternative| match &alternative.condition {
+                Some(condition) => plain_bounds(
+                    condition,
+                    arguments,
+                    alternative.fields.len(),
+                    &|name| match name {
+                        VarRef::Field(index) => Some(*index),
+                        _ => None,
+                    },
+                ),
+                None => Vec::new(),
+            })
+            .collect();
+        for attempt in 0..192 {
+            let which = (start + attempt) % count;
+            let alternative = &control.contract[which];
             let mut res_counter = self.next_res;
             let payload: Vec<Value> = alternative
                 .fields
                 .iter()
-                .map(|field| {
-                    draw_value_in_program(
-                        self.program,
-                        &mut rng,
-                        &field.ty,
-                        arguments,
-                        config,
-                        &mut res_counter,
-                    )
+                .enumerate()
+                .map(|(index, field)| {
+                    let bounded = match (&field.ty, bounds[which].get(index)) {
+                        (Type::Int(int_ty), Some((low, high)))
+                            if low.is_some() || high.is_some() =>
+                        {
+                            draw_int_between(&mut rng, *int_ty, *low, *high, config)
+                        }
+                        _ => None,
+                    };
+                    match bounded {
+                        Some(number) => Value::Int(number),
+                        None => draw_value_in_program(
+                            self.program,
+                            &mut rng,
+                            &field.ty,
+                            arguments,
+                            config,
+                            &mut res_counter,
+                        ),
+                    }
                 })
                 .collect();
             let valid = match &alternative.condition {

@@ -4,7 +4,9 @@ use std::process::ExitCode;
 use villanelle_v2::host::{Arithmetic, Host, Script};
 use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{Config, End, Value, run};
-use villanelle_v2::{check, codegen, erased, expand, load, load_surface, script, surface, text};
+use villanelle_v2::{
+    check, codegen, erased, expand, fuzz, load, load_surface, script, surface, text,
+};
 
 const USAGE: &str = "\
 vn2 test FILE...                          carry out the directives of core or Rails files
@@ -15,12 +17,22 @@ vn2 emit-llvm FILE [--usize 32|64]        emit Phase 4 typed LLVM IR for a core 
 vn2 emit-c FILE [--usize 32|64]           emit Phase 4 typed C ABI header for a core or Rails file
 vn2 run FILE ENTRY [VALUE...] [OPTIONS]   run one control in the oracle
 vn2 print FILE                            print a core or Rails program in the core glyph form
+vn2 fuzz [OPTIONS]                        try generated programs in reader, oracle and checker
 
 Options of `run`:
   --arithmetic   the host computes the checked arithmetic of the prelude
   --usize 32     the greatest usize is 2^32 - 1 (default: 2^64 - 1)
   --fuel N       stop after N steps (default: 1000000)
   --erased       run under the erased semantics, which checks nothing
+
+Options of `fuzz`:
+  --seed N       the first seed (default: 1); a program is a function of its seed
+  --count N      the number of seeds (default: 100)
+  --mutants      try the mutants of each program too
+  --show         print the programs and try nothing
+  --out DIR      write each finding to a file in DIR
+  --fuel N       steps of one run (default: 200000)
+  --seconds N    time for the checker on one program (default: 20)
 ";
 
 fn is_core_file(path: &str) -> bool {
@@ -227,9 +239,68 @@ fn parse_emit_args(arguments: &[String]) -> Result<(&str, u32), String> {
     }
 }
 
+/// `vn2 fuzz [--seed N] [--count N] [--mutants] [--show] [--out DIR]`.
+fn fuzz_command(arguments: &[String]) -> Result<bool, String> {
+    let mut first = 1u64;
+    let mut count = 100u64;
+    let mut show = false;
+    let mut out: Option<String> = None;
+    let mut options = fuzz::Options::default();
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        let mut number = |what: &str| -> Result<u64, String> {
+            rest.next()
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(|| format!("`{what}` takes a number"))
+        };
+        match argument.as_str() {
+            "--seed" => first = number("--seed")?,
+            "--count" => count = number("--count")?,
+            "--fuel" => options.fuel = number("--fuel")?,
+            "--seconds" => options.seconds = number("--seconds")?,
+            "--mutants" => options.mutants = true,
+            "--show" => show = true,
+            "--out" => out = Some(rest.next().ok_or("`--out` takes a directory")?.clone()),
+            _ => return Err(USAGE.to_string()),
+        }
+    }
+    if show {
+        for seed in first..first + count {
+            println!("┄ seed {seed}\n{}", fuzz::program_of(seed).print());
+        }
+        return Ok(true);
+    }
+    // A panic of the checker is a finding, and is reported as one.
+    std::panic::set_hook(Box::new(|_| {}));
+    let report = fuzz::campaign(first, count, &options);
+    println!("{}", report.summary());
+    for finding in &report.findings {
+        println!("seed {} {}: {}", finding.seed, finding.kind, finding.detail);
+    }
+    if let Some(directory) = out {
+        std::fs::create_dir_all(&directory).map_err(|error| format!("{directory}: {error}"))?;
+        for (index, finding) in report.findings.iter().enumerate() {
+            let path = format!(
+                "{directory}/seed{}-{}-{index}.core",
+                finding.seed, finding.kind
+            );
+            let text = format!(
+                "┄ vn2 fuzz --seed {} --count 1: {}\n┄ {}\n{}",
+                finding.seed,
+                finding.kind,
+                finding.detail.replace('\n', " "),
+                finding.program
+            );
+            std::fs::write(&path, text).map_err(|error| format!("{path}: {error}"))?;
+        }
+    }
+    Ok(report.findings.is_empty())
+}
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let result = match arguments.split_first() {
+        Some((command, rest)) if command == "fuzz" => fuzz_command(rest),
         Some((command, rest)) if command == "test" && !rest.is_empty() => test(rest),
         Some((command, rest)) if command == "check" && !rest.is_empty() => check_files(rest),
         Some((command, rest)) if command == "format" && !rest.is_empty() => format_files(rest),

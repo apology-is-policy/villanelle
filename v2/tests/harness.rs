@@ -2,7 +2,8 @@
 
 use std::collections::BTreeSet;
 use villanelle_v2::differential::{Verdict, compare};
-use villanelle_v2::generate::{CONSTRUCTS, Coverage, free, sample_runs, valid};
+use villanelle_v2::fuzz;
+use villanelle_v2::generate::{CONSTRUCTS, Coverage, free, sample_runs, template};
 use villanelle_v2::host::{Arithmetic, Seeded};
 use villanelle_v2::mutate::{Class, Kind, classify, mutate};
 use villanelle_v2::oracle::{Config, End};
@@ -32,8 +33,47 @@ const STUCK: [&str; 15] = [
     "X10 E-Decide",
 ];
 
+/// The generator of valid programs ([`villanelle_v2::generate::valid`]): what
+/// it writes reads back, resolves, runs to an end on every tried entry under
+/// both widths of `usize`, and gives the same observation under the erased
+/// semantics. Over these seeds it reaches every construct of the slice and
+/// every statement rule. What the checker says of the same programs is not
+/// asserted here yet: `docs/v2/review.md` (RC12, RC16) has the count.
 #[test]
-fn valid_programs_cover_every_construct_and_rule_and_never_stick() {
+fn generated_valid_programs_run_to_an_end_and_reach_every_construct() {
+    let options = fuzz::Options::default();
+    let report = fuzz::campaign_without_checker(1, 120, &options);
+    let failures: Vec<String> = report
+        .findings
+        .iter()
+        .map(|finding| format!("seed {} {}: {}", finding.seed, finding.kind, finding.detail))
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        report.coverage.missing().is_empty(),
+        "constructs not reached: {:?}",
+        report.coverage.missing()
+    );
+    for rule in RULES {
+        assert!(report.rules.contains(rule), "no run applied [{rule}]");
+    }
+    assert!(report.runs >= 2_000, "runs = {}", report.runs);
+}
+
+/// A program is a function of its seed, and seeds give different programs.
+#[test]
+fn a_generated_program_is_a_function_of_its_seed() {
+    let texts: BTreeSet<String> = (1..=40)
+        .map(|seed| fuzz::program_of(seed).print())
+        .collect();
+    assert_eq!(texts.len(), 40);
+    assert_eq!(fuzz::program_of(7).print(), fuzz::program_of(7).print());
+    let lines: Vec<usize> = texts.iter().map(|text| text.lines().count()).collect();
+    assert!(lines.iter().max() > lines.iter().min());
+}
+
+#[test]
+fn the_template_covers_every_construct_and_rule_and_never_sticks() {
     let mut rng = Rng::new(2026);
     let mut coverage = Coverage::new();
     let mut rules_seen = BTreeSet::new();
@@ -49,7 +89,7 @@ fn valid_programs_cover_every_construct_and_rule_and_never_stick() {
     };
 
     for seed in 0..80u64 {
-        let tree = valid(&mut rng);
+        let tree = template(&mut rng);
         coverage.observe(&tree);
 
         // Every generated program prints as core text and reads back to the
@@ -155,7 +195,7 @@ fn free_programs_cover_every_construct_and_agree_with_erased_when_unstuck() {
 }
 
 #[test]
-fn mutations_of_valid_programs_reach_every_stuck_state_of_the_slice() {
+fn mutations_of_the_template_reach_every_stuck_state_of_the_slice() {
     let mut rng = Rng::new(9001);
     let config = Config {
         fuel: 5_000,
@@ -168,7 +208,7 @@ fn mutations_of_valid_programs_reach_every_stuck_state_of_the_slice() {
     let mut unstuck_count = 0usize;
 
     for seed in 0..16u64 {
-        let tree = valid(&mut rng);
+        let tree = template(&mut rng);
         let program = resolve::resolve(&tree).expect("a valid program");
         let runs = sample_runs(&mut rng, &program, &config);
         for mutant in mutate(&tree) {

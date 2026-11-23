@@ -61,10 +61,10 @@ for every clause implemented.
 | --- | --- | --- | --- | --- |
 | Oracle: accepting and rejecting test for each clause | Met: 41 files, 126 runs, 12 rules, 15 stuck states, 9 refusals | Partly: 13 files, 33 runs, 10 stuck labels; the fault-boundary rules are wrong (RO1, RO3, RO4) | No: 2 files; one stuck label, `X4 B1`, which the oracle raises in 17 places; the test asserts counts of runs | No: 2 files; the test asserts no stuck state; one run varies the order of turns |
 | Checker: accepting and rejecting test for each clause | Met | Partly; unsound (RC2 to RC6) | Partly: the worked examples of the reference model; unsound (RC1); the loan checker was tested from outside only | No checker |
-| Generator reaches every construct of the slice (phase 2 exit) | Only through one fixed program (RG1) | No generator | No generator | No generator |
-| Oracle against erased semantics | 62 runs and the fixed program | The erased interpreter is a transcription of the oracle (RO7) and wrong under faults (RO5) | As slice 2 | As slice 2 |
+| Generator reaches every construct of the slice (phase 2 exit) | Met since 23 November (section 9, RG1) | No generator | No generator | No generator |
+| Oracle against erased semantics | 62 runs of the suite and 11,728 runs of 300 generated programs | The erased interpreter is a transcription of the oracle (RO7) and wrong under faults (RO5) | As slice 2 | As slice 2 |
 | Mutations rejected at the rate the author sets (phase 3 exit) | Five kinds on one program shape, 8 seeds | None | None | None |
-| No generated checked program is stuck over a long campaign (phase 3 exit) | No campaign | None | None | None |
+| No generated checked program is stuck over a long campaign (phase 3 exit) | No campaign yet; `vn2 fuzz` is the tool, and the checker must first accept the valid programs (RC12, RC16) | None | None | None |
 | Compiled code agrees with the oracle on generated programs (phase 4 exit) | One program shape | None; double free (RB1) | None | No backend; `emit-llvm` panics (RB9) |
 | Every kernel under `experiments/` within 1.2× of optimized Rust (phase 4 exit) | None measured (RB6) | None measured | None measured | |
 
@@ -423,6 +423,7 @@ A finding is closed here with the date and the test that holds it.
 | Finding | State |
 | --- | --- |
 | RD1 | Closed 23 November 2026 by the corrected status statements |
+| RG1 | Closed 23 November 2026 for the reader and the two semantics: `generate::valid` writes programs from their histories, and `generated_valid_programs_run_to_an_end_and_reach_every_construct` (`v2/tests/harness.rs`) holds it. Open for what was built on the old program: the checker and backend tests still run on `generate::template`, and the checker does not accept every generated program (RC12, RC16: of 300, it rejects 13, panics on 16 and times out on 3) |
 | All others | Open |
 
 ## 10. The course

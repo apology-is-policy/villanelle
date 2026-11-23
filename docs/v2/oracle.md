@@ -277,16 +277,27 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   the oracle.
 - **Program generator (`generate`, `v2/tests/harness.rs`).** Every generated
   program is built as a `syntax::Program`, printed as core text, parsed back
-  and resolved. `generate::valid` is **one fixed program** of 53 lines
-  (three functions, two extern controls and two controls) in which the seed picks the integer
-  types, two comparison operators and a few small subexpressions; it holds
-  statements that can never run and are there to reach a construct. Across 80
-  seeds and both 32-bit and 64-bit `usize`, every run of it ends in `done`,
-  applies all 12 statement rules, reaches all 61 syntactic constructs of the
-  slice, and yields `Verdict::Same` against the erased semantics. That is
-  one program shape, so it is not the generator the plan asks for and the
-  exit of phase 2 is not met ([review](review.md), RG1); a generator that
-  builds programs from random trees replaces it. `generate::free` builds
+  and resolved. `generate::valid` writes a body statement by statement and
+  keeps beside it every history that is still running ([K1] to [K3]): its
+  atoms, the names bound on it and an interval for each integer. A statement
+  runs on the histories that satisfy its selector, a test or a decision
+  splits each of them, a terminator ends them, and the body is complete when
+  none is left ([K7]). Every obligation ([P1] to [P6]) is discharged on the
+  intervals of the histories that run the statement, and the partial
+  operators are bounded as the fact logic bounds them ([A7] to [A9],
+  `generate/interval.rs`), so the generator concludes nothing that the fact
+  logic does not entail. A history whose intervals become empty gets `⊥` or
+  nothing. Loops have a counter that every `↑` moves; preconditions,
+  invariants and the conditions of alternatives are intervals, and the
+  conditions of a defined control are what held at its exits. A program is a
+  function of its seed (`fuzz::program_of`). Over seeds 1 to 300, at both
+  widths of `usize`, 11,728 runs end in `done`, none is stuck, each gives
+  the same observation under the erased semantics, and the programs reach
+  all 61 constructs and all 12 statement rules. `generate::template` is the
+  fixed program of 53 lines that was `valid` until 23 November
+  ([review](review.md), RG1); it is kept as one regression program, and the
+  checker and backend tests that say "generated" still run on it.
+  `generate::free` builds
   unconstrained well-resolved programs of 10 to 20 lines; across 250 seeds it
   reaches all 61 constructs, and every run that is not stuck in the oracle
   agrees with the erased semantics. Most of its runs are stuck in the first
@@ -297,8 +308,24 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   to [P8], X2, X3, X6, X7), `DropInvariant` ([K4], [P4]) and `DropEffect`
   ([F3], X9). `mutate::classify` runs each mutant in the oracle; across 16
   seeds of `generate::valid`, the stuck mutants reach all 15 stuck states of
-  slice 1. They are the target rejection set for the phase 3 checker. Since
-  `valid` is one program, they are the mutants of one program.
+  slice 1. They are the target rejection set for the phase 3 checker. That
+  test runs on the template, so they are the mutants of one program.
+- **Fuzzing (`fuzz`, `vn2 fuzz`).** `vn2 fuzz --seed N --count N` takes the
+  program of each seed through the reader, the oracle and the erased
+  semantics on entries that satisfy its precondition, and asks the checker;
+  `--mutants` does the same for every mutant, where a mutant that the
+  checker accepts must have no stuck run. Each failure is a finding with
+  its seed, and `--out DIR` writes the programs. The state on 23 November
+  2026: the reader and the two semantics have no finding over 300 seeds. Of
+  the 300 valid programs the checker accepts 268, rejects 13, panics on 16
+  and does not answer within 20 seconds on 3. The rejected programs were
+  looked at one by one only in part; the one analysed is valid by [A7] and
+  [A9], so these count against the decision procedure
+  ([review](review.md), RC12, RC16). Of 838 mutants of the first 25
+  programs, `resolve` refuses 132, the checker rejects 319 (a stuck run was
+  found for 218 of them) and accepts 353, none of which has a stuck run
+  among those tried. The harness test asserts the part that holds and does
+  not ask the checker yet.
 
 ## 9. The Rails surface reader and elaborator
 

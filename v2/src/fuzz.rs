@@ -1,0 +1,379 @@
+//! Fuzzing with generated programs: the reader, the two semantics and the
+//! checker are held against each other on programs that are valid by
+//! construction ([`crate::generate::valid`]) and on their mutants
+//! ([`crate::mutate`]).
+//!
+//! What must hold, and what a **finding** is when it does not:
+//!
+//! | Kind | Must hold |
+//! | --- | --- |
+//! | `reader` | The printed program reads back to the same text |
+//! | `resolve` | A valid program resolves |
+//! | `stuck` | No run of a valid program is stuck in the oracle |
+//! | `host`, `fuel` | The host has an answer for every call, and a run ends |
+//! | `erased` | The erased semantics gives the same observation ([R1] to [R3]) |
+//! | `rejected` | The checker accepts a valid program ([N3], [J5]) |
+//! | `panic`, `timeout` | The checker answers, and in time |
+//! | `unsound` | A mutant that the checker accepts has no stuck run |
+//!
+//! Every program is a function of its seed, so a finding is reproduced by
+//! its seed alone.
+
+use crate::check;
+use crate::differential::{Verdict, compare};
+use crate::generate::{Coverage, entry_runs, valid};
+use crate::host::{Arithmetic, Seeded};
+use crate::mutate::{Kind, mutate};
+use crate::oracle::{self, Config, End};
+use crate::rng::{Rng, mix};
+use crate::{resolve, text};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc;
+use std::time::Duration;
+
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// Whether the checker is asked about each program.
+    pub checker: bool,
+    /// Whether the mutants of each program are tried too.
+    pub mutants: bool,
+    pub fuel: u64,
+    /// Entries for each control, on each target.
+    pub entries: usize,
+    /// Hosts for each entry.
+    pub hosts: u64,
+    /// How long the checker may take on one program.
+    pub seconds: u64,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            checker: true,
+            mutants: false,
+            fuel: 200_000,
+            entries: 6,
+            hosts: 2,
+            seconds: 20,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Finding {
+    pub seed: u64,
+    pub kind: &'static str,
+    pub detail: String,
+    /// The program, or the mutant, in the core text form.
+    pub program: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Report {
+    pub programs: u64,
+    pub runs: u64,
+    pub accepted: u64,
+    pub mutants: u64,
+    /// Mutants that `resolve` refuses.
+    pub refused: u64,
+    /// Mutants that the checker rejects.
+    pub rejected: u64,
+    /// Rejected mutants for which a stuck run was found as well.
+    pub rejected_stuck: u64,
+    /// Mutants that the checker accepts and that no tried run leaves stuck.
+    pub survived: u64,
+    pub survivors: BTreeMap<Kind, u64>,
+    pub coverage: Coverage,
+    pub rules: BTreeSet<&'static str>,
+    pub findings: Vec<Finding>,
+}
+
+/// What the checker says of a program, given as text so that the answer can
+/// be awaited from another thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Checked {
+    Accepted,
+    Rejected(String),
+    Panicked(String),
+    TimedOut,
+}
+
+pub fn checker(source: &str, seconds: u64) -> Checked {
+    let (sender, receiver) = mpsc::channel();
+    let source = source.to_string();
+    std::thread::spawn(move || {
+        let answer = std::panic::catch_unwind(|| match crate::load(&source) {
+            Ok(program) => match check::check(&program) {
+                Ok(_) => Checked::Accepted,
+                Err(error) => Checked::Rejected(error.to_string()),
+            },
+            Err(error) => Checked::Rejected(format!("not resolved: {error}")),
+        });
+        let answer = answer.unwrap_or_else(|panic| {
+            let message = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_string()))
+                .unwrap_or_else(|| "a panic without a message".to_string());
+            Checked::Panicked(message)
+        });
+        let _ = sender.send(answer);
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(seconds))
+        .unwrap_or(Checked::TimedOut)
+}
+
+fn show(arguments: &[oracle::Value]) -> String {
+    let shown: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+    shown.join(", ")
+}
+
+fn configs(fuel: u64) -> [(u32, Config); 2] {
+    [
+        (
+            64,
+            Config {
+                fuel,
+                ..Config::default()
+            },
+        ),
+        (
+            32,
+            Config {
+                fuel,
+                ..Config::with_usize_bits(32)
+            },
+        ),
+    ]
+}
+
+/// The program of `seed`.
+pub fn program_of(seed: u64) -> crate::syntax::Program {
+    valid(&mut Rng::new(mix(&[seed, 0x76616c6964])))
+}
+
+/// Tries the program of `seed`, and its mutants if asked, and adds what it
+/// sees to `report`.
+pub fn one(seed: u64, options: &Options, report: &mut Report) {
+    let tree = program_of(seed);
+    let printed = tree.print();
+    report.programs += 1;
+    report.coverage.observe(&tree);
+    let find = |report: &mut Report, kind: &'static str, detail: String, program: &str| {
+        report.findings.push(Finding {
+            seed,
+            kind,
+            detail,
+            program: program.to_string(),
+        });
+    };
+
+    let reparsed = match text::parse(&printed) {
+        Ok(reparsed) => reparsed,
+        Err(error) => {
+            find(report, "reader", error.to_string(), &printed);
+            return;
+        }
+    };
+    if reparsed.print() != printed {
+        find(
+            report,
+            "reader",
+            "the program reads back to another text".to_string(),
+            &printed,
+        );
+        return;
+    }
+    let program = match resolve::resolve(&reparsed) {
+        Ok(program) => program,
+        Err(error) => {
+            find(report, "resolve", error.to_string(), &printed);
+            return;
+        }
+    };
+
+    let mut rng = Rng::new(mix(&[seed, 0x72756e73]));
+    for (bits, config) in configs(options.fuel) {
+        for (index, (entry, arguments)) in entry_runs(&mut rng, &program, &config, options.entries)
+            .into_iter()
+            .enumerate()
+        {
+            for host_seed in 0..options.hosts {
+                let mut host = Arithmetic(Seeded::new(
+                    &program,
+                    mix(&[seed, index as u64, host_seed, u64::from(bits)]),
+                ));
+                let outcome = compare(&program, &entry, arguments.clone(), &mut host, &config);
+                report.runs += 1;
+                report.rules.extend(outcome.oracle.rules.keys().copied());
+                let run = format!(
+                    "`{entry}({})`, usize of {bits} bits, host {host_seed}",
+                    show(&arguments)
+                );
+                let kind = match &outcome.oracle.end {
+                    End::Done { .. } => match &outcome.verdict {
+                        Verdict::Differ(difference) => {
+                            find(report, "erased", format!("{run}: {difference}"), &printed);
+                            continue;
+                        }
+                        _ => continue,
+                    },
+                    End::Stuck(_) => "stuck",
+                    End::OutOfFuel => "fuel",
+                    _ => "host",
+                };
+                find(
+                    report,
+                    kind,
+                    format!("{run} ends in `{}`", outcome.oracle.end),
+                    &printed,
+                );
+            }
+        }
+    }
+
+    if !options.checker {
+        return;
+    }
+    match checker(&printed, options.seconds) {
+        Checked::Accepted => report.accepted += 1,
+        Checked::Rejected(message) => find(report, "rejected", message, &printed),
+        Checked::Panicked(message) => find(report, "panic", message, &printed),
+        Checked::TimedOut => find(
+            report,
+            "timeout",
+            format!("the checker took more than {} seconds", options.seconds),
+            &printed,
+        ),
+    }
+
+    if !options.mutants {
+        return;
+    }
+    for mutant in mutate(&tree) {
+        report.mutants += 1;
+        let source = mutant.program.print();
+        let Ok(typed) = resolve::resolve(&mutant.program) else {
+            report.refused += 1;
+            continue;
+        };
+        // The first stuck run of the mutant, if a tried run is stuck.
+        let mut stuck: Option<String> = None;
+        let mut rng = Rng::new(mix(&[seed, 0x6d7574]));
+        'runs: for (bits, config) in configs(options.fuel) {
+            for (index, (entry, arguments)) in
+                entry_runs(&mut rng, &typed, &config, options.entries)
+                    .into_iter()
+                    .enumerate()
+            {
+                for host_seed in 0..options.hosts {
+                    let mut host = Arithmetic(Seeded::new(
+                        &typed,
+                        mix(&[seed, index as u64, host_seed, u64::from(bits)]),
+                    ));
+                    let run = oracle::run(&typed, &entry, arguments.clone(), &mut host, &config);
+                    if let End::Stuck(state) = &run.end {
+                        stuck = Some(format!(
+                            "`{entry}({})`, usize of {bits} bits, host {host_seed}: stuck X{} {} at {}:{}: {}",
+                            show(&arguments),
+                            state.state,
+                            state.clause,
+                            state.control,
+                            state.line,
+                            state.detail
+                        ));
+                        break 'runs;
+                    }
+                }
+            }
+        }
+        let about = format!(
+            "{:?} in `{}` ({})",
+            mutant.kind, mutant.control, mutant.detail
+        );
+        match checker(&source, options.seconds) {
+            Checked::Accepted => match stuck {
+                Some(run) => find(report, "unsound", format!("{about}; {run}"), &source),
+                None => {
+                    report.survived += 1;
+                    *report.survivors.entry(mutant.kind).or_insert(0) += 1;
+                }
+            },
+            Checked::Rejected(_) => {
+                report.rejected += 1;
+                if stuck.is_some() {
+                    report.rejected_stuck += 1;
+                }
+            }
+            Checked::Panicked(message) => {
+                find(report, "panic", format!("{about}; {message}"), &source)
+            }
+            Checked::TimedOut => find(
+                report,
+                "timeout",
+                format!(
+                    "{about}; the checker took more than {} seconds",
+                    options.seconds
+                ),
+                &source,
+            ),
+        }
+    }
+}
+
+/// Tries the programs of `count` seeds from `first`.
+pub fn campaign(first: u64, count: u64, options: &Options) -> Report {
+    let mut report = Report::default();
+    for seed in first..first + count {
+        one(seed, options, &mut report);
+    }
+    report
+}
+
+/// As [`campaign`], for the reader and the two semantics alone.
+pub fn campaign_without_checker(first: u64, count: u64, options: &Options) -> Report {
+    let options = Options {
+        checker: false,
+        mutants: false,
+        ..options.clone()
+    };
+    campaign(first, count, &options)
+}
+
+impl Report {
+    /// The counts, one to a line.
+    pub fn summary(&self) -> String {
+        let mut by_kind: BTreeMap<&str, u64> = BTreeMap::new();
+        for finding in &self.findings {
+            *by_kind.entry(finding.kind).or_insert(0) += 1;
+        }
+        let mut out = format!(
+            "{} programs, {} runs, {} accepted by the checker\n",
+            self.programs, self.runs, self.accepted
+        );
+        if self.mutants > 0 {
+            out.push_str(&format!(
+                "{} mutants: {} refused by resolve, {} rejected by the checker ({} of them with a stuck run), {} accepted with no stuck run\n",
+                self.mutants, self.refused, self.rejected, self.rejected_stuck, self.survived
+            ));
+            for (kind, count) in &self.survivors {
+                out.push_str(&format!("  accepted {kind:?}: {count}\n"));
+            }
+        }
+        let missing = self.coverage.missing();
+        out.push_str(&format!(
+            "constructs not reached: {}\n",
+            if missing.is_empty() {
+                "none".to_string()
+            } else {
+                missing.join(", ")
+            }
+        ));
+        out.push_str(&format!("{} findings", self.findings.len()));
+        for (kind, count) in by_kind {
+            out.push_str(&format!("\n  {kind}: {count}"));
+        }
+        out
+    }
+}

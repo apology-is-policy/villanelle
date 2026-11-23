@@ -425,7 +425,7 @@ fn generated_valid_programs_agree_across_oracle_erased_expanded_and_native_o0_o2
 
     for seed in 1..=8u64 {
         let mut rng = Rng::new(seed);
-        let tree = generate::valid(&mut rng);
+        let tree = generate::template(&mut rng);
         let program = resolve::resolve(&tree).unwrap();
         let expanded_tree = expand::expand(&tree).unwrap();
         assert_no_defined_calls(&expanded_tree);

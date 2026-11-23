@@ -4,16 +4,19 @@
 //! printed as core text, read back by [`crate::text::parse`], and resolved by
 //! [`crate::resolve::resolve`].
 //!
-//! Two generators are provided:
+//! Three generators are provided:
 //!
-//! - [`valid`] produces programs that are well-typed and never stuck in the
-//!   oracle on any valid execution input, under both 32-bit and 64-bit
-//!   `usize`.
+//! - [`valid`] writes programs that are valid by construction: they resolve,
+//!   no execution from an entry that satisfies its precondition is stuck in
+//!   the oracle under 32-bit or 64-bit `usize`, and the fact logic entails
+//!   every obligation (`generate/valid.rs`).
+//! - [`template`] is one fixed valid program with a few seeded choices, kept
+//!   as a regression program.
 //! - [`free`] produces arbitrary well-resolved programs whose expressions,
 //!   selectors, obligations, effects and decision arms are not constrained to
 //!   avoid runtime stuck states.
 
-use crate::host::draw_value;
+use crate::host::{draw_int_between, draw_int_near, draw_value, hints_of, plain_bounds};
 use crate::int::Int;
 use crate::oracle::{Config, Value, signature_holds};
 use crate::rng::Rng;
@@ -23,6 +26,11 @@ use crate::syntax::{
 };
 use crate::typed::{self, IntType, Type};
 use std::collections::BTreeMap;
+
+mod interval;
+mod valid;
+
+pub use valid::valid;
 
 /// Every syntactic construct of slice 1.
 pub const CONSTRUCTS: [&str; 61] = [
@@ -447,9 +455,12 @@ fn stmt(selector: Selector, command: Command) -> Statement {
     }
 }
 
-/// Generates a core program that is valid by construction: it resolves, and no
-/// valid execution is stuck in the oracle under 32-bit or 64-bit `usize`.
-pub fn valid(rng: &mut Rng) -> Program {
+/// One fixed program of 53 lines in which `rng` picks the integer types, two
+/// comparison operators and a few small subexpressions. It resolves, and no
+/// valid execution of it is stuck in the oracle under 32-bit or 64-bit
+/// `usize`. Until 23 November 2026 this was `valid`; it is kept as one
+/// regression program, with its entries in [`sample_runs`].
+pub fn template(rng: &mut Rng) -> Program {
     let int_ty = *rng.pick(&IntType::ALL);
     let int_ty2 = *rng.pick(&IntType::ALL);
     let signed_ty = *rng.pick(&SIGNED_TYPES);
@@ -1178,6 +1189,66 @@ pub fn sample_runs(
                 if out.len() >= 6 {
                     break;
                 }
+            }
+        }
+    }
+    out
+}
+
+/// Entries for every defined control of `program`: up to `each` argument
+/// lists that satisfy its precondition, drawn at, beside and between the
+/// literals of that precondition as well as across the types.
+pub fn entry_runs(
+    rng: &mut Rng,
+    program: &typed::Program,
+    config: &Config,
+    each: usize,
+) -> Vec<(String, Vec<Value>)> {
+    let mut out = Vec::new();
+    for control in &program.controls {
+        if control.body.is_none() {
+            continue;
+        }
+        let hints = hints_of(control.precondition.as_ref(), &[]);
+        let bounds = match &control.precondition {
+            Some(pre) => plain_bounds(pre, &[], control.parameters.len(), &|name| match name {
+                typed::VarRef::Parameter(index) => Some(*index),
+                _ => None,
+            }),
+            None => vec![(None, None); control.parameters.len()],
+        };
+        let mut found = 0;
+        for _ in 0..each * 24 {
+            if found == each {
+                break;
+            }
+            let candidate: Vec<Value> = control
+                .parameters
+                .iter()
+                .zip(&bounds)
+                .map(|(parameter, (low, high))| match &parameter.ty {
+                    // Within what the precondition says of the parameter
+                    // alone, most often; anywhere near its literals, else.
+                    Type::Int(ty) if rng.chance(3, 4) => {
+                        match draw_int_between(rng, *ty, *low, *high, config) {
+                            Some(number) => Value::Int(number),
+                            None => Value::Int(draw_int_near(rng, *ty, &hints, config)),
+                        }
+                    }
+                    Type::Int(ty) => Value::Int(draw_int_near(rng, *ty, &hints, config)),
+                    other => draw_value(rng, other, &[], config),
+                })
+                .collect();
+            let holds = match &control.precondition {
+                None => true,
+                Some(pre) => signature_holds(program, config, pre, &candidate, &[]),
+            };
+            if holds {
+                out.push((control.name.clone(), candidate));
+                found += 1;
+            }
+            if control.parameters.is_empty() {
+                break;
             }
         }
     }
