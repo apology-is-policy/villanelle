@@ -1718,3 +1718,69 @@ control c()
             .replace("RESULT", "stuck X2 E-Supervise"),
     );
 }
+
+#[test]
+fn a_component_read_out_of_a_constructor_has_no_declared_interval_a9() {
+    // Review finding RC8. The declared interval of [A9] belongs to a place.
+    // A component read out of a constructor is the term that was written
+    // there, and a formula does not hold that term to the range of the
+    // field's type, at any depth of the constructor.
+    let declarations = "struct pair {left : u32, right : u32}\nstruct wrap {inner : pair}\n";
+    stuck_and_rejected(
+        "P1",
+        &[
+            declarations,
+            r#"
+control c(a : u32)
+    ■ { r {} }
+    1  ⊤ ▷ ⊢ wrap {pair {a + 1, 0}}.inner.left * wrap {pair {a + 1, 0}}.inner.left ≤ 18446744065119617025
+    2  ⊤ ▷ ■ r {}
+
+//! run c(4294967295) => stuck X7 E-Oblige
+//! run c(3) => done r
+"#,
+        ]
+        .concat(),
+    );
+    // A component of a name has the interval of its type.
+    done_and_accepted(
+        "A9",
+        &[
+            declarations,
+            r#"
+control c(a : u32)
+    ■ { r {} }
+    1  ⊤ ▷ w : wrap := wrap {pair {a, 0}}
+    2  ⊤ ▷ ⊢ w.inner.left * w.inner.left ≤ 18446744065119617025
+    3  ⊤ ▷ ■ r {}
+
+//! run c(4294967295) => done r
+"#,
+        ]
+        .concat(),
+    );
+}
+
+#[test]
+fn a_move_mark_stands_on_what_is_consumed_o3() {
+    // Review finding RC7. The oracle moved `v` at `len(▾v)` and the checker
+    // read it. The position decides whether an expression is consumed
+    // ([E-Var]), and a read moves nothing ([O3]), so the mark on a read is
+    // refused when the text is resolved.
+    for (read, consumed) in [
+        ("n : usize := len(▾v)", "w : [u32] := ▾v"),
+        ("n : u32 := (▾v)[0]", "w : [[u32]] := [▾v]"),
+        ("t : ? len(▾v) = 2", "w : holder := holder {▾v}"),
+    ] {
+        let program = |statement: &str| {
+            format!(
+                "struct holder {{items : [u32]}}\ncontrol c()\n    ■ {{ r {{}} }}\n    1  ⊤ ▷ v : [u32] := [1, 2]\n    2  ⊤ ▷ {statement}\n    3  ⊤ ▷ ■ r {{}}\n\n//! run c() => done r\n"
+            )
+        };
+        match load(&program(read)) {
+            Ok(_) => panic!("[O3] a move mark on a read is resolved:\n{}", program(read)),
+            Err(error) => assert!(error.to_string().contains("[O3]"), "{error}"),
+        }
+        done_and_accepted("O3", &program(consumed));
+    }
+}

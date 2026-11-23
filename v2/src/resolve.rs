@@ -636,6 +636,13 @@ impl Typer<'_> {
     }
 
     fn build(&self, expr: &syntax::Expr, expected: &Type) -> Result<Expr, Error> {
+        if marks_a_read(expr, false) {
+            return fail(
+                self.line,
+                "O3",
+                "a move mark stands on an expression that is read: only what is consumed moves",
+            );
+        }
         // When the expected type is `&τ` or `&~τ`, handle borrow operands (`[W8]`, `[U11]`).
         if let Type::Ref(exp_mode, exp_inner) = expected {
             match expr {
@@ -3269,6 +3276,41 @@ fn resolve_parameters(
         });
     }
     Ok(out)
+}
+
+/// Whether a move mark of the text form stands on an expression that is
+/// read. Its position decides whether an expression is consumed ([E-Var]):
+/// the value of a bind, an operand given by value, a payload, a field of a
+/// constructor. An operand of an operator, an argument of a function, the
+/// base of a field or an index and the place of `len` or `clone` are read,
+/// and a read moves nothing ([O3]).
+fn marks_a_read(expr: &syntax::Expr, read: bool) -> bool {
+    use syntax::Expr as E;
+    match expr {
+        E::Integer(_)
+        | E::Boolean(_)
+        | E::String(_)
+        | E::Name(_)
+        | E::Old(_)
+        | E::EmptyMap
+        | E::TasksEmpty(_)
+        | E::Count(_) => false,
+        E::Move(inner) => read || marks_a_read(inner, false),
+        E::Struct(_, fields) | E::Variant(_, _, fields) | E::Vector(fields) => {
+            fields.iter().any(|field| marks_a_read(field, false))
+        }
+        E::Borrow(_, inner)
+        | E::Field(inner, _)
+        | E::Len(inner)
+        | E::Clone(inner)
+        | E::Unary(_, inner) => marks_a_read(inner, true),
+        E::Index(left, right) | E::Binary(_, left, right) => {
+            marks_a_read(left, true) || marks_a_read(right, true)
+        }
+        E::Call(_, arguments) => arguments
+            .iter()
+            .any(|argument| marks_a_read(argument, true)),
+    }
 }
 
 fn calls(expr: &Expr, out: &mut Vec<FunctionId>) {

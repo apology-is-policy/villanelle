@@ -483,6 +483,16 @@ fn int_bounds_for_type(ty: &Type) -> (Option<Int>, Option<Int>) {
     }
 }
 
+/// Whether an expression denotes a place: a name, or a component of one.
+fn is_place(expr: &Expr) -> bool {
+    match expr {
+        Expr::Var(_, _) | Expr::Old(_, _) | Expr::Borrow(_, _, _) => true,
+        Expr::Field(base, _, _, _) | Expr::Index(base, _, _) => is_place(base),
+        Expr::Move(inner, _) | Expr::Clone(inner, _) => is_place(inner),
+        _ => false,
+    }
+}
+
 /// Computes the declared interval `[low, high]` of an unfolded integer
 /// expression for `[A9]`.
 fn interval_unfolded(expr: &Expr, constants: &BTreeMap<VarId, Int>) -> (Option<Int>, Option<Int>) {
@@ -495,18 +505,15 @@ fn interval_unfolded(expr: &Expr, constants: &BTreeMap<VarId, Int>) -> (Option<I
         Expr::Move(inner, _) | Expr::Clone(inner, _) => interval_unfolded(inner, constants),
         Expr::Borrow(_, place, _) => int_bounds_for_type(&place.ty),
         Expr::Len(_) => (Some(Int::zero()), None),
-        Expr::Field(base, _, _, ty) => {
-            if matches!(&**base, Expr::Struct(_, _, _)) {
-                (None, None)
-            } else {
+        // The declared interval of a component belongs to a place. Read out
+        // of a constructor, at any depth, a component is the term that was
+        // written there, and a formula does not hold that term to the range
+        // of the field's type.
+        Expr::Field(base, _, _, ty) | Expr::Index(base, _, ty) => {
+            if is_place(base) {
                 int_bounds_for_type(ty)
-            }
-        }
-        Expr::Index(base, _, ty) => {
-            if matches!(&**base, Expr::Vector(_, _)) {
-                (None, None)
             } else {
-                int_bounds_for_type(ty)
+                (None, None)
             }
         }
         Expr::Negate(inner, _) => {

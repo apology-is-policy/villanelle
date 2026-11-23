@@ -992,7 +992,25 @@ runs its programs in the oracle too.
   effects of a named boundary those of every boundary its `B₁` supervises,
   to a fixed point, so that they count toward whatever supervises it.
 
-Tests: the last seven of `tests/checker_slice2.rs`, 22 programs.
+Tests: seven of `tests/checker_slice2.rs`, 22 programs.
+
+Two smaller findings went with them.
+
+- **The move mark of the text form** (RC7). `▾e` says that `e` is
+  consumed, and the position of an expression decides that ([E-Var]). The
+  oracle moved `v` at `len(▾v)` and the checker read it. `resolve` now
+  refuses the mark on an expression that is read, by [O3]: under an
+  operator, as an argument of a function, as the base of a field or an
+  index, as the place of `len` or `clone`, in a borrow. On the value of a
+  bind, an operand given by value, a payload or a field of a constructor it
+  is accepted and says what the position says already.
+- **The declared interval of a component** (RC8, [A9]). The checker gave a
+  field or an element the interval of its type unless its base was a
+  constructor written in place, so one level of nesting hid the
+  constructor: `wrap {pair {a + 1, 0}}.inner.left` had the interval of a
+  `u32`, which `a + 1` in a formula need not have, and the planes of a
+  product by it proved what is false. A component now has that interval
+  only as a component of a place.
 
 ## 14. Slice 2 Phase 4: Call Expansion and Typed LLVM IR Backend for Data, Resources, and Boundaries
 
