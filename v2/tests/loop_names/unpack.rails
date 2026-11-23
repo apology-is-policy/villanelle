@@ -1,0 +1,13 @@
+struct pair {a: u32, b: u32}
+
+control f(n: u32) ⊢ n ≤ 10 ■ done {v: u32}
+│ ↻ spin(i: u32 := 0)
+│ ║ ⊢ i ≤ n
+│ ║ p: pair := pair {i, i}
+│ ║ pair {a, b} := p
+│ ║ ? i = n → □ out {a}
+│ ║ ↑ spin(i + 1)
+│ ■ done {a}
+╵
+//! check
+//! run f(2) => done done {2}

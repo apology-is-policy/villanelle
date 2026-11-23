@@ -1,0 +1,13 @@
+extern control inspect(n: u32) ■ checked
+
+control sample() ■ done {value: u32}
+│ ↻ once
+│ ║ ~cells: [u32] := [2]
+│ ║ i: usize := 0
+│ ║ r := capture inspect(cells[i])
+│ ║ Δ ▾r: checked
+│ ║ cells[i] ← cells[i] + 3
+│ ║ □ out {cells: cells[i], i, r: 1}
+│ ■ done {cells}
+╵
+//! run sample() with [inspect -> checked] => done done {5}

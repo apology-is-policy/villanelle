@@ -1,0 +1,18 @@
+struct pair {a: u32, b: u32}
+extern control note(x: u32) ■ noted │ skipped
+
+control f(n: u32) ⊢ n ≤ 10 ■ done {v: u32}
+│ ~cells: [u32] := [0]
+│ ↻ spin(i: u32 := 0)
+│ ║ ⊢ i ≤ n
+│ ║ total: u32 := i
+│ ║ r := capture note(total)
+│ ║ Δ ▾r: noted │ skipped
+│ ║ cells[0] ← total
+│ ║ p: pair := pair {total, total}
+│ ║ pair {a, b} := p
+│ ║ ? i = n → □ out {total}
+│ ║ ↑ spin(i + 1)
+│ ■ done {total}
+╵
+//! run f(2) with [note -> noted; note -> noted; note -> noted] => done done {2}

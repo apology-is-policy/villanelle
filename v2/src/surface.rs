@@ -7417,7 +7417,7 @@ impl Elaborator {
 
         // Determine the core loop arms and rename any inner variable of the
         // loop body that collides with a loop output field name ([U9], [W4]).
-        let mut exported_names = HashSet::new();
+        let mut exported_names = std::collections::BTreeSet::new();
         let mut core_arms = Vec::new();
         if bare_count > 0 {
             let hidden_alt = "_done".to_string();
@@ -7952,25 +7952,23 @@ fn replace_bare_leaves(statements: &mut [Statement], hidden_alt: &str) {
 fn collect_inner_declarations(statements: &[Statement], out: &mut HashSet<String>) {
     for statement in statements {
         match &statement.command {
-            Command::Bind { name, .. } => {
+            Command::Bind { name, .. } | Command::Capture { name, .. } => {
                 out.insert(name.clone());
             }
-            Command::Decide { arms, .. } => {
+            Command::Unpack { names, .. } => out.extend(names.iter().cloned()),
+            Command::Decide { arms, .. } | Command::Loop { arms, .. } => {
                 for arm in arms {
-                    for var in &arm.names {
-                        out.insert(var.clone());
-                    }
-                }
-            }
-            Command::Loop { arms, .. } => {
-                for arm in arms {
-                    for var in &arm.names {
-                        out.insert(var.clone());
-                    }
+                    out.extend(arm.names.iter().cloned());
                 }
             }
             _ => {}
         }
+    }
+}
+
+fn rename_var(name: &mut String, renames: &HashMap<String, String>) {
+    if let Some(replacement) = renames.get(name) {
+        name.clone_from(replacement);
     }
 }
 
@@ -8010,31 +8008,58 @@ fn rename_expr(expr: &mut Expr, renames: &HashMap<String, String>) {
 fn rename_statements(statements: &mut [Statement], renames: &HashMap<String, String>) {
     for statement in statements {
         match &mut statement.command {
-            Command::Bind { name, value, .. } => {
-                if let Some(new_name) = renames.get(name) {
-                    *name = new_name.clone();
+            Command::Bind { name, value, .. } | Command::Assign { name, value } => {
+                rename_var(name, renames);
+                rename_expr(value, renames);
+            }
+            Command::AssignPlace { target, value } => {
+                rename_var(&mut target.root, renames);
+                for step in &mut target.steps {
+                    if let PlaceStep::Index(index) = step {
+                        rename_expr(index, renames);
+                    }
                 }
                 rename_expr(value, renames);
             }
-            Command::Assign { name, value } => {
-                if let Some(new_name) = renames.get(name) {
-                    *name = new_name.clone();
+            Command::Unpack { names, value, .. } => {
+                for name in names {
+                    rename_var(name, renames);
                 }
                 rename_expr(value, renames);
             }
-            Command::Oblige(formula) => rename_expr(formula, renames),
-            Command::Test { condition, .. } => rename_expr(condition, renames),
-            Command::Decide {
-                arguments, arms, ..
+            Command::Capture {
+                name, arguments, ..
             } => {
+                rename_var(name, renames);
+                for argument in arguments {
+                    rename_expr(argument, renames);
+                }
+            }
+            Command::Oblige(expr)
+            | Command::Test {
+                condition: expr, ..
+            }
+            | Command::Fault { message: expr, .. }
+            | Command::Terminate(Some(expr)) => {
+                rename_expr(expr, renames);
+            }
+            Command::Decide {
+                mode,
+                operation,
+                arguments,
+                arms,
+                ..
+            } => {
+                // The core stores the set variable in the operation slot of next.
+                if *mode == CallMode::AwaitNext {
+                    rename_var(operation, renames);
+                }
                 for arg in arguments {
                     rename_expr(arg, renames);
                 }
                 for arm in arms {
-                    for var in &mut arm.names {
-                        if let Some(new_name) = renames.get(var) {
-                            *var = new_name.clone();
-                        }
+                    for name in &mut arm.names {
+                        rename_var(name, renames);
                     }
                 }
             }
@@ -8047,44 +8072,58 @@ fn rename_statements(statements: &mut [Statement], renames: &HashMap<String, Str
             } => {
                 for param in parameters {
                     rename_expr(&mut param.initial, renames);
+                    rename_var(&mut param.name, renames);
                 }
                 if let Some(inv) = invariant {
                     rename_expr(inv, renames);
                 }
                 rename_statements(body, renames);
                 for arm in arms {
-                    for var in &mut arm.names {
-                        if let Some(new_name) = renames.get(var) {
-                            *var = new_name.clone();
-                        }
+                    for name in &mut arm.names {
+                        rename_var(name, renames);
                     }
                 }
             }
-            Command::Again { arguments, .. } => {
+            Command::Again { arguments, .. }
+            | Command::Supervise { arguments, .. }
+            | Command::Leave {
+                payload: arguments, ..
+            }
+            | Command::Exit {
+                payload: arguments, ..
+            } => {
                 for arg in arguments {
                     rename_expr(arg, renames);
-                }
-            }
-            Command::Leave { payload, .. } | Command::Exit { payload, .. } => {
-                for item in payload {
-                    rename_expr(item, renames);
                 }
             }
             Command::Spawn { arguments, set, .. } => {
                 for arg in arguments {
                     rename_expr(arg, renames);
                 }
-                if let Some(new_name) = renames.get(set) {
-                    *set = new_name.clone();
-                }
+                rename_var(set, renames);
             }
-            Command::Cancel { set } => {
-                if let Some(new_name) = renames.get(set) {
-                    *set = new_name.clone();
+            Command::Cancel { set } => rename_var(set, renames),
+            Command::Boundary {
+                body,
+                captures,
+                contingency,
+                ..
+            } => {
+                rename_statements(body, renames);
+                // Only the captured names cross into the contingency.
+                let mut captured = HashMap::new();
+                for name in captures {
+                    if let Some(new_name) = renames.get(name) {
+                        captured.insert(name.clone(), new_name.clone());
+                        name.clone_from(new_name);
+                    }
                 }
+                rename_statements(contingency, &captured);
             }
-            Command::Impossible => {}
-            _ => {}
+            Command::Impossible
+            | Command::Escalate
+            | Command::Terminate(None)
+            | Command::Recover { .. } => {}
         }
     }
 }

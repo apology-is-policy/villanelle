@@ -794,3 +794,20 @@ fn g10_keeps_plain_boundary_comments_next_to_the_work_body() {
     assert!(printed.contains("│ ┄ work closed\n│ ┄ between\n╵\ncontingency"));
     assert_eq!(surface::format(&printed).unwrap(), printed);
 }
+
+#[test]
+fn u9_renames_inner_binders_and_the_places_that_use_them() {
+    for source in [
+        include_str!("loop_names/capture_and_place.rails"),
+        include_str!("loop_names/unpack.rails"),
+        include_str!("loop_names/index_and_root.rails"),
+    ] {
+        let report = script::check_surface(source);
+        assert_eq!(report.runs, 1);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+    }
+    // A similarly spelled free name is still free after the loop is lowered.
+    let source = include_str!("loop_names/capture_and_place.rails")
+        .replace("cells[0] ← total", "cells[0] ← missing");
+    assert!(villanelle_v2::load_surface(&source).is_err());
+}
