@@ -1,0 +1,9 @@
+// [C1]: `get` takes its map as `&`; an exclusive borrow is written where a
+// shared one is expected.
+control bad()
+    ■ { done {} }
+    1  ⊤ ▷ ~m : string ⇀ u32 := ∅
+    2  ⊤ ▷ g : Δ get(&~m, "a") ▸ found {v} │ missing {}
+    3  ⊤ ▷ ■ done {}
+
+//! reject C1

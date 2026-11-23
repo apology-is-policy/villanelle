@@ -500,7 +500,11 @@ Otherwise `c` runs:
   mathematical integers, and makes no access: it reads through borrows and
   changes no tag. In a contract condition a parameter stands for the value it
   had at entry, which the instrumented semantics keeps; an `&~` parameter
-  stands for the value at completion, and `old(y)` for the value at entry. A
+  stands for the value at completion, and `old(y)` for the value at entry.
+  The value at completion is what the borrow that was passed refers to then,
+  whatever the body did with the parameter: the instrumented semantics keeps
+  that borrow too, and the condition reads through it when the parameter
+  itself has been passed on. A
   term that indexes out of range has a value of the element type, and a term
   that divides by zero has an integer value. This document does not fix those
   values, but each depends only on the operands of its term: the same term on
@@ -548,7 +552,10 @@ world, an alternative and a payload.
   relation and appends the event `(f, v̄, a, v̄′)` to the trace when `f` has an
   effect. If the precondition of `f` is false for `v̄`, stuck. A borrow that
   the host returns in a field `∈ ȳ` is a reborrow, by [B3], of a place within
-  one of the arguments `ȳ`.
+  one of the arguments `ȳ`: the host names the argument and the place within
+  what it lends, and the step makes the borrow, with a tag under the tag of
+  that argument. The mode is the one the field declares, and an exclusive
+  borrow comes only from an argument that was lent exclusively.
 - **[E-Host]** If the host yields an alternative outside the contract, a payload
   of the wrong type, a borrow that is not such a reborrow, payload borrows that
   are not all alive together when it completes (an exclusive one overlaps no
@@ -562,7 +569,14 @@ world, an alternative and a payload.
   its payload. Between those two events exactly one slot holds `res(r)`.
 
 Built-in operations `op` behave as extern controls with fixed contracts and no
-host state, except for the collection shapes they change by [B5].
+host state, except for the collection shapes they change by [B5]. They are
+`push`, `pop`, `take`, `get`, `insert`, `remove`, `entry_at` and `emit`, with
+the contracts of the corpus prelude
+([`prelude.txt`](corpus/prelude.txt)). An operand of one is an operand for a
+parameter of the type its contract gives, as for any control: a collection
+that the contract takes as `&~` is written `&~p` or is a name of that borrow
+type, which passes the borrow itself ([W8]). `trim` of the prelude is a
+function and not one of them.
 
 Effects are checked against allowances. Each activation carries the effect set
 its control declares.
@@ -688,7 +702,7 @@ excludes.
 | | Stuck when | Clause | Excluded by |
 | --- | --- | --- | --- |
 | **X1** | A body reaches its end with the history undisposed | [E-End] | Coverage [K7] |
-| **X2** | A name is read, moved or borrowed where it is unbound or moved, or assigned where it is unbound | [E-Var], [E-Assign] | Availability [O2], [O4] |
+| **X2** | A name is read, moved or borrowed where it is unbound or moved, or assigned where it is unbound; a component that is not `copy` is consumed; a retained name is not available when the contingency of a named boundary begins | [E-Var], [E-Assign], [E-Field], [E-Index], [E-Supervise] | Availability [O2], [O3], [O4], retained names [F6] |
 | **X3** | A name is bound twice in one run | [E-Bind] | [O1] |
 | **X4** | An access goes through a dead tag, or writes through a shared one | [B1] | Loans [L3], mutable places [C1] |
 | **X5** | A value that contains an obligation is destroyed or overwritten | [E-Scope], [E-Assign], [E-Temp] | Obligations [O4], [O5], temporaries [O3a], task sets [TK2] |
@@ -1475,3 +1489,6 @@ and what asked for it:
 | 22 November 2026 | [W11] restricts `await next(x)` to decisions (`Δ`), not `capture`. | Second review of the task rules: `capture` records no `d.empty` atom to track `[TK2]` consumption of `x` (the surface grammar already restricted `capture` to calls). |
 | 22 November 2026 | [E-AwaitHost] checks precondition and effect allowance before the `cancelled` shortcut and passes the turn (`ready`) when completing immediately with `cancelled`. | Second review of the task rules: prevents cancellation from bypassing `X7`/`X9` in unchecked programs and aligns immediate `cancelled` completion with choice 22 ("Every `await` passes the turn"). |
 | 23 November 2026 | [E-Contingency] says how each of the four ends of `B₂` runs, and that `B₂` has a scope of its own and sees only `x̄` and the message. `terminate n` is in the grammar, with the final result `terminated(n)` (sections 6.9 and 6.11). [E-Boundary] says that what the boundary has in its care ends with the scope of `B₁`. [E-Supervise] says that a fault leaves `B₂` as a fault from a call does. [O5] lists the scopes that the terminators of a boundary end. [F5] and [F6] list their requirements of form. | The oracle of slice 2 (review findings RO1, RO3, RO4, and the questions of RC5, RC6 and RC14): the rules were carried over from v1 by reference, and the code had read them five ways. The answers are v1's, where the text above does not say otherwise: the status is a literal from 0 to 255 and belongs to the outermost contingency of an entry control, which nothing invokes; a contingency sees only what it retains; the body of the boundary leaves the parameters of the restarted loop alone, which is what "the parameters it had when the boundary was entered" rests on. Two readings are stricter than v1: `recover` and `terminate n` end the scopes around the boundary by [E-Scope], where v1 released by fault disposition; and a contingency does not let its control go on (corpus finding O10 stays open). |
+| 23 November 2026 | [E-Formula] says that the value of an `&~` parameter at completion is read through the borrow as it was passed, which the instrumented semantics keeps. | The oracle (review finding RO2): it read the parameter's slot, which is empty when the body passed the borrow on, and then took the value at entry. The checker had it right. |
+| 23 November 2026 | [E-Extern] says that the host names the place a returned borrow refers to and the step makes the reborrow. | The oracle (RO6): a host sees values and no slots, so no host could answer a borrowed payload. The directive form is `&x…` or `&~x…`, with `x` a parameter ([oracle document](oracle.md)). Not answered here: whether a host may write through an `&~` argument. The host relation has no part of the store, so by this document it does not, although [W7] reads such a parameter at completion in the contract of an extern control too (review finding RO11). |
+| 23 November 2026 | Section 6.6 names the built-in operations and gives them the contracts of the corpus prelude; an operand of one follows the rule of any operand. The row X2 of section 6.10 lists the clauses under which the oracle reports that state. | The oracle (RO9, RO10): `take`, `entry_at` and `trim` were in the prelude and not in this document; the written mode of a collection operand was ignored, so `push(&v, x)` was read as `push(&~v, x)`; and the labels `X2 E-Field`, `X2 E-Index` and `X2 E-Supervise` had no row. `X5 E-Resource` is a check of the oracle on its own table of resources, which no run of a program reaches. |

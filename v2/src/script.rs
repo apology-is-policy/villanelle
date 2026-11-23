@@ -3,8 +3,8 @@
 use crate::differential::{Verdict, compare};
 use crate::host::{Answer, Arithmetic, Host, Scheduled, Script};
 use crate::int::Int;
-use crate::oracle::{Config, End, Event, Value};
-use crate::typed::{Program, Type};
+use crate::oracle::{Config, End, Event, RuntimeStep, Value};
+use crate::typed::{BorrowMode, Control, Program, Type};
 use crate::{check, erased, resolve, surface, text};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,8 +16,8 @@ enum Piece {
 }
 
 fn pieces(text: &str) -> Result<Vec<Piece>, String> {
-    const MARKS: [&str; 14] = [
-        "->", "=>", "|->", "↦", "(", ")", "{", "}", "[", "]", ",", ";", ".", "#",
+    const MARKS: [&str; 16] = [
+        "->", "=>", "|->", "↦", "(", ")", "{", "}", "[", "]", ",", ";", ".", "#", "&~", "&",
     ];
     let characters: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
@@ -120,10 +120,133 @@ enum RawValue {
         name: String,
         id: u64,
     },
+    /// `&x.a[0]` or `&~x.a[0]` in the answer of an extern control: the place
+    /// within its parameter `x` that a borrow of the payload refers to
+    /// ([E-Extern]).
+    Within {
+        exclusive: bool,
+        parameter: String,
+        steps: Vec<RawStep>,
+    },
+}
+
+/// One step of a place that an answer names: `.field`, or `[value]` for an
+/// element of a vector or the value at a key of a map.
+#[derive(Clone, Debug)]
+enum RawStep {
+    Field(String),
+    At(RawValue),
+}
+
+/// A value of the payload that answers `control`. A borrow is written as the
+/// place it refers to, `&x…` or `&~x…` with `x` a parameter of the control,
+/// alone or as a field of a view.
+fn resolve_answer_value(
+    program: &Program,
+    control: Option<&Control>,
+    raw: &RawValue,
+) -> Result<Value, String> {
+    match raw {
+        RawValue::Within {
+            exclusive,
+            parameter,
+            steps,
+        } => {
+            let Some(control) = control else {
+                return Err(format!(
+                    "`&{parameter}` names a parameter of a control that this program does not have"
+                ));
+            };
+            let Some(index) = control
+                .parameters
+                .iter()
+                .position(|candidate| candidate.name == *parameter)
+            else {
+                return Err(format!(
+                    "`{parameter}` is not a parameter of `{}`",
+                    control.name
+                ));
+            };
+            let mut ty = control.parameters[index].ty.deref_type().clone();
+            let mut path = Vec::with_capacity(steps.len());
+            for step in steps {
+                match (step, &ty) {
+                    (RawStep::Field(name), Type::Struct(id, struct_name)) => {
+                        let Some(position) = program.structs[*id]
+                            .fields
+                            .iter()
+                            .position(|field| field.name == *name)
+                        else {
+                            return Err(format!("struct `{struct_name}` has no field `{name}`"));
+                        };
+                        path.push(RuntimeStep::Field(position));
+                        ty = program.structs[*id].fields[position]
+                            .ty
+                            .deref_type()
+                            .clone();
+                    }
+                    (RawStep::Field(name), other) => {
+                        return Err(format!(
+                            "`.{name}` is no place within a value of type {other}"
+                        ));
+                    }
+                    (RawStep::At(position), Type::Vector(element)) => {
+                        let Value::Int(number) = resolve_raw_value(program, position)? else {
+                            return Err("the position in a vector is an integer".to_string());
+                        };
+                        let Some(position) = number.to_i128().and_then(|n| usize::try_from(n).ok())
+                        else {
+                            return Err(format!("{number} is not a position in a vector"));
+                        };
+                        path.push(RuntimeStep::Index(position));
+                        ty = (**element).clone();
+                    }
+                    (RawStep::At(key), Type::Map(key_ty, value)) => {
+                        let key = resolve_raw_value_typed(program, key, Some(key_ty))?;
+                        path.push(RuntimeStep::MapValue(key));
+                        ty = (**value).clone();
+                    }
+                    (RawStep::At(_), other) => {
+                        return Err(format!("`[…]` is no place within a value of type {other}"));
+                    }
+                }
+            }
+            let mode = if *exclusive {
+                BorrowMode::Exclusive
+            } else {
+                BorrowMode::Shared
+            };
+            Ok(Value::within(mode, index, path))
+        }
+        RawValue::Struct { name, fields }
+            if program
+                .structs
+                .iter()
+                .any(|definition| definition.name == *name && definition.is_view) =>
+        {
+            let id = program
+                .structs
+                .iter()
+                .position(|definition| definition.name == *name)
+                .expect("the view was found");
+            Ok(Value::Struct {
+                ty: id,
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|field| resolve_answer_value(program, control, field))
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        }
+        other => resolve_raw_value(program, other),
+    }
 }
 
 fn resolve_raw_value(program: &Program, raw: &RawValue) -> Result<Value, String> {
     match raw {
+        RawValue::Within { parameter, .. } => Err(format!(
+            "`&{parameter}` names a place within an argument, which only the answer of an extern control does"
+        )),
         RawValue::Bool(b) => Ok(Value::Bool(*b)),
         RawValue::Int(i) => Ok(Value::Int(i.clone())),
         RawValue::String(s) => Ok(Value::String(s.clone())),
@@ -492,7 +615,34 @@ impl Reader {
         }
     }
 
+    /// `&x`, `&x.a`, `&~x[0]`: a place within a parameter, after its sign.
+    fn within(&mut self, exclusive: bool) -> Result<RawValue, String> {
+        let parameter = self.word("the name of a parameter")?;
+        let mut steps = Vec::new();
+        loop {
+            if self.mark(".") {
+                steps.push(RawStep::Field(self.word("the name of a field")?));
+            } else if self.mark("[") {
+                steps.push(RawStep::At(self.value()?));
+                self.need("]")?;
+            } else {
+                break;
+            }
+        }
+        Ok(RawValue::Within {
+            exclusive,
+            parameter,
+            steps,
+        })
+    }
+
     fn value(&mut self) -> Result<RawValue, String> {
+        if self.mark("&~") {
+            return self.within(true);
+        }
+        if self.mark("&") {
+            return self.within(false);
+        }
         if let Some(Piece::Str(s)) = self.pieces.get(self.at).cloned() {
             self.at += 1;
             return Ok(RawValue::String(s));
@@ -1040,9 +1190,13 @@ fn check_with(source: &str, is_surface: bool) -> Report {
         let mut answers = Vec::with_capacity(raw_spec.answers.len());
         let mut bad_answer = None;
         for (ctrl, alt, raw_payload) in &raw_spec.answers {
+            let answered = program
+                .controls
+                .iter()
+                .find(|control| control.name == *ctrl);
             match raw_payload
                 .iter()
-                .map(|v| resolve_raw_value(&program, v))
+                .map(|v| resolve_answer_value(&program, answered, v))
                 .collect::<Result<Vec<_>, _>>()
             {
                 Ok(payload) => answers.push((

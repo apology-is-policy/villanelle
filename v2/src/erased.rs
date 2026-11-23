@@ -18,7 +18,10 @@
 
 use crate::host::Host;
 use crate::int::Int;
-use crate::oracle::{Config, Event, RuntimePlace, RuntimeStep, ScopeId, TaskSetId, Value, list};
+use crate::oracle::{
+    Config, Event, HOST_SCOPE, RuntimePlace, RuntimeStep, ScopeId, TaskSetId, Value, lent_within,
+    list,
+};
 use crate::syntax::escape_string;
 use crate::typed::{
     Arithmetic, BodyId, BorrowMode, BoundaryId, BuiltinOp, Command, Comparison, Control,
@@ -839,10 +842,36 @@ struct TaskSet {
     done_queue: VecDeque<usize>,
 }
 
+/// [E-Extern]: a borrow in the payload of a host names a place within one
+/// of the arguments (`Value::within`); this is the borrow of that place.
+fn lend(arguments: &[Value], value: Value) -> Result<Value, String> {
+    match value {
+        Value::Ref { mode, place, .. } if place.scope == HOST_SCOPE => {
+            let (_, lent, _) = lent_within(arguments, &place)?;
+            Ok(Value::Ref {
+                mode,
+                place: lent,
+                tag: 0,
+            })
+        }
+        Value::Struct { ty, name, fields } => Ok(Value::Struct {
+            ty,
+            name,
+            fields: fields
+                .into_iter()
+                .map(|field| lend(arguments, field))
+                .collect::<Result<_, _>>()?,
+        }),
+        other => Ok(other),
+    }
+}
+
 enum TaskState {
     Ready,
     WaitingHost {
         callee: ControlId,
+        /// The arguments as they were passed, with their borrows.
+        arguments: Vec<Value>,
         concrete_args: Vec<Value>,
     },
     WaitingNext {
@@ -1594,6 +1623,7 @@ impl<'a> Machine<'a> {
             TaskState::WaitingHost {
                 callee,
                 concrete_args,
+                ..
             } => {
                 let param_is_ref: Vec<bool> = self.program.controls[callee]
                     .parameters
@@ -1643,6 +1673,7 @@ impl<'a> Machine<'a> {
                 let TaskState::WaitingHost {
                     callee,
                     concrete_args,
+                    ..
                 } = std::mem::replace(&mut self.tasks[tid].state, TaskState::Ready)
                 else {
                     unreachable!();
@@ -1834,6 +1865,7 @@ impl<'a> Machine<'a> {
                     if let TaskState::WaitingHost {
                         callee,
                         concrete_args,
+                        ..
                     } = std::mem::replace(&mut self.tasks[owner_task].state, TaskState::Ready)
                     {
                         let param_is_ref: Vec<bool> = self.program.controls[callee]
@@ -2061,9 +2093,9 @@ impl<'a> Machine<'a> {
                     .payload
                     .iter()
                     .zip(fields)
-                    .map(|(value, field)| arith.normalize(value, &field.ty))
-                    .collect();
-                if !callee.is_pure() {
+                    .map(|(value, field)| lend(&values, arith.normalize(value, &field.ty)))
+                    .collect::<Result<_, _>>()?;
+                if !callee.is_pure(program) {
                     let mut concrete_payload = Vec::with_capacity(payload.len());
                     for v in &payload {
                         concrete_payload.push(self.deref_value(v)?);
@@ -2107,6 +2139,7 @@ impl<'a> Machine<'a> {
                     }
                     self.park_current(TaskState::WaitingHost {
                         callee: *callee_id,
+                        arguments: values,
                         concrete_args,
                     });
                     return Ok(None);
@@ -2178,9 +2211,9 @@ impl<'a> Machine<'a> {
                         .payload
                         .iter()
                         .zip(fields)
-                        .map(|(value, field)| arith.normalize(value, &field.ty))
-                        .collect();
-                    if !callee.is_pure() {
+                        .map(|(value, field)| lend(&values, arith.normalize(value, &field.ty)))
+                        .collect::<Result<_, _>>()?;
+                    if !callee.is_pure(program) {
                         let mut concrete_payload = Vec::with_capacity(payload.len());
                         for v in &payload {
                             concrete_payload.push(self.deref_value(v)?);
@@ -2646,6 +2679,7 @@ impl<'a> Machine<'a> {
     fn complete_waiting_host(&mut self, tid: usize) -> Result<Option<End>, String> {
         let TaskState::WaitingHost {
             callee,
+            arguments,
             concrete_args,
         } = std::mem::replace(&mut self.tasks[tid].state, TaskState::Ready)
         else {
@@ -2678,9 +2712,9 @@ impl<'a> Machine<'a> {
             .payload
             .iter()
             .zip(fields)
-            .map(|(value, field)| arith.normalize(value, &field.ty))
-            .collect();
-        if !callee_ctrl.is_pure() {
+            .map(|(value, field)| lend(&arguments, arith.normalize(value, &field.ty)))
+            .collect::<Result<_, _>>()?;
+        if !callee_ctrl.is_pure(self.program) {
             let mut concrete_payload = Vec::with_capacity(payload.len());
             for v in &payload {
                 concrete_payload.push(self.deref_value(v)?);
@@ -2775,6 +2809,7 @@ impl<'a> Machine<'a> {
                 TaskState::WaitingHost {
                     callee,
                     concrete_args,
+                    ..
                 } => (&self.program.controls[*callee], concrete_args.as_slice()),
                 _ => unreachable!(),
             })

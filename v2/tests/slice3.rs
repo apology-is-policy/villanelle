@@ -548,3 +548,49 @@ control caller()
         res2.end
     );
 }
+
+#[test]
+fn the_seeded_host_answers_borrowed_payloads_with_places_within_its_arguments() {
+    // [E-Extern]: a host names a place within an origin, and both semantics
+    // make the same borrow of it. The controls are those of
+    // `host_borrows.core`, which the scripted host answers there.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/slice3/host_borrows.core");
+    let source = std::fs::read_to_string(root).expect("host_borrows.core");
+    let program = villanelle_v2::load(&source).expect("resolved");
+    let config = Config::default();
+    let mut ended = std::collections::BTreeMap::new();
+    for seed in 0..60u64 {
+        for (entry, arguments) in [
+            ("reads", vec![Value::Int(Int::from_i128(8))]),
+            ("writes", Vec::new()),
+            ("picks", Vec::new()),
+            ("picks_first", Vec::new()),
+            ("splits", Vec::new()),
+            ("spans", Vec::new()),
+        ] {
+            let mut host = villanelle_v2::host::Seeded::new(&program, seed);
+            let outcome = villanelle_v2::differential::compare(
+                &program, entry, arguments, &mut host, &config,
+            );
+            assert!(
+                matches!(outcome.oracle.end, End::Done { .. }),
+                "seed {seed}: `{entry}` ended in `{}`",
+                outcome.oracle.end
+            );
+            assert_eq!(
+                outcome.verdict,
+                villanelle_v2::differential::Verdict::Same,
+                "seed {seed}: `{entry}` differed"
+            );
+            ended
+                .entry(entry)
+                .or_insert_with(std::collections::BTreeSet::new)
+                .insert(format!("{}", outcome.oracle.end));
+        }
+    }
+    // The host chooses among the places: each control that has a choice
+    // ends in more than one way over the seeds.
+    for entry in ["reads", "writes", "picks", "splits", "spans"] {
+        assert!(ended[entry].len() > 1, "`{entry}` ended one way only");
+    }
+}

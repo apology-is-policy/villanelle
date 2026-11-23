@@ -6434,7 +6434,7 @@ pub fn emit_native_harness_llvm(
         }
         let _ = writeln!(ext_code, "  switch i64 %pos, label %host_fail [ {sw} ]");
 
-        let pure = control.is_pure();
+        let pure = control.is_pure(program);
         let ctrl_g = reg.str_literal_map[control.name.as_bytes()].clone();
         for (idx, ans) in answers {
             let _ = writeln!(ext_code, "ans_{idx}:");

@@ -1,0 +1,59 @@
+// Slice 2 core conformance: which extern controls are pure ([I10],
+// [E-Host]). A pure one has no effect, is not `async`, and no resource type
+// occurs in its parameters or payloads, at any depth. A host that answers a
+// pure control differently on equal arguments is not faithful.
+
+extern resource token
+
+struct boxed {t : token}
+
+variant held {some {b : boxed} │ none {}}
+
+extern control make()
+    ■ { made {b : boxed} }
+
+extern control make_held()
+    ■ { made {h : held} }
+
+extern control burn(t : token)
+    ■ { done {} }
+
+extern control roll()
+    ■ { rolled {n : u32} }
+
+// `make` returns a resource inside a struct: it is not pure, and two calls
+// give two resources.
+control twice_boxed()
+    ■ { ok {} }
+    1  ⊤ ▷ a : Δ make() ▸ made {x}
+    2  ⊤ ▷ b : Δ make() ▸ made {y}
+    3  ⊤ ▷ boxed {t1} := x
+    4  ⊤ ▷ boxed {t2} := y
+    5  ⊤ ▷ c : Δ burn(t1) ▸ done {}
+    6  ⊤ ▷ d : Δ burn(t2) ▸ done {}
+    7  ⊤ ▷ ■ ok {}
+
+// The same through a variant that holds the struct.
+control twice_held()
+    ■ { ok {} }
+    1  ⊤ ▷ a : Δ make_held() ▸ made {x}
+    2  ⊤ ▷ b : Δ make_held() ▸ made {y}
+    3  ⊤ ▷ u : Δ held(x) ▸ some {bx} │ none {}
+    4  ⊤ ▷ w : Δ held(y) ▸ some {by} │ none {}
+    5  u.some ▷ boxed {t1} := bx
+    6  u.some ▷ c : Δ burn(t1) ▸ done {}
+    7  w.some ▷ boxed {t2} := by
+    8  w.some ▷ d : Δ burn(t2) ▸ done {}
+    9  ⊤ ▷ ■ ok {}
+
+// `roll` is pure: its answer is a function of its arguments.
+control twice_rolled()
+    ■ { ok {sum : u32} }
+    1  ⊤ ▷ a : Δ roll() ▸ rolled {x}
+    2  ⊤ ▷ b : Δ roll() ▸ rolled {y}
+    3  ⊤ ▷ ■ ok {x + y}
+
+//! run twice_boxed() with [make -> made {boxed {token#1}}; make -> made {boxed {token#2}}; burn -> done; burn -> done] => done ok
+//! run twice_held() with [make_held -> made {held.some {boxed {token#1}}}; make_held -> made {held.none}; burn -> done] => done ok
+//! run twice_rolled() with [roll -> rolled {3}; roll -> rolled {3}] => done ok {6}
+//! run twice_rolled() with [roll -> rolled {3}; roll -> rolled {4}] => violation

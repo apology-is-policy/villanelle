@@ -1,0 +1,59 @@
+// Slice 3 core conformance: the condition of an alternative on an `&~`
+// parameter ([E-Exit], [E-Formula], [W7]). The parameter stands for the
+// value at completion and `old` of it for the value at entry, whatever the
+// body did with the borrow: here it passes the borrow itself on, so the
+// parameter is moved when the control exits.
+
+control bump(x : &~u32)
+    ■ { done {} ⇐ x = old(x) + 1 }
+    1  ⊤ ▷ x ← x + 1
+    2  ⊤ ▷ ■ done {}
+
+control by_move(x : &~u32)
+    ■ { done {} ⇐ x = old(x) + 1 }
+    1  ⊤ ▷ d : Δ bump(x) ▸ done {}
+    2  ⊤ ▷ ■ done {}
+
+control by_reborrow(x : &~u32)
+    ■ { done {} ⇐ x = old(x) + 1 }
+    1  ⊤ ▷ d : Δ bump(&~x) ▸ done {}
+    2  ⊤ ▷ ■ done {}
+
+// X7 [E-Exit]: the conditions are false for the value at completion.
+control wrong_by_reborrow(x : &~u32)
+    ■ { done {} ⇐ x = old(x) + 2 }
+    1  ⊤ ▷ d : Δ bump(&~x) ▸ done {}
+    2  ⊤ ▷ ■ done {}
+
+control wrong_by_move(x : &~u32)
+    ■ { done {} ⇐ x = old(x) }
+    1  ⊤ ▷ d : Δ bump(x) ▸ done {}
+    2  ⊤ ▷ ■ done {}
+
+// A payload field and a parameter by value in the same condition: the
+// parameter by value stands for the value it had at entry.
+control add(x : &~u32, by : u32)
+    ■ { done {was : u32} ⇐ x = was + by ∧ was = old(x) }
+    1  ⊤ ▷ before : u32 := x
+    2  ⊤ ▷ x ← x + by
+    3  ⊤ ▷ ■ done {before}
+
+control drive(which : u32)
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ ~n : u32 := 10
+    2  ⊤ ▷ w0 : ? which = 0
+    3  ⊤ ▷ w1 : ? which = 1
+    4  ⊤ ▷ w2 : ? which = 2
+    5  ⊤ ▷ w3 : ? which = 3
+    6  w0.true ▷ a : Δ by_reborrow(&~n) ▸ done {}
+    7  w1.true ▷ b : Δ by_move(&~n) ▸ done {}
+    8  w2.true ▷ c : Δ wrong_by_reborrow(&~n) ▸ done {}
+    9  w3.true ▷ e : Δ wrong_by_move(&~n) ▸ done {}
+    10 w0.false ∧ w1.false ∧ w2.false ∧ w3.false ▷ f : Δ add(&~n, 5) ▸ done {was}
+    11 ⊤ ▷ ■ ok {n}
+
+//! run drive(0) => done ok {11}
+//! run drive(1) => done ok {11}
+//! run drive(2) => stuck X7 E-Exit
+//! run drive(3) => stuck X7 E-Exit
+//! run drive(4) => done ok {15}

@@ -199,6 +199,22 @@ an effect gives the same answer to the same arguments. An answer that fails
 ends the run in `violation`. That is a fault of the trusted host and not a
 stuck state. A step of a control with an effect is recorded as an event.
 
+A control is without an effect, in the sense of [I10], when it declares none,
+is not `async`, and no resource type occurs in its parameters or payloads at
+any depth: a struct, a variant or an outcome that holds a resource counts
+(`Program::resource_occurs`).
+
+A host is given values and sees no slots. For a field of the payload that is
+a borrow it names a place within one of its arguments
+(`Value::within(mode, argument, steps)`), and the step of the oracle makes the
+reborrow: a tag under the tag of that argument, by [B3]. A view in the
+payload holds such a place for each of its borrows. The oracle refuses, as a
+violation, a value where a borrow is expected, a place that is not there or
+holds a value of another type, an exclusive borrow of what was lent shared,
+an argument that the field does not list after `∈`, and two places of one
+payload that overlap unless both are shared. The erased interpreter makes
+the same borrow without a tag.
+
 Three hosts exist. `Script` answers from a list, in order, and a run whose list
 is exhausted or names another control ends in `host-failed`: a defect of the
 test. `Arithmetic` computes the checked arithmetic of the prelude: a control
@@ -209,7 +225,9 @@ a seeded generator and checks each candidate against the alternative's
 condition (`signature_holds`) before returning it; a control without an effect
 derives its generator from the host's seed, the control's name and the
 arguments (`rng::mix`), so two calls with the same arguments get the same
-answer.
+answer. For a borrow it draws one of the places of the wanted type within
+the origins of the field, and passes over an alternative for which the
+arguments hold none.
 
 ## 6. Directives
 
@@ -221,6 +239,7 @@ must yield.
 //! run add(250, 6) => stuck X7 E-Arith
 //! run pump(2) with [read -> value {7}; read -> closed] => done total {7}
 //!     trace [read(2) -> value {7}; read(2) -> closed {}]
+//! run reads(8) with [first_item -> item {&xs[1]}] => done ok {8}
 //! run address(4294967295) usize 32 => stuck X7 E-Arith
 //! reject W1
 ```
@@ -234,6 +253,11 @@ arithmetic`, `with [...]` for a scripted host, `usize 32`, `fuel N`. After
 the precondition of the entry is false; section 8 of the core does not count
 such a run as an execution). `trace [...]` states the events. `reject` names
 the clause by which `resolve` must refuse the program.
+
+In the answer of a scripted host a borrow is written as the place it refers
+to: `&x` or `&~x`, with `x` a parameter of the control that is answered,
+followed by any number of `.field` and `[value]` steps, where `[n]` is an
+element of a vector and `[key]` the value at a key of a map.
 
 Every `run` that ends in `done`, `faulted`, `terminated` or `fuel` is also carried out under the erased
 semantics with the host's answers replayed, and the two observations must agree
@@ -827,6 +851,40 @@ that day how each end of a contingency runs.
   more runs of named boundaries in `faults_and_boundaries.core`. The suite
   of slice 2 has 37 files and 64 runs.
 
+### 12.2 Hosts, built-in operations and exit conditions, as requalified on 23 November 2026
+
+Five further findings of the review are closed (RO2, RO6, RO8, RO9, RO10).
+Three of them are about borrows and have their tests with slice 3.
+
+- **The condition of an exit** ([E-Exit], RO2). An activation keeps, for
+  each parameter that is or holds a borrow, the borrow as it was passed, and
+  the condition of an alternative reads the value at completion through it.
+  The oracle read the parameter's slot, which is empty when the body passed
+  the borrow on, and then took the value at entry: a true condition was
+  stuck and a false one passed. `tests/slice3/exit_conditions.core`.
+- **Borrows from a host** ([E-Extern], [E-Host], RO6): section 5.
+  `tests/slice3/host_borrows.core` has 11 runs that end and 10 violations,
+  and `the_seeded_host_answers_borrowed_payloads_with_places_within_its_arguments`
+  (`tests/slice3.rs`) runs its controls under 60 seeds in both semantics.
+  The native driver of the backend still answers a borrowed payload with a
+  value in a cell of its own, which is no place within an argument; the one
+  backend test that does so compares compiled code with the erased
+  interpreter alone.
+- **Pure operations** ([I10], RO8): a resource inside a struct or a variant
+  of the payload makes an extern control impure, so two calls may give two
+  resources. `tests/slice2/pure_operations.core`, with the violation of a
+  pure control that answers in two ways.
+- **Built-in operations** (RO9, RO10). Their contracts are those of the
+  corpus prelude, which the core now names. The collection of `push`, `pop`,
+  `insert` and `remove` is `&~p` or a name of type `&~`, which passes the
+  borrow itself and is moved by it; a value or `&p` is refused by `C1`. The
+  map of `get` and `entry_at`, the key of `get` and `remove` and the text of
+  `emit` are operands for a `&` parameter: `&p`, a name of that type, or a
+  value read where it is; `&~p` is refused. Four files
+  `tests/slice2/reject_c1_*.core` hold the refusals, and
+  `tests/slice3/builtin_operands.core` the runs, with example 6.3 of the
+  reference model, whose `insert` gives back the value it replaced.
+
 ## 13. Slice 2 Phase 3: Ownership, Faults, Boundaries, and Data Fact Logic
 
 Slice 2 Phase 3 extends the checker (`check.rs`), fact logic (`facts.rs`), and
@@ -869,6 +927,30 @@ ownership, fault, and boundary constructs of slice 2:
   validates all generated certificates across all four canonical Slice 2
   `.rails` files (over 148 certificates), and confirms every stuck control of
   `tests/slice2/*.core` is rejected by its corresponding Phase 3 clause.
+
+### 13.1 Captures, as requalified on 23 November 2026
+
+Two programs that the checker accepted are stuck in the oracle (review
+findings RC2 and RC3), and both are refused now.
+
+- **A captured operation writes at the capture.** For `push`, `pop`,
+  `insert` and `remove` the place gets a fresh name at the capture
+  statement, as it does at a decision. The record of the capture keeps the
+  collection before and after, and the decision of the outcome adds what
+  the alternative says of the two (`shape_facts`: the conditions of the
+  corpus prelude, and that the collection is the same on an alternative
+  that leaves it). A decision that is written directly uses the same
+  function.
+- **The record goes with the value** ([I12]). An assignment to a name drops
+  the record of its capture on those histories, a bind or an assignment of
+  a captured outcome carries the record to the new name, and a loop that
+  assigns a name of the body around it drops the record at its entry.
+- **Tests that run the program too.** `stuck_and_rejected` and
+  `done_and_accepted` (`tests/checker_slice2.rs`) take a program with its
+  directive, require the oracle to find it stuck, or to run it to its end,
+  and the checker to refuse it by the clause given, or to accept it with
+  certificates that validate again. The tests of these two findings use
+  them; the earlier tests of the file ask the checker alone.
 
 ## 14. Slice 2 Phase 4: Call Expansion and Typed LLVM IR Backend for Data, Resources, and Boundaries
 

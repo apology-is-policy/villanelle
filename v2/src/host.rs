@@ -6,9 +6,9 @@
 //! wrong answer ends the run in `violation`, not in a stuck state.
 
 use crate::int::Int;
-use crate::oracle::{Config, Value, signature_holds};
+use crate::oracle::{Config, RuntimeStep, Value, signature_holds};
 use crate::rng::{Rng, mix};
-use crate::typed::{self, Comparison, Control, Expr, IntType, Program, Type, VarRef};
+use crate::typed::{self, BorrowMode, Comparison, Control, Expr, IntType, Program, Type, VarRef};
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -721,6 +721,186 @@ impl<'a> Seeded<'a> {
     }
 }
 
+/// A place that a host may name: the argument, the steps to the place, and
+/// the value there.
+type Named = (usize, Vec<RuntimeStep>, Value);
+
+/// What a borrow of a payload asks of the arguments: a place of the type
+/// `ty` within the argument `argument`, to be borrowed with `mode`.
+struct Wanted<'a> {
+    program: &'a Program,
+    argument: usize,
+    mode: BorrowMode,
+    ty: &'a Type,
+}
+
+impl Wanted<'_> {
+    /// The places within `value`, which has the type `ty`, that hold a
+    /// value of the wanted type.
+    fn within(&self, ty: &Type, value: &Value, steps: &mut Vec<RuntimeStep>, out: &mut Vec<Named>) {
+        if ty == self.ty {
+            out.push((self.argument, steps.clone(), value.clone()));
+        }
+        match (ty, value) {
+            (Type::Struct(id, _), Value::Struct { fields, .. }) => {
+                let definitions = &self.program.structs[*id].fields;
+                for (index, (definition, field)) in definitions.iter().zip(fields).enumerate() {
+                    steps.push(RuntimeStep::Field(index));
+                    self.within(definition.ty.deref_type(), field, steps, out);
+                    steps.pop();
+                }
+            }
+            (
+                Type::Variant(id, _),
+                Value::Variant {
+                    constructor,
+                    fields,
+                    ..
+                },
+            ) => {
+                let definitions = &self.program.variants[*id].constructors[*constructor].fields;
+                for (index, (definition, field)) in definitions.iter().zip(fields).enumerate() {
+                    steps.push(RuntimeStep::VariantField(*constructor, index));
+                    self.within(&definition.ty, field, steps, out);
+                    steps.pop();
+                }
+            }
+            (Type::Vector(element), Value::Vector(items)) => {
+                for (index, item) in items.iter().enumerate() {
+                    steps.push(RuntimeStep::Index(index));
+                    self.within(element, item, steps, out);
+                    steps.pop();
+                }
+            }
+            (Type::Map(_, element), Value::Map(entries)) => {
+                for (key, item) in entries {
+                    steps.push(RuntimeStep::MapValue(key.clone()));
+                    self.within(element, item, steps, out);
+                    steps.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The places that the borrow may refer to within the argument, whose
+    /// parameter has the type `ty`: within what the parameter lends, or
+    /// what the borrows of a view lend. An exclusive borrow comes only from
+    /// what was lent exclusively.
+    fn lent(&self, ty: &Type, value: &Value, steps: &mut Vec<RuntimeStep>, out: &mut Vec<Named>) {
+        match (ty, value) {
+            (Type::Ref(lender, referent), _) => {
+                if self.mode == BorrowMode::Shared || *lender == BorrowMode::Exclusive {
+                    self.within(referent, value, steps, out);
+                }
+            }
+            (Type::Struct(id, _), Value::Struct { fields, .. })
+                if self.program.structs[*id].is_view =>
+            {
+                let definitions = &self.program.structs[*id].fields;
+                for (index, (definition, field)) in definitions.iter().zip(fields).enumerate() {
+                    steps.push(RuntimeStep::Field(index));
+                    self.lent(&definition.ty, field, steps, out);
+                    steps.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One call of the seeded host while it answers the borrows of a payload:
+/// the places it has named so far, with their modes.
+struct Lending<'a> {
+    control: &'a Control,
+    arguments: &'a [Value],
+    config: &'a Config,
+    taken: Vec<(BorrowMode, usize, Vec<RuntimeStep>)>,
+}
+
+impl Seeded<'_> {
+    /// A payload value of the type `ty`, which is or holds a borrow: each
+    /// borrow names a place within one of the `origins` ([E-Extern]) that
+    /// overlaps no place already named in this payload unless both are
+    /// shared ([E-Host]). Returns what the host answers and the same with
+    /// each borrow replaced by the value it refers to, for the condition of
+    /// the alternative; `None` when the arguments hold no such place.
+    fn lend(
+        &self,
+        rng: &mut Rng,
+        lending: &mut Lending<'_>,
+        ty: &Type,
+        origins: &[usize],
+        next_res: &mut u64,
+    ) -> Option<(Value, Value)> {
+        match ty {
+            Type::Ref(mode, wanted) => {
+                let mut places = Vec::new();
+                for &origin in origins {
+                    let wanted = Wanted {
+                        program: self.program,
+                        argument: origin,
+                        mode: *mode,
+                        ty: wanted,
+                    };
+                    wanted.lent(
+                        &lending.control.parameters[origin].ty,
+                        &lending.arguments[origin],
+                        &mut Vec::new(),
+                        &mut places,
+                    );
+                }
+                places.retain(|(argument, steps, _)| {
+                    !lending
+                        .taken
+                        .iter()
+                        .any(|(other_mode, other, other_steps)| {
+                            let shorter = steps.len().min(other_steps.len());
+                            other == argument
+                                && (*mode == BorrowMode::Exclusive
+                                    || *other_mode == BorrowMode::Exclusive)
+                                && steps[..shorter] == other_steps[..shorter]
+                        })
+                });
+                if places.is_empty() {
+                    return None;
+                }
+                let (argument, steps, referent) = places.swap_remove(rng.index(places.len()));
+                lending.taken.push((*mode, argument, steps.clone()));
+                Some((Value::within(*mode, argument, steps), referent))
+            }
+            Type::Struct(id, name) if self.program.structs[*id].is_view => {
+                let mut answered = Vec::new();
+                let mut referred = Vec::new();
+                for field in &self.program.structs[*id].fields {
+                    let (value, referent) = if self.program.contains_borrow_or_view(&field.ty) {
+                        self.lend(rng, lending, &field.ty, origins, next_res)?
+                    } else {
+                        let value = draw_value_in_program(
+                            self.program,
+                            rng,
+                            &field.ty,
+                            lending.arguments,
+                            lending.config,
+                            next_res,
+                        );
+                        (value.clone(), value)
+                    };
+                    answered.push(value);
+                    referred.push(referent);
+                }
+                let made = |fields| Value::Struct {
+                    ty: *id,
+                    name: name.clone(),
+                    fields,
+                };
+                Some((made(answered), made(referred)))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl Host for Seeded<'_> {
     fn call(
         &mut self,
@@ -728,7 +908,7 @@ impl Host for Seeded<'_> {
         arguments: &[Value],
         config: &Config,
     ) -> Result<Answer, String> {
-        let mut rng = if control.is_pure() {
+        let mut rng = if control.is_pure(self.program) {
             let mut words = Vec::with_capacity(4 + control.name.len() + arguments.len() * 3);
             words.push(self.seed);
             words.push(control.name.len() as u64);
@@ -767,7 +947,7 @@ impl Host for Seeded<'_> {
             let which = (start + attempt) % count;
             let alternative = &control.contract[which];
             let mut res_counter = self.next_res;
-            let payload: Vec<Value> = alternative
+            let mut payload: Vec<Value> = alternative
                 .fields
                 .iter()
                 .enumerate()
@@ -793,10 +973,44 @@ impl Host for Seeded<'_> {
                     }
                 })
                 .collect();
+            // A borrow of the payload names a place within an origin; the
+            // condition reads the value there.
+            let mut referred = payload.clone();
+            let mut lending = Lending {
+                control,
+                arguments,
+                config,
+                taken: Vec::new(),
+            };
+            let mut lent = true;
+            for (index, field) in alternative.fields.iter().enumerate() {
+                if !self.program.contains_borrow_or_view(&field.ty) {
+                    continue;
+                }
+                match self.lend(
+                    &mut rng,
+                    &mut lending,
+                    &field.ty,
+                    &field.origins,
+                    &mut res_counter,
+                ) {
+                    Some((value, referent)) => {
+                        payload[index] = value;
+                        referred[index] = referent;
+                    }
+                    None => {
+                        lent = false;
+                        break;
+                    }
+                }
+            }
+            if !lent {
+                continue;
+            }
             let valid = match &alternative.condition {
                 None => true,
                 Some(condition) => {
-                    signature_holds(self.program, config, condition, arguments, &payload)
+                    signature_holds(self.program, config, condition, arguments, &referred)
                 }
             };
             if valid {

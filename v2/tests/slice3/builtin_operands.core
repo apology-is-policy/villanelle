@@ -1,0 +1,71 @@
+// Slice 3 core conformance: the operands of the built-in operations
+// ([E-Decide], [W8], [B5]). A built-in behaves as an extern control with a
+// fixed contract, so its collection is an operand for a borrow parameter
+// like any other: `&~p` lends the place, and a name of borrow type passes
+// the borrow itself.
+
+// `&~values` is a reborrow, and `values` is there for the next statement.
+control fill(values : &~[u32], n : u32)
+    ■ { done {} ⇐ len(values) = len(old(values)) + 2 }
+    1  ⊤ ▷ a : Δ push(&~values, n) ▸ done {}
+    2  ⊤ ▷ b : Δ push(&~values, n + 1) ▸ done {}
+    3  ⊤ ▷ ■ done {}
+
+// `values` as an operand is the borrow itself, which the operation takes.
+control append(values : &~[u32], n : u32)
+    ■ { done {} ⇐ len(values) = len(old(values)) + 1 }
+    1  ⊤ ▷ a : Δ push(values, n) ▸ done {}
+    2  ⊤ ▷ ■ done {}
+
+// X2 [E-Var]: the borrow was passed on by statement 1 ([O2]).
+control append_twice(values : &~[u32], n : u32)
+    ■ { done {} }
+    1  ⊤ ▷ a : Δ push(values, n) ▸ done {}
+    2  ⊤ ▷ b : Δ push(values, n) ▸ done {}
+    3  ⊤ ▷ ■ done {}
+
+// A shared borrow by name is `copy`, and passing it leaves it there. The key
+// of `get` is read where it is, as a value, a place or a borrow.
+control looks(settings : &string ⇀ u32, key : &string)
+    ■ { ok {sum : u32} }
+    1  ⊤ ▷ own : string := "b"
+    2  ⊤ ▷ g1 : Δ get(settings, key) ▸ found {a} │ missing {}
+    3  ⊤ ▷ g2 : Δ get(settings, &own) ▸ found {b} │ missing {}
+    4  ⊤ ▷ g3 : Δ get(&settings, "c") ▸ found {c} │ missing {}
+    5  g1.found ∧ g2.found ∧ g3.missing ▷ ■ ok {a + b}
+    6  ⊤ ▷ ■ ok {0}
+
+// The example of section 6.3 of the reference model: `insert` gives back
+// the value it replaced.
+control touch(settings : &~string ⇀ string, key : &string)
+    ■ { kept {length : usize} │ added {} }
+    1  ⊤            ▷ get : Δ get(&settings, key) ▸ found {value} │ missing {}
+    2  get.missing  ▷ insert : Δ insert(&~settings, clone(key), "") ▸ inserted {} │ replaced {previous}
+    3  get.missing  ▷ ■ added {}
+    4  get.found    ▷ ■ kept {len(value)}
+
+control drive(which : u32)
+    ■ { ok {n : usize} }
+    1  ⊤ ▷ ~v : [u32] := [1]
+    2  ⊤ ▷ w0 : ? which = 0
+    3  ⊤ ▷ w1 : ? which = 1
+    4  w0.true ▷ a : Δ fill(&~v, 7) ▸ done {}
+    5  w1.true ▷ b : Δ append(&~v, 7) ▸ done {}
+    6  w0.false ∧ w1.false ▷ c : Δ append_twice(&~v, 7) ▸ done {}
+    7  ⊤ ▷ ■ ok {len(v)}
+
+control drive_touch(key : string)
+    ■ { ok {n : usize, m : usize} }
+    1  ⊤ ▷ ~settings : string ⇀ string := ∅
+    2  ⊤ ▷ i : Δ insert(&~settings, "greeting", "hello") ▸ inserted {} │ replaced {previous}
+    3  ⊤ ▷ t : Δ touch(&~settings, &key) ▸ kept {length} │ added {}
+    4  t.kept ▷ ■ ok {length, len(settings)}
+    5  t.added ▷ ■ ok {0, len(settings)}
+
+//! run drive(0) => done ok {3}
+//! run drive(1) => done ok {2}
+//! run drive(2) => stuck X2 E-Var
+//! run looks({"a" ↦ 1, "b" ↦ 2}, "a") => done ok {3}
+//! run looks({"a" ↦ 1, "b" ↦ 2, "c" ↦ 3}, "a") => done ok {0}
+//! run drive_touch("greeting") => done ok {5, 1}
+//! run drive_touch("other") => done ok {0, 2}

@@ -1,0 +1,98 @@
+// Slice 3 core conformance: a borrow in the payload of an extern control
+// ([E-Extern], [E-Host]). A host sees values and no slots, so it names a
+// place within one of its arguments (`&x…` or `&~x…` in a directive) and
+// the semantics makes the reborrow ([B3]).
+
+struct pair {left : u32, right : [u32]}
+
+view struct span {first : &u32, last : &u32}
+
+extern control first_item(xs : &[u32])
+    ■ { item {out : &u32 ∈ xs} │ none {} }
+
+extern control slot_of(p : &~pair, at : usize)
+    ■ { slot {out : &~u32 ∈ p} │ none {} }
+
+extern control either(a : &[u32], b : &[u32])
+    ■ { pick {out : &u32 ∈ a, b} }
+
+extern control only_first(a : &[u32], b : &[u32])
+    ■ { pick {out : &u32 ∈ a} }
+
+extern control both(p : &~pair)
+    ■ { two {x : &~u32 ∈ p, y : &~u32 ∈ p} }
+
+extern control ends(xs : &[u32])
+    ■ { whole {s : span ∈ xs} }
+
+// The borrow is read where the host said it is.
+control reads(n : u32)
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ xs : [u32] := [7, n]
+    2  ⊤ ▷ d : Δ first_item(&xs) ▸ item {r} │ none {}
+    3  d.none ▷ ■ ok {0}
+    4  d.item ▷ ■ ok {r}
+
+// An exclusive borrow from the host writes the place it names.
+control writes()
+    ■ { ok {v : u32, w : u32} }
+    1  ⊤ ▷ ~p : pair := pair {1, [2, 3]}
+    2  ⊤ ▷ d : Δ slot_of(&~p, 1) ▸ slot {r} │ none {}
+    3  d.slot ▷ r ← 9
+    4  ⊤ ▷ ■ ok {p.left, p.right[1]}
+
+// The payload may come from either origin; the host picks one.
+control picks()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ a : [u32] := [1]
+    2  ⊤ ▷ b : [u32] := [2]
+    3  ⊤ ▷ d : Δ either(&a, &b) ▸ pick {r}
+    4  ⊤ ▷ ■ ok {r}
+
+// A borrow must come from an origin that the field declares.
+control picks_first()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ a : [u32] := [1]
+    2  ⊤ ▷ b : [u32] := [2]
+    3  ⊤ ▷ d : Δ only_first(&a, &b) ▸ pick {r}
+    4  ⊤ ▷ ■ ok {r}
+
+// Two exclusive borrows of one payload are alive together, so they do not
+// overlap.
+control splits()
+    ■ { ok {v : u32, w : u32} }
+    1  ⊤ ▷ ~p : pair := pair {1, [2, 3]}
+    2  ⊤ ▷ d : Δ both(&~p) ▸ two {x, y}
+    3  ⊤ ▷ x ← 5
+    4  ⊤ ▷ y ← 6
+    5  ⊤ ▷ ■ ok {p.left, p.right[0]}
+
+// A view in the payload holds borrows that the host names one by one.
+control spans()
+    ■ { ok {v : u32} }
+    1  ⊤ ▷ xs : [u32] := [4, 5, 6]
+    2  ⊤ ▷ d : Δ ends(&xs) ▸ whole {s}
+    3  ⊤ ▷ ■ ok {s.first + s.last}
+
+//! run reads(8) with [first_item -> item {&xs[1]}] => done ok {8}
+//! run reads(8) with [first_item -> item {&xs[0]}] => done ok {7}
+//! run reads(8) with [first_item -> none] => done ok {0}
+//! run writes() with [slot_of -> slot {&~p.right[1]}] => done ok {1, 9}
+//! run writes() with [slot_of -> slot {&~p.left}] => done ok {9, 3}
+//! run writes() with [slot_of -> none] => done ok {1, 3}
+//! run picks() with [either -> pick {&b[0]}] => done ok {2}
+//! run picks() with [either -> pick {&a[0]}] => done ok {1}
+//! run picks_first() with [only_first -> pick {&a[0]}] => done ok {1}
+//! run splits() with [both -> two {&~p.left, &~p.right[0]}] => done ok {5, 6}
+//! run spans() with [ends -> whole {span {&xs[0], &xs[2]}}] => done ok {10}
+// [E-Host]: an answer that is no reborrow of a place within an origin.
+//! run reads(8) with [first_item -> item {7}] => violation
+//! run reads(8) with [first_item -> item {&xs[2]}] => violation
+//! run reads(8) with [first_item -> item {&xs}] => violation
+//! run reads(8) with [first_item -> item {&~xs[0]}] => violation
+//! run writes() with [slot_of -> slot {&p.left}] => violation
+//! run writes() with [slot_of -> slot {&~p.right}] => violation
+//! run picks_first() with [only_first -> pick {&b[0]}] => violation
+//! run splits() with [both -> two {&~p.left, &~p.left}] => violation
+//! run splits() with [both -> two {&~p.right, &~p.right[0]}] => violation
+//! run spans() with [ends -> whole {span {&xs[0], &xs[3]}}] => violation

@@ -105,6 +105,61 @@ pub enum Value {
     TaskSet(TaskSetId),
 }
 
+/// The scope of a place that a host names within one of its arguments. No
+/// scope of a run has this number.
+pub const HOST_SCOPE: ScopeId = ScopeId::MAX;
+
+impl Value {
+    /// A borrow as a host answers it ([E-Extern]): the place `steps` within
+    /// its argument number `argument`. A host sees values and no slots, so
+    /// it names the place and the semantics makes the reborrow ([B3]).
+    pub fn within(mode: BorrowMode, argument: usize, steps: Vec<RuntimeStep>) -> Value {
+        Value::Ref {
+            mode,
+            place: RuntimePlace {
+                scope: HOST_SCOPE,
+                var: argument,
+                steps,
+            },
+            tag: 0,
+        }
+    }
+}
+
+/// The borrow among the arguments of a host call that the place `named` by
+/// the host lies within, and that place in the store. The steps of `named`
+/// first go through the fields of a view to a borrow that it holds, and
+/// then into what that borrow refers to.
+pub(crate) fn lent_within(
+    arguments: &[Value],
+    named: &RuntimePlace,
+) -> Result<(BorrowMode, RuntimePlace, TagId), String> {
+    let Some(mut current) = arguments.get(named.var) else {
+        return Err(format!("argument {} does not exist", named.var));
+    };
+    let mut steps = named.steps.as_slice();
+    loop {
+        match current {
+            Value::Ref { mode, place, tag } => {
+                let mut lent = place.clone();
+                lent.steps.extend(steps.iter().cloned());
+                return Ok((*mode, lent, *tag));
+            }
+            Value::Struct { fields, .. } => {
+                let Some((RuntimeStep::Field(index), rest)) = steps.split_first() else {
+                    return Err(format!("argument {} is not a borrow", named.var));
+                };
+                let Some(field) = fields.get(*index) else {
+                    return Err(format!("argument {} has no field {index}", named.var));
+                };
+                current = field;
+                steps = rest;
+            }
+            _ => return Err(format!("argument {} is not a borrow", named.var)),
+        }
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -142,6 +197,23 @@ impl fmt::Display for Value {
                 "outcome.{alternative_name} {{{}}}",
                 list(payload)
             ),
+            Value::Ref { mode, place, .. } if place.scope == HOST_SCOPE => {
+                let sign = match mode {
+                    BorrowMode::Shared => "&",
+                    BorrowMode::Exclusive => "&~",
+                };
+                write!(formatter, "{sign}argument#{}", place.var)?;
+                for step in &place.steps {
+                    match step {
+                        RuntimeStep::Field(index) => write!(formatter, ".{index}")?,
+                        RuntimeStep::Index(index) => write!(formatter, "[{index}]")?,
+                        RuntimeStep::VariantField(_, index) => write!(formatter, ".{index}")?,
+                        RuntimeStep::MapValue(key) => write!(formatter, "[{key}]")?,
+                        RuntimeStep::MapKey(key) => write!(formatter, "[key {key}]")?,
+                    }
+                }
+                Ok(())
+            }
             Value::Ref { mode, tag, .. } => match mode {
                 BorrowMode::Shared => write!(formatter, "&ref#{tag}"),
                 BorrowMode::Exclusive => write!(formatter, "&~ref#{tag}"),
@@ -629,6 +701,11 @@ struct Activation {
     kind: ActivationKind,
     /// Concrete entry argument snapshots (`old(y)` in contract conditions, [E-Formula]).
     arguments: Vec<Value>,
+    /// The arguments that are or hold a borrow, as they were passed: the
+    /// instrumented semantics keeps them so that a condition reads the value
+    /// at completion through them whatever the body did with the parameter
+    /// ([E-Formula], [E-Exit]).
+    borrowed: Vec<Option<Value>>,
     scopes: Vec<Scope>,
 }
 
@@ -1536,6 +1613,56 @@ impl<'a> Machine<'a> {
 
     fn read_place(&self, place: &RuntimePlace) -> Result<Value, Fail> {
         read_place_from_state(&self.entry_slots, &self.stack, &self.tasks, place)
+    }
+
+    /// [E-Extern]: a borrow in the payload of a host is a reborrow, by [B3],
+    /// of a place within one of the arguments. The host named the place
+    /// (`Value::within`); this makes the borrow, with a tag under the tag of
+    /// the argument. An answer that names no such place is not a payload of
+    /// the alternative, and the reason is returned ([E-Host]).
+    fn lend(&mut self, arguments: &[Value], value: &mut Value, ty: &Type) -> Result<(), String> {
+        match value {
+            Value::Ref { mode, place, tag } if place.scope == HOST_SCOPE => {
+                let Type::Ref(_, referent_ty) = ty else {
+                    return Err("a borrow stands where the contract has a value".to_string());
+                };
+                let (lender, lent, parent) = lent_within(arguments, place)?;
+                if *mode == BorrowMode::Exclusive && lender != BorrowMode::Exclusive {
+                    return Err(format!(
+                        "an exclusive borrow within argument {}, which was lent shared",
+                        place.var
+                    ));
+                }
+                let referent = self
+                    .read_place(&lent)
+                    .map_err(|_| format!("a place that is not within argument {}", place.var))?;
+                if !self
+                    .config
+                    .fits_in_program(self.program, &referent, referent_ty)
+                {
+                    return Err(format!(
+                        "a place within argument {} that holds no value of type {referent_ty}",
+                        place.var
+                    ));
+                }
+                let made = self
+                    .tags
+                    .create_borrow(parent, lent.clone(), *mode)
+                    .map_err(|failure| failure.detail)?;
+                self.count("B3");
+                *place = lent;
+                *tag = made;
+                Ok(())
+            }
+            Value::Struct { ty: id, fields, .. } if self.program.structs[*id].is_view => {
+                let program = self.program;
+                for (field, definition) in fields.iter_mut().zip(&program.structs[*id].fields) {
+                    self.lend(arguments, field, &definition.ty)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     fn deref_formula(&self, value: &Value) -> Result<Value, Fail> {
@@ -2996,7 +3123,7 @@ impl<'a> Machine<'a> {
             }
         }
 
-        let answer = match self.host.call(callee, &concrete_args, self.config) {
+        let mut answer = match self.host.call(callee, &concrete_args, self.config) {
             Ok(answer) => answer,
             Err(detail) => return Ok(Answered::Ended(End::HostFailed(detail))),
         };
@@ -3012,6 +3139,14 @@ impl<'a> Machine<'a> {
             ));
         };
         let alternative = &callee.contract[index];
+        for (value, field) in answer.payload.iter_mut().zip(&alternative.fields) {
+            if let Err(detail) = self.lend(&arguments, value, &field.ty) {
+                return violation(format!(
+                    "`{}` answered `{}` with {detail} in `{}`",
+                    callee.name, answer.alternative, field.name
+                ));
+            }
+        }
         let typed = answer.payload.len() == alternative.fields.len()
             && answer
                 .payload
@@ -3136,7 +3271,7 @@ impl<'a> Machine<'a> {
                 ));
             }
         }
-        if callee.is_pure() {
+        if callee.is_pure(self.program) {
             let key = (id, concrete_args.clone());
             let given = (index, concrete_payload.clone());
             match self.answers.get(&key) {
@@ -3880,6 +4015,7 @@ impl<'a> Machine<'a> {
                         in_contingency: None,
                     },
                     arguments: Vec::new(),
+                    borrowed: Vec::new(),
                     scopes: vec![Scope {
                         id: scope_id,
                         body: 0,
@@ -4031,16 +4167,13 @@ impl<'a> Machine<'a> {
                 let control = &self.program.controls[control_id];
                 let entry = &control.contract[*alternative];
                 if let Some(condition) = &entry.condition {
-                    // Completion parameter values (reading current targets for `&~`/view parameters).
+                    // A parameter that is or holds a borrow stands for the
+                    // value at completion, read through the borrow as it was
+                    // passed: the body may have passed the parameter on.
                     let mut final_params = act.arguments.clone();
-                    if let Some(root_scope) = act.scopes.first() {
-                        for (idx, param) in control.parameters.iter().enumerate() {
-                            if self.program.contains_borrow_or_view(&param.ty)
-                                && let Some((_, Slot::Available(v), _)) =
-                                    root_scope.slots.iter().find(|(s, _, _)| *s == idx)
-                            {
-                                final_params[idx] = self.deref_formula(v)?;
-                            }
+                    for (index, borrow) in act.borrowed.iter().enumerate() {
+                        if let Some(borrow) = borrow {
+                            final_params[index] = self.deref_formula(borrow)?;
                         }
                     }
                     let mut concrete_fields = Vec::with_capacity(values.len());
@@ -4267,6 +4400,16 @@ impl<'a> Machine<'a> {
         entry_snapshots: Vec<Value>,
     ) -> Activation {
         let scope_id = self.alloc_scope_id();
+        let parameters = &self.program.controls[control].parameters;
+        let borrowed = arguments
+            .iter()
+            .zip(parameters)
+            .map(|(value, parameter)| {
+                self.program
+                    .contains_borrow_or_view(&parameter.ty)
+                    .then(|| value.clone())
+            })
+            .collect();
         let mut slots = Vec::with_capacity(arguments.len());
         for (i, v) in arguments.into_iter().enumerate() {
             let tag = self.tags.new_owner(scope_id, i);
@@ -4283,6 +4426,7 @@ impl<'a> Machine<'a> {
         Activation {
             kind: ActivationKind::Control(control),
             arguments: entry_snapshots,
+            borrowed,
             scopes: vec![scope],
         }
     }
@@ -4315,7 +4459,7 @@ impl<'a> Machine<'a> {
         self.locate();
 
         let callee_ctrl = &self.program.controls[callee];
-        let answer = match self.host.call(callee_ctrl, &concrete_args, self.config) {
+        let mut answer = match self.host.call(callee_ctrl, &concrete_args, self.config) {
             Ok(answer) => answer,
             Err(detail) => {
                 self.tasks[tid].stack = std::mem::take(&mut self.stack);
@@ -4338,6 +4482,15 @@ impl<'a> Machine<'a> {
             return finish_violation(self, detail);
         };
         let alternative = &callee_ctrl.contract[index];
+        for (value, field) in answer.payload.iter_mut().zip(&alternative.fields) {
+            if let Err(detail) = self.lend(&arguments, value, &field.ty) {
+                let detail = format!(
+                    "`{}` answered `{}` with {detail} in `{}`",
+                    callee_ctrl.name, answer.alternative, field.name
+                );
+                return finish_violation(self, detail);
+            }
+        }
         let typed = answer.payload.len() == alternative.fields.len()
             && answer
                 .payload
@@ -4468,7 +4621,7 @@ impl<'a> Machine<'a> {
                 return finish_violation(self, detail);
             }
         }
-        if !callee_ctrl.is_pure() {
+        if !callee_ctrl.is_pure(self.program) {
             self.trace.push(Event {
                 control: callee_ctrl.name.clone(),
                 arguments: concrete_args,

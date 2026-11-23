@@ -426,32 +426,22 @@ impl Control {
     }
 
     /// Whether the operation is locally pure ([I10]): not `async`, no effects,
-    /// and no resource types in parameters or payloads. For defined controls that
-    /// may transitively invoke `run`, use `Program::control_is_pure`.
-    pub fn is_pure(&self) -> bool {
-        if self.is_async || !self.uses.is_empty() {
-            return false;
-        }
-        let has_resource = |ty: &Type| {
-            fn check(t: &Type) -> bool {
-                match t {
-                    Type::Resource(_, _) => true,
-                    Type::Ref(_, inner) | Type::Vector(inner) => check(inner),
-                    Type::Map(k, v) => check(k) || check(v),
-                    _ => false,
-                }
-            }
-            check(ty)
-        };
-        if self.parameters.iter().any(|p| has_resource(&p.ty)) {
-            return false;
-        }
-        for alt in &self.contract {
-            if alt.fields.iter().any(|f| has_resource(&f.ty)) {
-                return false;
-            }
-        }
-        true
+    /// and no resource type anywhere in its parameters or payloads. This is
+    /// the whole of [I10] for an extern control; for a defined one, which
+    /// may reach a `run`, use `Program::control_is_pure`.
+    pub fn is_pure(&self, program: &Program) -> bool {
+        !self.is_async
+            && self.uses.is_empty()
+            && !self
+                .parameters
+                .iter()
+                .any(|parameter| program.resource_occurs(&parameter.ty))
+            && !self.contract.iter().any(|alternative| {
+                alternative
+                    .fields
+                    .iter()
+                    .any(|field| program.resource_occurs(&field.ty))
+            })
     }
 }
 
@@ -822,6 +812,62 @@ impl Program {
         }
     }
 
+    /// Whether a resource type occurs in `ty` ([I10]): as the type itself,
+    /// behind a borrow, or in a component of a struct, a variant, a
+    /// collection or the payload of a captured outcome.
+    pub fn resource_occurs(&self, ty: &Type) -> bool {
+        fn occurs(program: &Program, ty: &Type, seen: &mut Vec<Type>) -> bool {
+            match ty {
+                Type::Resource(_, _) => true,
+                Type::Bool
+                | Type::Int(_)
+                | Type::String
+                | Type::Tasks(_, _)
+                | Type::TasksNamed(_)
+                | Type::Named(_)
+                | Type::OutcomeNamed(_) => false,
+                Type::Ref(_, inner) | Type::Vector(inner) => occurs(program, inner, seen),
+                Type::Map(key, value) => occurs(program, key, seen) || occurs(program, value, seen),
+                Type::Struct(_, _) | Type::Variant(_, _) | Type::Outcome(_, _) => {
+                    if seen.contains(ty) {
+                        return false;
+                    }
+                    seen.push(ty.clone());
+                    match ty {
+                        Type::Struct(id, _) => program.structs[*id]
+                            .fields
+                            .iter()
+                            .any(|field| occurs(program, &field.ty, seen)),
+                        Type::Variant(id, _) => {
+                            program.variants[*id]
+                                .constructors
+                                .iter()
+                                .any(|constructor| {
+                                    constructor
+                                        .fields
+                                        .iter()
+                                        .any(|field| occurs(program, &field.ty, seen))
+                                })
+                        }
+                        Type::Outcome(id, _) => {
+                            program.outcomes[*id]
+                                .alternatives
+                                .iter()
+                                .any(|alternative| {
+                                    alternative
+                                        .fields
+                                        .iter()
+                                        .any(|field| occurs(program, &field.ty, seen))
+                                })
+                        }
+                        _ => unreachable!("an aggregate"),
+                    }
+                }
+            }
+        }
+        occurs(self, ty, &mut Vec::new())
+    }
+
     /// Whether `ty` holds an obligation ([U11]): a resource, a captured outcome,
     /// or an aggregate with a component that does.
     pub fn holds_obligation(&self, ty: &Type) -> bool {
@@ -919,7 +965,7 @@ impl Program {
             false
         }
         let ctrl = &self.controls[id];
-        if !ctrl.is_pure() {
+        if !ctrl.is_pure(self) {
             return false;
         }
         let Some(body) = &ctrl.body else {

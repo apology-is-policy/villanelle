@@ -1784,25 +1784,20 @@ impl<'g, 'a> Builder<'g, 'a> {
         self.resolve_builtin_op(operation, arguments, line)
     }
 
-    fn resolve_builtin_op(
-        &mut self,
+    /// The operand of a built-in for a parameter `&~τ`, where `τ` is the
+    /// type of the place it names: `&~p`, or a name of type `&~τ`, which
+    /// passes the borrow itself ([W8]). The place is what the operation
+    /// writes ([B5]).
+    fn exclusive_operand(
+        &self,
         operation: &str,
-        arguments: &[syntax::Expr],
+        argument: &syntax::Expr,
         line: u32,
-    ) -> Result<(ControlId, Operation, Vec<Expr>, Vec<Alternative>), Error> {
+    ) -> Result<(Expr, Place), Error> {
         let typer = self.typer(Mode::Expression, line);
-        fn unwrap_place(e: &syntax::Expr) -> &syntax::Expr {
-            match e {
-                syntax::Expr::Borrow(_, inner) => inner,
-                other => other,
-            }
-        }
-        match operation {
-            "push" => {
-                if arguments.len() != 2 {
-                    return fail(line, "C1", "`push` takes 2 arguments");
-                }
-                let (place, through_exc) = typer.resolve_place(unwrap_place(&arguments[0]))?;
+        match argument {
+            syntax::Expr::Borrow(BorrowMode::Exclusive, inner) => {
+                let (place, through_exc) = typer.resolve_place(inner)?;
                 if !self.is_mutable_place(&place, through_exc) {
                     return fail(
                         line,
@@ -1810,12 +1805,65 @@ impl<'g, 'a> Builder<'g, 'a> {
                         format!("`{}` is not a mutable place", self.vars[place.root].name),
                     );
                 }
+                let ty = Type::Ref(BorrowMode::Exclusive, Box::new(place.ty.clone()));
+                Ok((
+                    Expr::Borrow(BorrowMode::Exclusive, place.clone(), ty),
+                    place,
+                ))
+            }
+            syntax::Expr::Name(name)
+                if self
+                    .find(name)
+                    .is_some_and(|(_, ty)| matches!(ty, Type::Ref(BorrowMode::Exclusive, _))) =>
+            {
+                let (var, ty) = self.find(name).expect("the name was found");
+                let (place, _) = typer.resolve_place(argument)?;
+                Ok((Expr::Var(var, ty), place))
+            }
+            _ => fail(
+                line,
+                "C1",
+                format!(
+                    "`{operation}` takes its collection as an exclusive borrow: `&~p`, or a name of type `&~`"
+                ),
+            ),
+        }
+    }
+
+    /// The operand of a built-in for a parameter `&τ`, where `τ` is the type
+    /// of the place or of the expression: `&p`, a name of type `&τ`, or a
+    /// value that is read where it is, as for any operand of that type.
+    fn shared_operand(&self, argument: &syntax::Expr, line: u32) -> Result<Expr, Error> {
+        let typer = self.typer(Mode::Expression, line);
+        let inner = match argument {
+            syntax::Expr::Borrow(_, inner) => &**inner,
+            other => other,
+        };
+        let ty = match typer.resolve_place(inner) {
+            Ok((place, _)) => place.ty,
+            Err(_) => typer.infer(inner)?.ty().deref_type().clone(),
+        };
+        typer.build(argument, &Type::Ref(BorrowMode::Shared, Box::new(ty)))
+    }
+
+    fn resolve_builtin_op(
+        &mut self,
+        operation: &str,
+        arguments: &[syntax::Expr],
+        line: u32,
+    ) -> Result<(ControlId, Operation, Vec<Expr>, Vec<Alternative>), Error> {
+        let typer = self.typer(Mode::Expression, line);
+        match operation {
+            "push" => {
+                if arguments.len() != 2 {
+                    return fail(line, "C1", "`push` takes 2 arguments");
+                }
+                let (collection, place) = self.exclusive_operand("push", &arguments[0], line)?;
                 let Type::Vector(elem_ty) = &place.ty else {
                     return fail(line, "C1", "`push` requires a vector place");
                 };
                 let elem_ty = (**elem_ty).clone();
                 let val_expr = typer.build(&arguments[1], &elem_ty)?;
-                let borrow_ty = Type::Ref(BorrowMode::Exclusive, Box::new(place.ty.clone()));
                 let contract = vec![Alternative {
                     name: "done".to_string(),
                     fields: Vec::new(),
@@ -1828,10 +1876,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                         target: Some(place.clone()),
                         contract: contract.clone(),
                     },
-                    vec![
-                        Expr::Borrow(BorrowMode::Exclusive, place, borrow_ty),
-                        val_expr,
-                    ],
+                    vec![collection, val_expr],
                     contract,
                 ))
             }
@@ -1839,19 +1884,11 @@ impl<'g, 'a> Builder<'g, 'a> {
                 if arguments.len() != 1 {
                     return fail(line, "C1", "`pop` takes 1 argument");
                 }
-                let (place, through_exc) = typer.resolve_place(unwrap_place(&arguments[0]))?;
-                if !self.is_mutable_place(&place, through_exc) {
-                    return fail(
-                        line,
-                        "C1",
-                        format!("`{}` is not a mutable place", self.vars[place.root].name),
-                    );
-                }
+                let (collection, place) = self.exclusive_operand("pop", &arguments[0], line)?;
                 let Type::Vector(elem_ty) = &place.ty else {
                     return fail(line, "C1", "`pop` requires a vector place");
                 };
                 let elem_ty = (**elem_ty).clone();
-                let borrow_ty = Type::Ref(BorrowMode::Exclusive, Box::new(place.ty.clone()));
                 let contract = vec![
                     Alternative {
                         name: "item".to_string(),
@@ -1875,7 +1912,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                         target: Some(place.clone()),
                         contract: contract.clone(),
                     },
-                    vec![Expr::Borrow(BorrowMode::Exclusive, place, borrow_ty)],
+                    vec![collection],
                     contract,
                 ))
             }
@@ -1926,25 +1963,12 @@ impl<'g, 'a> Builder<'g, 'a> {
                 if arguments.len() != 2 {
                     return fail(line, "C1", "`get` takes 2 arguments");
                 }
-                let raw_map = unwrap_place(&arguments[0]);
-                let map_expr = if let Ok((place, _)) = typer.resolve_place(raw_map) {
-                    let bty = Type::Ref(BorrowMode::Shared, Box::new(place.ty.clone()));
-                    Expr::Borrow(BorrowMode::Shared, place, bty)
-                } else {
-                    typer.infer(raw_map)?
-                };
+                let map_expr = self.shared_operand(&arguments[0], line)?;
                 let Type::Map(k_ty, v_ty) = map_expr.ty().deref_type().clone() else {
                     return fail(line, "C1", "`get` requires a map argument");
                 };
-                let raw_key = unwrap_place(&arguments[1]);
-                let key_expr = if let Ok((place, _)) = typer.resolve_place(raw_key)
-                    && place.ty == *k_ty
-                {
-                    let bty = Type::Ref(BorrowMode::Shared, Box::new(place.ty.clone()));
-                    Expr::Borrow(BorrowMode::Shared, place, bty)
-                } else {
-                    typer.build(raw_key, &k_ty)?
-                };
+                let key_expr =
+                    typer.build(&arguments[1], &Type::Ref(BorrowMode::Shared, k_ty.clone()))?;
                 let contract = vec![
                     Alternative {
                         name: "found".to_string(),
@@ -1976,21 +2000,13 @@ impl<'g, 'a> Builder<'g, 'a> {
                 if arguments.len() != 3 {
                     return fail(line, "C1", "`insert` takes 3 arguments");
                 }
-                let (place, through_exc) = typer.resolve_place(unwrap_place(&arguments[0]))?;
-                if !self.is_mutable_place(&place, through_exc) {
-                    return fail(
-                        line,
-                        "C1",
-                        format!("`{}` is not a mutable place", self.vars[place.root].name),
-                    );
-                }
+                let (collection, place) = self.exclusive_operand("insert", &arguments[0], line)?;
                 let Type::Map(k_ty, v_ty) = &place.ty else {
                     return fail(line, "C1", "`insert` requires a map place");
                 };
                 let (k_ty, v_ty) = ((**k_ty).clone(), (**v_ty).clone());
                 let key_expr = typer.build(&arguments[1], &k_ty)?;
                 let val_expr = typer.build(&arguments[2], &v_ty)?;
-                let borrow_ty = Type::Ref(BorrowMode::Exclusive, Box::new(place.ty.clone()));
                 let contract = vec![
                     Alternative {
                         name: "inserted".to_string(),
@@ -2014,11 +2030,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                         target: Some(place.clone()),
                         contract: contract.clone(),
                     },
-                    vec![
-                        Expr::Borrow(BorrowMode::Exclusive, place, borrow_ty),
-                        key_expr,
-                        val_expr,
-                    ],
+                    vec![collection, key_expr, val_expr],
                     contract,
                 ))
             }
@@ -2026,28 +2038,15 @@ impl<'g, 'a> Builder<'g, 'a> {
                 if arguments.len() != 2 {
                     return fail(line, "C1", "`remove` takes 2 arguments");
                 }
-                let (place, through_exc) = typer.resolve_place(unwrap_place(&arguments[0]))?;
-                if !self.is_mutable_place(&place, through_exc) {
-                    return fail(
-                        line,
-                        "C1",
-                        format!("`{}` is not a mutable place", self.vars[place.root].name),
-                    );
-                }
+                let (collection, place) = self.exclusive_operand("remove", &arguments[0], line)?;
                 let Type::Map(k_ty, v_ty) = &place.ty else {
                     return fail(line, "C1", "`remove` requires a map place");
                 };
                 let (k_ty, v_ty) = ((**k_ty).clone(), (**v_ty).clone());
-                let raw_key = unwrap_place(&arguments[1]);
-                let key_expr = if let Ok((kplace, _)) = typer.resolve_place(raw_key)
-                    && kplace.ty == k_ty
-                {
-                    let bty = Type::Ref(BorrowMode::Shared, Box::new(kplace.ty.clone()));
-                    Expr::Borrow(BorrowMode::Shared, kplace, bty)
-                } else {
-                    typer.build(raw_key, &k_ty)?
-                };
-                let borrow_ty = Type::Ref(BorrowMode::Exclusive, Box::new(place.ty.clone()));
+                let key_expr = typer.build(
+                    &arguments[1],
+                    &Type::Ref(BorrowMode::Shared, Box::new(k_ty.clone())),
+                )?;
                 let contract = vec![
                     Alternative {
                         name: "removed".to_string(),
@@ -2071,10 +2070,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                         target: Some(place.clone()),
                         contract: contract.clone(),
                     },
-                    vec![
-                        Expr::Borrow(BorrowMode::Exclusive, place, borrow_ty),
-                        key_expr,
-                    ],
+                    vec![collection, key_expr],
                     contract,
                 ))
             }
@@ -2082,13 +2078,7 @@ impl<'g, 'a> Builder<'g, 'a> {
                 if arguments.len() != 2 {
                     return fail(line, "C1", "`entry_at` takes 2 arguments");
                 }
-                let raw_map = unwrap_place(&arguments[0]);
-                let map_expr = if let Ok((place, _)) = typer.resolve_place(raw_map) {
-                    let bty = Type::Ref(BorrowMode::Shared, Box::new(place.ty.clone()));
-                    Expr::Borrow(BorrowMode::Shared, place, bty)
-                } else {
-                    typer.infer(raw_map)?
-                };
+                let map_expr = self.shared_operand(&arguments[0], line)?;
                 let Type::Map(k_ty, v_ty) = map_expr.ty().deref_type().clone() else {
                     return fail(line, "C1", "`entry_at` requires a map argument");
                 };
@@ -2136,15 +2126,10 @@ impl<'g, 'a> Builder<'g, 'a> {
                 if arguments.len() != 1 {
                     return fail(line, "C1", "`emit` takes 1 argument");
                 }
-                let raw_text = unwrap_place(&arguments[0]);
-                let text_expr = if let Ok((place, _)) = typer.resolve_place(raw_text)
-                    && place.ty == Type::String
-                {
-                    let bty = Type::Ref(BorrowMode::Shared, Box::new(Type::String));
-                    Expr::Borrow(BorrowMode::Shared, place, bty)
-                } else {
-                    typer.build(raw_text, &Type::String)?
-                };
+                let text_expr = typer.build(
+                    &arguments[0],
+                    &Type::Ref(BorrowMode::Shared, Box::new(Type::String)),
+                )?;
                 let contract = vec![Alternative {
                     name: "done".to_string(),
                     fields: Vec::new(),

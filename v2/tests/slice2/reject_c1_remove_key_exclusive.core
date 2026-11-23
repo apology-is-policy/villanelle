@@ -1,0 +1,10 @@
+// [C1]: `remove` takes its key as `&`; an exclusive borrow is written where
+// a shared one is expected.
+control bad()
+    ■ { done {} }
+    1  ⊤ ▷ ~m : string ⇀ u32 := ∅
+    2  ⊤ ▷ ~k : string := "a"
+    3  ⊤ ▷ r : Δ remove(&~m, &~k) ▸ removed {v} │ missing {}
+    4  ⊤ ▷ ■ done {}
+
+//! reject C1

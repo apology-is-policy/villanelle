@@ -147,7 +147,7 @@ variant shape
 
 emit(text: &string)                                ■ done
 get(map: &k ⇀ v, key: &k)                          ■ found {value: &v ∈ map} │ missing
-insert(map: &~k ⇀ v, key: k, value: v)             ■ inserted │ replaced
+insert(map: &~k ⇀ v, key: k, value: v)             ■ inserted │ replaced {previous: v}
 push(values: &~[t], value: t)                      ■ done
 ```
 
@@ -493,7 +493,7 @@ control touch(settings: &~string ⇀ string, key: &string) ■ kept {length: usi
 
 ```text
 1  ⊤            ▷ get : Δ get(&settings, key) ▸ found {value} │ missing {}
-2  get.missing  ▷ insert : Δ insert(&~settings, clone(key), "") ▸ inserted {} │ replaced {}
+2  get.missing  ▷ insert : Δ insert(&~settings, clone(key), "") ▸ inserted {} │ replaced {previous}
 3  get.missing  ▷ ■ added {}
 4  get.found    ▷ ■ kept {len(value)}
 ```
@@ -1207,3 +1207,12 @@ the recommendation in each case:
 | 10 | The tag trace of 5.4 | Stuck at step 6; rejected at statement 5 | [B1], [B2], [L3] |
 | 12.1 | Two children that borrow from their parent | Accepted | [TK2], [TK3], [O6] |
 | 12.2 | A child that borrows what an iteration owns | Rejected | [L3], [TK3] |
+
+## 16. Changes after acceptance
+
+The author accepted this document on 20 November 2026. What changed afterwards,
+and what asked for it:
+
+| Date | Change | Asked for by |
+| --- | --- | --- |
+| 23 November 2026 | `insert` has the alternative `replaced {previous: v}` in section 3, and the core form of example 6.3 names the payload. The surface forms are as they were: an arm without a pattern binds nothing ([U8]). | The oracle (review finding RO9): the corpus prelude gives `insert` that contract, and with the listing of section 3 the example was refused by [C2]. A map whose values hold obligations could not give up a replaced value in any other way. |

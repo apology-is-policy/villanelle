@@ -1861,6 +1861,16 @@ fn collect_operand_modified(program: &Program, arg: &Expr, out: &mut BTreeSet<Va
     }
 }
 
+/// Whether a built-in operation changes the shape of its collection on the
+/// alternative `alt_pos` ([B5]).
+fn changes_shape(op: BuiltinOp, alt_pos: usize) -> bool {
+    match op {
+        BuiltinOp::Push | BuiltinOp::Pop | BuiltinOp::Remove => alt_pos == 0,
+        BuiltinOp::Insert => true,
+        _ => false,
+    }
+}
+
 fn collect_modified_vars(
     program: &Program,
     body: &ControlBody,
@@ -3157,6 +3167,96 @@ impl<'a> BodyChecker<'a> {
         self.refresh_dependent_local_borrows(place.root, guard);
     }
 
+    /// [I12]: the facts of a capture are facts of the value that was
+    /// captured. On the histories `guard`, where the name gets another
+    /// value, they are no longer facts of the name.
+    fn forget_capture(&mut self, var: VarId, guard: Formula) {
+        if let Some(entries) = self.captured.get_mut(&var) {
+            let outside = self.solver.bdd.not(guard);
+            for (captured_on, _) in entries.iter_mut() {
+                *captured_on = self.solver.bdd.and(*captured_on, outside);
+            }
+            entries.retain(|(captured_on, _)| *captured_on != bdd::FALSE);
+        }
+    }
+
+    /// [I12]: a captured outcome that is given to another name, by a bind
+    /// or an assignment on the histories `guard`, takes the facts of its
+    /// capture with it.
+    fn carry_capture(&mut self, value: &Expr, to: VarId, guard: Formula) {
+        let from = match value {
+            Expr::Var(VarRef::Local(from), _) => *from,
+            Expr::Move(inner, _) => match &**inner {
+                Expr::Var(VarRef::Local(from), _) => *from,
+                _ => return,
+            },
+            _ => return,
+        };
+        let Some(entries) = self.captured.get(&from).cloned() else {
+            return;
+        };
+        for (captured_on, info) in entries {
+            let on = self.solver.bdd.and(captured_on, guard);
+            if on != bdd::FALSE {
+                self.captured.entry(to).or_default().push((on, info));
+            }
+        }
+    }
+
+    /// A fresh name for a collection of the type `ty` after an operation
+    /// that changes its shape.
+    fn alloc_shape_term(&mut self, ty: &Type) -> TermId {
+        let prefix = if matches!(ty, Type::Map(_, _)) {
+            "_map"
+        } else {
+            "_vec"
+        };
+        self.alloc_type_term(prefix, ty)
+    }
+
+    /// What `push`, `pop`, `insert` and `remove` say of their collection as
+    /// it was (`old`) and as it is (`new`) on the alternative `alt_pos`:
+    /// the conditions of the corpus prelude. On an alternative that leaves
+    /// the collection as it was, `new` is `old`.
+    fn shape_facts(
+        &mut self,
+        op: BuiltinOp,
+        old: &LinearTerm,
+        new: &LinearTerm,
+        alt_pos: usize,
+        atom: Formula,
+    ) {
+        let len_old_id = self.solver.intern_term(AtomTerm::Len(old.clone()));
+        let len_new_id = self.solver.intern_term(AtomTerm::Len(new.clone()));
+        self.solver.instantiate_all();
+        let len_old = LinearTerm::var(len_old_id);
+        let len_new = LinearTerm::var(len_new_id);
+        let one = LinearTerm::from_i128(1);
+        let fact = match (op, alt_pos) {
+            (BuiltinOp::Push, 0) | (BuiltinOp::Insert, 0) => {
+                self.solver.eq(&len_new, &len_old.add(&one))
+            }
+            (BuiltinOp::Pop, 0) | (BuiltinOp::Remove, 0) => {
+                let non_empty = self.solver.le(&one, &len_old);
+                let shorter = self.solver.eq(&len_new, &len_old.sub(&one));
+                self.solver.bdd.and(non_empty, shorter)
+            }
+            (BuiltinOp::Pop, _) => {
+                let empty = self.solver.eq(&len_old, &LinearTerm::from_i128(0));
+                let same = self.solver.eq(new, old);
+                self.solver.bdd.and(empty, same)
+            }
+            (BuiltinOp::Insert, _) => {
+                let non_empty = self.solver.le(&one, &len_old);
+                let same_length = self.solver.eq(&len_new, &len_old);
+                self.solver.bdd.and(non_empty, same_length)
+            }
+            (BuiltinOp::Remove, _) => self.solver.eq(new, old),
+            _ => return,
+        };
+        self.solver.add_fact(atom, fact);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn apply_builtin_facts(
         &mut self,
@@ -3169,42 +3269,17 @@ impl<'a> BodyChecker<'a> {
         env: &Env,
     ) {
         match op {
-            BuiltinOp::Push => {
-                if alt_pos == 0
-                    && let Some(place) = target
-                {
-                    let v_old = translate_place(self.program, &mut self.solver, place, env);
-                    let len_old_id = self.solver.intern_term(AtomTerm::Len(v_old));
-                    let v_new_tid = self.alloc_type_term("_vec", &place.ty);
-                    let v_new = LinearTerm::var(v_new_tid);
-                    let len_new_id = self.solver.intern_term(AtomTerm::Len(v_new.clone()));
-                    self.solver.instantiate_all();
-                    let plus_one = LinearTerm::var(len_old_id).add(&LinearTerm::from_i128(1));
-                    let eq_len = self.solver.eq(&LinearTerm::var(len_new_id), &plus_one);
-                    self.solver.add_fact(atom, eq_len);
-                    self.apply_place_write(place, atom, v_new, env);
-                }
-            }
-            BuiltinOp::Pop => {
+            BuiltinOp::Push | BuiltinOp::Pop | BuiltinOp::Insert | BuiltinOp::Remove => {
+                // [B5]: the operation writes the collection on the
+                // alternatives that change its shape.
                 if let Some(place) = target {
-                    let v_old = translate_place(self.program, &mut self.solver, place, env);
-                    let len_old_id = self.solver.intern_term(AtomTerm::Len(v_old));
-                    self.solver.instantiate_all();
-                    let len_old = LinearTerm::var(len_old_id);
-                    if alt_pos == 0 {
-                        let non_empty = self.solver.le(&LinearTerm::from_i128(1), &len_old);
-                        self.solver.add_fact(atom, non_empty);
-                        let v_new_tid = self.alloc_type_term("_vec", &place.ty);
-                        let v_new = LinearTerm::var(v_new_tid);
-                        let len_new_id = self.solver.intern_term(AtomTerm::Len(v_new.clone()));
-                        self.solver.instantiate_all();
-                        let minus_one = len_old.sub(&LinearTerm::from_i128(1));
-                        let eq_len = self.solver.eq(&LinearTerm::var(len_new_id), &minus_one);
-                        self.solver.add_fact(atom, eq_len);
-                        self.apply_place_write(place, atom, v_new, env);
+                    let old = translate_place(self.program, &mut self.solver, place, env);
+                    if changes_shape(op, alt_pos) {
+                        let new = LinearTerm::var(self.alloc_shape_term(&place.ty));
+                        self.shape_facts(op, &old, &new, alt_pos, atom);
+                        self.apply_place_write(place, atom, new, env);
                     } else {
-                        let is_empty = self.solver.eq(&len_old, &LinearTerm::from_i128(0));
-                        self.solver.add_fact(atom, is_empty);
+                        self.shape_facts(op, &old, &old, alt_pos, atom);
                     }
                 }
             }
@@ -3227,49 +3302,6 @@ impl<'a> BodyChecker<'a> {
                         let is_empty = self.solver.eq(&len_old, &LinearTerm::from_i128(0));
                         self.solver.add_fact(atom, is_empty);
                     }
-                }
-            }
-            BuiltinOp::Insert => {
-                if let Some(place) = target {
-                    let m_old = translate_place(self.program, &mut self.solver, place, env);
-                    let len_old_id = self.solver.intern_term(AtomTerm::Len(m_old));
-                    self.solver.instantiate_all();
-                    let len_old = LinearTerm::var(len_old_id);
-                    let m_new_tid = self.alloc_type_term("_map", &place.ty);
-                    let m_new = LinearTerm::var(m_new_tid);
-                    let len_new_id = self.solver.intern_term(AtomTerm::Len(m_new.clone()));
-                    self.solver.instantiate_all();
-                    if alt_pos == 0 {
-                        let plus_one = len_old.add(&LinearTerm::from_i128(1));
-                        let eq_len = self.solver.eq(&LinearTerm::var(len_new_id), &plus_one);
-                        self.solver.add_fact(atom, eq_len);
-                    } else {
-                        let non_empty = self.solver.le(&LinearTerm::from_i128(1), &len_old);
-                        let eq_len = self.solver.eq(&LinearTerm::var(len_new_id), &len_old);
-                        let both = self.solver.bdd.and(non_empty, eq_len);
-                        self.solver.add_fact(atom, both);
-                    }
-                    self.apply_place_write(place, atom, m_new, env);
-                }
-            }
-            BuiltinOp::Remove => {
-                if let Some(place) = target
-                    && alt_pos == 0
-                {
-                    let m_old = translate_place(self.program, &mut self.solver, place, env);
-                    let len_old_id = self.solver.intern_term(AtomTerm::Len(m_old));
-                    self.solver.instantiate_all();
-                    let len_old = LinearTerm::var(len_old_id);
-                    let non_empty = self.solver.le(&LinearTerm::from_i128(1), &len_old);
-                    let m_new_tid = self.alloc_type_term("_map", &place.ty);
-                    let m_new = LinearTerm::var(m_new_tid);
-                    let len_new_id = self.solver.intern_term(AtomTerm::Len(m_new.clone()));
-                    self.solver.instantiate_all();
-                    let minus_one = len_old.sub(&LinearTerm::from_i128(1));
-                    let eq_len = self.solver.eq(&LinearTerm::var(len_new_id), &minus_one);
-                    let both = self.solver.bdd.and(non_empty, eq_len);
-                    self.solver.add_fact(atom, both);
-                    self.apply_place_write(place, atom, m_new, env);
                 }
             }
             BuiltinOp::Get => {
@@ -3543,6 +3575,7 @@ impl<'a> BodyChecker<'a> {
                         }
                     }
                     self.record_expr_loan_roots(*var, value, r_i);
+                    self.carry_capture(value, *var, r_i);
                 }
                 Command::Unpack {
                     struct_id,
@@ -3667,6 +3700,8 @@ impl<'a> BodyChecker<'a> {
                     }
                     let not_ri = self.solver.bdd.not(r_i);
                     self.moved[*var] = self.solver.bdd.and(self.moved[*var], not_ri);
+                    self.forget_capture(*var, r_i);
+                    self.carry_capture(value, *var, r_i);
                 }
                 Command::AssignPlace { target, value } => {
                     check_expr_obligations(
@@ -3773,7 +3808,7 @@ impl<'a> BodyChecker<'a> {
                     operation,
                     arguments,
                 } => {
-                    let old_args: Vec<LinearTerm> = arguments
+                    let mut old_args: Vec<LinearTerm> = arguments
                         .iter()
                         .map(|a| translate_term(self.program, &mut self.solver, a, &env))
                         .collect();
@@ -3876,6 +3911,21 @@ impl<'a> BodyChecker<'a> {
                         } => {
                             let uses = vec!["console.write".to_string()];
                             self.check_effects(&uses, "emit", r_i, line, &visible_vars, in_loop)?;
+                        }
+                        Operation::Builtin {
+                            target: Some(place),
+                            ..
+                        } => {
+                            // [B5], [I12]: the operation runs at the capture,
+                            // so the collection is written here, whatever
+                            // the alternative. What the alternative says of
+                            // the old and the new collection is known when
+                            // the outcome is decided.
+                            let old = translate_place(self.program, &mut self.solver, place, &env);
+                            let new = LinearTerm::var(self.alloc_shape_term(&place.ty));
+                            self.apply_place_write(place, r_i, new.clone(), &env);
+                            old_args[0] = old;
+                            post_args[0] = new;
                         }
                         _ => {}
                     }
@@ -4099,7 +4149,7 @@ impl<'a> BodyChecker<'a> {
                     }
 
                     let (is_pure, pure_cid) = match op_kind {
-                        Operation::Control(cid) if self.program.controls[*cid].is_pure() => {
+                        Operation::Control(cid) if self.program.control_is_pure(*cid) => {
                             (true, Some(*cid))
                         }
                         _ => (false, None),
@@ -4263,7 +4313,7 @@ impl<'a> BodyChecker<'a> {
                                                     self.solver.add_fact(g, cf);
                                                 }
                                             }
-                                            Operation::Builtin { op, .. } => {
+                                            Operation::Builtin { op, target, .. } => {
                                                 self.apply_builtin_facts(
                                                     *op,
                                                     None,
@@ -4273,6 +4323,15 @@ impl<'a> BodyChecker<'a> {
                                                     &field_terms,
                                                     &env,
                                                 );
+                                                if target.is_some() {
+                                                    self.shape_facts(
+                                                        *op,
+                                                        &info.old_args[0],
+                                                        &info.post_args[0],
+                                                        arm.alternative,
+                                                        g,
+                                                    );
+                                                }
                                             }
                                             _ => {}
                                         }
@@ -4402,6 +4461,7 @@ impl<'a> BodyChecker<'a> {
                             let fresh_tid = self.alloc_var_term(var);
                             let active_on_loop = self.solver.bdd.and(self.defined[var], r_i);
                             self.set_version(var, active_on_loop, fresh_tid);
+                            self.forget_capture(var, r_i);
                         }
                     }
 

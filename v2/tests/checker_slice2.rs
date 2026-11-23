@@ -885,3 +885,250 @@ fn slice_two_surface_files_and_core_stuck_controls_conform() {
         ",
     );
 }
+
+/// The program is stuck in the oracle in the way its directive says, and the
+/// checker refuses it by `clause`.
+fn stuck_and_rejected(clause: &str, source: &str) {
+    let report = villanelle_v2::script::check(source);
+    assert!(
+        report.failures.is_empty() && report.runs > 0 && !report.stuck.is_empty(),
+        "[{clause}] the oracle does not find the program stuck: {:?}\n{source}",
+        report.failures
+    );
+    reject_core(clause, source);
+}
+
+/// The program runs to its end in the oracle, as its directive says, and the
+/// checker accepts it.
+fn done_and_accepted(clause: &str, source: &str) {
+    let report = villanelle_v2::script::check(source);
+    assert!(
+        report.failures.is_empty() && report.runs > 0 && report.stuck.is_empty(),
+        "[{clause}] the oracle does not run the program to its end: {:?}\n{source}",
+        report.failures
+    );
+    accept_core(clause, source);
+}
+
+#[test]
+fn a_captured_operation_writes_where_it_is_captured_i12_b5() {
+    // Review finding RC2. The operation runs at the capture, so its `&~`
+    // operand is written there; what the alternative says of the collection
+    // before and after is known when the outcome is decided.
+    stuck_and_rejected(
+        "P5",
+        r#"
+control c()
+    ■ { r {n : u32} }
+    1  ⊤ ▷ ~v : [u32] := [10, 20]
+    2  ⊤ ▷ o := capture pop(&~v)
+    3  ⊤ ▷ d : Δ outcome(▾o) ▸ item {x} │ empty {}
+    4  ⊤ ▷ ■ r {v[1]}
+
+//! run c() => stuck X7 E-Index
+"#,
+    );
+    // Between the capture and the decision nothing is known of the new
+    // length either.
+    stuck_and_rejected(
+        "P5",
+        r#"
+control c()
+    ■ { r {n : u32} }
+    1  ⊤ ▷ ~v : [u32] := [10, 20]
+    2  ⊤ ▷ o := capture pop(&~v)
+    3  ⊤ ▷ last : u32 := v[1]
+    4  ⊤ ▷ d : Δ outcome(▾o) ▸ item {x} │ empty {}
+    5  ⊤ ▷ ■ r {last}
+
+//! run c() => stuck X7 E-Index
+"#,
+    );
+    done_and_accepted(
+        "I12",
+        r#"
+control c()
+    ■ { r {n : u32} }
+    1  ⊤ ▷ ~v : [u32] := [10, 20]
+    2  ⊤ ▷ o := capture pop(&~v)
+    3  ⊤ ▷ d : Δ outcome(▾o) ▸ item {x} │ empty {}
+    4  d.empty ▷ ⊥
+    5  d.item ▷ ⊢ len(v) = 1
+    6  d.item ▷ ■ r {v[0]}
+
+//! run c() => done r {10}
+"#,
+    );
+    done_and_accepted(
+        "I12",
+        r#"
+control c()
+    ■ { r {n : u32} }
+    1  ⊤ ▷ ~v : [u32] := [10, 20]
+    2  ⊤ ▷ o := capture push(&~v, 30)
+    3  ⊤ ▷ d : Δ outcome(▾o) ▸ done {}
+    4  ⊤ ▷ ■ r {v[2]}
+
+//! run c() => done r {30}
+"#,
+    );
+    stuck_and_rejected(
+        "P1",
+        r#"
+control c()
+    ■ { r {} }
+    1  ⊤ ▷ ~v : [u32] := [10, 20]
+    2  ⊤ ▷ o := capture push(&~v, 30)
+    3  ⊤ ▷ d : Δ outcome(▾o) ▸ done {}
+    4  ⊤ ▷ ⊢ len(v) = 2
+    5  ⊤ ▷ ■ r {}
+
+//! run c() => stuck X7 E-Oblige
+"#,
+    );
+    // An alternative that leaves the collection as it was says so.
+    done_and_accepted(
+        "I12",
+        r#"
+control c()
+    ■ { r {n : usize} }
+    1  ⊤ ▷ ~v : [u32] := [10]
+    2  ⊤ ▷ first := capture pop(&~v)
+    3  ⊤ ▷ d1 : Δ outcome(▾first) ▸ item {x} │ empty {}
+    4  d1.empty ▷ ⊥
+    5  ⊤ ▷ second := capture pop(&~v)
+    6  ⊤ ▷ d2 : Δ outcome(▾second) ▸ item {y} │ empty {}
+    7  d2.item ▷ ⊥
+    8  d2.empty ▷ ⊢ len(v) = 0
+    9  ⊤ ▷ ■ r {len(v)}
+
+//! run c() => done r {0}
+"#,
+    );
+    done_and_accepted(
+        "I12",
+        r#"
+control c()
+    ■ { r {n : usize} }
+    1  ⊤ ▷ ~m : string ⇀ u32 := ∅
+    2  ⊤ ▷ o := capture insert(&~m, "a", 1)
+    3  ⊤ ▷ d : Δ outcome(▾o) ▸ inserted {} │ replaced {previous}
+    4  d.replaced ▷ ⊥
+    5  d.inserted ▷ ⊢ len(m) = 1
+    6  ⊤ ▷ p := capture remove(&~m, "a")
+    7  ⊤ ▷ e : Δ outcome(▾p) ▸ removed {was} │ missing {}
+    8  e.removed ▷ ⊢ len(m) = 0
+    9  e.missing ▷ ⊢ len(m) = 1
+    10 ⊤ ▷ ■ r {len(m)}
+
+//! run c() => done r {0}
+"#,
+    );
+    stuck_and_rejected(
+        "P1",
+        r#"
+control c()
+    ■ { r {} }
+    1  ⊤ ▷ ~m : string ⇀ u32 := ∅
+    2  ⊤ ▷ o := capture insert(&~m, "a", 1)
+    3  ⊤ ▷ d : Δ outcome(▾o) ▸ inserted {} │ replaced {previous}
+    4  ⊤ ▷ ⊢ len(m) = 0
+    5  ⊤ ▷ ■ r {}
+
+//! run c() => stuck X7 E-Oblige
+"#,
+    );
+}
+
+#[test]
+fn the_facts_of_a_capture_go_with_the_captured_value_i12() {
+    // Review finding RC3. A name that gets another outcome has the facts of
+    // that outcome's capture, and no longer those of its own.
+    let probe = r#"
+extern control probe(n : u32)
+    ■ { small {v : u32} ⇐ v < n │ big {} }
+    uses net
+"#;
+    stuck_and_rejected(
+        "P1",
+        &format!(
+            r#"{probe}
+control c()
+    ■ {{ r {{}} }}
+    uses net
+    1  ⊤ ▷ ~o := capture probe(5)
+    2  ⊤ ▷ d1 : Δ outcome(▾o) ▸ small {{a}} │ big {{}}
+    3  ⊤ ▷ p := capture probe(100)
+    4  ⊤ ▷ o ← ▾p
+    5  ⊤ ▷ d2 : Δ outcome(▾o) ▸ small {{b}} │ big {{}}
+    6  d2.small ▷ ⊢ b < 5
+    7  ⊤ ▷ ■ r {{}}
+
+//! run c() with [probe -> small {{1}}; probe -> small {{50}}] => stuck X7 E-Oblige
+"#
+        ),
+    );
+    done_and_accepted(
+        "I12",
+        &format!(
+            r#"{probe}
+control c()
+    ■ {{ r {{}} }}
+    uses net
+    1  ⊤ ▷ ~o := capture probe(5)
+    2  ⊤ ▷ d1 : Δ outcome(▾o) ▸ small {{a}} │ big {{}}
+    3  d1.small ▷ ⊢ a < 5
+    4  ⊤ ▷ p := capture probe(100)
+    5  ⊤ ▷ o ← ▾p
+    6  ⊤ ▷ d2 : Δ outcome(▾o) ▸ small {{b}} │ big {{}}
+    7  d2.small ▷ ⊢ b < 100
+    8  ⊤ ▷ ■ r {{}}
+
+//! run c() with [probe -> small {{1}}; probe -> small {{50}}] => done r
+"#
+        ),
+    );
+    // The same through a bind: the new name has the facts.
+    done_and_accepted(
+        "I12",
+        &format!(
+            r#"{probe}
+control c()
+    ■ {{ r {{}} }}
+    uses net
+    1  ⊤ ▷ o := capture probe(5)
+    2  ⊤ ▷ q := ▾o
+    3  ⊤ ▷ d : Δ outcome(▾q) ▸ small {{a}} │ big {{}}
+    4  d.small ▷ ⊢ a < 5
+    5  ⊤ ▷ ■ r {{}}
+
+//! run c() with [probe -> small {{4}}] => done r
+"#
+        ),
+    );
+    // A loop that assigns the name: what was captured before the loop is
+    // not known of the value after an iteration.
+    stuck_and_rejected(
+        "P1",
+        &format!(
+            r#"{probe}
+control c()
+    ■ {{ r {{}} }}
+    uses net
+    1  ⊤ ▷ ~o := capture probe(5)
+    2  ⊤ ▷ lp : ↻ again_(i : u32 := 0) {{
+           1  ⊤ ▷ d : Δ outcome(▾o) ▸ small {{a}} │ big {{}}
+           2  d.small ▷ ⊢ a < 5
+           3  ⊤ ▷ t : ? i < 1
+           4  t.false ▷ □ done {{}}
+           5  ⊤ ▷ p := capture probe(100)
+           6  ⊤ ▷ o ← ▾p
+           7  ⊤ ▷ ↑ again_(i + 1)
+       }} ▸ done {{}}
+    3  ⊤ ▷ ■ r {{}}
+
+//! run c() with [probe -> small {{1}}; probe -> small {{50}}] => stuck X7 E-Oblige
+"#
+        ),
+    );
+}
