@@ -461,7 +461,14 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   semantics on entries that satisfy its precondition, and asks the checker.
   `--native` compiles each accepted program at `-O0` and `-O2`, for both
   widths of `usize`, and requires that every run ends as the oracle's did
-  and with the same trace. `--mutants` tries every mutant too, where a
+  and with the same trace; a run that ends in a fault or with `terminate n`
+  is compared as one that ends in an outcome. The runs of a program share a
+  process, which has 60 seconds; where it fails, each run is compiled and
+  run alone, and the finding names the runs that fail with the answers of
+  their hosts. With `VN2_KEEP_IR=DIR` in the environment the text of every
+  compiled module is kept in `DIR`. For slice 2 on 23 November 2026:
+  300 programs, 23,520 runs of compiled programs with no difference.
+  `--mutants` tries every mutant too, where a
   mutant that the checker accepts must have no stuck run. A run of a mutant
   has 20,000 steps (`--mutant-fuel`), a tenth of the steps of a run of a
   program: a mutant that never ends uses all of them in every run. Each
@@ -917,12 +924,18 @@ and Rails surface reader, elaborator, and formatter (`surface.rs`):
   otherwise than the loop found it; [O6](b) makes the `□` of one alternative
   agree, so in a checked program such a bit says no more than the atom of
   the alternative, and the interpreter is spared deciding which of the three
-  answers of [O6](b) holds. A fault releases by the formulas of the
-  statement at which it occurred, for every body of the activation; a
-  contingency keeps the place of the statement of the work that faulted,
-  and the names around its boundary are released by the formulas of that
-  statement when the contingency lets the fault out ([F5]). The backend
-  lays a body out without any of this (RB1). Differential tests verify exact outcome and trace
+  answers of [O6](b) holds. A contingency finds the names around its
+  boundary as the statement of the work that faulted left them ([F5]): the
+  layout keeps a bit for each statement of the work that may fault and
+  leaves some such name otherwise than the boundary found it, the fault sets
+  it, and the formulas of the contingency are written over these bits. So
+  the formulas of a statement cover the names of every body around it, and
+  a fault or a terminator ends each scope by the formulas of the statement
+  at which it occurred ([R3] and [R4] of the core, which say so since that
+  day). `erased::layout` is this layout and the backend takes it from there
+  (RB1): the interpreter runs the formulas that compiled code evaluates. A
+  fault at a statement where the layout expects none ends the run as
+  undefined. Differential tests verify exact outcome and trace
   agreement (including `conn.release(...)` events and `faulted "..."` ends)
   between `oracle` and `erased`.
 - **Rails surface & formatter (`surface.rs`).** Adds layout (`[Y12]`),
@@ -1181,14 +1194,37 @@ paired native-performance suite (`v2/tests/backend_slice2.rs`):
   pass aggregates by pointer for portability across Apple `arm64` and Linux
   `x86_64`.
 - **Static cleanup, resource release, and structured arm-chain lowering
-  (`[R2]`–`[R5]`).** Reuses `erased::compute_availability` (including post-end
+  (`[R2]`–`[R5]`).** Takes the layout of the erased semantics
+  (`erased::layout`, including post-end
   snapshots for lexical boundary fallthrough) so `[R4]` destruction and `[R5]`
   `on fault release` unwinding (`@vn2_release_<res>`) are driven purely by
-  static history-bit selectors with zero runtime moved flags. Unchecked vector
+  static history-bit selectors with zero runtime moved flags. Since 23
+  November 2026 (review findings RB1, RB3, RB11) every scope that a
+  terminator or a fault ends is ended by the formulas of that statement
+  (`end_scopes` and `emit_unwind` in `emit_body_unit`); a `□` and a
+  statement of the work of a boundary set a bit where a formula asks which
+  one ended the loop or faulted; what a boundary has in its care ends with
+  the scope of its work however the work ends; and the message of a fault
+  has one owner: the contingency holds it in a slot of its own
+  (`%lex_fault_<body>`, `%unit_fault` for a named boundary), `escalate`
+  passes that slot on, every other end of the contingency destroys it, and
+  the name of the message reads the slot where no statement consumes the
+  name and owns a copy otherwise. Unchecked vector
   indexing and `⊥ → unreachable` follow `[R2]`. A general structured arm-chain
   lowering pass (`plan_structured_flow`) chains mutually exclusive `Decide` and
   two-sided `Test` arm spans directly into their arm statements, eliminating
   redundant history-bit checks and speculative arm branches in hot loops.
+- **Checked files of the suite in compiled code.** `script::native_runs`
+  gives the runs of the directives of a core text file as a compiled program
+  takes them, and
+  `checked_core_programs_of_slice_two_run_natively_as_the_oracle_does`
+  compiles every file of `v2/tests/slice2/` that the checker accepts whole
+  and compares each run with the oracle at `-O0` and `-O2`. Most files of
+  the suite hold a control that is there to be stuck, so the checker
+  refuses them; the two it accepts are `erased_nested_ownership.core` and
+  `checked_faults_and_boundaries.core`, which is written for this: the ends
+  of a contingency with messages that own memory, care lists, a boundary in
+  the work of another, a named boundary.
 - **Verification (`v2/tests/backend_slice2.rs`).** Verifies Theorem 4 expansion
   plus `check::check` and `kernel::validate` across all 4 Slice 2 `.rails`
   files and a dedicated `&τ`/`&~τ`/`old(y)`/resource/fault/boundary test;

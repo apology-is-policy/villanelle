@@ -1,0 +1,298 @@
+// Slice 2 core conformance for a checked program ([R1] to [R5]). The checker
+// accepts every control of this file, so the file is compiled, and each run
+// is compared in the oracle, the erased semantics and compiled code. The
+// controls are the ways in which a fault ends scopes: at which statement of
+// the work a fault occurred decides what the names around the boundary still
+// hold ([F5]), the message of a fault has one owner, and what a boundary has
+// in its care ends with its work ([E-Boundary]).
+
+extern resource conn on fault release
+
+extern control open_conn()
+    ■ { opened {c : conn} }
+    uses net
+
+extern control close_conn(c : conn)
+    ■ { closed {} }
+    uses net
+
+contingent extern control close_now(c : conn)
+    ■ { closed {} }
+    uses net
+
+contingent extern control note(n : u32)
+    ■ { done {} }
+    uses net
+
+contingent extern control count(n : usize)
+    ■ { done {} }
+    uses net
+
+contingent extern control say(s : &string)
+    ■ { done {} }
+    uses net
+
+control may(n : u32)
+    ■ { done {} }
+    faults
+    1  ⊤ ▷ t : ? n = 0
+    2  t.true ▷ fault "zero"
+    3  t.false ▷ ■ done {}
+
+// `recover ↑ ℓ` starts the loop again with the parameters as they are, and
+// not as the loop was entered ([E-Contingency]).
+control retries(n : u32)
+    ■ { done {tries : u32} }
+    1  ⊤ ▷ lp : ↻ go(~i : u32 := 0) {
+           ⊢ i ≤ 3
+           1  ⊤ ▷ t : ? i < 3
+           2  t.false ▷ □ fin {i}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ d : Δ may(n) ▸ done {}
+              } contingency (m : string) {
+                  1  ⊤ ▷ recover ↑ go
+              }
+           5  ⊤ ▷ □ fin {i}
+       } ▸ fin {k}
+    2  ⊤ ▷ ■ done {k}
+
+// A parameter of the loop that owns memory stays through `recover`.
+control collects(n : u32)
+    ■ { done {k : usize} }
+    1  ⊤ ▷ lp : ↻ go(~i : u32 := 0, ~acc : [u32] := [7]) {
+           ⊢ i ≤ 3
+           1  ⊤ ▷ t : ? i < 3
+           2  t.false ▷ □ fin {▾acc}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ p : Δ push(&~acc, i) ▸ done {}
+           5  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ d : Δ may(n) ▸ done {}
+              } contingency (m : string) {
+                  1  ⊤ ▷ recover ↑ go
+              }
+           6  ⊤ ▷ □ fin {▾acc}
+       } ▸ fin {v}
+    2  ⊤ ▷ size : usize := len(&v)
+    3  ⊤ ▷ ■ done {size}
+
+// `escalate` passes the message on. Here the message owns memory, and the
+// contingency reads it.
+control passes_on(s : string)
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault trim(s)
+       } contingency (m : string) {
+           1  ⊤ ▷ a : Δ say(&m) ▸ done {}
+           2  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ⊥
+
+// The contingency consumes the name of the message and escalates: the fault
+// goes on with the message it had.
+control keeps_message(s : string)
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault trim(s)
+       } contingency (m : string) {
+           1  ⊤ ▷ v : [string] := [▾m]
+           2  ⊤ ▷ escalate
+       }
+    2  ⊤ ▷ ⊥
+
+// A new fault in the contingency: with the old message as its own, and with
+// another, where the old one ends with the contingency.
+control faults_again(s : string, n : u32)
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ fault trim(s)
+       } contingency [n] (m : string) {
+           1  ⊤ ▷ t : ? n = 0
+           2  t.true ▷ fault m
+           3  t.false ▷ fault "another"
+       }
+    2  ⊤ ▷ ⊥
+
+// `recover` ends the contingency, and its message with it.
+control retries_with_text(s : string)
+    ■ { done {tries : u32} }
+    uses net
+    1  ⊤ ▷ lp : ↻ go(~i : u32 := 0) {
+           ⊢ i ≤ 2
+           1  ⊤ ▷ t : ? i < 2
+           2  t.false ▷ □ fin {i}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ b : boundary {
+                  1  ⊤ ▷ fault trim(s)
+              } contingency (m : string) {
+                  1  ⊤ ▷ a : Δ say(&m) ▸ done {}
+                  2  ⊤ ▷ recover ↑ go
+              }
+           5  ⊤ ▷ ⊥
+       } ▸ fin {k}
+    2  ⊤ ▷ ■ done {k}
+
+// What the boundary has in its care: the contingency reads it after a fault,
+// and it ends with the work where the work exits or falls off its end.
+control cares(n : u32)
+    ■ { done {k : u32} │ early {} }
+    faults
+    uses net
+    1  ⊤ ▷ v : [u32] := [1, 2, n]
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ t : ? n = 1
+           2  t.true ▷ ■ early {}
+           3  ⊤ ▷ d : Δ may(n) ▸ done {}
+       } contingency [v] (m : string) {
+           1  ⊤ ▷ a : Δ count(len(&v)) ▸ done {}
+           2  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ■ done {7}
+
+// A boundary in the work of another. The inner work faults before it
+// consumes the name or after, its contingency passes the fault on, and the
+// outer contingency lets it out: the name is released where it was still
+// held.
+control nested(n : u32)
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ outer : boundary {
+           1  ⊤ ▷ inner : boundary {
+                  1  ⊤ ▷ t : ? n = 0
+                  2  t.true ▷ fault "first"
+                  3  ⊤ ▷ cl : Δ close_conn(c) ▸ closed {}
+                  4  ⊤ ▷ fault "second"
+              } contingency (m : string) {
+                  1  ⊤ ▷ escalate
+              }
+           2  ⊤ ▷ ⊥
+       } contingency (m2 : string) {
+           1  ⊤ ▷ a : Δ note(1) ▸ done {}
+           2  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ⊥
+
+// The inner work consumes a name of the outer one and completes, and the
+// outer work faults after it or before it.
+control inner_completes(n : u32)
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ v : [u32] := [n]
+    3  ⊤ ▷ outer : boundary {
+           1  ⊤ ▷ t : ? n = 0
+           2  t.true ▷ fault "before"
+           3  ⊤ ▷ inner : boundary {
+                  1  ⊤ ▷ w : [u32] := ▾v
+                  2  ⊤ ▷ cl : Δ close_conn(c) ▸ closed {}
+              } contingency (m : string) {
+                  1  ⊤ ▷ ⊥
+              }
+           4  ⊤ ▷ fault "after"
+       } contingency (m2 : string) {
+           1  ⊤ ▷ a : Δ note(2) ▸ done {}
+           2  ⊤ ▷ escalate
+       }
+    4  ⊤ ▷ ⊥
+
+// The inner contingency restarts a loop of the outer work, and the outer
+// contingency lets the last fault out. The name is consumed in the last run
+// of the loop only.
+control inner_recovers(n : u32)
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ outer : boundary {
+           1  ⊤ ▷ lp : ↻ go(~i : u32 := 0) {
+                  ⊢ i ≤ 2
+                  1  ⊤ ▷ t : ? i < 2
+                  2  t.false ▷ cl : Δ close_conn(c) ▸ closed {}
+                  3  t.false ▷ fault "spent"
+                  4  ⊤ ▷ i ← i + 1
+                  5  ⊤ ▷ inner : boundary {
+                         1  ⊤ ▷ d : Δ may(n) ▸ done {}
+                     } contingency (m : string) {
+                         1  ⊤ ▷ recover ↑ go
+                     }
+                  6  ⊤ ▷ t2 : ? n = 2
+                  7  t2.true ▷ □ out {}
+                  8  ⊤ ▷ fault "held"
+              } ▸ out {}
+           2  ⊤ ▷ fault "out"
+       } contingency (m2 : string) {
+           1  ⊤ ▷ a : Δ note(3) ▸ done {}
+           2  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ⊥
+
+// The work moves a name of the body around it that owns memory, and faults:
+// `terminate n` ends every scope, and the name is not ended a second time.
+pub control stops(n : u32)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ v : [u32] := [n, n]
+    2  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    3  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ w : [u32] := ▾v
+           2  ⊤ ▷ cl : Δ close_conn(c) ▸ closed {}
+           3  ⊤ ▷ d : Δ may(n) ▸ done {}
+       } contingency {
+           1  ⊤ ▷ terminate 9
+       }
+    4  ⊤ ▷ ■ ok {}
+
+// A named boundary. Its contingency has what the boundary retains and the
+// message, and ends quietly or lets the fault out with the message it had.
+boundary guarded(s : string, c : conn, n : u32) retains c {
+    1  ⊤ ▷ t : ? n = 2
+    2  t.true ▷ cl : Δ close_now(c) ▸ closed {}
+    3  t.true ▷ terminate
+    4  ⊤ ▷ fault trim(s)
+} contingency (m : string) {
+    1  ⊤ ▷ cl : Δ close_now(c) ▸ closed {}
+    2  ⊤ ▷ a : Δ say(&m) ▸ done {}
+    3  ⊤ ▷ t : ? len(&m) = 4
+    4  t.true ▷ terminate
+    5  t.false ▷ escalate
+}
+
+control supervises(s : string, n : u32)
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    2  ⊤ ▷ supervise guarded(▾s, ▾c, n)
+    3  ⊤ ▷ ■ ok {}
+
+//! run retries(0) with [] => done done {3}
+//! run retries(1) with [] => done done {1}
+//! run collects(0) with [] => done done {4}
+//! run collects(1) with [] => done done {2}
+//! run passes_on("  heap text ") with [say -> done] => faulted "heap text" trace [say("heap text") -> done]
+//! run keeps_message("  heap text ") with [] => faulted "heap text"
+//! run faults_again("  heap text ", 0) with [] => faulted "heap text"
+//! run faults_again("  heap text ", 1) with [] => faulted "another"
+//! run retries_with_text(" again ") with [say -> done; say -> done] => done done {2} trace [say("again") -> done; say("again") -> done]
+//! run cares(0) with [count -> done] => faulted "zero" trace [count(3) -> done]
+//! run cares(1) with [] => done early
+//! run cares(2) with [] => done done {7}
+//! run nested(0) with [open_conn -> opened {conn#1}; note -> done] => faulted "first" trace [open_conn() -> opened {conn#1}; note(1) -> done; conn.release(conn#1) -> released]
+//! run nested(1) with [open_conn -> opened {conn#1}; close_conn -> closed; note -> done] => faulted "second" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed; note(1) -> done]
+//! run inner_completes(0) with [open_conn -> opened {conn#1}; note -> done] => faulted "before" trace [open_conn() -> opened {conn#1}; note(2) -> done; conn.release(conn#1) -> released]
+//! run inner_completes(1) with [open_conn -> opened {conn#1}; close_conn -> closed; note -> done] => faulted "after" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed; note(2) -> done]
+//! run inner_recovers(0) with [open_conn -> opened {conn#1}; close_conn -> closed; note -> done] => faulted "spent" trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed; note(3) -> done]
+//! run inner_recovers(1) with [open_conn -> opened {conn#1}; note -> done] => faulted "held" trace [open_conn() -> opened {conn#1}; note(3) -> done; conn.release(conn#1) -> released]
+//! run inner_recovers(2) with [open_conn -> opened {conn#1}; note -> done] => faulted "out" trace [open_conn() -> opened {conn#1}; note(3) -> done; conn.release(conn#1) -> released]
+//! run stops(0) with [open_conn -> opened {conn#1}; close_conn -> closed] => terminated 9 trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run stops(1) with [open_conn -> opened {conn#1}; close_conn -> closed] => done ok trace [open_conn() -> opened {conn#1}; close_conn(conn#1) -> closed]
+//! run supervises(" long text ", 0) with [open_conn -> opened {conn#1}; close_now -> closed; say -> done] => faulted "long text" trace [open_conn() -> opened {conn#1}; close_now(conn#1) -> closed; say("long text") -> done]
+//! run supervises(" four ", 0) with [open_conn -> opened {conn#1}; close_now -> closed; say -> done] => done ok trace [open_conn() -> opened {conn#1}; close_now(conn#1) -> closed; say("four") -> done]
+//! run supervises(" four ", 2) with [open_conn -> opened {conn#1}; close_now -> closed] => done ok trace [open_conn() -> opened {conn#1}; close_now(conn#1) -> closed]

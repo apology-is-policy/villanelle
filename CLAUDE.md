@@ -151,8 +151,9 @@ reader, the two semantics and the checker, their mutants, and with `--native`
 their compiled code, and prints the counts of the search over the campaign;
 a program is a function of its seed, `--slice 2` takes the programs with the
 data of slice 2, and
-a release build (`cargo run --release`) is some ten times faster. Inputs are `.core` (the
-core text form) or `.rails`.
+a release build (`cargo run --release`) is some ten times faster. With
+`VN2_KEEP_IR=DIR` in the environment the IR of every compiled batch is kept
+in `DIR`. Inputs are `.core` (the core text form) or `.rails`.
 
 Set `TELLUR_NATIVE_TARGET_DIR` to share the native dependency cache between
 builds. `./bin/vnc` is the installed release compiler when present; otherwise use

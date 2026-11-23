@@ -177,6 +177,25 @@ fn checked(report: &mut Report, source: &str, seconds: u64) -> Checked {
     answer
 }
 
+/// The answers of a host as a script writes them.
+fn answers(answers: &[(String, crate::host::Answer)]) -> String {
+    let shown: Vec<String> = answers
+        .iter()
+        .map(|(control, answer)| {
+            if answer.payload.is_empty() {
+                format!("{control} -> {}", answer.alternative)
+            } else {
+                format!(
+                    "{control} -> {} {{{}}}",
+                    answer.alternative,
+                    show(&answer.payload)
+                )
+            }
+        })
+        .collect();
+    shown.join("; ")
+}
+
 fn show(arguments: &[oracle::Value]) -> String {
     let shown: Vec<String> = arguments.iter().map(ToString::to_string).collect();
     shown.join(", ")
@@ -200,6 +219,11 @@ fn configs(fuel: u64) -> [(u32, Config); 2] {
         ),
     ]
 }
+
+/// A run that ended, for the compiled program: the width of `usize`, the
+/// entry with the answers of the host, and how the oracle's run ended and
+/// what it did.
+type Ended = (u32, NativeRunSpec, String, Vec<oracle::Event>);
 
 /// The program of `seed`, with the constructs of slice 1.
 pub fn program_of(seed: u64) -> crate::syntax::Program {
@@ -257,7 +281,7 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
 
     // The runs that ended, for the compiled program: the entry, the answers
     // of the host, and how the oracle's run ended and what it did.
-    let mut ended: Vec<(u32, NativeRunSpec, String, Vec<oracle::Event>)> = Vec::new();
+    let mut ended: Vec<Ended> = Vec::new();
     let mut rng = Rng::new(mix(&[seed, 0x72756e73]));
     for (bits, config) in configs(options.fuel) {
         for (index, (entry, arguments)) in entry_runs(&mut rng, &program, &config, options.entries)
@@ -276,6 +300,22 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
                     "`{entry}({})`, usize of {bits} bits, host {host_seed}",
                     show(&arguments)
                 );
+                // A run that ended is one for the compiled program too.
+                let keep = |ended: &mut Vec<Ended>, end: erased::End| {
+                    if options.native {
+                        ended.push((
+                            bits,
+                            NativeRunSpec {
+                                entry: entry.clone(),
+                                arguments: arguments.clone(),
+                                arithmetic: false,
+                                answers: outcome.answers.clone(),
+                            },
+                            end.to_string(),
+                            outcome.oracle.trace.clone(),
+                        ));
+                    }
+                };
                 let kind = match &outcome.oracle.end {
                     End::Done {
                         alternative,
@@ -286,36 +326,31 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
                             continue;
                         }
                         _ => {
-                            if options.native {
-                                let end = erased::End::Done {
-                                    alternative: alternative.clone(),
-                                    payload: payload.clone(),
-                                };
-                                ended.push((
-                                    bits,
-                                    NativeRunSpec {
-                                        entry: entry.clone(),
-                                        arguments: arguments.clone(),
-                                        arithmetic: false,
-                                        answers: outcome.answers.clone(),
-                                    },
-                                    end.to_string(),
-                                    outcome.oracle.trace.clone(),
-                                ));
-                            }
+                            let end = erased::End::Done {
+                                alternative: alternative.clone(),
+                                payload: payload.clone(),
+                            };
+                            keep(&mut ended, end);
                             continue;
                         }
                     },
                     // A fault that leaves the entry and `terminate n` end a
                     // run as an outcome does ([E-Root], [E-Contingency]).
-                    End::Faulted(_) | End::Terminated(_) => {
-                        if matches!(outcome.oracle.end, End::Faulted(_)) {
-                            report.faulted += 1;
-                        } else {
-                            report.terminated += 1;
-                        }
+                    End::Faulted(message) => {
+                        report.faulted += 1;
                         if let Verdict::Differ(difference) = &outcome.verdict {
                             find(report, "erased", format!("{run}: {difference}"), &printed);
+                        } else {
+                            keep(&mut ended, erased::End::Faulted(message.clone()));
+                        }
+                        continue;
+                    }
+                    End::Terminated(status) => {
+                        report.terminated += 1;
+                        if let Verdict::Differ(difference) = &outcome.verdict {
+                            find(report, "erased", format!("{run}: {difference}"), &printed);
+                        } else {
+                            keep(&mut ended, erased::End::Terminated(*status));
                         }
                         continue;
                     }
@@ -371,8 +406,28 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
                 let results = match run_native_batch(&program, &specs, bits, level) {
                     Ok(results) => results,
                     Err(error) => {
+                        // The runs of a batch share a process. Each one
+                        // alone says which of them ended it.
+                        let mut alone = Vec::new();
+                        for (_, spec, end, _) in runs.iter().copied() {
+                            let one = std::slice::from_ref(spec);
+                            if let Err(error) = run_native_batch(&program, one, bits, level) {
+                                let error: String = error.chars().take(300).collect();
+                                alone.push(format!(
+                                    "`{}({})` with the answers [{}], which the oracle ends in `{end}`: {error}",
+                                    spec.entry,
+                                    show(&spec.arguments),
+                                    answers(&spec.answers)
+                                ));
+                            }
+                        }
                         let error: String = error.chars().take(1500).collect();
-                        find(report, "native", format!("{target}: {error}"), &printed);
+                        let detail = if alone.is_empty() {
+                            format!("{target}: {error}")
+                        } else {
+                            format!("{target}: {}", alone.join("; "))
+                        };
+                        find(report, "native", detail, &printed);
                         continue;
                     }
                 };

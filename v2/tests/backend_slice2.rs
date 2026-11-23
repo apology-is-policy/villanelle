@@ -928,6 +928,114 @@ fn slice_two_core_programs_agree_natively() {
     verify_native_specs("lexical_boundaries.core", &lex_core, &lex_specs, 64);
 }
 
+/// The core text files of the slice 2 suite that the checker accepts, with
+/// the runs of their directives that end.
+fn checked_core_files() -> Vec<(String, villanelle_v2::typed::Program, Vec<NativeRunSpec>)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/slice2");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "core"))
+        .collect();
+    paths.sort();
+    let mut files = Vec::new();
+    for path in paths {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let Ok((program, specs)) = script::native_runs(&source) else {
+            continue;
+        };
+        if specs.is_empty() || check::check(&program).is_err() {
+            continue;
+        }
+        files.push((name, program, specs));
+    }
+    files
+}
+
+/// How the oracle ends each run, and what it does.
+fn oracle_ends(
+    program: &villanelle_v2::typed::Program,
+    specs: &[NativeRunSpec],
+) -> Vec<(String, Vec<villanelle_v2::oracle::Event>)> {
+    specs
+        .iter()
+        .map(|spec| {
+            let script = Script {
+                answers: spec.answers.iter().cloned().collect(),
+            };
+            let config = Config::default();
+            let arguments = spec.arguments.clone();
+            let out = if spec.arithmetic {
+                let mut host = villanelle_v2::host::Arithmetic(script);
+                run(program, &spec.entry, arguments, &mut host, &config)
+            } else {
+                let mut host = script;
+                run(program, &spec.entry, arguments, &mut host, &config)
+            };
+            (out.end.to_string(), out.trace)
+        })
+        .collect()
+}
+
+/// What a checked program becomes is compiled: every file of the suite that
+/// the checker accepts runs its directives in compiled code, at `-O0` and
+/// `-O2`, to the end and the trace of the oracle ([R1] to [R5]).
+#[test]
+fn checked_core_programs_of_slice_two_run_natively_as_the_oracle_does() {
+    let files = checked_core_files();
+    let mut runs = 0;
+    let mut failures = Vec::new();
+    for (name, program, specs) in &files {
+        let expected = oracle_ends(program, specs);
+        for level in [0, 2] {
+            let native = match run_native_batch(program, specs, 64, level) {
+                Ok(native) => native,
+                Err(error) => {
+                    let error: String = error.chars().take(400).collect();
+                    failures.push(format!("{name} -O{level}: {error}"));
+                    continue;
+                }
+            };
+            if native.len() != expected.len() {
+                failures.push(format!(
+                    "{name} -O{level}: {} runs of {}",
+                    native.len(),
+                    expected.len()
+                ));
+                continue;
+            }
+            for (index, ((end, trace), (native_end, native_trace))) in
+                expected.iter().zip(&native).enumerate()
+            {
+                let entry = &specs[index].entry;
+                if native_end.to_string() != *end {
+                    failures.push(format!(
+                        "{name} -O{level} run {index} of `{entry}`: `{native_end}`, and the oracle `{end}`"
+                    ));
+                } else if native_trace != trace {
+                    failures.push(format!(
+                        "{name} -O{level} run {index} of `{entry}`: the trace is not the oracle's"
+                    ));
+                }
+            }
+        }
+        runs += specs.len();
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // The files of the suite that the checker accepts whole: most of the
+    // others hold a control that is there to be stuck.
+    let names: Vec<&str> = files.iter().map(|(name, _, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "checked_faults_and_boundaries.core",
+            "erased_nested_ownership.core"
+        ]
+    );
+    assert_eq!(runs, 36);
+}
+
 #[test]
 fn paired_native_performance_matches_optimized_rust_on_slice_two_data_kernel() {
     // Slice 2 data kernel:

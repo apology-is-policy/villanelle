@@ -19,8 +19,10 @@
 //! - **[R4], [R5]** At assignments, loop transitions (`↑`, `□`, `recover`),
 //!   exits (`■`), lexical boundaries, and fault unwinding, live owned slots are
 //!   destroyed (`Drop`) and `on fault release` resources are released strictly
-//!   from static `erased::compute_availability` (`D(x) ∧ ¬M(x)`) formulas over
-//!   history bits, with zero runtime moved flags.
+//!   from the static formulas of `erased::layout` (`D(x) ∧ ¬M(x)`) over
+//!   history bits, with zero runtime moved flags. The formulas of a statement
+//!   cover the names of the bodies around it, so every scope that ends at a
+//!   statement is ended by the formulas of that statement.
 
 use crate::erased;
 use crate::host::Answer;
@@ -55,6 +57,17 @@ struct HistoryPlan {
     bits: usize,
     own: Vec<Vec<usize>>,
     avail_at: Vec<Vec<Vec<Option<Selector>>>>,
+    /// [O6](b): the bit that a `□` sets, by its body and position, where a
+    /// formula asks which `□` ended the loop.
+    leave_bit: HashMap<(BodyId, usize), usize>,
+    /// [F5]: the bit that a statement of the work of a boundary sets when a
+    /// fault occurs at it, by its body and position, where a formula asks
+    /// at which statement the work faulted.
+    fault_bit: HashMap<(BodyId, usize), usize>,
+    /// The names that read the message of a fault without owning it: the
+    /// message of a contingency that no statement consumes. No scope ends
+    /// them.
+    borrowed: Vec<bool>,
     stmt_sel: Vec<Vec<Selector>>,
     stmt_next: Vec<Vec<String>>,
     skip_target: Vec<Vec<String>>,
@@ -216,6 +229,12 @@ fn mention(selector: &Selector, plan: &mut HistoryPlan) {
     match selector {
         Selector::Top => {}
         Selector::Atom(site, alternative) => {
+            // The atoms of the `□` statements of a loop and of the
+            // statements of a boundary that fault follow the alternatives
+            // of their site.
+            if plan.bit[*site].len() <= *alternative {
+                plan.bit[*site].resize(*alternative + 1, None);
+            }
             if plan.bit[*site][*alternative].is_none() {
                 plan.bit[*site][*alternative] = Some(plan.bits);
                 plan.bits += 1;
@@ -308,7 +327,12 @@ fn needs_runtime_cleanup(program: &Program, ty: &Type) -> bool {
 }
 
 fn build_plan(program: &Program, body: &ControlBody, param_count: usize) -> HistoryPlan {
-    let avail_at = erased::compute_availability(program, body, param_count);
+    let erased::Layout {
+        avail_at,
+        leaves,
+        faults,
+        ..
+    } = erased::layout(program, body, param_count);
     let mut stmt_sel = Vec::with_capacity(body.bodies.len());
     let mut stmt_next = Vec::with_capacity(body.bodies.len());
     let mut skip_target = Vec::with_capacity(body.bodies.len());
@@ -351,6 +375,9 @@ fn build_plan(program: &Program, body: &ControlBody, param_count: usize) -> Hist
         bits: 0,
         own: vec![Vec::new(); body.bodies.len()],
         avail_at,
+        leave_bit: HashMap::new(),
+        fault_bit: HashMap::new(),
+        borrowed: vec![false; body.vars.len()],
         stmt_sel,
         stmt_next,
         skip_target,
@@ -390,6 +417,18 @@ fn build_plan(program: &Program, body: &ControlBody, param_count: usize) -> Hist
         }
         for s in &avail_sels {
             mention(s, &mut plan);
+        }
+    }
+    // A `□` or a statement that faults sets a bit only where a formula
+    // that some scope end evaluates names it.
+    for (leave_body, pc, site, index) in leaves {
+        if let Some(Some(bit)) = plan.bit[site].get(index) {
+            plan.leave_bit.insert((leave_body, pc), *bit);
+        }
+    }
+    for (fault_body, pc, site, index) in faults {
+        if let Some(Some(bit)) = plan.bit[site].get(index) {
+            plan.fault_bit.insert((fault_body, pc), *bit);
         }
     }
     for (site, bits) in body.sites.iter().zip(&plan.bit) {
@@ -1913,17 +1952,18 @@ fn emit_tagged_eq<'a>(
         }
         let s_ll = sub_ty(k);
         let _ = writeln!(out, "arm_{k}:");
-        let _ = writeln!(out, "  %pa = getelementptr {ll}, ptr %a, i32 0, i32 1");
-        let _ = writeln!(out, "  %pb = getelementptr {ll}, ptr %b, i32 0, i32 1");
+        // A name of the function is written once: each arm has its own.
+        let _ = writeln!(out, "  %pa_{k} = getelementptr {ll}, ptr %a, i32 0, i32 1");
+        let _ = writeln!(out, "  %pb_{k} = getelementptr {ll}, ptr %b, i32 0, i32 1");
         for (fi, f) in fields.iter().enumerate() {
             let ftid = reg.type_ids[f.ty.deref_type()];
             let _ = writeln!(
                 out,
-                "  %fa_{k}_{fi} = getelementptr {s_ll}, ptr %pa, i32 0, i32 {fi}"
+                "  %fa_{k}_{fi} = getelementptr {s_ll}, ptr %pa_{k}, i32 0, i32 {fi}"
             );
             let _ = writeln!(
                 out,
-                "  %fb_{k}_{fi} = getelementptr {s_ll}, ptr %pb, i32 0, i32 {fi}"
+                "  %fb_{k}_{fi} = getelementptr {s_ll}, ptr %pb_{k}, i32 0, i32 {fi}"
             );
             let _ = writeln!(
                 out,
@@ -2044,17 +2084,17 @@ fn emit_type_cmp(out: &mut String, reg: &RuntimeRegistry<'_>, tid: usize) {
                     }
                     let s_ll = format!("%vn2.variant.{vid}.c{k}");
                     let _ = writeln!(out, "arm_{k}:");
-                    let _ = writeln!(out, "  %pa = getelementptr {ll}, ptr %a, i32 0, i32 1");
-                    let _ = writeln!(out, "  %pb = getelementptr {ll}, ptr %b, i32 0, i32 1");
+                    let _ = writeln!(out, "  %pa_{k} = getelementptr {ll}, ptr %a, i32 0, i32 1");
+                    let _ = writeln!(out, "  %pb_{k} = getelementptr {ll}, ptr %b, i32 0, i32 1");
                     for (fi, f) in c.fields.iter().enumerate() {
                         let ftid = reg.type_ids[f.ty.deref_type()];
                         let _ = writeln!(
                             out,
-                            "  %fa_{k}_{fi} = getelementptr {s_ll}, ptr %pa, i32 0, i32 {fi}"
+                            "  %fa_{k}_{fi} = getelementptr {s_ll}, ptr %pa_{k}, i32 0, i32 {fi}"
                         );
                         let _ = writeln!(
                             out,
-                            "  %fb_{k}_{fi} = getelementptr {s_ll}, ptr %pb, i32 0, i32 {fi}"
+                            "  %fb_{k}_{fi} = getelementptr {s_ll}, ptr %pb_{k}, i32 0, i32 {fi}"
                         );
                         let _ = writeln!(
                             out,
@@ -2255,18 +2295,21 @@ fn emit_type_clone(out: &mut String, reg: &RuntimeRegistry<'_>, tid: usize) {
                 }
                 let s_ll = format!("%vn2.variant.{vid}.c{k}");
                 let _ = writeln!(out, "arm_{k}:");
-                let _ = writeln!(out, "  %sp = getelementptr {ll}, ptr %p, i32 0, i32 1");
-                let _ = writeln!(out, "  %dp = getelementptr {ll}, ptr %dst, i32 0, i32 1");
+                let _ = writeln!(out, "  %sp_{k} = getelementptr {ll}, ptr %p, i32 0, i32 1");
+                let _ = writeln!(
+                    out,
+                    "  %dp_{k} = getelementptr {ll}, ptr %dst, i32 0, i32 1"
+                );
                 for (fi, f) in c.fields.iter().enumerate() {
                     let ftid = reg.type_ids[f.ty.deref_type()];
                     let f_ll = llvm_ty(program, &f.ty, reg.usize_bits);
                     let _ = writeln!(
                         out,
-                        "  %sf_{k}_{fi} = getelementptr {s_ll}, ptr %sp, i32 0, i32 {fi}"
+                        "  %sf_{k}_{fi} = getelementptr {s_ll}, ptr %sp_{k}, i32 0, i32 {fi}"
                     );
                     let _ = writeln!(
                         out,
-                        "  %df_{k}_{fi} = getelementptr {s_ll}, ptr %dp, i32 0, i32 {fi}"
+                        "  %df_{k}_{fi} = getelementptr {s_ll}, ptr %dp_{k}, i32 0, i32 {fi}"
                     );
                     let _ = writeln!(
                         out,
@@ -2411,6 +2454,13 @@ fn emit_type_cleanup(out: &mut String, reg: &RuntimeRegistry<'_>, tid: usize, is
             }
             let _ = writeln!(out, "  ret void");
         }
+        // A variant or an outcome with no component anywhere is a number.
+        Type::Variant(vid, _) if is_unit_variant(program, *vid) => {
+            let _ = writeln!(out, "  ret void");
+        }
+        Type::Outcome(oid, _) if is_unit_outcome(program, *oid) => {
+            let _ = writeln!(out, "  ret void");
+        }
         Type::Variant(vid, _) => {
             emit_tagged_cleanup(
                 out,
@@ -2471,13 +2521,13 @@ fn emit_tagged_cleanup<'a>(
         }
         let s_ll = sub_ty(k);
         let _ = writeln!(out, "arm_{k}:");
-        let _ = writeln!(out, "  %pay = getelementptr {ll}, ptr %p, i32 0, i32 1");
+        let _ = writeln!(out, "  %pay_{k} = getelementptr {ll}, ptr %p, i32 0, i32 1");
         for (fi, f) in fields.iter().enumerate() {
             if predicate(reg.program, &f.ty) {
                 let ftid = reg.type_ids[f.ty.deref_type()];
                 let _ = writeln!(
                     out,
-                    "  %f_{k}_{fi} = getelementptr {s_ll}, ptr %pay, i32 0, i32 {fi}"
+                    "  %f_{k}_{fi} = getelementptr {s_ll}, ptr %pay_{k}, i32 0, i32 {fi}"
                 );
                 let _ = writeln!(
                     out,
@@ -2877,6 +2927,18 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
                 "  call fastcc void @vn2_release_{tid}(ptr {ptr})"
             );
         }
+    }
+
+    /// A copy of the string at `ptr`, which owns its text.
+    fn emit_string_copy(&mut self, ptr: &str) -> String {
+        let tid = self.reg.intern_type(&Type::String);
+        self.reg.require_clone(tid);
+        let copy = self.fresh_reg();
+        let _ = writeln!(
+            self.code,
+            "  {copy} = call fastcc %vn2.string @vn2_clone_{tid}(ptr {ptr})"
+        );
+        copy
     }
 
     fn finish_read_operand(&mut self, op: ReadOperand) {
@@ -3558,7 +3620,7 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
         };
         for var_id in (0..body.vars.len()).rev() {
             let var = &body.vars[var_id];
-            if var.body != target_body || exclude.contains(&var_id) {
+            if var.body != target_body || exclude.contains(&var_id) || plan.borrowed[var_id] {
                 continue;
             }
             let applicable = if is_fault {
@@ -3730,6 +3792,44 @@ fn adjust_unwind_for_named_b1(unit: UnitKind, target: UnwindTarget) -> UnwindTar
     }
 }
 
+/// The message that a fault carries on from the contingency it leaves.
+#[derive(Clone, Copy, PartialEq)]
+enum Carried {
+    /// A new fault: its message is its own.
+    Nothing,
+    /// `escalate` in the contingency of a lexical boundary: the message that
+    /// the contingency was entered with.
+    Lexical(BodyId),
+    /// `escalate` in the contingency of a named boundary.
+    Unit,
+}
+
+/// Whether `body` is `home` or lies inside it.
+fn is_within(roles: &[BodyRole], mut body: BodyId, home: BodyId) -> bool {
+    loop {
+        if body == home {
+            return true;
+        }
+        body = match &roles[body] {
+            BodyRole::Root => return false,
+            BodyRole::Loop { parent_body, .. }
+            | BodyRole::LexicalB1 { parent_body, .. }
+            | BodyRole::LexicalB2 { parent_body, .. } => *parent_body,
+        };
+    }
+}
+
+/// Whether some statement consumes the name `var` of the body `home`: its
+/// formula is other than `⊤` at some statement that has the name in scope.
+fn is_consumed(plan: &HistoryPlan, roles: &[BodyRole], home: BodyId, var: VarId) -> bool {
+    plan.avail_at.iter().enumerate().any(|(inner, snaps)| {
+        is_within(roles, inner, home)
+            && snaps
+                .iter()
+                .any(|snap| !matches!(snap[var], Some(Selector::Top)))
+    })
+}
+
 /// Emits `[R2]`/`[R1]`/`[R3]`/`[R4]`/`[R5]` LLVM IR for any `ControlBody`
 /// (defined control, named boundary B1, or named boundary B2).
 #[allow(clippy::too_many_arguments)]
@@ -3746,8 +3846,30 @@ fn emit_body_unit<'a>(
     unit_out_term: Option<(String, Type)>,
     pre_bound_var_count: usize,
 ) {
-    let plan = build_plan(program, body, pre_bound_var_count);
+    let mut plan = build_plan(program, body, pre_bound_var_count);
     let roles = classify_body_roles(body);
+    // The message of a fault has one owner. A contingency holds it for
+    // `escalate` in a slot of its own (`%lex_fault_<body>`, `%unit_fault`);
+    // the name that the contingency gives it reads that slot where no
+    // statement consumes the name, and owns a copy otherwise.
+    for role in &roles {
+        if let BodyRole::LexicalB1 {
+            b2,
+            message_var: Some(message),
+            ..
+        } = role
+        {
+            plan.borrowed[*message] = !is_consumed(&plan, &roles, *b2, *message);
+        }
+    }
+    let unit_message: Option<VarId> = match unit {
+        UnitKind::NamedBoundaryB2 => Some(params_sig.len() - 1),
+        UnitKind::Control { .. } | UnitKind::NamedBoundaryB1 { .. } => None,
+    };
+    if let Some(message) = unit_message {
+        plan.borrowed[message] = !is_consumed(&plan, &roles, 0, message);
+    }
+    let plan = plan;
     let mut emitter = IrEmitter::new(program, reg);
 
     let is_control = matches!(unit, UnitKind::Control { .. });
@@ -3818,89 +3940,151 @@ fn emit_body_unit<'a>(
     for bit_id in 0..plan.bits {
         let _ = writeln!(emitter.code, "  store i1 false, ptr %bit_{bit_id}");
     }
+    if let Some(message) = unit_message {
+        emitter
+            .allocas
+            .push("  %unit_fault = alloca %vn2.string".to_string());
+        let _ = writeln!(emitter.code, "  store %vn2.string %m_in, ptr %unit_fault");
+        if !plan.borrowed[message] {
+            let copy = emitter.emit_string_copy("%unit_fault");
+            let _ = writeln!(
+                emitter.code,
+                "  store %vn2.string {copy}, ptr %slot_{message}"
+            );
+        }
+    }
     let _ = writeln!(emitter.code, "  br label %b0_entry");
 
-    let emit_unwind =
-        |em: &mut IrEmitter<'_, '_>, fail_body: BodyId, fail_pc: usize, msg_reg: &str| {
-            let raw_target = compute_unwind_target(body, &roles, fail_body, fail_pc);
-            let target = adjust_unwind_for_named_b1(unit, raw_target);
-            match target {
-                UnwindTarget::LexicalCatch {
-                    b2,
-                    message_var,
-                    frames_to_unwind,
-                    ..
-                } => {
-                    for &(fb, fpc) in &frames_to_unwind {
-                        let (lb, lpc) = if fb == fail_body {
-                            (fail_body, fail_pc)
-                        } else {
-                            (fb, fpc)
-                        };
-                        em.emit_scope_cleanup(body, &plan, fb, lb, lpc, &[], true);
-                    }
-                    let _ = writeln!(
-                        em.code,
-                        "  store %vn2.string {msg_reg}, ptr %lex_fault_{b2}"
-                    );
-                    if let Some(mvar) = message_var {
-                        let _ =
-                            writeln!(em.code, "  store %vn2.string {msg_reg}, ptr %slot_{mvar}");
-                    }
-                    let _ = writeln!(em.code, "  br label %b{b2}_entry");
-                }
-                UnwindTarget::NamedBoundaryB1Fault { frames_to_unwind } => {
-                    let UnitKind::NamedBoundaryB1 { id: bid } = unit else {
-                        unreachable!();
-                    };
-                    let bdef = &program.boundaries[bid];
-                    let retains = &bdef.retains;
-                    for &(fb, fpc) in &frames_to_unwind {
-                        let excl: &[VarId] = if fb == 0 { retains } else { &[] };
-                        let (lb, lpc) = if fb == fail_body {
-                            (fail_body, fail_pc)
-                        } else {
-                            (fb, fpc)
-                        };
-                        em.emit_scope_cleanup(body, &plan, fb, lb, lpc, excl, true);
-                    }
-                    let mut call_args = Vec::new();
-                    for &ridx in retains {
-                        let r_ll = em.llvm_ty(&bdef.parameters[ridx].ty);
-                        let rv = em.fresh_reg();
-                        let _ = writeln!(em.code, "  {rv} = load {r_ll}, ptr %slot_{ridx}");
-                        call_args.push(format!("{r_ll} {rv}"));
-                    }
-                    call_args.push(format!("%vn2.string {msg_reg}"));
-                    if bdef.may_fault {
-                        call_args.push(format!("ptr {}", unit_out_fault.as_deref().unwrap()));
-                    }
-                    let ret_r = em.fresh_reg();
-                    let _ = writeln!(
-                        em.code,
-                        "  {ret_r} = call fastcc i32 @vn2_boundary_b2_{bid}({})",
-                        call_args.join(", ")
-                    );
-                    let _ = writeln!(em.code, "  ret i32 {ret_r}");
-                }
-                UnwindTarget::RootFault { frames_to_unwind } => {
-                    for &(fb, fpc) in &frames_to_unwind {
-                        let (lb, lpc) = if fb == fail_body {
-                            (fail_body, fail_pc)
-                        } else {
-                            (fb, fpc)
-                        };
-                        em.emit_scope_cleanup(body, &plan, fb, lb, lpc, &[], true);
-                    }
-                    if let Some(ref fptr) = unit_out_fault {
-                        let _ = writeln!(em.code, "  store %vn2.string {msg_reg}, ptr {fptr}");
-                        let _ = writeln!(em.code, "  ret i32 -1");
-                    } else {
-                        let _ = writeln!(em.code, "  unreachable");
-                    }
+    // [E-Unwind], [R5]: a fault at the statement `fail_pc` of `fail_body`
+    // ends every scope up to the boundary that takes it, each by the
+    // formulas of that statement.
+    let emit_unwind = |em: &mut IrEmitter<'_, '_>,
+                       fail_body: BodyId,
+                       fail_pc: usize,
+                       msg_reg: &str,
+                       carried: Carried| {
+        let raw_target = compute_unwind_target(body, &roles, fail_body, fail_pc);
+        let target = adjust_unwind_for_named_b1(unit, raw_target);
+        let end = |em: &mut IrEmitter<'_, '_>, frames: &[(BodyId, usize)], kept: &[VarId]| {
+            for &(fb, _) in frames {
+                let excl: &[VarId] = if fb == 0 { kept } else { &[] };
+                em.emit_scope_cleanup(body, &plan, fb, fail_body, fail_pc, excl, true);
+                // The message of a contingency that the fault leaves ends
+                // with its scope, unless the fault carries it on.
+                if matches!(roles[fb], BodyRole::LexicalB2 { .. })
+                    && carried != Carried::Lexical(fb)
+                {
+                    em.emit_drop_ptr(&format!("%lex_fault_{fb}"), &Type::String);
                 }
             }
         };
+        match target {
+            UnwindTarget::LexicalCatch {
+                b2,
+                message_var,
+                frames_to_unwind,
+                ..
+            } => {
+                end(em, &frames_to_unwind, &[]);
+                // [F5]: the contingency reads the names around the
+                // boundary as this statement left them.
+                if let Some(bit_id) = plan.fault_bit.get(&(fail_body, fail_pc)) {
+                    let _ = writeln!(em.code, "  store i1 true, ptr %bit_{bit_id}");
+                }
+                let _ = writeln!(
+                    em.code,
+                    "  store %vn2.string {msg_reg}, ptr %lex_fault_{b2}"
+                );
+                if let Some(mvar) = message_var {
+                    if plan.borrowed[mvar] {
+                        let _ =
+                            writeln!(em.code, "  store %vn2.string {msg_reg}, ptr %slot_{mvar}");
+                    } else {
+                        let copy = em.emit_string_copy(&format!("%lex_fault_{b2}"));
+                        let _ = writeln!(em.code, "  store %vn2.string {copy}, ptr %slot_{mvar}");
+                    }
+                }
+                let _ = writeln!(em.code, "  br label %b{b2}_entry");
+            }
+            UnwindTarget::NamedBoundaryB1Fault { frames_to_unwind } => {
+                let UnitKind::NamedBoundaryB1 { id: bid } = unit else {
+                    unreachable!();
+                };
+                let bdef = &program.boundaries[bid];
+                let retains = &bdef.retains;
+                end(em, &frames_to_unwind, retains);
+                let mut call_args = Vec::new();
+                for &ridx in retains {
+                    let r_ll = em.llvm_ty(&bdef.parameters[ridx].ty);
+                    let rv = em.fresh_reg();
+                    let _ = writeln!(em.code, "  {rv} = load {r_ll}, ptr %slot_{ridx}");
+                    call_args.push(format!("{r_ll} {rv}"));
+                }
+                call_args.push(format!("%vn2.string {msg_reg}"));
+                if bdef.may_fault {
+                    call_args.push(format!("ptr {}", unit_out_fault.as_deref().unwrap()));
+                }
+                let ret_r = em.fresh_reg();
+                let _ = writeln!(
+                    em.code,
+                    "  {ret_r} = call fastcc i32 @vn2_boundary_b2_{bid}({})",
+                    call_args.join(", ")
+                );
+                let _ = writeln!(em.code, "  ret i32 {ret_r}");
+            }
+            UnwindTarget::RootFault { frames_to_unwind } => {
+                end(em, &frames_to_unwind, &[]);
+                if unit_message.is_some() && carried != Carried::Unit {
+                    em.emit_drop_ptr("%unit_fault", &Type::String);
+                }
+                if let Some(ref fptr) = unit_out_fault {
+                    let _ = writeln!(em.code, "  store %vn2.string {msg_reg}, ptr {fptr}");
+                    let _ = writeln!(em.code, "  ret i32 -1");
+                } else {
+                    let _ = writeln!(em.code, "  unreachable");
+                }
+            }
+        }
+    };
+    let emit_fault = |em: &mut IrEmitter<'_, '_>, fail_body: BodyId, fail_pc: usize, msg: &str| {
+        emit_unwind(em, fail_body, fail_pc, msg, Carried::Nothing);
+    };
+
+    // [E-Scope], [R4]: a terminator at the statement `pc` of `from` ends the
+    // scopes from its own outward, through that of `through` or all of them,
+    // each by the formulas of that statement. The names `kept` of the last
+    // one stay.
+    let end_scopes = |em: &mut IrEmitter<'_, '_>,
+                      from: BodyId,
+                      pc: usize,
+                      through: Option<BodyId>,
+                      kept: &[VarId]| {
+        for (fb, _) in ancestor_chain_to_root(&roles, from, pc) {
+            let last = through == Some(fb);
+            let excl: &[VarId] = if last { kept } else { &[] };
+            em.emit_scope_cleanup(body, &plan, fb, from, pc, excl, false);
+            match &roles[fb] {
+                // What a boundary has in its care ends with the scope of
+                // its work ([E-Boundary]).
+                BodyRole::LexicalB1 {
+                    contingency_vars, ..
+                } => {
+                    for &cv in contingency_vars {
+                        let cty = body.vars[cv].ty.clone();
+                        em.emit_drop_ptr(&format!("%slot_{cv}"), &cty);
+                    }
+                }
+                // The message of the fault ends with the contingency.
+                BodyRole::LexicalB2 { .. } => {
+                    em.emit_drop_ptr(&format!("%lex_fault_{fb}"), &Type::String);
+                }
+                BodyRole::Root | BodyRole::Loop { .. } => {}
+            }
+            if last {
+                break;
+            }
+        }
+    };
 
     // Emit each body `0..body.bodies.len()`.
     for (b_id, b) in body.bodies.iter().enumerate() {
@@ -4111,7 +4295,7 @@ fn emit_body_unit<'a>(
                             }
                             let _ = writeln!(em.code, "  br label %{next_lbl}");
                         },
-                        &emit_unwind,
+                        &emit_fault,
                         unit_out_term.as_ref().map(|(t, _)| t.as_str()),
                     );
                 }
@@ -4212,7 +4396,7 @@ fn emit_body_unit<'a>(
                                 let _ = writeln!(em.code, "  br label %{arm_next}");
                             }
                         },
-                        &emit_unwind,
+                        &emit_fault,
                         unit_out_term.as_ref().map(|(t, _)| t.as_str()),
                     );
                 }
@@ -4293,7 +4477,7 @@ fn emit_body_unit<'a>(
                         let _ = writeln!(emitter.code, "{f_lbl}:");
                         let fmsg = emitter.fresh_reg();
                         let _ = writeln!(emitter.code, "  {fmsg} = load %vn2.string, ptr {fp}");
-                        emit_unwind(&mut emitter, b_id, s_idx, &fmsg);
+                        emit_fault(&mut emitter, b_id, s_idx, &fmsg);
                         let _ = writeln!(emitter.code, "{ok_lbl}:");
                     }
                     let _ = writeln!(emitter.code, "  br label %{next_lbl}");
@@ -4305,15 +4489,7 @@ fn emit_body_unit<'a>(
                     let head = body.bodies[*target].head.as_ref().expect("a loop head");
                     let arg_vals =
                         emitter.emit_exprs_ordered(arguments, &VarAccess::ControlSlots(body));
-                    // Drop remaining live locals of active loop bodies up to `*target`.
-                    let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
-                    for (fb, fpc) in chain {
-                        let (lb, lpc) = if fb == b_id { (b_id, s_idx) } else { (fb, fpc) };
-                        emitter.emit_scope_cleanup(body, &plan, fb, lb, lpc, &[], false);
-                        if fb == *target {
-                            break;
-                        }
-                    }
+                    end_scopes(&mut emitter, b_id, s_idx, Some(*target), &[]);
                     for (&param_var, val) in head.parameters.iter().zip(arg_vals) {
                         let ll_ty = emitter.llvm_ty(&body.vars[param_var].ty);
                         let _ =
@@ -4327,25 +4503,26 @@ fn emit_body_unit<'a>(
                 } => {
                     let pay_vals =
                         emitter.emit_exprs_ordered(payload, &VarAccess::ControlSlots(body));
-                    // Unwind frames from `b_id` up through the enclosing loop body.
-                    let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
-                    let mut enclosing_loop = None;
-                    for (fb, fpc) in chain {
-                        let (lb, lpc) = if fb == b_id { (b_id, s_idx) } else { (fb, fpc) };
-                        emitter.emit_scope_cleanup(body, &plan, fb, lb, lpc, &[], false);
-                        if let BodyRole::Loop {
-                            parent_body,
-                            stmt_idx,
-                            site,
-                            arms,
-                        } = &roles[fb]
-                        {
-                            enclosing_loop = Some((*parent_body, *stmt_idx, *site, arms.clone()));
-                            break;
-                        }
+                    // The scopes end from this one through that of the loop.
+                    let loop_body = ancestor_chain_to_root(&roles, b_id, s_idx)
+                        .into_iter()
+                        .map(|(fb, _)| fb)
+                        .find(|fb| matches!(roles[*fb], BodyRole::Loop { .. }))
+                        .expect("loop parent for leave");
+                    end_scopes(&mut emitter, b_id, s_idx, Some(loop_body), &[]);
+                    let BodyRole::Loop {
+                        parent_body,
+                        stmt_idx: loop_stmt_idx,
+                        site: loop_site,
+                        arms: loop_arms,
+                    } = roles[loop_body].clone()
+                    else {
+                        unreachable!("a loop body");
+                    };
+                    // [O6](b): which `□` ended the loop, where a formula asks.
+                    if let Some(bit_id) = plan.leave_bit.get(&(b_id, s_idx)) {
+                        let _ = writeln!(emitter.code, "  store i1 true, ptr %bit_{bit_id}");
                     }
-                    let (parent_body, loop_stmt_idx, loop_site, loop_arms) =
-                        enclosing_loop.expect("loop parent for leave");
                     if let Some(bit_id) = plan.bit[loop_site][*alternative] {
                         let _ = writeln!(emitter.code, "  store i1 true, ptr %bit_{bit_id}");
                     }
@@ -4365,11 +4542,7 @@ fn emit_body_unit<'a>(
                     };
                     let pay_vals =
                         emitter.emit_exprs_ordered(payload, &VarAccess::ControlSlots(body));
-                    let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
-                    for (fb, fpc) in chain {
-                        let (lb, lpc) = if fb == b_id { (b_id, s_idx) } else { (fb, fpc) };
-                        emitter.emit_scope_cleanup(body, &plan, fb, lb, lpc, &[], false);
-                    }
+                    end_scopes(&mut emitter, b_id, s_idx, None, &[]);
                     let contract_alt = &program.controls[cid].contract[*alternative];
                     for (field_idx, (field, val)) in
                         contract_alt.fields.iter().zip(pay_vals).enumerate()
@@ -4384,9 +4557,11 @@ fn emit_body_unit<'a>(
                 }
                 Command::Fault { message, .. } => {
                     let msg_val = emitter.emit_expr(message, &VarAccess::ControlSlots(body));
-                    emit_unwind(&mut emitter, b_id, s_idx, &msg_val);
+                    emit_fault(&mut emitter, b_id, s_idx, &msg_val);
                 }
                 Command::Escalate => {
+                    // The original fault goes on with its message, which
+                    // the contingency has held since it was entered.
                     let mut cur = b_id;
                     while !matches!(roles[cur], BodyRole::LexicalB2 { .. } | BodyRole::Root) {
                         cur = match &roles[cur] {
@@ -4395,59 +4570,32 @@ fn emit_body_unit<'a>(
                             _ => 0,
                         };
                     }
-                    let msg_val = if matches!(roles[cur], BodyRole::LexicalB2 { .. }) {
-                        let r = emitter.fresh_reg();
-                        let _ = writeln!(
-                            emitter.code,
-                            "  {r} = load %vn2.string, ptr %lex_fault_{cur}"
-                        );
-                        r
-                    } else if matches!(unit, UnitKind::NamedBoundaryB2) {
-                        "%m_in".to_string()
+                    let (held, carried) = if matches!(roles[cur], BodyRole::LexicalB2 { .. }) {
+                        (format!("%lex_fault_{cur}"), Carried::Lexical(cur))
                     } else {
-                        "zeroinitializer".to_string()
+                        assert!(unit_message.is_some(), "`escalate` outside a contingency");
+                        ("%unit_fault".to_string(), Carried::Unit)
                     };
-                    emit_unwind(&mut emitter, b_id, s_idx, &msg_val);
+                    let msg_val = emitter.fresh_reg();
+                    let _ = writeln!(emitter.code, "  {msg_val} = load %vn2.string, ptr {held}");
+                    emit_unwind(&mut emitter, b_id, s_idx, &msg_val, carried);
                 }
                 Command::Terminate(opt_expr) => {
+                    end_scopes(&mut emitter, b_id, s_idx, None, &[]);
                     if let Some(status) = opt_expr {
+                        // [E-Contingency]: the execution ends with a status.
                         let val = status.to_string();
-                        let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
-                        for (fb, fpc) in chain {
-                            let (lb, lpc) = if fb == b_id { (b_id, s_idx) } else { (fb, fpc) };
-                            emitter.emit_scope_cleanup(body, &plan, fb, lb, lpc, &[], false);
-                        }
                         if let Some((ref tptr, ref tty)) = unit_out_term {
                             let t_ll = emitter.llvm_ty(tty);
                             let _ = writeln!(emitter.code, "  store {t_ll} {val}, ptr {tptr}");
                         }
                         let _ = writeln!(emitter.code, "  ret i32 -2");
                     } else {
-                        let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
-                        let mut lex_b2 = None;
-                        for (fb, fpc) in &chain {
-                            let (lb, lpc) = if *fb == b_id {
-                                (b_id, s_idx)
-                            } else {
-                                (*fb, *fpc)
-                            };
-                            emitter.emit_scope_cleanup(body, &plan, *fb, lb, lpc, &[], false);
-                            if let BodyRole::LexicalB2 {
-                                parent_body,
-                                stmt_idx,
-                                ..
-                            } = roles[*fb]
-                            {
-                                lex_b2 = Some((parent_body, stmt_idx));
-                                break;
-                            }
+                        // [E-Supervise]: a body of a named boundary ends.
+                        if unit_message.is_some() {
+                            emitter.emit_drop_ptr("%unit_fault", &Type::String);
                         }
-                        if let Some((parent_body, bnd_idx)) = lex_b2 {
-                            let resume_lbl = &plan.stmt_next[parent_body][bnd_idx];
-                            let _ = writeln!(emitter.code, "  br label %{resume_lbl}");
-                        } else {
-                            let _ = writeln!(emitter.code, "  ret i32 0");
-                        }
+                        let _ = writeln!(emitter.code, "  ret i32 0");
                     }
                 }
                 Command::Recover { body: target_loop } => {
@@ -4459,15 +4607,7 @@ fn emit_body_unit<'a>(
                         .as_ref()
                         .map(|head| head.parameters.clone())
                         .unwrap_or_default();
-                    let chain = ancestor_chain_to_root(&roles, b_id, s_idx);
-                    for (fb, fpc) in chain {
-                        let (lb, lpc) = if fb == b_id { (b_id, s_idx) } else { (fb, fpc) };
-                        let kept: &[VarId] = if fb == *target_loop { &parameters } else { &[] };
-                        emitter.emit_scope_cleanup(body, &plan, fb, lb, lpc, kept, false);
-                        if fb == *target_loop {
-                            break;
-                        }
-                    }
+                    end_scopes(&mut emitter, b_id, s_idx, Some(*target_loop), &parameters);
                     let _ = writeln!(emitter.code, "  br label %b{target_loop}_entry");
                 }
                 Command::Impossible => {
@@ -5843,6 +5983,7 @@ fn emit_printers(
 ) {
     let u = reg.usize_ty;
     let _ = writeln!(out, "declare i32 @printf(ptr, ...)");
+    let _ = writeln!(out, "declare i32 @fflush(ptr)");
     let _ = writeln!(out, "declare i32 @putchar(i32)");
     let _ = writeln!(out, "declare void @exit(i32)");
     let _ = writeln!(
@@ -6758,6 +6899,8 @@ pub fn emit_native_harness_llvm(
             let _ = writeln!(main_out, "  br label %{end_lbl}");
         }
         let _ = writeln!(main_out, "{end_lbl}:");
+        // What a run wrote is there if a later run ends the process.
+        let _ = writeln!(main_out, "  call i32 @fflush(ptr null)");
     }
     let _ = writeln!(main_out, "  ret i32 0");
     let _ = writeln!(main_out, "}}\n");
@@ -6817,6 +6960,43 @@ pub fn emit_native_harness_llvm(
     out
 }
 
+/// The seconds a compiled batch of runs may take. A run of a checked program
+/// ends ([K7] with the fuel of the oracle's run), so a batch that takes
+/// longer is a difference, and is reported as one.
+const NATIVE_SECONDS: u64 = 60;
+
+/// Runs the binary at `bin_path` with its output in the file `out_path`, and
+/// ends it after [`NATIVE_SECONDS`].
+fn run_with_limit(
+    bin_path: &std::path::Path,
+    out_path: &std::path::Path,
+) -> Result<std::process::ExitStatus, String> {
+    let out_file = std::fs::File::create(out_path)
+        .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+    let mut child = ProcessCommand::new(bin_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(out_file)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to run {}: {e}", bin_path.display()))?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(e) => return Err(format!("failed to wait for {}: {e}", bin_path.display())),
+        }
+        if started.elapsed().as_secs() >= NATIVE_SECONDS {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "native binary did not end in {NATIVE_SECONDS} seconds"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// Compiles `program` with `clang -x ir` at optimization level `opt_level`
 /// (`0`, `2`, or `3`), executes all `specs` natively in a single process, and
 /// returns the `(erased::End, Vec<Event>)` of each run.
@@ -6839,6 +7019,13 @@ pub fn run_native_batch(
     let bin_path = tmp_dir.join(format!("vn2_native_{pid}_{id}.bin"));
 
     std::fs::write(&ll_path, &ir).map_err(|e| format!("write {}: {e}", ll_path.display()))?;
+    // For looking at what was compiled: `VN2_KEEP_IR` names a directory
+    // that gets a copy of the text.
+    if let Some(keep) = std::env::var_os("VN2_KEEP_IR") {
+        let kept =
+            std::path::Path::new(&keep).join(format!("vn2_native_{pid}_{id}_O{opt_level}.ll"));
+        let _ = std::fs::write(kept, &ir);
+    }
 
     let opt_flag = format!("-O{}", opt_level.min(3));
     let compile = ProcessCommand::new("clang")
@@ -6862,20 +7049,26 @@ pub fn run_native_batch(
         ));
     }
 
-    let exec_out = ProcessCommand::new(&bin_path)
-        .output()
-        .map_err(|e| format!("failed to run {}: {e}", bin_path.display()));
+    let out_path = tmp_dir.join(format!("vn2_native_{pid}_{id}.out"));
+    let ran = run_with_limit(&bin_path, &out_path);
     let _ = std::fs::remove_file(&bin_path);
-    let exec_out = exec_out?;
-    if !exec_out.status.success() {
+    let written = std::fs::read(&out_path);
+    let _ = std::fs::remove_file(&out_path);
+    let status = ran?;
+    let written = written.map_err(|e| format!("read {}: {e}", out_path.display()))?;
+    if !status.success() {
         return Err(format!(
-            "native binary exited with {:?}:\n{}",
-            exec_out.status.code(),
-            String::from_utf8_lossy(&exec_out.stderr)
+            "native binary exited with {:?} after {} of {} runs",
+            status.code(),
+            written
+                .split(|byte| *byte == b'\n')
+                .filter(|line| line.starts_with(b"DONE ") || line == b"HOST_FAILED")
+                .count(),
+            specs.len()
         ));
     }
 
-    let stdout = String::from_utf8_lossy(&exec_out.stdout);
+    let stdout = String::from_utf8_lossy(&written);
     let mut results = Vec::new();
     let mut current_events = Vec::new();
 

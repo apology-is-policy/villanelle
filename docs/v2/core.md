@@ -1338,10 +1338,21 @@ removed. It is what release code implements.
   allowances are not evaluated. Integer arithmetic and indexing are unchecked.
   `⊥` has no behavior, and no code is generated for it.
 - **[R3]** Histories remain, as one bit per atom that some selector or
-  destruction condition mentions.
+  destruction condition mentions. Two things of a history are not atoms, and
+  a destruction condition can depend on them: the `□` at which a loop ended,
+  where two `□` of the loop leave a name of the bodies around it in
+  different states ([O6]), and the statement of `B₁` at which a fault
+  occurred, where two such statements do ([F5]). The erased semantics keeps a
+  bit for each such `□` and each such statement, which is set when the loop
+  ends there or the fault occurs there, and none where they all leave the
+  names alike.
 - **[R4]** At the end of a scope the names destroyed are those whose
-  availability formula holds on the current history ([O5], [O6]). No value
-  carries a flag of its own.
+  availability formula holds on the current history ([O5], [O6]). The
+  formula is that of the statement at which the scope ends. It covers the
+  names of the bodies around that statement as the bodies inside them left
+  them, so a terminator or a fault that ends several scopes ends each of
+  them by the formulas of its own statement. No value carries a flag of its
+  own.
 - **[R5]** Under a fault, resources declared `on fault release` are released
   under the same condition.
 - **[R6]** Tasks, sets, turns and cancellation flags are behavior and remain.
@@ -1516,3 +1527,4 @@ and what asked for it:
 | 23 November 2026 | Section 6.6 names the built-in operations and gives them the contracts of the corpus prelude; an operand of one follows the rule of any operand. The row X2 of section 6.10 lists the clauses under which the oracle reports that state. | The oracle (RO9, RO10): `take`, `entry_at` and `trim` were in the prelude and not in this document; the written mode of a collection operand was ignored, so `push(&v, x)` was read as `push(&~v, x)`; and the labels `X2 E-Field`, `X2 E-Index` and `X2 E-Supervise` had no row. `X5 E-Resource` is a check of the oracle on its own table of resources, which no run of a program reaches. |
 | 23 November 2026 | [F5] says in which state the names around a lexical boundary are when its contingency ends: as they were at the statement of `B₁` that faulted, for every such statement; and that a statement of `B₂` that may fault is one of the `B₁` of a boundary around it. | The checker (RC4): it took the availability at the entry of the boundary, so it accepted a program whose `B₁` fills an outer name before it faults (stuck, `X5`) and refused one whose `B₁` consumes it. |
 | 23 November 2026 | [F5] says on which histories a contingency runs: those of the statements of `B₁` that may fault, and none where there is no such statement. | The generator of slice 2 (review finding RC21): the checker gave a contingency every history of its boundary and refused `⊥` in the contingency of work that cannot fault, which the oracle never runs. |
+| 23 November 2026 | [R3] says what the erased semantics keeps of a history beside its atoms: the `□` at which a loop ended and the statement of `B₁` at which a fault occurred, where the availability of a name around the loop or the boundary depends on it. [R4] says that a scope is ended by the formulas of the statement at which it ends. | The erased interpreter and the backend (review findings RO5 and RB1): both ended an outer scope by the formulas of the statement that holds the loop or the boundary, which do not see what the body inside did, and compiled code freed a moved value a second time. |

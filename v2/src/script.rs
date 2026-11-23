@@ -1,5 +1,6 @@
 //! Test directives: runs written beside a program, and what each must yield.
 
+use crate::codegen::NativeRunSpec;
 use crate::differential::{Verdict, compare};
 use crate::host::{Answer, Arithmetic, Host, Scheduled, Script};
 use crate::int::Int;
@@ -994,6 +995,74 @@ fn directives(source: &str) -> Result<Vec<Directive>, String> {
         .collect()
 }
 
+/// The arguments of the entry of a run, and the answers of its script.
+type Call = (Vec<Value>, Vec<(String, Answer)>);
+
+/// The call of a run, as values of the program.
+fn call_of(program: &Program, raw_spec: &RawRunSpec) -> Result<Call, String> {
+    let arguments = raw_spec
+        .arguments
+        .iter()
+        .map(|v| resolve_raw_value(program, v))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut answers = Vec::with_capacity(raw_spec.answers.len());
+    for (ctrl, alt, raw_payload) in &raw_spec.answers {
+        let answered = program
+            .controls
+            .iter()
+            .find(|control| control.name == *ctrl);
+        let payload = raw_payload
+            .iter()
+            .map(|v| resolve_answer_value(program, answered, v))
+            .collect::<Result<Vec<_>, _>>()?;
+        answers.push((
+            ctrl.clone(),
+            Answer {
+                alternative: alt.clone(),
+                payload,
+            },
+        ));
+    }
+    Ok((arguments, answers))
+}
+
+/// The runs of the directives of a core text file as the compiled program
+/// takes them: the entry, its arguments and the answers of the script, in the
+/// order of the file. A run is left out where compiled code has no behavior
+/// to compare: one that expects a stuck state or a host that fails, one with
+/// a schedule of tasks, and one with another configuration than the default.
+pub fn native_runs(source: &str) -> Result<(Program, Vec<NativeRunSpec>), String> {
+    let directives = directives(source)?;
+    let tree = text::parse(source).map_err(|error| error.to_string())?;
+    let program = resolve::resolve(&tree).map_err(|error| error.to_string())?;
+    let mut specs = Vec::new();
+    for directive in &directives {
+        let Directive::Run(raw_spec) = directive else {
+            continue;
+        };
+        let ends = matches!(
+            raw_spec.expect,
+            RawExpect::Done { .. } | RawExpect::Faulted(_) | RawExpect::Terminated(_)
+        );
+        if !ends
+            || !raw_spec.turns.is_empty()
+            || raw_spec.cancel_at_turn.is_some()
+            || raw_spec.config.usize_max != Config::default().usize_max
+        {
+            continue;
+        }
+        let (arguments, answers) =
+            call_of(&program, raw_spec).map_err(|err| format!("line {}: {err}", raw_spec.line))?;
+        specs.push(NativeRunSpec {
+            entry: raw_spec.entry.clone(),
+            arguments,
+            arithmetic: raw_spec.arithmetic,
+            answers,
+        });
+    }
+    Ok((program, specs))
+}
+
 /// What the directives of one file came to.
 #[derive(Clone, Debug, Default)]
 pub struct Report {
@@ -1173,13 +1242,8 @@ fn check_with(source: &str, is_surface: bool) -> Report {
             continue;
         };
         report.runs += 1;
-        let arguments = match raw_spec
-            .arguments
-            .iter()
-            .map(|v| resolve_raw_value(&program, v))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(args) => args,
+        let (arguments, answers) = match call_of(&program, &raw_spec) {
+            Ok(call) => call,
             Err(err) => {
                 report
                     .failures
@@ -1187,37 +1251,6 @@ fn check_with(source: &str, is_surface: bool) -> Report {
                 continue;
             }
         };
-        let mut answers = Vec::with_capacity(raw_spec.answers.len());
-        let mut bad_answer = None;
-        for (ctrl, alt, raw_payload) in &raw_spec.answers {
-            let answered = program
-                .controls
-                .iter()
-                .find(|control| control.name == *ctrl);
-            match raw_payload
-                .iter()
-                .map(|v| resolve_answer_value(&program, answered, v))
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(payload) => answers.push((
-                    ctrl.clone(),
-                    Answer {
-                        alternative: alt.clone(),
-                        payload,
-                    },
-                )),
-                Err(err) => {
-                    bad_answer = Some(err);
-                    break;
-                }
-            }
-        }
-        if let Some(err) = bad_answer {
-            report
-                .failures
-                .push(format!("line {}: {err}", raw_spec.line));
-            continue;
-        }
         let expect = match &raw_spec.expect {
             RawExpect::Done {
                 alternative,
