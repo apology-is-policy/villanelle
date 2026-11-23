@@ -443,11 +443,10 @@ of slice 1:
   Its search has the shape of its proof: a split for each bound, with the
   splinters on one side and the tightened bound on the other. The refinement
   starts from the goal and the structure. A candidate that has a model is
-  completed to one of every term. Every premise that this model fails is
-  conjoined before the next candidate is taken, and where it fails none,
-  every instance that it fails: the instances bring the rows of quotients
-  and products, and those that a model far from the program fails are
-  mostly beside the point. A model that fails nothing is the counterexample, and the goal and every premise are
+  completed to one of every term. Every premise and every instance that
+  this model fails is conjoined before the next candidate is taken: a model
+  that fails one fails several, and each would cost a candidate.
+  A model that fails nothing is the counterexample, and the goal and every premise are
   evaluated in it before it is shown ([M1]). The truth of a row in a model
   is worked out when a formula reads it. A query has three
   answers besides a fault of the procedure itself: proved, refuted with a
@@ -486,16 +485,18 @@ names and terms in ordered tables, and a hash table is used only where
 nothing reads its order (the tables of the diagram, the tables that give
 a term or a row its number, and sets that are only asked whether they hold
 a thing). The counts of 23 November 2026, for the
-ten surface programs of the three slices: 552 queries, 689 candidates, 639
-theory checks of 8,397 rows, 1,476 premises added, and no exchange. For the
+ten surface programs of the three slices: 552 queries, 602 candidates, 551
+theory checks of 6,742 rows, 1,486 premises added, and no exchange. For the
 data kernel of slice 2 (`v2/tests/kernels/slice2_data.rails`): 212 queries,
-1,125 candidates, 786 theory checks of 45,172 rows, 1,454 exchanges that
-write 67,200 entries, and 689 splits.
+915 candidates, 581 theory checks of 35,051 rows, 3,240 exchanges that
+write 120,731 entries, and 2,375 splits.
 Over the 5,403 mutants of 25 generated programs: 1,116,283 queries,
-1,716,050 candidates, 1,552,087 theory checks of 27,456,158 rows, 346,577
-exchanges that write 3,358,331 entries, and 143,641 splits. No theory
-check of these programs, of the 300 generated ones or of the mutants goes
-on to the Omega test.
+1,408,543 candidates, 1,252,564 theory checks of 21,804,605 rows, 239,878
+exchanges that write 7,436,643 entries, and 80,203 splits. One of these
+theory checks goes on to the Omega test, which refutes its rows without a
+splinter; it accounts for 4.5 million of the entries. No theory check of
+the surface programs, of the data kernel or of the 300 generated programs
+does.
 
 `v2/tests/kernel.rs` tests the kernel's matcher: every instance of [A1],
 [A2] and [A7] to [A9] that it grants is evaluated with the values that the
@@ -521,8 +522,9 @@ programs, and the expansion of each); and the data kernel, its expansion,
 and a program whose exit condition rests on remainders and a product
 (`v2/tests/kernels/remainders_and_products.core`) are checked within a
 stated number of theory checks and of entries written. The last is a mutant
-that a campaign found: it is valid, and a search that added every failed
-instance at once did not decide it. A precondition on the difference of two
+that a campaign found: it is valid, one of its candidates has rows that
+the splits do not decide, and its answer was the limit of [J6] until the
+Omega test refuted that candidate. A precondition on the difference of two
 parameters, which bounds neither, holds the Omega test in the checker: the
 splits do not end on it, the answer was the limit of [J6], and it is now a
 proof with sixteen splinters that validates from the certificate text. The

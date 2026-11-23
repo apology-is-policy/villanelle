@@ -1444,8 +1444,8 @@ fn the_search_stays_small_on_the_kernel_program_of_slice_two() {
         let done = counts::now().since(&before);
         report.revalidate().expect("the kernel validates again");
         assert!(report.certificates.len() >= 170, "{name}");
-        assert!(done.theory_checks <= 1_200, "{name}: {done}");
-        assert!(done.entries <= 600_000, "{name}: {done}");
+        assert!(done.theory_checks <= 900, "{name}: {done}");
+        assert!(done.entries <= 400_000, "{name}: {done}");
         assert!(done.tableaus <= done.theory_checks, "{name}: {done}");
     }
 }
@@ -1453,10 +1453,11 @@ fn the_search_stays_small_on_the_kernel_program_of_slice_two() {
 /// The exit condition `7 ≥ r0` holds of
 /// `v17 * 5 mod 4 + v17 mod 4 * (v17 mod 8) mod 6` for `-18 ≤ v17 ≤ 18`,
 /// and it takes the remainders case by case to see it. The program is a
-/// mutant of a generated one (seed 18, a literal 3 shifted to 4). When the
-/// search added every instance that a model failed, whether or not the
-/// model failed a premise too, the candidates of this question had rows that
-/// the splits did not decide, and the question reached the limit of [J6].
+/// mutant of a generated one (seed 18, a literal 3 shifted to 4). The
+/// search adds every instance that a model fails, and one candidate of this
+/// question then has rows that the splits do not decide. The question
+/// reached the limit of [J6] until the theory check was complete; the Omega
+/// test now refutes that candidate.
 #[test]
 fn a_condition_on_remainders_and_products_is_decided() {
     let program = load(include_str!("kernels/remainders_and_products.core")).expect("resolved");
@@ -1469,6 +1470,7 @@ fn a_condition_on_remainders_and_products_is_decided() {
         "{}",
         report.certificates.len()
     );
-    assert!(done.theory_checks <= 1_400, "{done}");
-    assert!(done.entries <= 300_000, "{done}");
+    assert_eq!(done.omega_tests, 1, "{done}");
+    assert!(done.theory_checks <= 800, "{done}");
+    assert!(done.entries <= 8_000_000, "{done}");
 }

@@ -1397,14 +1397,12 @@ impl Solver {
                     self.complete_int_model(&candidate_literals, &assignment, &mut int_model);
                     let mut truth = Truth::new(&assignment, &int_model, self.theory_atoms.len());
 
-                    // Every premise that the model fails is added, not the
-                    // first alone: a model that fails one fails several,
-                    // and each would cost a candidate. Instances are added
-                    // only for a model that fails no premise. A model that
-                    // fails a fact is far from the program, and the
-                    // instances it fails are mostly beside the point; they
-                    // bring the rows of quotients and products, which are
-                    // the hard ones for the theory check.
+                    // Every premise and every instance that the model fails
+                    // is added, not the first alone: a model that fails one
+                    // fails several, and each would cost a candidate. The
+                    // instances bring the rows of quotients and products,
+                    // which are the hard ones for the theory check, and
+                    // which a candidate needs sooner or later.
                     let before = parts.len();
                     for (idx, &s) in self.structure.iter().enumerate() {
                         if !added_structure[idx] && !self.holds_in(s, &mut truth) {
@@ -1420,13 +1418,11 @@ impl Solver {
                             parts.push(Part::Fact(idx));
                         }
                     }
-                    if parts.len() == before {
-                        for (idx, added) in added_instances.iter_mut().enumerate() {
-                            if !*added && !self.holds_in(self.instances[idx].formula, &mut truth) {
-                                *added = true;
-                                working = self.bdd.and(working, self.instances[idx].formula);
-                                parts.push(Part::Instance(self.instances[idx].name.clone()));
-                            }
+                    for (idx, added) in added_instances.iter_mut().enumerate() {
+                        if !*added && !self.holds_in(self.instances[idx].formula, &mut truth) {
+                            *added = true;
+                            working = self.bdd.and(working, self.instances[idx].formula);
+                            parts.push(Part::Instance(self.instances[idx].name.clone()));
                         }
                     }
                     if parts.len() > before {
