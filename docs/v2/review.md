@@ -64,8 +64,8 @@ for every clause implemented.
 | Generator reaches every construct of the slice (phase 2 exit) | Met since 23 November (section 9, RG1) | Met since 23 November for the constructs: `generate::valid_data` (`vn2 fuzz --slice 2`) writes the data of the slice and the operations on it, resources with the obligations they bring, captured outcomes, faults, and lexical and named boundaries, valid by construction as slice 1 is, and reaches all 56 constructs that `generate::DATA_CONSTRUCTS` lists, beside the 61 of slice 1. Since 24 November it writes the three shapes that were missing. Of the first 300 programs, 105 have a boundary in the work of another, 63 a `recover ↑ ℓ` and 19 one of a loop further out than the body the boundary stands in; 148 have an operation with a parameter of an outcome type and 130 one with such a payload field (RG7) | No generator | No generator |
 | Oracle against erased semantics | 62 runs of the suite and 11,728 runs of 300 generated programs | The erased interpreter is a transcription of the oracle (RO7). Since 23 November it releases under a fault as the oracle does where one task runs (RO5; the part with tasks is open for slice 4), also after a boundary or a loop that did not run (RB12). 36,348 runs of 900 generated programs with data, resources, captured outcomes, faults and boundaries give the same observation; 3,732 of them end in a fault that leaves the entry and 1,338 with `terminate n` | As slice 2 | As slice 2 |
 | Mutations rejected at the rate the author sets (phase 3 exit) | Seven kinds on generated programs since 23 November, and with those of slice 2 nine that apply since 24 November. Every mutant for which a stuck run was found is rejected: 769 of 6,851 mutants of 25 programs (761 of 5,403 with the seven kinds), and 72 in the suite. The checker accepts 4,951 for which none was found. The rate is not set | Twelve kinds since 24 November: the seven of slice 1, in the bodies of boundaries too, and a statement removed, two statements in each other's place, a clone consumed, `faults` removed and `on fault release` removed. Every mutant for which a stuck run was found is rejected: 1,454 of 13,073 mutants of 40 generated programs; `resolve` refuses 1,608, and the checker accepts 9,385 for which none was found, and gives an answer in ten seconds on every one. A program written for the five kinds has a stuck mutant of each, in the states X1, X2, X5 and X8. The rate is not set | None | None |
-| No generated checked program is stuck over a long campaign (phase 3 exit) | No long campaign yet. The checker accepts all of 300 generated programs, none of which is stuck in 11,728 runs, and 5,403 mutants of 25 of them gave none that was accepted and stuck | The checker accepts 896 of 900 generated programs with data, resources, captured outcomes, faults and boundaries, none of which is stuck in 36,348 runs. It gives no answer in ten seconds on the other four (RC22). 13,073 mutants of 40 of them gave none that was accepted and stuck. No long campaign yet | None | None |
-| Compiled code agrees with the oracle on generated programs (phase 4 exit) | Since 23 November: 300 generated programs at both widths of `usize`, at `-O0` and `-O2`, 23,456 runs with no difference (`vn2 fuzz --native`); six of them with their expansions in the suite. No longer campaign yet | Since 23 November: 300 generated programs with data, resources, captured outcomes, faults and boundaries at both widths of `usize`, at `-O0` and `-O2`, 23,424 runs with no difference; the runs that end in a fault (1,249 of the 11,716 runs in the oracle) and with `terminate n` (325) are compared as the others are. The four files of the suite that the checker accepts whole run in compiled code too, 58 runs (RB1 to RB3, RB10, RB12). Since RB11 the harness counts the allocations of every compiled run, in this slice and the others, and a run that leaves one live is a difference: the 23,424 runs make 26,752 allocations and release each. No longer campaign yet | None | No backend; `emit-llvm` panics (RB9) |
+| No generated checked program is stuck over a long campaign (phase 3 exit) | No long campaign yet. The checker accepts all of 300 generated programs, none of which is stuck in 11,728 runs, and 5,403 mutants of 25 of them gave none that was accepted and stuck | The checker accepts all of 900 generated programs with data, resources, captured outcomes, faults and boundaries, none of which is stuck in 36,348 runs (896 before RC22 was closed, with no answer in ten seconds on the other four). 13,073 mutants of 40 of them gave none that was accepted and stuck. No long campaign yet | None | None |
+| Compiled code agrees with the oracle on generated programs (phase 4 exit) | Since 23 November: 300 generated programs at both widths of `usize`, at `-O0` and `-O2`, 23,456 runs with no difference (`vn2 fuzz --native`); six of them with their expansions in the suite. No longer campaign yet | Since 23 November: 300 generated programs with data, resources, captured outcomes, faults and boundaries at both widths of `usize`, at `-O0` and `-O2`, 23,432 runs with no difference; the runs that end in a fault (1,249 of the 11,716 runs in the oracle) and with `terminate n` (325) are compared as the others are. The four files of the suite that the checker accepts whole run in compiled code too, 58 runs (RB1 to RB3, RB10, RB12). Since RB11 the harness counts the allocations of every compiled run, in this slice and the others, and a run that leaves one live is a difference: the 23,432 runs make 26,768 allocations and release each. No longer campaign yet | None | No backend; `emit-llvm` panics (RB9) |
 | Every kernel under `experiments/` within 1.2× of optimized Rust (phase 4 exit) | None measured (RB6) | None measured | None measured | |
 
 Two exits concern the whole language and are not met: the oracle does not run
@@ -298,28 +298,48 @@ that file in the oracle only), and it knew in a contingency nothing of the
 histories on which the work faults.
 
 **RC22.** Found on 23 November by `vn2 fuzz --slice 2`: one of the first 300
-programs (`v2/tests/open/rc22_structs_in_loops.core`, 80 lines, no run of it
-stuck) gets no answer from the checker in two minutes. Its control `c1`
-takes structs apart in two nested loops and then decides on an extern
-control with structs for arguments. A sample of the running check shows the
-time in the conjunction of the premises into one diagram (`Solver::decide`,
-`Bdd::apply`). Without the loops the control is checked in 36 theory checks.
-It is not understood further. The programs with resources and captured
-outcomes gave two more of the first 300: `rc22_structs_of_bools.core`, which
-gets no answer in two minutes either and whose check took 800 megabytes of
-memory in its first five seconds, and `rc22_exchanges.core`, which the
-checker accepts after 27 seconds in which 136 theory checks write 81,786,060
-entries of tableaus. The second may be another defect than the first. With
-faults and boundaries one program of 900 gets no answer in 90 seconds
-(`rc22_faults_and_boundaries.core`); the three before it are programs of an
-earlier generator, which gives other programs for their seeds now. Since 24
-November the generator writes boundaries in the work of boundaries and
-outcome types in contracts, and four of 900 programs get no answer in ten
-seconds (seeds 287, 407, 591 and 767). `rc22_boundaries_in_works.core` is
-the smallest, 65 lines: the checker accepts it after about a minute in 275
-theory checks, with most of the time spent by the system on memory and no
-tableau exchanged, as with the first of the programs above and unlike
-`rc22_exchanges.core`.
+programs (80 lines, no run of it stuck) got no answer from the checker in
+two minutes. The generators of the days after gave four more: one that got
+no answer either and whose check held 800 megabytes after five seconds, one
+with faults and boundaries, one with a boundary in the work of another (65
+lines, accepted after a minute in 275 theory checks with no tableau
+exchanged), and one that the checker accepted after 27 seconds in which 136
+theory checks wrote 81,786,060 entries of tableaus. With the generator of
+24 November four of 900 programs got no answer in ten seconds. The five
+programs are in `v2/tests/kernels/`.
+
+Closed on 24 November. There were two defects, and a bound was missing.
+
+The first was in the models of the search. `Solver::decide` conjoins a
+premise or an instance where the model of a candidate fails it. The model
+had the number zero for every constructor term that the candidate did not
+speak of, and the theory check gave one number to all the terms of a sort
+without arithmetic that no row kept apart. Two constructor terms with
+different arguments were then one value in the model. That fails the
+instance of [A4] which says that equal terms have equal arguments, and the
+search conjoined it for every two such terms. Each brings the disequality
+of two numbers, which the diagram holds as a choice of their order, and
+the lemmas refute the orders one at a time. On the smallest program the
+formula of one question passed 540,000 nodes, and the check held 1.3
+gigabytes after twelve seconds. A model now gives a content one number
+(`v2/src/facts/completion.rs`; section 7 of the
+[fact logic](facts.md) says what a model of the crate is). The four
+programs are checked in 115 to 327 theory checks, and the diagrams of all
+their questions together hold 26,819 to 52,049 nodes.
+
+The second was in the theory check. One candidate of
+`kernels/exchanges.core` has no model, and the splits went on with it for
+26,213 tableaus before the Omega test refuted it in seven splinters. The
+test is now asked as soon as a search without a turn has found nothing,
+and the splits take turns after it. A search for a model is made after
+every round of rounded sums as well: a round has several times the rows of
+the round before (7,298 rows from 25 on one candidate of the data kernel),
+and a model that the first search missed is found with the rows of one
+round. The program takes 8,845,759 entries.
+
+The bound: nothing limited a diagram. A node that the diagram of a
+question grows by is now a step of [J6], and the nodes are a count that
+`vn2 check --counts` prints.
 
 **RC23.** Found on 23 November by probes for the generator of captured
 outcomes. [I12] of the fact logic gives a decision on a captured outcome the
@@ -554,8 +574,8 @@ ends with one allocation live at `-O0` and at `-O2`.
 release of a string out of the compiled text of the checked files and
 requires that the count sees it: 40 of 116 runs. So [R4] is tested on every
 run of compiled code. How much that tests is the number of allocations,
-which `vn2 fuzz --native` prints: the 23,424 runs of 300 programs of slice 2
-make 26,752, the programs of slice 1 none (they have no data), and the
+which `vn2 fuzz --native` prints: the 23,432 runs of 300 programs of slice 2
+make 26,768, the programs of slice 1 none (they have no data), and the
 checked files of the suite 78 (`erased_nested_ownership.core` none). The
 first campaign with the count found RB12; the suites of slices 1 to 3 had
 nothing live. Limits: the count is one number for a run, so a leak and a
@@ -692,7 +712,7 @@ A finding is closed here with the date and the test that holds it.
 | RC8 | Closed 23 November 2026. A component has the declared interval of its type only as a component of a value term, as [A9] of the [fact logic](facts.md) has it; read out of a constructor at any depth it is the term written there and has none. `a_component_read_out_of_a_constructor_has_no_declared_interval_a9`: a formula that holds for every `u32` and fails for `a + 1` at the end of the range is stuck in the oracle and refused, and the same formula of a component of a name is accepted |
 | RC20 | Closed 23 November 2026. The effects of a named boundary include those of the boundaries its `B₁` supervises (`resolve.rs`), as [F6] says of what supervises. `the_effects_of_a_supervised_boundary_count_toward_what_supervises_f3_f6`: a boundary that supervises one that writes is accepted, and the control that supervises it must allow the effect |
 | RC21 | Closed 23 November 2026. The statements of `B₂` have the histories of the statements of `B₁` that may fault: for a lexical boundary the disjunction of their reach, and for a named boundary, whose `B₂` is checked in a diagram of its own, all or none by whether one of them can happen. [F5] of the [core](core.md) says so now (section 12). `a_contingency_runs_on_the_histories_that_fault_f5_f6_p6` (`v2/tests/checker_slice2.rs`): five programs, each run in the oracle as well. |
-| RC22 | Open. Five programs are in `v2/tests/open/` (`rc22_structs_in_loops.core`, `rc22_structs_of_bools.core`, `rc22_exchanges.core`, `rc22_faults_and_boundaries.core`, `rc22_boundaries_in_works.core`); no test reads them. `the_checker_accepts_generated_programs_with_data` (`v2/tests/harness.rs`) asks the checker about the first 30 seeds, none of which is one of them now (`NO_ANSWER` is empty). Four of 900 generated programs are not answered in ten seconds |
+| RC22 | Closed 24 November 2026. A model of a candidate gives a content one number (`v2/src/facts/completion.rs`), the theory check asks the Omega test before its splits take turns and looks for a model after every round of rounded sums, and a node of a diagram is a step of [J6] and a count. The five programs are in `v2/tests/kernels/`. Tests: `the_diagram_stays_small_on_programs_with_constructor_terms` (four programs: at most 500 theory checks and 150,000 nodes each, where one question had passed 540,000 nodes), `rows_that_keep_the_splits_are_decided_by_the_omega_test` (8.8 million entries where there were 81.8 million) and `the_nodes_of_a_diagram_are_steps_j6` in `v2/tests/checker.rs`; `constructor_terms_are_one_value_exactly_where_their_contents_are_a4_m1` in `v2/tests/checker_slice2.rs` (one program accepted, two stuck and rejected). All 900 generated programs of slice 2 are answered, and both mutant campaigns give the answers they gave before, mutant for mutant: 6,851 mutants of 25 programs of slice 1 and 13,073 of 40 of slice 2 |
 | RC23 | Closed 23 November 2026. On the histories that did not see the capture, a decision on a captured outcome adds the conditions of the captured operation over fresh names, each of the type of its parameter; `old(p)` is another name than `p` for an `&~` parameter alone ([I12], section 14 of the [fact logic](facts.md)). `a_captured_outcome_keeps_its_conditions_where_the_capture_is_not_visible_i12` (`v2/tests/checker_slice2.rs`): through the payload of a loop, as the parameter of a loop, with one fresh name in two conjuncts of a condition; a condition that says less than the exit claims is stuck in the oracle and refused, and what a condition says of an argument is not known of the name that was the argument |
 | RC24 | Closed 24 November 2026. A name in the care of a boundary is, in the contingency, the constant expression that it was ([I3]). Test: `a_name_in_the_care_of_a_boundary_is_the_constant_it_was_i3` in `v2/tests/checker_slice2.rs` (a program that was refused, and one that is stuck and rejected); seed 781 of `vn2 fuzz --slice 2` |
 | RO5 | Closed 23 November 2026 for one task; open for tasks (slice 4). `the_erased_semantics_follows_ownership_through_nested_bodies` (`v2/tests/slice2.rs`) runs `v2/tests/slice2/erased_nested_ownership.core`: nine controls in which a loop, the work of a boundary or a loop inside the work consumes or assigns a name of the body around it before a fault, 12 runs, each with the trace of the oracle and each compared with the erased semantics; the checker accepts the file. Ten of the 12 runs differed before. The campaigns of `vn2 fuzz --slice 2` hold it on generated programs |

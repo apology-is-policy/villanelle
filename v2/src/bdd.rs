@@ -150,6 +150,11 @@ impl Bdd {
         result
     }
 
+    /// How many nodes the diagram holds.
+    pub fn nodes_made(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub fn and(&mut self, a: Formula, b: Formula) -> Formula {
         self.apply(0, a, b)
     }

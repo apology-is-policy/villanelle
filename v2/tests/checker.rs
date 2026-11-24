@@ -1474,3 +1474,93 @@ fn a_condition_on_remainders_and_products_is_decided() {
     assert!(done.theory_checks <= 800, "{done}");
     assert!(done.entries <= 8_000_000, "{done}");
 }
+
+/// Review finding RC22, held by counts. Four programs of the generator of
+/// slice 2 with structs, vectors and strings, on which the checker gave no
+/// answer in two minutes or answered after a minute with more than a
+/// gigabyte of diagram. The model of a candidate had one number, zero, for
+/// every constructor term that the candidate did not speak of, and for
+/// every class of terms that it only said were equal. So the model failed
+/// the instance "equal constructor terms have equal arguments" for every
+/// two terms with different arguments, the search added them all, and the
+/// diagram of the conjunction had hundreds of thousands of nodes for each
+/// of the lemmas about the order of the numbers. A model now has a number
+/// for a content (`facts/completion.rs`), and the nodes that the diagrams
+/// of a check hold are a count.
+#[test]
+fn the_diagram_stays_small_on_programs_with_constructor_terms() {
+    for (name, source) in [
+        (
+            "structs in loops",
+            include_str!("kernels/structs_in_loops.core"),
+        ),
+        (
+            "structs of bools",
+            include_str!("kernels/structs_of_bools.core"),
+        ),
+        (
+            "faults and boundaries",
+            include_str!("kernels/faults_and_boundaries.core"),
+        ),
+        (
+            "boundaries in works",
+            include_str!("kernels/boundaries_in_works.core"),
+        ),
+    ] {
+        let program = load(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let before = counts::now();
+        let report = check::check(&program).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let done = counts::now().since(&before);
+        report.revalidate().expect("the kernel validates again");
+        assert!(report.certificates.len() >= 150, "{name}");
+        assert!(done.theory_checks <= 500, "{name}: {done}");
+        assert!(done.premises <= 1_500, "{name}: {done}");
+        assert!(done.nodes <= 150_000, "{name}: {done}");
+    }
+}
+
+/// Review finding RC22, the part of the theory check. One candidate of this
+/// program has no model: a product of two remainders is at least 12, with
+/// the four rows that [A9] gives a product and the rows of eight quotients.
+/// The splits went on with it for 26,213 tableaus, in which the exchanges
+/// wrote 81 million entries, before the Omega test refuted it in seven
+/// splinters. The test is now asked as soon as a search without a turn has
+/// found nothing.
+#[test]
+fn rows_that_keep_the_splits_are_decided_by_the_omega_test() {
+    let program = load(include_str!("kernels/exchanges.core")).expect("resolved");
+    let before = counts::now();
+    let report = check::check(&program).unwrap_or_else(|error| panic!("{error}"));
+    let done = counts::now().since(&before);
+    report.revalidate().expect("the kernel validates again");
+    assert!(report.certificates.len() >= 100);
+    assert!(done.omega_tests >= 1, "{done}");
+    assert!(done.theory_checks <= 300, "{done}");
+    assert!(done.entries <= 20_000_000, "{done}");
+}
+
+/// A node that a diagram grows by in a question is a step of [J6]. The
+/// conjunction of the premises can be far larger than the premises, and a
+/// search that counted candidates, exchanges and splits alone was bounded
+/// in none of the memory it took (review finding RC22). The body below has
+/// sixteen tests of one name; every question about it is small in what the
+/// search counted before, and the diagram is what the limit ends.
+#[test]
+fn the_nodes_of_a_diagram_are_steps_j6() {
+    let mut source = String::from("pub control c(x : i32)\n    ■ { r } :=\n");
+    for index in 0..16 {
+        source.push_str(&format!("    ⊤ ▷ t{index} : ? x < {index}\n"));
+    }
+    source.push_str("    ⊤ ▷ ⊢ x ≤ 2147483647\n    ⊤ ▷ ■ r\n");
+    let before = counts::now();
+    let report = accept_core("P1", &source);
+    let done = counts::now().since(&before);
+    assert!(!report.certificates.is_empty());
+    let other_steps = done.candidates + done.tableaus + done.exchanges + done.splits;
+    assert!(other_steps < 60, "{done}");
+    assert!(done.nodes > 60, "{done}");
+
+    let error = facts::with_step_limit(60, || check_core(&source)).expect_err("no answer");
+    assert_eq!(error.clause, "J6", "{error}");
+    assert!(error.counterexample.is_none());
+}

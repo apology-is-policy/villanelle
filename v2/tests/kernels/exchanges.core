@@ -1,8 +1,11 @@
-// Open finding RC22 of docs/v2/review.md: a valid program, written by the
+// Review finding RC22 of docs/v2/review.md: a valid program, written by the
 // generator of slice 2 (seed 11 on 23 November 2026, with resources and
-// captured outcomes), which the checker accepts after 136 theory checks
-// that write 81,786,060 entries of tableaus in 158,958 exchanges. No run
-// of it is stuck. No test reads this file.
+// captured outcomes), which the checker accepted after 136 theory checks
+// that wrote 81,786,060 entries of tableaus in 158,958 exchanges: one
+// candidate without a model kept the splits for 26,213 tableaus, and the
+// Omega test then refuted it at once. No run of it is stuck. The test
+// `rows_that_keep_the_splits_are_decided_by_the_omega_test` of
+// `tests/checker.rs` reads this file.
 extern resource rs0
 
 contingent extern control k0(p0 : rs0) ■ { done {} }

@@ -1,7 +1,9 @@
-// Open finding RC22 of docs/v2/review.md: a valid program, written by the
+// Review finding RC22 of docs/v2/review.md: a valid program, written by the
 // generator of slice 2 (seed 56 on 23 November 2026), on which the checker
-// gives no answer in two minutes. No run of it is stuck. The control `c1`
-// alone is enough. No test reads this file.
+// gave no answer in two minutes. No run of it is stuck. The control `c1`
+// alone was enough. The test
+// `the_diagram_stays_small_on_programs_with_constructor_terms` of
+// `tests/checker.rs` reads this file.
 
 copy struct st0 {m0 : bool, m1 : u32, m2 : u32}
 

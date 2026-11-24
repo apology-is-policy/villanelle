@@ -40,15 +40,19 @@
 //! 6. **The Omega test** (`omega`), which decides every set of rows.
 //!    Splitting ends when the solutions are bounded; on rows that have
 //!    rational solutions without a bound and no integer one, and that the
-//!    first four parts do not decide, it can go on for ever. So part 5 has
-//!    half of the steps that are left when it begins, and where it runs out
-//!    of them, or of turns, part 6 starts from the rows as they were
-//!    given.
+//!    first four parts do not decide, it can go on for ever, and on rows
+//!    with bounds it can go on for tens of thousands of tableaus. So part
+//!    6 starts from the rows as they were given as soon as splitting
+//!    without a turn has found nothing, with half of the steps that are
+//!    left. Its splinters are as many as the coefficients are large; where
+//!    it runs out of steps, part 5 takes turns with the other half.
 //!
-//! Splitting without a turn is tried once before part 4. Most candidates
-//! have a model, and it is found in the tableau of the rows as they are:
-//! part 4 can add many times the rows it was given, and every exchange
-//! after that pays for them.
+//! Splitting without a turn is tried before part 4, and again after each
+//! round of it. Most candidates have a model, and it is found in the
+//! tableau of the rows as they are: part 4 can add many times the rows it
+//! was given, each round several times those of the round before, and
+//! every exchange after that pays for them. A model that the first search
+//! missed is often found with the rows of one round.
 //!
 //! With part 6 the method is complete: it ends without the count of steps
 //! on every set of rows. The count still ends a search that is too long,
@@ -1204,14 +1208,15 @@ pub fn solve(rows: &[Row], budget: &mut u64) -> Outcome {
             Ok(Found::Open) => {}
         }
         // Part 5 without a turn, before part 4 adds rows: most candidates
-        // have a model, and it is found in the small tableau.
-        if round == 0 {
-            match simplex.search(steps.len(), SPLIT_DEPTH, 0, budget) {
-                Err(Limit) => return Outcome::Limit,
-                Ok(Found::Refuted(found)) => return refuted(steps, found),
-                Ok(Found::Model(model)) => return finish(model, &removed),
-                Ok(Found::Open) => {}
-            }
+        // have a model, and it is found in the small tableau. Where it is
+        // not, the rows that part 4 adds may show the way to one, and each
+        // round of part 4 has several times the rows of the one before:
+        // the search is made again before the next.
+        match simplex.search(steps.len(), SPLIT_DEPTH, 0, budget) {
+            Err(Limit) => return Outcome::Limit,
+            Ok(Found::Refuted(found)) => return refuted(steps, found),
+            Ok(Found::Model(model)) => return finish(model, &removed),
+            Ok(Found::Open) => {}
         }
         if round == ROUNDS {
             break;
@@ -1229,17 +1234,29 @@ pub fn solve(rows: &[Row], budget: &mut u64) -> Outcome {
             }
         }
     }
-    // Part 5, with half of the steps that are left. The number of turns is
-    // raised step by step: a search to the end of the branches it prefers
-    // would not return from one in which every split leaves a rational
-    // solution.
+    // Part 6, with half of the steps that are left. The rows have kept
+    // their secret from a search without a turn in every round, and the
+    // splits can go on with such rows for tens of thousands of tableaus
+    // where the test decides them in a few sums.
     let mut share = *budget / 2;
     *budget -= share;
-    let mut turns = 0;
+    match complete(rows, steps.clone(), budget) {
+        Outcome::Limit => {}
+        answer => {
+            *budget += share;
+            return answer;
+        }
+    }
+    // Part 5 with turns, with the other half, where the test did not end:
+    // its splinters are as many as the coefficients are large. The number
+    // of turns is raised step by step: a search to the end of the branches
+    // it prefers would not return from one in which every split leaves a
+    // rational solution.
+    let mut turns = 1;
     loop {
         match simplex.search(steps.len(), SPLIT_DEPTH, turns, &mut share) {
             Err(Limit) => break,
-            Ok(Found::Open) if turns < SPLIT_DEPTH => turns = (2 * turns).max(1),
+            Ok(Found::Open) if turns < SPLIT_DEPTH => turns *= 2,
             Ok(Found::Open) => break,
             Ok(Found::Refuted(found)) => {
                 *budget += share;
@@ -1252,7 +1269,7 @@ pub fn solve(rows: &[Row], budget: &mut u64) -> Outcome {
         }
     }
     *budget += share;
-    complete(rows, steps, budget)
+    Outcome::Limit
 }
 
 /// Part 6, on the rows as they were given. `steps` holds the steps so far,

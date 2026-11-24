@@ -1,8 +1,10 @@
-// Open finding RC22 of docs/v2/review.md: a valid program, written by the
+// Review finding RC22 of docs/v2/review.md: a valid program, written by the
 // generator of slice 2 (seed 287 on 24 November 2026, with a boundary in
-// the work of another), which the checker accepts after about a minute, in
-// 275 theory checks: the time goes into memory and not into the search. No
-// run of it is stuck. No test reads this file.
+// the work of another), which the checker accepted after about a minute, in
+// 275 theory checks: the time went into the memory of a diagram and not
+// into the search. No run of it is stuck. The test
+// `the_diagram_stays_small_on_programs_with_constructor_terms` of
+// `tests/checker.rs` reads this file.
 ┄ seed 287
 copy struct st0 {m0 : bool}
 

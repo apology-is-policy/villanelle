@@ -144,8 +144,9 @@ minutes:
 `format`, `expand`, `emit-llvm`, `emit-c`, `run`, `print`, `fuzz`). `check
 --certificates` prints the certificate text, and `validate` reads one and
 validates it in the kernel. `check --counts` prints the work of the search
-as counts (theory checks, exchanges, entries written); measure the checker
-with them, since a time depends on the load of the machine. `vn2 fuzz --seed N
+as counts (theory checks, nodes of diagrams, exchanges, entries written);
+measure the checker with them, since a time depends on the load of the
+machine. `vn2 fuzz --seed N
 --count N [--slice 2] [--mutants] [--native] [--out DIR]` tries generated programs in the
 reader, the two semantics and the checker, their mutants, and with `--native`
 their compiled code, and prints the counts of the search over the campaign;

@@ -1,7 +1,9 @@
-// Open finding RC22 of docs/v2/review.md: a valid program, written by the
+// Review finding RC22 of docs/v2/review.md: a valid program, written by the
 // generator of slice 2 (seed 23 on 23 November 2026, with resources and
-// captured outcomes), on which the checker gives no answer in two minutes.
-// No run of it is stuck. No test reads this file.
+// captured outcomes), on which the checker gave no answer in two minutes.
+// No run of it is stuck. The test
+// `the_diagram_stays_small_on_programs_with_constructor_terms` of
+// `tests/checker.rs` reads this file.
 struct st0 {m0 : bool}
 
 function f0(a0 : usize, a1 : i16, a2 : i16) ⊢ a0 < 9 : u32 := 8 mod 7

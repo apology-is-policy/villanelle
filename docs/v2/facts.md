@@ -544,10 +544,11 @@ the bound that the small-model property of integer programs gives is another.
 **The integrality step of the crate in `v2/`** (`lia.rs`) is such a method.
 It replaces a variable that an equality defines, removes a variable
 whose coefficient is a unit on one side by adding up its bounds, rounds every
-row it derives, looks once for a model along the splits it prefers, adds the
-rounded sum of two rows where rounding says more than the rows did, and then
-splits, with half of the steps that it has left. Where the splits do not
-end, the Omega test decides the rows as they were given. In an equality
+row it derives, looks for a model along the splits it prefers, and adds the
+rounded sum of two rows where rounding says more than the rows did, in
+rounds, with a search for a model after each. Where that finds neither a
+model nor a contradiction, the Omega test decides the rows as they were
+given, with half of the steps that are left. In an equality
 without a unit coefficient it changes a variable for a new one, which is a
 sum of the terms, until a coefficient is a unit. For a variable that no
 side bounds with units it splits on each bound of one side, at a distance
@@ -560,7 +561,38 @@ of the step is right: a yes has a proof that the kernel validated, and a no
 has a model that was evaluated. The count of steps of [J6] still ends a
 search that is too long, and such a query is reported as the compiler's
 limit: the number of splinters grows with the coefficients, so the step
-ends on every set of rows and is not fast on every one.
+ends on every set of rows and is not fast on every one. Where the test
+runs out of its steps, the splits go on with the other half, and leave the
+branch they prefer a number of times that is raised step by step.
+
+**The search of the crate** (`facts.rs`) takes the premises as it needs
+them. It begins with the goal and `Ω`. A candidate that has a model is
+completed to a model of every term of the body; every fact and every
+instance is evaluated in it, and those that the model fails are conjoined
+before the next candidate is taken. A model that fails none is the
+counterexample of [M1]. Nothing that [J2] and [J3] ask for is left out by
+this: a yes is a diagram that is false, and it is false with every premise
+if it is false with some; a no is a model of them all. A node that the
+diagram grows by in a question is a step of [J6], so the memory of a
+question is bounded as its candidates are.
+
+What the search adds depends on the model, so the completion
+(`facts/completion.rs`) makes the model as values are. A quotient, a
+remainder and a product are what their operands make them. A value of a
+sort without arithmetic is, in a structure of [J1], an element of a set,
+and the crate writes it as a number that says only which element it is.
+The theory check sees such terms only in rows that say two of them are
+equal, or which of two is the smaller, and answers with one number for all
+that no row keeps apart. The completion gives them the numbers of their
+contents instead: a constructor term, a vector literal and a string
+literal have one number for one content and another for every other
+content, in an order that the rows of the candidate hold in, and a field,
+a length and a tag are those of the constructor term that has the number.
+With one number for two contents a model fails, for every two constructor
+terms with different arguments, the instance that says equal terms have
+equal arguments ([A4], [A5]). A search that added all of those for a body
+with a dozen such terms built a diagram of more than a million nodes, and
+gave no answer in two minutes (finding RC22 of the review).
 
 Two properties keep the work small. Step 2 settles most obligations of ordinary
 code in step 3, as in section 2.1: a test and the obligation it serves are the
@@ -1004,3 +1036,15 @@ it.
    constant was no constant in the contingency, and it refused a program
    of the generator in which a product with such a name decides a test
    (review finding RC24). The care list moves the value and binds nothing.
+12. **24 November 2026, section 7: the search of the crate, its models and
+   the order of the integrality step.** The section described the
+   reference procedure and the integrality step of the crate, and not how
+   the crate takes its premises, which is by the models of its candidates.
+   A model had the number zero for every constructor term that the
+   candidate did not speak of, the search added an instance for every two
+   of them, and the checker gave no answer on four programs of the
+   generator of slice 2 (finding RC22 of the review). The notes now say
+   what a model of the crate is, that a node of a diagram is a step of
+   [J6], and that the Omega test is asked before the splits take turns:
+   one candidate of a fifth program kept the splits for 26,213 tableaus
+   and was refuted by the test in seven splinters. No clause changed.

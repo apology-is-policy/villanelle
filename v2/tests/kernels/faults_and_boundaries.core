@@ -1,7 +1,9 @@
-// Open finding RC22 of docs/v2/review.md: a valid program, written by the
+// Review finding RC22 of docs/v2/review.md: a valid program, written by the
 // generator of slice 2 (seed 362 on 23 November 2026, with faults and
-// boundaries), on which the checker gives no answer in 90 seconds. No run
-// of it is stuck. No test reads this file.
+// boundaries), on which the checker gave no answer in 90 seconds. No run
+// of it is stuck. The test
+// `the_diagram_stays_small_on_programs_with_constructor_terms` of
+// `tests/checker.rs` reads this file.
 extern resource rs0
 
 contingent extern control k0(p0 : rs0) ■ { done {} }

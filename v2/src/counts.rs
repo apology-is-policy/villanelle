@@ -31,6 +31,10 @@ pub struct Counts {
     pub models: u64,
     /// Premises and instances that a model failed, and that were added.
     pub premises: u64,
+    /// Nodes that the diagrams of the search came to hold, counted where a
+    /// question ends. A diagram is the memory of a check, and no other
+    /// count shows it.
+    pub nodes: u64,
     /// Tableaus built, exchanges made in them, and entries written by the
     /// exchanges.
     pub tableaus: u64,
@@ -54,6 +58,7 @@ thread_local! {
         refuted: 0,
         models: 0,
         premises: 0,
+        nodes: 0,
         tableaus: 0,
         exchanges: 0,
         entries: 0,
@@ -121,6 +126,7 @@ impl Counts {
             refuted: self.refuted + other.refuted,
             models: self.models + other.models,
             premises: self.premises + other.premises,
+            nodes: self.nodes + other.nodes,
             tableaus: self.tableaus + other.tableaus,
             exchanges: self.exchanges + other.exchanges,
             entries: self.entries + other.entries,
@@ -141,6 +147,7 @@ impl Counts {
             refuted: self.refuted - earlier.refuted,
             models: self.models - earlier.models,
             premises: self.premises - earlier.premises,
+            nodes: self.nodes - earlier.nodes,
             tableaus: self.tableaus - earlier.tableaus,
             exchanges: self.exchanges - earlier.exchanges,
             entries: self.entries - earlier.entries,
@@ -156,8 +163,8 @@ impl std::fmt::Display for Counts {
         write!(
             out,
             "{} queries, {} candidates ({} by an earlier lemma), {} theory checks of {} rows \
-             ({} refuted, {} with a model), {} premises added, {} tableaus, {} exchanges \
-             writing {} entries, {} splits, {} Omega tests with {} splinters",
+             ({} refuted, {} with a model), {} premises added, {} nodes of diagrams, {} tableaus, \
+             {} exchanges writing {} entries, {} splits, {} Omega tests with {} splinters",
             self.queries,
             self.candidates,
             self.lemmas_reused,
@@ -166,6 +173,7 @@ impl std::fmt::Display for Counts {
             self.refuted,
             self.models,
             self.premises,
+            self.nodes,
             self.tableaus,
             self.exchanges,
             self.entries,

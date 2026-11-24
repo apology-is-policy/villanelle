@@ -32,7 +32,7 @@ can be read on its own. Nothing in it is built for speed.
 | `syntax`, `text` | The core text form (section 3): its tree, printer and reader |
 | `surface` | The Rails surface syntax ([surface](surface.md)): layout ([Y1] to [Y10]), grammar ([G1] to [G10]), elaboration ([U1] to [U15]) into `syntax::Program` and surface warnings ([U5], [U17], [U18]) (section 9) |
 | `typed`, `resolve` | The typed core, and what is checked on the way to it (section 4) |
-| `bdd`, `facts`, `kernel` | The ROBDD engine; the `Th_Z` fact logic with its search and its counterexamples ([M1] to [M6]); and the certificate kernel, which is given the query by the checker, makes the formula of every instance from its name with its own matcher for the axiom list, checks the proof of every lemma (a tree of the steps of [V3], with Split) and recomputes the Boolean step in a diagram of its own ([V1] to [V4]) (section 10) |
+| `bdd`, `facts`, `kernel` | The ROBDD engine; the `Th_Z` fact logic with its search, the models of its candidates (`facts/completion.rs`) and its counterexamples ([M1] to [M6]); and the certificate kernel, which is given the query by the checker, makes the formula of every instance from its name with its own matcher for the axiom list, checks the proof of every lemma (a tree of the steps of [V3], with Split) and recomputes the Boolean step in a diagram of its own ([V1] to [V4]) (section 10) |
 | `certificate` | The text of certificates ([V5]): the writer, and a reader that makes the tables, the goals and the premises from a text alone and gives them to the kernel (section 10) |
 | `counts` | The work of the search as counts for each thread, which `vn2 check --counts` prints; nothing reads them to decide anything (section 10) |
 | `terms`, `lia`, `rational` | The terms, rows, proofs, names of instances and certificates that the search and the kernel both read; the theory check for the rows of a candidate, which answers with a model, a proof or the counted limit of [J6], and whose last part, the Omega test (`lia/omega.rs`), decides rows without bounds (section 7 of the [fact logic](facts.md) has a note on the method); and the rationals of its simplex method |
@@ -405,8 +405,8 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   checker about 30; over 900 seeds `vn2 fuzz --slice 2` gives
   36,348 runs with no stuck run and no difference, of which 3,732 end in a
   fault and 1,338 with `terminate n`, and the
-  checker accepts 896 programs and does not answer on
-  four in ten seconds (review finding RC22).
+  checker accepts all 900 (it gave no answer in ten seconds on four of
+  them before review finding RC22 was closed).
 - **Obligations in generated programs.** A program with data declares up to
   two resources, and for each a contingent extern control that takes a
   value of it and ends it. A value of kind `must` ([T1]) is a resource, a
@@ -511,8 +511,8 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   many allocations the compiled runs made. With
   `VN2_KEEP_IR=DIR` in the environment the text of every
   compiled module is kept in `DIR`. For slice 2 on 24 November 2026:
-  300 programs, 23,424 runs of compiled programs with no difference, which
-  make 26,752 allocations.
+  300 programs, 23,432 runs of compiled programs with no difference, which
+  make 26,768 allocations.
   `--mutants` tries every mutant too, where a
   mutant that the checker accepts must have no stuck run. A run of a mutant
   has 20,000 steps (`--mutant-fuel`), a tenth of the steps of a run of a
@@ -533,7 +533,9 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   counts for each kind, and the seven kinds of before have their numbers
   of before. For slice 2 (`--slice 2 --mutants`, 40 programs): 13,073
   mutants, 1,608 refused, 2,080 rejected (1,454 with a stuck run), 9,385
-  accepted with no stuck run, and gives an answer in ten seconds on every one. The time
+  accepted with no stuck run, and gives an answer in ten seconds on every one.
+  These numbers are the same before and after the search was changed for
+  review finding RC22. The time
   limit of the checker is of the clock. A check that reaches it ends
   (`counts::set_deadline`: the search asks for the time now and then, and
   so does the diagram package as a diagram grows); before 23 November it
@@ -632,11 +634,12 @@ of slice 1:
   product envelopes from declared intervals ([A9]), lazy CEGAR refinement over
   `Ω`, `Ψ` and `[J3]`, and the theory check of `lia`: equalities replaced,
   variables with a unit coefficient projected out, the simplex method over
-  the rationals, a first search for a model along the splits, rounded sums,
-  splits, and behind them the Omega test, with a proof as a tree of the
-  steps of [V3] that is pruned to what its ends rely on. The splits have
-  half of the steps that are left; where they do not end, the Omega test
-  starts from the rows as they were given. It changes variables in an
+  the rationals, a search for a model along the splits before each round
+  of rounded sums, the Omega test, and behind it splits that take turns,
+  with a proof as a tree of the steps of [V3] that is pruned to what its
+  ends rely on. The Omega test has half of the steps that are left and
+  starts from the rows as they were given; where it does not end, the
+  splits have the other half. It changes variables in an
   equality without a unit coefficient, and for a variable that no side
   bounds with units it tries the sums of the bounds as they are, then the
   sums of the bounds tightened by the distance that the coefficients fix,
@@ -644,9 +647,18 @@ of slice 1:
   Its search has the shape of its proof: a split for each bound, with the
   splinters on one side and the tightened bound on the other. The refinement
   starts from the goal and the structure. A candidate that has a model is
-  completed to one of every term. Every premise and every instance that
+  completed to one of every term (`facts/completion.rs`): a quotient, a
+  remainder and a product are what their operands make them; a constructor
+  term, a vector literal and a string literal are the number of their
+  content, one number for one content; the terms that the candidate only
+  says are equal, or in an order, get the numbers of their contents in
+  that order; and a field, a length and a tag are those of the constructor
+  term that has the number. Every premise and every instance that
   this model fails is conjoined before the next candidate is taken: a model
-  that fails one fails several, and each would cost a candidate.
+  that fails one fails several, and each would cost a candidate. A model
+  that had one number for two contents failed an instance for every two
+  constructor terms (review finding RC22). A node that the diagram grows
+  by is a step of the limit of [J6].
   A model that fails nothing is the counterexample, and the goal and every premise are
   evaluated in it before it is shown ([M1]). The truth of a row in a model
   is worked out when a formula reads it. A query has three
@@ -676,7 +688,8 @@ of slice 1:
   iteration notes ([M4]).
 
 **The work of the search is measured by counts** (`counts`): queries,
-candidates, theory checks and their rows, premises added, tableaus,
+candidates, theory checks and their rows, premises added, the nodes that
+the diagrams came to hold, tableaus,
 exchanges of the simplex method with the entries they write, splits, and
 the theory checks that went on to the Omega test with the splinters it
 tried. `vn2 check --counts` prints them, and `vn2 fuzz` prints their sum
@@ -685,22 +698,25 @@ under every load, and by [J6] the same in every run: the checker keeps
 names and terms in ordered tables, and a hash table is used only where
 nothing reads its order (the tables of the diagram, the tables that give
 a term or a row its number, and sets that are only asked whether they hold
-a thing). The counts of 23 November 2026, for the
-ten surface programs of the three slices: 552 queries, 602 candidates, 551
-theory checks of 6,742 rows, 1,486 premises added, and no exchange. For the
+a thing). The counts of 24 November 2026, for the
+ten surface programs of the three slices: 553 queries, 568 candidates, 536
+theory checks of 5,012 rows, 1,015 premises added, 23,301 nodes, and no
+exchange. For the
 data kernel of slice 2 (`v2/tests/kernels/slice2_data.rails`): 212 queries,
-915 candidates, 581 theory checks of 35,051 rows, 3,240 exchanges that
-write 120,731 entries, and 2,375 splits.
-Over the 5,403 mutants of 25 generated programs: 1,116,283 queries,
-1,408,543 candidates, 1,252,564 theory checks of 21,804,605 rows, 239,878
-exchanges that write 7,436,643 entries, and 80,203 splits (over the 6,851
-mutants that the same programs have since 24 November: 1,323,287 queries,
-1,664,289 candidates, 1,480,640 theory checks of 25,703,845 rows, 276,477
-exchanges that write 7,881,928 entries, and 90,888 splits). One of these
-theory checks goes on to the Omega test, which refutes its rows without a
-splinter; it accounts for 4.5 million of the entries. No theory check of
-the surface programs, of the data kernel or of the 300 generated programs
-does.
+607 candidates, 490 theory checks of 16,239 rows, 95,568 nodes, 1,299
+exchanges that write 35,514 entries, and 632 splits (before a model gave a
+content one number: 915 candidates and 581 theory checks of 35,051 rows).
+Over the 6,851 mutants of 25 generated programs: 1,323,287 queries,
+1,664,289 candidates, 1,480,640 theory checks of 25,703,861 rows,
+274,463,989 nodes, 264,489 exchanges that write 3,515,700 entries, and
+84,201 splits. Six of these theory checks go on to the Omega test, with 24
+splinters between them; before the test was asked ahead of the splits that
+take turns, one did, and the exchanges wrote 7,881,928 entries. Over the
+13,073 mutants of 40 programs of slice 2: 2,836,869 queries, 2,215,849
+theory checks of 27,946,898 rows, 3,814,652 premises added, 453,442,725
+nodes, and 8,743,177 exchanges that write 248,677,216 entries (before:
+2,428,111 theory checks of 45,332,785 rows, 7,173,936 premises added, and
+357,502,067 entries). The answers are the same, mutant for mutant.
 
 `v2/tests/kernel.rs` tests the kernel's matcher: every instance of [A1],
 [A2] and [A7] to [A9] that it grants is evaluated with the values that the
@@ -731,7 +747,15 @@ the splits do not decide, and its answer was the limit of [J6] until the
 Omega test refuted that candidate. A precondition on the difference of two
 parameters, which bounds neither, holds the Omega test in the checker: the
 splits do not end on it, the answer was the limit of [J6], and it is now a
-proof with sixteen splinters that validates from the certificate text. The
+proof with sixteen splinters that validates from the certificate text.
+Five programs of the generator of slice 2 on which the checker gave no
+answer, or one after a minute (review finding RC22), are in
+`v2/tests/kernels/` too: four are checked within a stated number of theory
+checks, of premises and of nodes of diagrams, and the fifth, in which a
+candidate without a model kept the splits, within a stated number of
+entries. A body of sixteen tests has no answer with sixty steps, though
+its questions take fewer candidates, tableaus, exchanges and splits than
+that: the nodes of its diagram are steps. The
 same test holds the limit that remains: a wedge between two lines with
 coefficients of a million has no integer point and about a million
 splinters, and its answer is the limit of [J6], after 283,119 splinters

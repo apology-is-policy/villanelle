@@ -2411,3 +2411,80 @@ fn mutations_of_ownership_are_stuck_and_rejected() {
     );
     assert_eq!(states(Kind::DropFaultRelease), ["X8 E-Unwind"], "{stuck:?}");
 }
+
+#[test]
+fn constructor_terms_are_one_value_exactly_where_their_contents_are_a4_m1() {
+    // Review finding RC22. The model that the search completes for a
+    // candidate gives a constructor term the number of its content
+    // (`facts/completion.rs`), and nothing of that decides an answer: a
+    // premise or an instance that the model fails is added, and a model
+    // that fails none is evaluated in the goal and in every premise
+    // ([M1]). The programs here are decided by what [A4] says of two
+    // constructor terms, with the terms equal and different in every way
+    // that the completion numbers them: by an argument that is a value of
+    // the program, by a pattern that takes a term apart, and by a copy.
+    let declarations = "copy struct flag {on : bool}\nstruct pair {left : flag, right : u8}\n";
+    done_and_accepted(
+        "A4",
+        &[
+            declarations,
+            r#"
+control c(p : u32)
+    ■ { r {} }
+    1  ⊤ ▷ flag {a} := flag {p = 6}
+    2  ⊤ ▷ flag {b} := flag {p ≠ 6}
+    3  ⊤ ▷ f : flag := flag {p > 5 ∧ p < 7}
+    4  ⊤ ▷ g : flag := f
+    5  ⊤ ▷ pair {h, n} := pair {g, 3}
+    6  ⊤ ▷ ⊢ (a ∨ b) ∧ ¬(a ∧ b)
+    7  ⊤ ▷ ⊢ (h.on ∧ a ∨ ¬h.on ∧ b) ∧ n = 3
+    8  ⊤ ▷ ■ r {}
+
+//! run c(6) => done r
+//! run c(7) => done r
+"#,
+        ]
+        .concat(),
+    );
+    // Two terms with the same argument are one value, so a field of one is
+    // the field of the other: the claim that they differ is refuted, with a
+    // model in which the two are one number.
+    stuck_and_rejected(
+        "P1",
+        &[
+            declarations,
+            r#"
+control c(p : u32)
+    ■ { r {} }
+    1  ⊤ ▷ flag {a} := flag {p = 6}
+    2  ⊤ ▷ f : flag := flag {p > 5 ∧ p < 7}
+    3  ⊤ ▷ ⊢ a ∧ ¬f.on ∨ ¬a ∧ f.on
+    4  ⊤ ▷ ■ r {}
+
+//! run c(6) => stuck X7 E-Oblige
+"#,
+        ]
+        .concat(),
+    );
+    // Two terms with different arguments are two values: the claim that a
+    // field of one is that of the other is refuted for the argument that
+    // makes them differ.
+    stuck_and_rejected(
+        "P1",
+        &[
+            declarations,
+            r#"
+control c(p : u32)
+    ■ { r {} }
+    1  ⊤ ▷ flag {a} := flag {p = 6}
+    2  ⊤ ▷ flag {b} := flag {p ≠ 6}
+    3  ⊤ ▷ pair {h, n} := pair {flag {b}, 3}
+    4  ⊤ ▷ ⊢ h.on ∧ a ∨ ¬h.on ∧ ¬a
+    5  ⊤ ▷ ■ r {}
+
+//! run c(6) => stuck X7 E-Oblige
+"#,
+        ]
+        .concat(),
+    );
+}

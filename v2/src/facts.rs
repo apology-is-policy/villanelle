@@ -10,6 +10,8 @@
 //! search: it makes the formula of every instance again, by its own
 //! statement of the axioms.
 
+mod completion;
+
 use crate::bdd::{self, Bdd, Formula};
 use crate::counts;
 use crate::int::Int;
@@ -183,11 +185,17 @@ pub struct Solver {
     instantiated_terms: HashSet<TermId>,
     instantiated_pairs: HashSet<(TermId, TermId)>,
     instantiated_ext: HashSet<(TermId, TermId)>,
+    /// The terms that are no constructor terms and have a field term for
+    /// every field of their struct, with those field terms: the sides of
+    /// the instances of extensionality, which model completion reads too.
+    whole: Vec<(TermId, StructId, Vec<TermId>)>,
     instantiated_update_frames: HashSet<(TermId, LinearTerm)>,
     /// Theory lemmas learned across queries of this body.
     pub lemmas: Vec<TheoryLemma>,
     /// The count of steps that one query may take ([J6]).
     pub step_limit: u64,
+    /// The nodes of the diagram that the counts have ([`counts::Counts`]).
+    counted_nodes: usize,
 }
 
 impl Solver {
@@ -212,9 +220,11 @@ impl Solver {
             instantiated_terms: HashSet::new(),
             instantiated_pairs: HashSet::new(),
             instantiated_ext: HashSet::new(),
+            whole: Vec::new(),
             instantiated_update_frames: HashSet::new(),
             lemmas: Vec::new(),
             step_limit: STEP_LIMIT_HERE.with(std::cell::Cell::get),
+            counted_nodes: 0,
         };
         solver.usize_max_term = solver.intern_term(AtomTerm::UsizeMax);
         solver
@@ -1002,9 +1012,11 @@ impl Solver {
         // fields (none for a constructor term), and the fields.
         type Side = (TermId, Vec<TermId>, Vec<LinearTerm>);
         let mut by_struct: BTreeMap<StructId, Vec<Side>> = BTreeMap::new();
+        self.whole.clear();
         for ((base_id, sid), slots) in fields_by_base_struct {
             if slots.iter().all(Option::is_some) {
                 let named: Vec<TermId> = slots.into_iter().flatten().collect();
+                self.whole.push((base_id, sid, named.clone()));
                 let fields = named.iter().map(|id| LinearTerm::var(*id)).collect();
                 by_struct
                     .entry(sid)
@@ -1163,104 +1175,6 @@ impl Solver {
         self.bdd.not(conj)
     }
 
-    fn complete_int_model(
-        &self,
-        candidate_literals: &[(TheoryAtomId, bool)],
-        assignment: &BTreeMap<usize, bool>,
-        int_model: &mut BTreeMap<TermId, Int>,
-    ) {
-        let mut constrained = HashSet::new();
-        for &(atom_id, _) in candidate_literals {
-            for &var in self.theory_atoms[atom_id].coeffs.keys() {
-                constrained.insert(var);
-            }
-        }
-        let u32_max = Int::power_of_two(32).minus(&Int::from_u64(1));
-
-        for _ in 0..8 {
-            let mut changed = false;
-            for (id, term) in self.terms.iter().enumerate() {
-                if constrained.contains(&id) {
-                    continue;
-                }
-                let val = match term {
-                    AtomTerm::UsizeMax => Some(u32_max.clone()),
-                    AtomTerm::DivConst(t, k) => {
-                        Some(t.eval(int_model).divide(k).map_or(Int::zero(), |p| p.0))
-                    }
-                    AtomTerm::Div(s, t) => Some(
-                        s.eval(int_model)
-                            .divide(&t.eval(int_model))
-                            .map_or(Int::zero(), |p| p.0),
-                    ),
-                    AtomTerm::Rem(s, t) => Some(
-                        s.eval(int_model)
-                            .divide(&t.eval(int_model))
-                            .map_or(Int::zero(), |p| p.1),
-                    ),
-                    AtomTerm::Mul { left, right, .. } => {
-                        Some(left.eval(int_model).times(&right.eval(int_model)))
-                    }
-                    AtomTerm::Len(base) => base.as_var().and_then(|bid| match &self.terms[bid] {
-                        AtomTerm::VecLit(items) => Some(Int::from_u64(items.len() as u64)),
-                        AtomTerm::EmptyMap => Some(Int::zero()),
-                        _ => None,
-                    }),
-                    AtomTerm::VariantTag { base, .. } => {
-                        base.as_var().and_then(|bid| match &self.terms[bid] {
-                            AtomTerm::VariantCtor { ctor_idx, .. } => {
-                                Some(Int::from_u64(*ctor_idx as u64))
-                            }
-                            _ => None,
-                        })
-                    }
-                    AtomTerm::Var { .. }
-                    | AtomTerm::PureAlt(_, _)
-                    | AtomTerm::PurePay(_, _, _, _)
-                    | AtomTerm::StrLit(_)
-                    | AtomTerm::EmptyMap
-                    | AtomTerm::VecLit(_)
-                    | AtomTerm::StructCtor(_, _)
-                    | AtomTerm::Field { .. }
-                    | AtomTerm::VariantCtor { .. }
-                    | AtomTerm::Index { .. }
-                    | AtomTerm::Update { .. }
-                    | AtomTerm::Trim(_) => None,
-                };
-                if let Some(v) = val
-                    && int_model.get(&id) != Some(&v)
-                {
-                    int_model.insert(id, v);
-                    changed = true;
-                }
-            }
-
-            // The guards are read in the values as they are here, whatever
-            // the definitions below then change.
-            let values = int_model.clone();
-            let mut truth = Truth::new(assignment, &values, self.theory_atoms.len());
-            for (guard, var_id, rhs) in &self.definitions {
-                if constrained.contains(var_id) || !self.holds_in(*guard, &mut truth) {
-                    continue;
-                }
-                let v = match rhs {
-                    DefRhs::Linear(term) => term.eval(int_model),
-                    DefRhs::BoolFormula(phi) => {
-                        let b = self.holds_in(*phi, &mut truth);
-                        Int::from_u64(u64::from(b))
-                    }
-                };
-                if int_model.get(var_id) != Some(&v) {
-                    int_model.insert(*var_id, v);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-    }
-
     /// Whether `formula` holds in a model. The truth of a row is worked out
     /// when the formula first asks for it: a formula reads the variables of
     /// one path, and a body has many more rows than that.
@@ -1301,6 +1215,37 @@ impl Solver {
         visible_vars: &[(String, TermId, bool)],
         in_loop: bool,
     ) -> Decision {
+        let decision = self.search(negated_goal, visible_vars, in_loop);
+        let nodes = self.bdd.nodes_made();
+        let made = (nodes - self.counted_nodes) as u64;
+        self.counted_nodes = nodes;
+        counts::count(|counts| counts.nodes += made);
+        decision
+    }
+
+    /// Conjoins `formula` with the formula of the search so far. A node that
+    /// the diagram grows by is a step of [J6]: a conjunction can be far
+    /// larger than what it is made of, and a search that is bounded in its
+    /// candidates alone is not bounded in its memory. `None` where the
+    /// steps are spent.
+    fn conjoin(&mut self, working: Formula, formula: Formula, budget: &mut u64) -> Option<Formula> {
+        let before = self.bdd.nodes_made();
+        let both = self.bdd.and(working, formula);
+        let made = (self.bdd.nodes_made() - before) as u64;
+        if made >= *budget {
+            *budget = 0;
+            return None;
+        }
+        *budget -= made;
+        Some(both)
+    }
+
+    fn search(
+        &mut self,
+        negated_goal: Formula,
+        visible_vars: &[(String, TermId, bool)],
+        in_loop: bool,
+    ) -> Decision {
         self.instantiate_all();
         counts::count(|counts| counts.queries += 1);
         let mut working = negated_goal;
@@ -1311,10 +1256,16 @@ impl Solver {
         // What the certificate of a yes names, in the order of the search.
         let mut parts = Vec::new();
         let mut budget = self.step_limit;
+        let limit = Decision::Limit {
+            steps: self.step_limit,
+        };
 
-        for (idx, &s) in self.structure.iter().enumerate() {
-            working = self.bdd.and(working, s);
-            added_structure[idx] = true;
+        for (idx, added) in added_structure.iter_mut().enumerate() {
+            let Some(both) = self.conjoin(working, self.structure[idx], &mut budget) else {
+                return limit;
+            };
+            working = both;
+            *added = true;
             parts.push(Part::Structure(idx));
         }
 
@@ -1338,7 +1289,10 @@ impl Solver {
                     counts::count(|counts| counts.lemmas_reused += 1);
                     let lemma = self.lemmas[idx].clone();
                     let lf = self.lemma_formula(&lemma);
-                    working = self.bdd.and(working, lf);
+                    let Some(both) = self.conjoin(working, lf, &mut budget) else {
+                        return limit;
+                    };
+                    working = both;
                     parts.push(Part::Lemma(lemma));
                     continue 'search;
                 }
@@ -1382,10 +1336,13 @@ impl Solver {
                         proof,
                     };
                     let lf = self.lemma_formula(&lemma);
-                    working = self.bdd.and(working, lf);
                     self.lemmas.push(lemma.clone());
                     added_lemmas.push(true);
                     parts.push(Part::Lemma(lemma));
+                    let Some(both) = self.conjoin(working, lf, &mut budget) else {
+                        return limit;
+                    };
+                    working = both;
                 }
                 lia::Outcome::Sat(mut int_model) => {
                     counts::count(|counts| counts.models += 1);
@@ -1394,7 +1351,15 @@ impl Solver {
                             "the theory check gave a model that fails the row {row:?}"
                         ));
                     }
-                    self.complete_int_model(&candidate_literals, &assignment, &mut int_model);
+                    self.complete_int_model(&rows, &assignment, &mut int_model);
+                    // The completion numbers terms of the rows anew, so the
+                    // rows are evaluated again: every premise that the
+                    // search has conjoined holds in the model by them.
+                    if let Some(row) = rows.iter().find(|row| !row.holds(&int_model)) {
+                        return Decision::Fault(format!(
+                            "the completed model of a candidate fails the row {row:?}"
+                        ));
+                    }
                     let mut truth = Truth::new(&assignment, &int_model, self.theory_atoms.len());
 
                     // Every premise and every instance that the model fails
@@ -1404,26 +1369,33 @@ impl Solver {
                     // which are the hard ones for the theory check, and
                     // which a candidate needs sooner or later.
                     let before = parts.len();
+                    let mut failed = Vec::new();
                     for (idx, &s) in self.structure.iter().enumerate() {
                         if !added_structure[idx] && !self.holds_in(s, &mut truth) {
                             added_structure[idx] = true;
-                            working = self.bdd.and(working, s);
+                            failed.push(s);
                             parts.push(Part::Structure(idx));
                         }
                     }
                     for (idx, &f) in self.facts.iter().enumerate() {
                         if !added_facts[idx] && !self.holds_in(f, &mut truth) {
                             added_facts[idx] = true;
-                            working = self.bdd.and(working, f);
+                            failed.push(f);
                             parts.push(Part::Fact(idx));
                         }
                     }
                     for (idx, added) in added_instances.iter_mut().enumerate() {
                         if !*added && !self.holds_in(self.instances[idx].formula, &mut truth) {
                             *added = true;
-                            working = self.bdd.and(working, self.instances[idx].formula);
+                            failed.push(self.instances[idx].formula);
                             parts.push(Part::Instance(self.instances[idx].name.clone()));
                         }
+                    }
+                    for formula in failed {
+                        let Some(both) = self.conjoin(working, formula, &mut budget) else {
+                            return limit;
+                        };
+                        working = both;
                     }
                     if parts.len() > before {
                         let added = (parts.len() - before) as u64;
