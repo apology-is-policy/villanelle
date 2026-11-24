@@ -1423,6 +1423,36 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    /// [E-Extern]: what the host leaves behind an argument lent
+    /// exclusively is written there. The oracle tells a write that the
+    /// host may not make; here each is made as it is given.
+    fn host_writes(
+        &mut self,
+        callee: ControlId,
+        arguments: &[Value],
+        writes: &[(usize, Value)],
+    ) -> Result<(), String> {
+        let program = self.program;
+        for (position, value) in writes {
+            let Some(Type::Ref(_, referent)) = program.controls[callee]
+                .parameters
+                .get(*position)
+                .map(|p| &p.ty)
+            else {
+                return Err("a host wrote behind an argument that is no borrow".to_string());
+            };
+            if program.kind(referent) == Kind::Must {
+                continue;
+            }
+            let Some(Value::Ref { place, .. }) = arguments.get(*position) else {
+                return Err("a host wrote behind an argument that holds no borrow".to_string());
+            };
+            let value = self.arith.normalize(value, referent);
+            self.write_place(&place.clone(), value)?;
+        }
+        Ok(())
+    }
+
     fn deref_value(&self, value: &Value) -> Result<Value, String> {
         match value {
             Value::Ref { place, .. } => {
@@ -2366,6 +2396,7 @@ impl<'a> Machine<'a> {
                         callee.name, answer.alternative
                     ));
                 };
+                self.host_writes(*callee_id, &values, &answer.writes)?;
                 let fields = &callee.contract[index].fields;
                 if answer.payload.len() != fields.len() {
                     return Err(format!(
@@ -2484,6 +2515,7 @@ impl<'a> Machine<'a> {
                             callee.name, answer.alternative
                         ));
                     };
+                    self.host_writes(*callee_id, &values, &answer.writes)?;
                     let fields = &callee.contract[index].fields;
                     if answer.payload.len() != fields.len() {
                         return Err(format!(
@@ -2987,6 +3019,8 @@ impl<'a> Machine<'a> {
                 callee_ctrl.name, answer.alternative
             ));
         };
+        self.host_writes(callee, &arguments, &answer.writes)?;
+        let callee_ctrl = &self.program.controls[callee];
         let fields = &callee_ctrl.contract[index].fields;
         if answer.payload.len() != fields.len() {
             return Err(format!(

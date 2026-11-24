@@ -1,0 +1,110 @@
+// [E-Extern] The host gives, beside the payload, the value it leaves behind
+// each argument lent exclusively (`~x <- v` in a directive), and the step
+// writes it there: a write access through the tag of the argument ([B1],
+// [B2]), before the borrows of the payload are made. The condition of the
+// alternative reads the argument at completion, after the write, and `old`
+// of it before. Nothing is written behind an argument of kind `must`.
+// [E-Host]: a value of the wrong type, one behind an argument that was not
+// lent exclusively, or one that changes a value of kind `must`, is a
+// violation.
+
+extern resource token
+
+struct counter {n : u32, label : string}
+
+extern control bump(x : &~u32)
+    ■ { done {} ⇐ x = old(x) + 1 }
+
+extern control rename(c : &~counter, to : &string)
+    ■ { done {} }
+
+extern control peek(x : &u32)
+    ■ { seen {} }
+
+extern control keeps(t : &~token)
+    ■ { kept {} }
+
+extern control slot_of(c : &~counter)
+    ■ { slot {out : &~u32 ∈ c} }
+
+// The write is the value at completion that the condition reads.
+control bumps(start : u32)
+    ⊢ start < 100
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := start
+    ⊤ ▷ d : Δ bump(&~x) ▸ done {}
+    ⊤ ▷ ■ ok {x}
+
+// Through an exclusive borrow name, which the call passes on.
+control bumps_through_a_name(start : u32)
+    ⊢ start < 100
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := start
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ d : Δ bump(r) ▸ done {}
+    ⊤ ▷ ■ ok {x}
+
+// A struct is written whole; a host that writes nothing leaves it.
+control renames()
+    ■ { ok {c : counter} }
+    ⊤ ▷ ~c : counter := counter {3, "old"}
+    ⊤ ▷ to : string := "new"
+    ⊤ ▷ d : Δ rename(&~c, &to) ▸ done {}
+    ⊤ ▷ ■ ok {c}
+
+// X4: the write ends a borrow made through the argument's place before the
+// call: a borrow of a field, made through the exclusive borrow name.
+control write_ends_a_borrow()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~c : counter := counter {3, "old"}
+    ⊤ ▷ r : &~counter := &~c
+    ⊤ ▷ to : string := "new"
+    ⊤ ▷ n : &u32 := &r.n
+    ⊤ ▷ d : Δ rename(r, &to) ▸ done {}
+    ⊤ ▷ ■ ok {n}
+
+// The borrow of the payload is made after the write, and lives.
+control borrows_after_the_write()
+    ■ { ok {c : counter} }
+    ⊤ ▷ ~c : counter := counter {3, "old"}
+    ⊤ ▷ d : Δ slot_of(&~c) ▸ slot {s}
+    ⊤ ▷ s ← s + 10
+    ⊤ ▷ ■ ok {c}
+
+control peeks()
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := 1
+    ⊤ ▷ d : Δ peek(&x) ▸ seen {}
+    ⊤ ▷ ■ ok {x}
+
+control keeps_a_token()
+    ■ { ok {} }
+    ⊤ ▷ g : Δ keeps_open() ▸ opened {t}
+    ⊤ ▷ ~u : token := ▾t
+    ⊤ ▷ k : Δ keeps(&~u) ▸ kept {}
+    ⊤ ▷ c : Δ close(▾u) ▸ closed {}
+    ⊤ ▷ ■ ok {}
+
+extern control keeps_open()
+    ■ { opened {t : token} }
+
+extern control close(t : token)
+    ■ { closed {} }
+
+//! run bumps(4) with [bump -> done ~x <- 5] => done ok {5}
+//! run bumps_through_a_name(4) with [bump -> done ~x <- 5] => done ok {5}
+//! run renames() with [rename -> done ~c <- counter {7, "new"}] => done ok {counter {7, "new"}}
+//! run renames() with [rename -> done] => done ok {counter {3, "old"}}
+//! run write_ends_a_borrow() with [rename -> done ~c <- counter {7, "new"}] => stuck X4 B1
+//! run borrows_after_the_write() with [slot_of -> slot {&~c.n} ~c <- counter {5, "w"}] => done ok {counter {15, "w"}}
+//! run keeps_a_token() with [keeps_open -> opened {token#1}; keeps -> kept ~t <- token#1; close -> closed] => done ok
+// [E-Host]: the condition of the alternative is false after the write.
+//! run bumps(4) with [bump -> done ~x <- 7] => violation
+//! run bumps(4) with [bump -> done] => violation
+// [E-Host]: a value of the wrong type.
+//! run renames() with [rename -> done ~c <- 7] => violation
+// [E-Host]: a write behind an argument that was not lent exclusively.
+//! run peeks() with [peek -> seen ~x <- 2] => violation
+//! run renames() with [rename -> done ~to <- "x"] => violation
+// [E-Host]: a write that changes a value of kind `must`.
+//! run keeps_a_token() with [keeps_open -> opened {token#1}; keeps -> kept ~t <- token#2; close -> closed] => violation

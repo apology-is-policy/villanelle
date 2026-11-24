@@ -67,13 +67,14 @@ const SLICE3_REFUSALS: [&str; 1] = ["C1"];
 
 /// The rule files of the borrows: a dead borrow in each says what ended it,
 /// and the cause is the clause that the run is about ([B2] to [B5]).
-const RULE_FILES: [&str; 7] = [
+const RULE_FILES: [&str; 8] = [
     "b1_access.core",
     "b2_invalidation.core",
     "b3_creation.core",
     "b4_moves_and_scopes.core",
     "b5_shapes.core",
     "e_borrow_operands.core",
+    "e_extern_writes.core",
     "e_views.core",
 ];
 
@@ -84,10 +85,11 @@ const SHARED: &str = "a shared borrow of its place";
 const EXCLUSIVE: &str = "an exclusive borrow of its place";
 const SHAPE: &str = "a change of shape of its collection";
 const SCOPE: &str = "the scope of what it refers to ended";
+const HOST: &str = "a write of the host behind it";
 
 /// For each run of the rule files that is stuck by a dead borrow: the file,
 /// the control in which it is stuck, and what ended the borrow.
-const DEATHS: [(&str, &str, &str); 39] = [
+const DEATHS: [(&str, &str, &str); 40] = [
     ("b1_access.core", "read_through_dead", ASSIGNMENT),
     ("b1_access.core", "write_through_dead", READ),
     ("b1_access.core", "lend_through_dead", ASSIGNMENT),
@@ -136,6 +138,7 @@ const DEATHS: [(&str, &str, &str); 39] = [
         READ,
     ),
     ("e_borrow_operands.core", "read_ends_fields", READ),
+    ("e_extern_writes.core", "write_ends_a_borrow", HOST),
     ("e_views.core", "field_through_dead", ASSIGNMENT),
     (
         "borrows_and_tags.core",
@@ -216,10 +219,10 @@ fn slice_three_core_conforms_and_matches_erased() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert!(runs >= 130, "{runs} runs");
+    assert!(runs >= 143, "{runs} runs");
     // Every run that is not stuck and has a host that answers is compared
     // with the erased semantics ([R4], [R5]).
-    assert!(compared >= 67 && compared < runs, "{compared} compared");
+    assert!(compared >= 73 && compared < runs, "{compared} compared");
 }
 
 #[test]
@@ -664,6 +667,7 @@ control caller()
             Ok(Answer {
                 alternative: "ok".to_string(),
                 payload: vec![Value::Int(Int::from_u64(7))],
+                writes: Vec::new(),
             })
         }
     }
@@ -695,6 +699,7 @@ control caller()
                     place: RuntimePlace::root(999, 0),
                     tag: 999,
                 }],
+                writes: Vec::new(),
             })
         }
     }
@@ -756,4 +761,23 @@ fn the_seeded_host_answers_borrowed_payloads_with_places_within_its_arguments() 
     for entry in ["reads", "writes", "picks", "splits", "spans"] {
         assert!(ended[entry].len() > 1, "`{entry}` ended one way only");
     }
+}
+
+/// RO11: the native driver answers a borrowed payload with a cell of its own
+/// and writes nothing behind an argument (RO6), so the runs whose host writes
+/// are left out of the compiled runs of a file rather than compiled with the
+/// write lost. Of the six runs of `e_extern_writes.core` that end, one has a
+/// host that writes nothing.
+#[test]
+fn runs_whose_host_writes_are_left_out_of_compiled_code_ro11() {
+    let source = include_str!("slice3/e_extern_writes.core");
+    let (_, specs) = script::native_runs(source).expect("the runs of the file");
+    let entries: Vec<&str> = specs.iter().map(|spec| spec.entry.as_str()).collect();
+    assert_eq!(entries, ["renames"]);
+    assert!(
+        specs[0]
+            .answers
+            .iter()
+            .all(|(_, answer)| answer.writes.is_empty())
+    );
 }

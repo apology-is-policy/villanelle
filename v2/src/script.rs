@@ -17,8 +17,9 @@ enum Piece {
 }
 
 fn pieces(text: &str) -> Result<Vec<Piece>, String> {
-    const MARKS: [&str; 16] = [
-        "->", "=>", "|->", "↦", "(", ")", "{", "}", "[", "]", ",", ";", ".", "#", "&~", "&",
+    const MARKS: [&str; 18] = [
+        "->", "=>", "|->", "↦", "(", ")", "{", "}", "[", "]", ",", ";", ".", "#", "&~", "&", "<-",
+        "~",
     ];
     let characters: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
@@ -743,6 +744,9 @@ impl Reader {
     }
 }
 
+/// An answer of a script as a directive writes it.
+type RawAnswer = (String, String, Vec<RawValue>, Vec<(String, RawValue)>);
+
 #[derive(Clone, Debug)]
 enum RawExpect {
     Done {
@@ -811,7 +815,9 @@ struct RawRunSpec {
     entry: String,
     arguments: Vec<RawValue>,
     arithmetic: bool,
-    answers: Vec<(String, String, Vec<RawValue>)>,
+    /// Each answer: the control, the alternative, the payload, and what the
+    /// host leaves behind parameters lent exclusively (`~x <- v`).
+    answers: Vec<RawAnswer>,
     turns: Vec<usize>,
     cancel_at_turn: Option<u64>,
     config: Config,
@@ -886,7 +892,13 @@ fn directive(line: usize, text: &str) -> Result<Directive, String> {
                     let control = reader.word("a control")?;
                     reader.need("->")?;
                     let (alternative, payload) = reader.outcome()?;
-                    spec.answers.push((control, alternative, payload));
+                    let mut writes = Vec::new();
+                    while reader.mark("~") {
+                        let parameter = reader.word("a parameter")?;
+                        reader.need("<-")?;
+                        writes.push((parameter, reader.value()?));
+                    }
+                    spec.answers.push((control, alternative, payload, writes));
                 }
             }
             "turns" => {
@@ -1006,7 +1018,7 @@ fn call_of(program: &Program, raw_spec: &RawRunSpec) -> Result<Call, String> {
         .map(|v| resolve_raw_value(program, v))
         .collect::<Result<Vec<_>, _>>()?;
     let mut answers = Vec::with_capacity(raw_spec.answers.len());
-    for (ctrl, alt, raw_payload) in &raw_spec.answers {
+    for (ctrl, alt, raw_payload, raw_writes) in &raw_spec.answers {
         let answered = program
             .controls
             .iter()
@@ -1015,11 +1027,26 @@ fn call_of(program: &Program, raw_spec: &RawRunSpec) -> Result<Call, String> {
             .iter()
             .map(|v| resolve_answer_value(program, answered, v))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut writes = Vec::with_capacity(raw_writes.len());
+        for (parameter, raw) in raw_writes {
+            let found = answered.and_then(|control| {
+                control
+                    .parameters
+                    .iter()
+                    .position(|candidate| candidate.name == *parameter)
+                    .map(|index| (index, control.parameters[index].ty.deref_type()))
+            });
+            let Some((index, ty)) = found else {
+                return Err(format!("`~{parameter}` names no parameter of `{ctrl}`"));
+            };
+            writes.push((index, resolve_raw_value_typed(program, raw, Some(ty))?));
+        }
         answers.push((
             ctrl.clone(),
             Answer {
                 alternative: alt.clone(),
                 payload,
+                writes,
             },
         ));
     }
@@ -1053,6 +1080,10 @@ pub fn native_runs(source: &str) -> Result<(Program, Vec<NativeRunSpec>), String
         }
         let (arguments, answers) =
             call_of(&program, raw_spec).map_err(|err| format!("line {}: {err}", raw_spec.line))?;
+        // The native driver writes nothing behind an argument (RO6, RO11).
+        if answers.iter().any(|(_, answer)| !answer.writes.is_empty()) {
+            continue;
+        }
         specs.push(NativeRunSpec {
             entry: raw_spec.entry.clone(),
             arguments,

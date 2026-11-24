@@ -215,6 +215,13 @@ an argument that the field does not list after `∈`, and two places of one
 payload that overlap unless both are shared. The erased interpreter makes
 the same borrow without a tag.
 
+Beside the payload a host may name, for an argument lent exclusively, the
+value it leaves behind that borrow (`Answer.writes`), and the step writes it
+there through the argument's tag before it makes the borrows of the payload
+(RO11, section 15.1). A write behind an argument that was not lent
+exclusively, a value of another type, and a change to a value of kind
+`must` are violations. The seeded host writes nothing.
+
 Three hosts exist. `Script` answers from a list, in order, and a run whose list
 is exhausted or names another control ends in `host-failed`: a defect of the
 test. `Arithmetic` computes the checked arithmetic of the prelude: a control
@@ -246,12 +253,15 @@ must yield.
 //! run pump(2) with [read -> value {7}; read -> closed] => done total {7}
 //!     trace [read(2) -> value {7}; read(2) -> closed {}]
 //! run reads(8) with [first_item -> item {&xs[1]}] => done ok {8}
+//! run bumps(4) with [bump -> done ~x <- 5] => done ok {5}
 //! run address(4294967295) usize 32 => stuck X7 E-Arith
 //! reject W1
 ```
 
 `run` names an entry control and its arguments. The options follow: `with
 arithmetic`, `with [...]` for a scripted host, `usize 32`, `fuel N`. After
+In a scripted answer, `~x <- v` after the alternative and its payload is the
+value that the host leaves behind its parameter `x`. After
 `=>` comes the expected end: `done` with the alternative and its payload,
 `faulted` with the message, `terminated` with the status of `terminate n`,
 `stuck` with the state and the clause, `violation`, `host-failed`, `fuel`, or
@@ -1586,6 +1596,27 @@ statement, so its value moves no name that an operand before it mentions
 (`Ctx.read`); the first campaign without that rule had one program rejected
 by [O2], with `len(v2)` read after the bind had moved `v2`. The programs of
 slice 1 are unchanged, text for text over 600 seeds.
+
+A host writes behind an argument lent exclusively (RO11, [E-Extern]).
+`host::Answer` has `writes`, a list of an argument's index and the value
+the host leaves behind it; in a directive the answer is followed by
+`~x <- v`, with `x` the name of the parameter (`script.rs` resolves it at
+the parameter's type). `Machine::host_writes` (`oracle.rs`) checks each
+write ([E-Host]: the argument is lent exclusively, the value is of the type
+it refers to, and a value of kind `must` is not changed), makes the write
+an access through the argument's tag (`Access::Host`, whose death reads "a
+write of the host behind it ended it"), and stores the value before the
+borrows of the payload are made; the event holds the values of the call.
+The condition of the alternative reads the argument after the write and
+`old` of it from the values of the call. The table of the answers of a
+pure control (`Machine.answers`) has the values at completion beside the
+answer, so a host that writes otherwise on equal arguments is a
+violation. `erased.rs` writes the same values at its
+three calls of a host. `e_extern_writes.core` holds it: 21 files, 143 runs,
+73 compared, and 40 dead borrows with their causes. The native driver
+writes nothing behind an argument, as it answers a borrowed payload with a
+cell of its own (RO6), and `emit_native_harness_llvm` refuses a run whose
+host writes; `script::native_runs` leaves such runs out.
 
 ## 16. Slice 3 Phase 3: Static ROBDD Loan Checking and Borrow/View Fact Logic
 

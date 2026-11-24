@@ -539,6 +539,8 @@ enum Access {
     LendExclusive,
     /// The shape of a collection changes ([B5]): a write to all of it.
     Shape,
+    /// A host writes behind an argument it was lent exclusively ([E-Extern]).
+    Host,
 }
 
 impl Access {
@@ -576,6 +578,7 @@ impl Death {
                 "an exclusive borrow of its place ended it ([B2], [B3])"
             }
             Death::By(Access::Shape) => "a change of shape of its collection ended it ([B2], [B5])",
+            Death::By(Access::Host) => "a write of the host behind it ended it ([B2], [E-Extern])",
             Death::ScopeEnd => "the scope of what it refers to ended ([B4])",
         }
     }
@@ -1538,6 +1541,10 @@ impl Evaluator<'_> {
     }
 }
 
+/// What a pure extern control gave: the alternative, the payload and the
+/// values of its parameters at completion ([E-Extern], RO11).
+type Given = (usize, Vec<Value>, Vec<Value>);
+
 struct Machine<'a> {
     program: &'a Program,
     config: &'a Config,
@@ -1558,7 +1565,7 @@ struct Machine<'a> {
     steps: u64,
     rules: BTreeMap<&'static str, u64>,
     /// What each pure extern control answered, by its arguments ([E-Host]).
-    answers: HashMap<(ControlId, Vec<Value>), (usize, Vec<Value>)>,
+    answers: HashMap<(ControlId, Vec<Value>), Given>,
     /// Resource table: `(ResourceId, handle_id)` -> `true` while open, `false` once closed ([E-Resource]).
     resources: BTreeMap<(ResourceId, u64), bool>,
     /// Where the statement being run is, for the report of a stuck state.
@@ -1699,6 +1706,71 @@ impl<'a> Machine<'a> {
 
     fn read_place(&self, place: &RuntimePlace) -> Result<Value, Fail> {
         read_place_from_state(&self.entry_slots, &self.stack, &self.tasks, place)
+    }
+
+    /// [E-Extern]: writes what the host leaves behind the arguments lent
+    /// exclusively, each a write access through the tag of its argument
+    /// ([B1], [B2]), and gives the values of the parameters at completion.
+    /// Nothing is written behind an argument of kind `must`. An answer that
+    /// writes where it may not, or a value of the wrong type, is a
+    /// violation ([E-Host]), whose reason is returned.
+    fn host_writes(
+        &mut self,
+        callee: ControlId,
+        arguments: &[Value],
+        concrete_args: &[Value],
+        writes: Vec<(usize, Value)>,
+    ) -> Result<Result<Vec<Value>, String>, Fail> {
+        let program = self.program;
+        let control = &program.controls[callee];
+        let mut completed = concrete_args.to_vec();
+        let mut written = Vec::new();
+        for (position, value) in writes {
+            let Some(parameter) = control.parameters.get(position) else {
+                return Ok(Err(format!(
+                    "`{}` wrote behind argument {position}, which it does not have",
+                    control.name
+                )));
+            };
+            let Type::Ref(BorrowMode::Exclusive, referent) = &parameter.ty else {
+                return Ok(Err(format!(
+                    "`{}` wrote behind `{}`, which it was not lent exclusively",
+                    control.name, parameter.name
+                )));
+            };
+            if written.contains(&position) {
+                return Ok(Err(format!(
+                    "`{}` wrote behind `{}` twice",
+                    control.name, parameter.name
+                )));
+            }
+            written.push(position);
+            if !self.config.fits_in_program(program, &value, referent) {
+                return Ok(Err(format!(
+                    "`{}` left {value} behind `{}`, which is no value of {referent}",
+                    control.name, parameter.name
+                )));
+            }
+            if program.kind(referent) == Kind::Must {
+                if value != concrete_args[position] {
+                    return Ok(Err(format!(
+                        "`{}` changed what `{}` refers to, which has kind must",
+                        control.name, parameter.name
+                    )));
+                }
+                continue;
+            }
+            let Value::Ref { place, tag, .. } = &arguments[position] else {
+                return Ok(Err(format!(
+                    "`{}` wrote behind `{}`, which holds no borrow",
+                    control.name, parameter.name
+                )));
+            };
+            let (place, tag) = (place.clone(), *tag);
+            self.write_runtime_place(&place, tag, value.clone(), false, Access::Host)?;
+            completed[position] = value;
+        }
+        Ok(Ok(completed))
     }
 
     /// [E-Extern]: a borrow in the payload of a host is a reborrow, by [B3],
@@ -3245,6 +3317,11 @@ impl<'a> Machine<'a> {
                 callee.name, answer.alternative
             ));
         };
+        let writes = std::mem::take(&mut answer.writes);
+        let completed = match self.host_writes(id, &arguments, &concrete_args, writes)? {
+            Ok(completed) => completed,
+            Err(detail) => return violation(detail),
+        };
         let alternative = &callee.contract[index];
         for (value, field) in answer.payload.iter_mut().zip(&alternative.fields) {
             if let Err(detail) = self.lend(&arguments, value, &field.ty) {
@@ -3364,7 +3441,7 @@ impl<'a> Machine<'a> {
         }
         if let Some(condition) = &alternative.condition {
             let env = SignatureEnv {
-                parameters: &concrete_args,
+                parameters: &completed,
                 old_parameters: &concrete_args,
                 fields: &concrete_payload,
             };
@@ -3380,7 +3457,7 @@ impl<'a> Machine<'a> {
         }
         if callee.is_pure(self.program) {
             let key = (id, concrete_args.clone());
-            let given = (index, concrete_payload.clone());
+            let given = (index, concrete_payload.clone(), completed);
             match self.answers.get(&key) {
                 Some(earlier) if *earlier != given => {
                     return violation(format!(
@@ -4603,6 +4680,12 @@ impl<'a> Machine<'a> {
             );
             return finish_violation(self, detail);
         };
+        let writes = std::mem::take(&mut answer.writes);
+        let completed = match self.host_writes(callee, &arguments, &concrete_args, writes)? {
+            Ok(completed) => completed,
+            Err(detail) => return finish_violation(self, detail),
+        };
+        let callee_ctrl = &self.program.controls[callee];
         let alternative = &callee_ctrl.contract[index];
         for (value, field) in answer.payload.iter_mut().zip(&alternative.fields) {
             if let Err(detail) = self.lend(&arguments, value, &field.ty) {
@@ -4728,7 +4811,7 @@ impl<'a> Machine<'a> {
         }
         if let Some(condition) = &alternative.condition {
             let env = SignatureEnv {
-                parameters: &concrete_args,
+                parameters: &completed,
                 old_parameters: &concrete_args,
                 fields: &concrete_payload,
             };

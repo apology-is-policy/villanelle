@@ -6442,6 +6442,17 @@ pub fn emit_native_harness_llvm(
     specs: &[NativeRunSpec],
     usize_bits: u32,
 ) -> String {
+    // The driver answers a borrowed payload with a cell of its own and
+    // writes nothing behind an argument (RO6, RO11 of the review): a run
+    // whose host writes is left out of the compiled runs, not compiled
+    // with the write lost.
+    assert!(
+        specs.iter().all(|spec| spec
+            .answers
+            .iter()
+            .all(|(_, answer)| answer.writes.is_empty())),
+        "the native driver does not write behind an argument: leave runs whose host writes out"
+    );
     let mut reg = RuntimeRegistry::new(program, usize_bits);
     let term_tys = compute_control_terminate_tys(program);
     let mut body_out = String::new();

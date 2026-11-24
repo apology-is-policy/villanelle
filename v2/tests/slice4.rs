@@ -410,6 +410,7 @@ control entry(x : u32) ■ { done {} │ cancelled {} } uses io.net
             Answer {
                 alternative: "done".to_string(),
                 payload: Vec::new(),
+                writes: Vec::new(),
             },
         )]),
     });

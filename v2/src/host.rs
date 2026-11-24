@@ -15,6 +15,10 @@ use std::collections::{BTreeMap, VecDeque};
 pub struct Answer {
     pub alternative: String,
     pub payload: Vec<Value>,
+    /// The values that the host leaves behind arguments it was lent
+    /// exclusively, by the position of the argument ([E-Extern]). An
+    /// argument that is not named keeps what it holds.
+    pub writes: Vec<(usize, Value)>,
 }
 
 pub trait Host {
@@ -203,11 +207,13 @@ fn checked(
             Answer {
                 alternative: fits.name.clone(),
                 payload: vec![result],
+                writes: Vec::new(),
             }
         } else {
             Answer {
                 alternative: fails.name.clone(),
                 payload: Vec::new(),
+                writes: Vec::new(),
             }
         },
     ))
@@ -1135,6 +1141,7 @@ impl Host for Seeded<'_> {
                 return Ok(Answer {
                     alternative: alternative.name.clone(),
                     payload,
+                    writes: Vec::new(),
                 });
             }
         }

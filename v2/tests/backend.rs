@@ -224,6 +224,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                 Answer {
                     alternative: "not_found".to_string(),
                     payload: Vec::new(),
+                    writes: Vec::new(),
                 },
             )],
         },
@@ -237,6 +238,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                     Answer {
                         alternative: "opened".to_string(),
                         payload: vec![Value::Int(Int::from_u64(10))],
+                        writes: Vec::new(),
                     },
                 ),
                 (
@@ -244,6 +246,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                     Answer {
                         alternative: "data".to_string(),
                         payload: vec![Value::Int(Int::from_u64(42))],
+                        writes: Vec::new(),
                     },
                 ),
                 (
@@ -251,6 +254,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                     Answer {
                         alternative: "closed".to_string(),
                         payload: Vec::new(),
+                        writes: Vec::new(),
                     },
                 ),
                 (
@@ -258,6 +262,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                     Answer {
                         alternative: "text".to_string(),
                         payload: vec![Value::Int(Int::from_u64(42))],
+                        writes: Vec::new(),
                     },
                 ),
                 (
@@ -265,6 +270,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                     Answer {
                         alternative: "sent".to_string(),
                         payload: Vec::new(),
+                        writes: Vec::new(),
                     },
                 ),
             ],
@@ -287,6 +293,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                 Answer {
                     alternative: "loaded".to_string(),
                     payload: vec![Value::Int(Int::from_u64(9))],
+                    writes: Vec::new(),
                 },
             )],
         },
@@ -299,6 +306,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                 Answer {
                     alternative: "missing".to_string(),
                     payload: Vec::new(),
+                    writes: Vec::new(),
                 },
             )],
         },
@@ -311,6 +319,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                 Answer {
                     alternative: "invalid".to_string(),
                     payload: vec![Value::Int(Int::from_u64(77))],
+                    writes: Vec::new(),
                 },
             )],
         },
@@ -323,6 +332,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                 Answer {
                     alternative: "too_large".to_string(),
                     payload: Vec::new(),
+                    writes: Vec::new(),
                 },
             )],
         },
@@ -348,6 +358,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                     Answer {
                         alternative: "equal".to_string(),
                         payload: Vec::new(),
+                        writes: Vec::new(),
                     },
                 ),
                 (
@@ -355,6 +366,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                     Answer {
                         alternative: "after".to_string(),
                         payload: Vec::new(),
+                        writes: Vec::new(),
                     },
                 ),
                 (
@@ -362,6 +374,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                     Answer {
                         alternative: "before".to_string(),
                         payload: Vec::new(),
+                        writes: Vec::new(),
                     },
                 ),
             ],
@@ -375,6 +388,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                 Answer {
                     alternative: "after".to_string(),
                     payload: Vec::new(),
+                    writes: Vec::new(),
                 },
             )],
         },
@@ -387,6 +401,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
                 Answer {
                     alternative: "equal".to_string(),
                     payload: Vec::new(),
+                    writes: Vec::new(),
                 },
             )],
         },

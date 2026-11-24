@@ -181,6 +181,7 @@ fn ans(alt: &str, payload: Vec<Value>) -> Answer {
     Answer {
         alternative: alt.to_string(),
         payload,
+        writes: Vec::new(),
     }
 }
 

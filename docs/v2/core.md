@@ -556,24 +556,36 @@ The remaining commands end scopes and are given in sections 6.7 to 6.9.
 
 **The host.** The world `W` holds the resource table, the event trace, and
 whatever state the host keeps. An extern control is a relation
-`host(W, f, v̄) ∋ (W′, a, v̄′)`: given the world and the arguments it yields a new
-world, an alternative and a payload.
+`host(W, f, v̄) ∋ (W′, a, v̄′, ū)`: given the world and the arguments it yields a new
+world, an alternative, a payload, and for each argument lent exclusively the
+value that the host leaves behind that borrow (the value it found there, if
+it writes nothing).
 
 - **[E-Extern]** A decision on an extern control takes one step of the host
   relation and appends the event `(f, v̄, a, v̄′)` to the trace when `f` has an
-  effect. If the precondition of `f` is false for `v̄`, stuck. A borrow that
-  the host returns in a field `∈ ȳ` is a reborrow, by [B3], of a place within
-  one of the arguments `ȳ`: the host names the argument and the place within
-  what it lends, and the step makes the borrow, with a tag under the tag of
-  that argument. The mode is the one the field declares, and an exclusive
-  borrow comes only from an argument that was lent exclusively.
+  effect. If the precondition of `f` is false for `v̄`, stuck. A borrow that the
+  host returns in a field `∈ ȳ` is a reborrow, by [B3], of a place within one of
+  the arguments `ȳ`: the host names the argument and the place within what it
+  lends, and the step makes the borrow, with a tag under the tag of that
+  argument. The mode is the one the field declares, and an exclusive borrow
+  comes only from an argument that was lent exclusively. A value that the host
+  leaves behind an argument lent exclusively is written there by the step, a
+  write access through the tag of that argument ([B1], [B2]), before the borrows
+  of the payload are made; the event holds the arguments as they were at the
+  call. The condition of the alternative reads the argument at completion, after
+  the write, and `old` of it before ([E-Formula]). Nothing is written behind an
+  argument whose type has kind `must`: the host cannot complete an obligation in
+  place.
 - **[E-Host]** If the host yields an alternative outside the contract, a payload
-  of the wrong type, a borrow that is not such a reborrow, payload borrows that
-  are not all alive together when it completes (an exclusive one overlaps no
-  other), or a payload for which `φₐ` is false, the configuration
-  ends in `host-violation`. So it does when the host answers an extern control
-  that is pure ([fact logic](facts.md), [I10]) differently on equal arguments. This is a fault of the trusted host and not a stuck
-  state: the claims of section 8 assume a host that respects its contracts.
+  of the wrong type, a value behind an argument that is of the wrong type, that
+  changes what an argument of kind `must` refers to, or that stands behind an
+  argument that was not lent exclusively, a borrow that is not such a reborrow,
+  payload borrows that are not all alive together when it completes (an
+  exclusive one overlaps no other), or a payload for which `φₐ` is false, the
+  configuration ends in `host-violation`. So it does when the host answers an
+  extern control that is pure ([fact logic](facts.md), [I10]) differently on
+  equal arguments. This is a fault of the trusted host and not a stuck state:
+  the claims of section 8 assume a host that respects its contracts.
 
   A value of an outcome type in a payload is to be one that its operation
   **gives**. `out(a, v̄)` of type `outcome⟨g⟩` is given by `g` when there are
@@ -1580,6 +1592,7 @@ and what asked for it:
 | 24 November 2026 | [E-Unwind] gives the order in which the slots of a scope and the parts of a value are released under a fault: the names of a body in the reverse of the order in which its text first binds them, the parts of a value from the first. [R5] refers to it. | The clause tests of the data rules (review finding RO12). The order was not stated, and a release is an event of the trace: the oracle released in the reverse of the order in which the run had bound the names, the erased semantics and compiled code in the order of the text, and the three differed on a program in which a name has a binder on each of two histories. The order of the text is the one an implementation has without a record of each run ([R4]). |
 | 24 November 2026 | [E-Assign] says that an assignment to a component looks its root up as [E-Var] does. | The same tests: [O4] asks [O2] of the root, and the semantics named the stuck state only for a whole name without a slot. The oracle reports it as `X2 E-Var`. |
 | 24 November 2026 | [E-Formula] says that a formula reads through a borrow only while its tag is alive, and is stuck otherwise; the row X4 of section 6.10 names it. | The clause tests of the borrow rules (review finding RO15). A formula makes no access, so [B1] did not apply to it, and nothing said what `⊢ r = 5` is worth when the place that `r` borrowed is gone. The oracle read the place as it was then, and was stuck by `X7 E-Index` where an element had been popped. [L2] counts a mention in a formula as a use, so the checker excludes the state. |
+| 24 November 2026 | The host relation gives, beside the payload, the value that the host leaves behind each argument lent exclusively, and [E-Extern] writes it there; [E-Host] says which such values are violations. | Review finding RO11, named in the entry of 23 November above. [W7] reads an `&~` parameter at completion in the contract of an extern control as of a defined one, and with a host that could not write, a condition such as `x = old(x) + 1` had no faithful host. The write is an access through the tag of the argument, so it ends the borrows made through that argument before the call, and the borrows of the payload are made after it. The checker treats what such an argument refers to after the call as a value of its type that the condition constrains ([I9]), which was sound with or without the write. |
 | 24 November 2026 | [E-Formula] says that the value of a parameter at entry or at completion is read only where a formula of the signature mentions it. | The same tests (review finding RO17): the oracle read every argument through its borrow at a call and every borrowed parameter at an exit, so a call that passed a dead borrow to a control that never reads it was stuck, although passing a borrow is no access. |
 | 24 November 2026 | [E-Assign] says that a name of borrow type through which an assignment writes is read as [E-Var] says. | The same tests: `r ← e` where `r` was moved is a read of a moved name, and the oracle reported an assignment to one (`X2 E-Assign`). It reports `X2 E-Var`. |
 | 24 November 2026 | [C1] says what stands where a borrow type is expected: `&p` or `&~p`, or a name or a field of a view of that type. | The reader of the core text (review finding RO14): it took any expression of the type that the borrow refers to, a constructor or a literal among them, and a name of exclusive borrow type for a shared one. The grammar has `&p` and `&~p` as the only borrows, [W5a] gives a function a place, and [U11] of the surface binds other expressions to hidden names; the reader asks for these forms now. |
