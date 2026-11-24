@@ -982,3 +982,206 @@ fn extract_core_control(file_src: &str, headers: &[&str], control_name: &str) ->
     );
     out
 }
+
+/// The program is stuck in the oracle, as its directive says, and the
+/// checker refuses it by `clause`.
+fn stuck_and_rejected(clause: &str, source: &str) {
+    let report = villanelle_v2::script::check(source);
+    assert!(
+        report.failures.is_empty() && report.runs > 0 && !report.stuck.is_empty(),
+        "[{clause}] the oracle does not find the program stuck: {:?}\n{source}",
+        report.failures
+    );
+    reject_core(clause, source);
+}
+
+/// The program runs to its end in the oracle, as its directive says, and the
+/// checker accepts it.
+fn done_and_accepted(clause: &str, source: &str) {
+    let report = villanelle_v2::script::check(source);
+    assert!(
+        report.failures.is_empty() && report.runs > 0 && report.stuck.is_empty(),
+        "[{clause}] the oracle does not run the program to its end: {:?}\n{source}",
+        report.failures
+    );
+    accept_core(clause, source);
+}
+
+/// Review finding RC1: a borrow bound in a loop body writes a name around
+/// the loop, and the checker kept what it knew of the name before the loop
+/// on every turn, because no loan of it was recorded when the loop was
+/// entered. Each of these was accepted with validated certificates and is
+/// stuck in the oracle: an assertion on a later turn, an overflow, an index
+/// past the end, a write through a field of a view, the precondition of a
+/// call through the borrow, and an assertion after the loop.
+const RC1_STUCK: [(&str, &str); 6] = [
+    (
+        "P1",
+        r#"
+control c(n : u8) ■ { r {v : u8} }
+⊤ ▷ ~x : u8 := 0
+⊤ ▷ s : ↻ l(i : u8 := 0) {
+    ⊢ i ≤ 10
+    ⊤ ▷ ⊢ x = 0
+    ⊤ ▷ t : ? i = 10
+    t.true ▷ □ out
+    ⊤ ▷ p : &~u8 := &~x
+    ⊤ ▷ p ← 1
+    ⊤ ▷ ↑ l(i + 1)
+} ▸ out
+⊤ ▷ ■ r {x}
+
+//! run c(0) => stuck X7 E-Oblige
+"#,
+    ),
+    (
+        "P5",
+        r#"
+control c() ■ { r {v : u8} }
+⊤ ▷ ~x : u8 := 0
+⊤ ▷ s : ↻ l() {
+    ⊤ ▷ p : &~u8 := &~x
+    ⊤ ▷ p ← p + 1
+    ⊤ ▷ ↑ l()
+}
+
+//! run c() => stuck X7 E-Arith
+"#,
+    ),
+    (
+        "P5",
+        r#"
+control c() ■ { r {v : u32} }
+⊤ ▷ v : [u32] := [1, 2, 3]
+⊤ ▷ ~i : usize := 0
+⊤ ▷ s : ↻ l() {
+    ⊤ ▷ e : u32 := v[i]
+    ⊤ ▷ p : &~usize := &~i
+    ⊤ ▷ p ← p + 1
+    ⊤ ▷ ↑ l()
+}
+
+//! run c() => stuck X7 E-Index
+"#,
+    ),
+    (
+        "P5",
+        r#"
+view struct cell {slot : &~u8}
+control c() ■ { r {v : u8} }
+⊤ ▷ ~x : u8 := 0
+⊤ ▷ s : ↻ l() {
+    ⊤ ▷ w : cell := cell {&~x}
+    ⊤ ▷ w.slot ← w.slot + 1
+    ⊤ ▷ ↑ l()
+}
+
+//! run c() => stuck X7 E-Arith
+"#,
+    ),
+    (
+        "P3",
+        r#"
+control bump(x : &~u8) ⊢ x < 255 ■ { done {} ⇐ x = old(x) + 1 }
+⊤ ▷ x ← x + 1
+⊤ ▷ ■ done {}
+control c() ■ { r {v : u8} }
+⊤ ▷ ~x : u8 := 0
+⊤ ▷ s : ↻ l() {
+    ⊤ ▷ p : &~u8 := &~x
+    ⊤ ▷ d : Δ bump(p) ▸ done {}
+    ⊤ ▷ ↑ l()
+}
+
+//! run c() => stuck X7 E-Call
+"#,
+    ),
+    (
+        "P1",
+        r#"
+control c() ■ { r {v : u8} }
+⊤ ▷ ~x : u8 := 0
+⊤ ▷ s : ↻ l(i : u8 := 0) {
+    ⊢ i ≤ 3
+    ⊤ ▷ t : ? i = 3
+    t.true ▷ □ out
+    ⊤ ▷ p : &~u8 := &~x
+    ⊤ ▷ p ← 9
+    ⊤ ▷ ↑ l(i + 1)
+} ▸ out
+⊤ ▷ ⊢ x = 0
+⊤ ▷ ■ r {x}
+
+//! run c() => stuck X7 E-Oblige
+"#,
+    ),
+];
+
+/// The same loops, with an invariant that says what the borrow writes: the
+/// name is renamed at the entry of the loop ([I9]: a place that the body
+/// lends exclusively), the invariant gives the new name its value, and a
+/// write through the local borrow name is an update of the place it
+/// abbreviates ([I7]).
+const RC1_DONE: [&str; 3] = [
+    r#"
+control c() ■ { r {v : u8} }
+⊤ ▷ ~x : u8 := 0
+⊤ ▷ s : ↻ l(i : u8 := 0) {
+    ⊢ i ≤ 10 ∧ x = i
+    ⊤ ▷ t : ? i = 10
+    t.true ▷ □ out
+    ⊤ ▷ p : &~u8 := &~x
+    ⊤ ▷ p ← p + 1
+    ⊤ ▷ ↑ l(i + 1)
+} ▸ out
+⊤ ▷ ⊢ x = 10
+⊤ ▷ ■ r {x}
+
+//! run c() => done r {10}
+"#,
+    r#"
+control c() ■ { r {v : u32} }
+⊤ ▷ v : [u32] := [1, 2, 3]
+⊤ ▷ ~i : usize := 0
+⊤ ▷ s : ↻ l() {
+    ⊢ i ≤ 3
+    ⊤ ▷ t : ? i = 3
+    t.true ▷ □ out
+    ⊤ ▷ e : u32 := v[i]
+    ⊤ ▷ p : &~usize := &~i
+    ⊤ ▷ p ← p + 1
+    ⊤ ▷ ↑ l()
+} ▸ out
+⊤ ▷ ■ r {v[0]}
+
+//! run c() => done r {1}
+"#,
+    r#"
+control bump(x : &~u8) ⊢ x < 255 ■ { done {} ⇐ x = old(x) + 1 }
+⊤ ▷ x ← x + 1
+⊤ ▷ ■ done {}
+control c() ■ { r {v : u8} }
+⊤ ▷ ~x : u8 := 0
+⊤ ▷ s : ↻ l(i : u8 := 0) {
+    ⊢ i ≤ 10 ∧ x = i
+    ⊤ ▷ t : ? i = 10
+    t.true ▷ □ out
+    ⊤ ▷ p : &~u8 := &~x
+    ⊤ ▷ d : Δ bump(p) ▸ done {}
+    ⊤ ▷ ↑ l(i + 1)
+} ▸ out
+⊤ ▷ ■ r {x}
+
+//! run c() => done r {10}
+"#,
+];
+
+#[test]
+fn a_loop_renames_what_its_body_lends_exclusively_i9() {
+    for (clause, source) in RC1_STUCK {
+        stuck_and_rejected(clause, source);
+    }
+    for source in RC1_DONE {
+        done_and_accepted("I9", source);
+    }
+}

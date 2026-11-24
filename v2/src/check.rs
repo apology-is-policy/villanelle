@@ -1939,11 +1939,33 @@ fn collect_modified_vars(
 ) {
     for stmt in &body.bodies[body_id].statements {
         match &stmt.command {
-            Command::Assign { var, .. } => {
-                out.insert(*var);
+            // [I9]: what a body changes is read off its text, and a place
+            // that it lends exclusively is one, wherever the borrow stands:
+            // a borrow bound in the body writes the name around it although
+            // no loan of it is recorded when the loop is entered (RC1).
+            Command::Bind { value, .. } | Command::Unpack { value, .. } => {
+                collect_operand_modified(program, value, out);
             }
-            Command::AssignPlace { target, .. } => {
+            Command::Assign { var, value } => {
+                out.insert(*var);
+                collect_operand_modified(program, value, out);
+            }
+            Command::AssignPlace { target, value } => {
                 out.insert(target.root);
+                collect_operand_modified(program, value, out);
+            }
+            Command::Again { arguments, .. }
+            | Command::Supervise { arguments, .. }
+            | Command::Spawn { arguments, .. }
+            | Command::Leave {
+                payload: arguments, ..
+            }
+            | Command::Exit {
+                payload: arguments, ..
+            } => {
+                for arg in arguments {
+                    collect_operand_modified(program, arg, out);
+                }
             }
             Command::Decide {
                 op_kind, arguments, ..
@@ -1975,7 +1997,14 @@ fn collect_modified_vars(
                     collect_operand_modified(program, arg, out);
                 }
             }
-            Command::Loop { body: inner, .. } => {
+            Command::Loop {
+                body: inner,
+                initial,
+                ..
+            } => {
+                for arg in initial {
+                    collect_operand_modified(program, arg, out);
+                }
                 collect_modified_vars(program, body, *inner, out);
             }
             Command::Boundary {
