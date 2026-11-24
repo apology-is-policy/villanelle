@@ -661,9 +661,27 @@ the instance "`s̄ = t̄` implies `g(s̄) = g(t̄)`", and the kernel makes that
 instance from its name as it makes any other. For symbols this decides the
 same entailment, since the terms of a query are finitely many. A proof
 therefore uses Row, Combine, Round, Split, and Close by a row `0 ≤ b`; Chain,
-Merge and the other forms of Close do not occur. Whether the instances that
-the crate has for constructors, fields and updates are all that [J1] asks is
-examined when slice 2 is requalified.
+Merge and the other forms of Close do not occur.
+
+For [A4] and [A5] the crate has instances of two terms together: the
+argument of a constructor term is the field of an equal value; constructor
+terms are equal exactly when their arguments are, and different for
+different constructors; and two values of a struct are equal when their
+fields are, for values whose fields the checker wrote. It writes them for
+every struct value that a formula compares. For [A6] the crate has the
+instances that [J3] names. Every instance is true of real values, and the
+instances decide each axiom as a statement of a program: the tests of slice
+2 hold both against the oracle (section 12.4 of the
+[oracle document](oracle.md)). One thing they do not decide (review finding
+RC26, open). That a value of a variant type is of one of its constructors,
+and that a struct without fields has one value, is known in the crate only
+of a value that a decision has taken apart ([I11]). [J1] entails both of
+every value, so there the crate answers no where the entailment holds.
+
+A literal is a term of its type. `[]` at two types is two terms, and so is
+`∅`; `[1, 0]` is another term than `[true, false]`. Every term so has one
+sort, and a value of one type is never the same number as a value of
+another.
 
 The text of [V5] is described in section 10 of the
 [oracle document](oracle.md). It holds the tables of a body (history atoms,
@@ -672,13 +690,18 @@ formulas, the names of the instances and the lemmas with their proofs. What
 reads it needs neither the program nor the checker. The crate has a reader
 that gives a text to the kernel.
 
-One thing is open. The crate does not know the sort of every vector
-term, so it cannot always say which type an element has that only a frame
-instance of [A6] speaks of. The kernel grants what the theory says of a term
-by its type, by its declared interval or by the number of its constructors
-only for a term that the checker wrote. Such an element therefore has no
-range until the program mentions it. That is sound, and it can lose a proof
-that [A1] allows (finding RC17).
+The frame instance of [A6] speaks of an element `t[j]` that the program
+may not mention, and the crate gives that term no range. The kernel grants
+what the theory says of a term by its type, by its declared interval or by
+the number of its constructors only for a term that the checker wrote, and
+the search does not always know the type of such an element (finding RC17).
+[J3] has the range, and leaving it out cannot change an answer ([J5]). The
+term stands only in instances of [A6] and of [S5], and there only as a side
+of the equality that the instance concludes. So all that a model says of it
+is which other elements it equals. Where one of those is a term of the
+program, that term has the range, and the equality carries it over. Where
+none is, the elements that are equal can be given any value of the type
+together, and the model is a model with the range as well.
 
 ## 9. Counterexamples
 
@@ -1054,3 +1077,15 @@ it.
    The report gives its length where the model has one, and no number
    for the name. The crate printed the number that the model of its
    search gives the term (review finding RC25).
+14. **24 November 2026, section 8: a literal is a term of its type, and
+   the two notes that were open.** The instances of [A3] to [A6] were held
+   against real values, as section 6 says soundness needs. The crate had
+   one term for `[]` at every type, one for `∅`, and one for `[1, 0]` and
+   `[true, false]`, so a value of one type was the same number as a value
+   of another. No wrong acceptance was reproduced: the names of two such
+   values have their sorts, and the search pairs elements of one sort only.
+   A literal term now has its type. The note on an element that only a
+   frame instance speaks of said that a proof could be lost; it says now
+   why none is (finding RC17). The note on the instances for constructors
+   says what the examination found (finding RC26, open). No clause
+   changed.

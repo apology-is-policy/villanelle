@@ -723,7 +723,8 @@ nodes, and 8,743,177 exchanges that write 248,677,216 entries (before:
 real operations give, on operands at the ends of every type and beyond them;
 the kernel grants every instance that the search makes for terms of every
 form; and it refuses eighteen names that name no instance, and the range of a
-term that the checker did not write.
+term that the checker did not write. Every instance of [A3] to [A6] is
+evaluated with values of the oracle as well (section 12.4).
 
 `v2/tests/checker.rs` tests every checking, fact-logic, certificate and
 counterexample clause of slice 1 with accepting and rejecting programs, verifies
@@ -821,8 +822,8 @@ of another sort is counted by one ([J1]).
 | `pure-pay F A I [ARGUMENTS]` | `pay_{F, A, I}(t̄)`, field `I` of the payload of its alternative `A` |
 | `len {t}` | `len(t)` ([A3]) |
 | `str "text"` | A string literal |
-| `empty-map` | `∅` |
-| `vec [ITEMS]` | A vector literal |
+| `empty-map "key" "value"` | `∅`, with the types of its keys and of its values. A literal is a term of its type |
+| `vec "element" [ITEMS]` | A vector literal, with the type of its elements |
 | `struct S [ARGUMENTS]` | The constructor term `S {t̄}` ([A4]) |
 | `field {t} S I TYPE KIND RANGE` | `t.xᵢ`, field `I` of struct `S`. `KIND` is `bool` or `other`; `TYPE` and `RANGE` are as for `var` |
 | `ctor V C N [ARGUMENTS]` | Constructor `C` of the `N` constructors of variant `V`, applied ([A5]) |
@@ -1137,9 +1138,11 @@ control says which sentence of the rule it holds.
 constructors, fields, indexes, unpacks, assignments and built-in operands
 ([C1], [C2], [C4]) and the move mark on a read ([O3]). The test
 `slice_two_core_conforms_and_matches_erased` asks that 20 rules are
-applied, 17 stuck labels reached and 15 clauses of refusal met; the suite
-of slice 2 has 99 files and 300 runs, 199 of them compared with the erased
-semantics. The oracle counts an application of [E-Temp] now.
+applied, 18 stuck labels reached and 15 clauses of refusal met; the suite
+of slice 2 has 100 files and 358 runs, 236 of them compared with the
+erased semantics. One of the files and 58 of the runs are those of section
+12.4, with the label `X7 E-Oblige`. The oracle counts an application of
+[E-Temp] now.
 
 What the files found:
 
@@ -1171,6 +1174,70 @@ A counterexample gives no number for a name of a data type (RC25): the
 model of the search has one for every term, and it is no value of the
 name. `Solver::counterexample` leaves such a name out and gives its
 length where the model has one.
+
+### 12.4 The axioms of the data, held against real values on 24 November 2026
+
+Soundness needs that every instance of the theory is true of real values
+(section 6 of the [fact logic](facts.md)). For [A1], [A2] and [A7] to [A9]
+`tests/kernel.rs` has held that since the kernel makes the instances. For
+[A3] to [A6], and for [S5] on a field, an element, a length, a write and
+`trim`, three tests of the same file hold it now.
+
+- `the_instances_of_the_data_axioms_hold_for_real_values` writes terms as
+  the checker writes them, in 200 worlds drawn at random: names of sixteen
+  types (integers, `bool`, `string`, two structs, a variant, six vector
+  types, two map types) that hold values of the oracle, and over them
+  fields, elements, lengths, constructor terms, literals, writes of an
+  element, the names that a decision gives the fields of a variant value,
+  and names bound to the value of a term. A term has the value that the
+  oracle's operation gives. An element out of range is the oracle's value
+  for the type ([E-Formula]), and a write out of range leaves the vector
+  as it was. Every term then gets a number: its value for an integer, zero
+  or one for a truth value, and for any other value a number that no other
+  value has, of its type or of another. Every instance that the search
+  makes is granted by the kernel and true for these numbers. The test
+  counts the instances of each part of the theory, and where an instance
+  has a condition it counts those whose condition holds.
+- `a_wrong_value_makes_the_instance_of_its_axiom_false` gives one term a
+  number that is not that of its real value, sixteen times: a literal of
+  two elements with the length three, `∅` with an entry, a length below
+  zero and one above `usize.max`, two string literals that are one value,
+  a field that is not the argument, constructor terms with different
+  arguments that are one value and with equal arguments that are two, two
+  values with equal fields that differ, a constructor term of another
+  constructor, terms of two constructors that are one value, a value of
+  no constructor, a write that changes the length, a written element that
+  is not what was written, and a write that changes another element. Each
+  time the instance of the axiom is false. Four more numbers are wrong
+  where the condition of the instance does not hold, and the instance
+  stays true.
+- `a_literal_at_two_types_is_two_terms`: `[]` at six types, `∅` at two,
+  and `[1, 0]` beside `[true, false]`. Before this test the crate had one
+  term for each of the three, and a value of one type had the number of a
+  value of another.
+
+`tests/slice2/facts_data.core` has the same axioms as statements of a
+program, and the oracle says what is true: an obligation `⊢ φ` that a run
+finds false is stuck ([E-Oblige]). Each axiom is there as a statement that
+every run finds true, with a statement beside it that some run finds
+false. `the_axioms_of_the_data_are_proved_and_what_they_do_not_say_is_not`
+(`tests/checker_slice2.rs`) holds the checker against the 58 runs, control
+by control, as section 12.3 describes: of the 49 controls it refuses the
+21 in which a run is stuck and proves 23. The other five are true of
+every run and not proved. Two are what the logic leaves out ([A3]): the
+elements of a vector literal, and the length of a string literal. Three
+are review finding RC26: two values of a struct without fields are equal,
+two values of a variant with one constructor are equal, and a value of a
+variant with three constructors is one of the three. The checker knows
+the constructor of a variant value only where a decision has taken the
+value apart.
+
+With a literal as a term of its type the campaigns answer as before,
+program for program and mutant for mutant. The search of the 13,073
+mutants of slice 2 makes the same 2,215,849 theory checks, of 27,945,739
+rows where there were 27,946,898, and adds 3,815,083 premises where it
+added 3,814,652; the campaigns of slice 1, which has no literal of data,
+count the same in every number.
 
 ## 13. Slice 2 Phase 3: Ownership, Faults, Boundaries, and Data Fact Logic
 

@@ -2538,18 +2538,22 @@ const ASKS_MORE: [(&str, &str, &str, &str); 3] = [
 /// control further out on the stack ([E-Effect]).
 const STUCK_BY_ANOTHER: [(&str, &str); 1] = [("op_text", "says")];
 
-/// Every control of the rule files in which a run of the oracle is stuck is
-/// rejected by the checker, and every other control of them is accepted:
-/// the checker draws the line where the instrumented semantics does, clause
-/// by clause ([O1] to [O5], [O3a], [P5], [F1] to [F3]).
-#[test]
-fn the_rule_files_of_the_data_are_rejected_exactly_where_a_run_is_stuck() {
+/// Holds the checker against the oracle on files of the suite, control by
+/// control: a control in which a run is stuck must be rejected, and any
+/// other must be accepted, apart from those of `asks_more`, which the
+/// checker refuses by the clause named, and those of `stuck_by_another`.
+/// Gives the numbers of the controls rejected and accepted.
+fn held_against_the_oracle(
+    files: &[&str],
+    asks_more: &[(&str, &str, &str, &str)],
+    stuck_by_another: &[(&str, &str)],
+) -> (usize, usize) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/slice2");
     let mut failures = Vec::new();
     let mut rejected = 0;
     let mut accepted = 0;
-    let mut asks_more = 0;
-    for name in RULE_FILES {
+    let mut asked_more = 0;
+    for name in files {
         let source = std::fs::read_to_string(dir.join(format!("{name}.core"))).unwrap();
         let report = villanelle_v2::script::check(&source);
         assert!(
@@ -2560,15 +2564,15 @@ fn the_rule_files_of_the_data_are_rejected_exactly_where_a_run_is_stuck() {
         let program = load(&source).unwrap_or_else(|e| panic!("{name}: {e}"));
         let verdicts = check::check_each(&program).unwrap_or_else(|e| panic!("{name}: {e}"));
         for (control, verdict) in verdicts {
-            if let Some((_, _, clause, _)) = ASKS_MORE
+            if let Some((_, _, clause, _)) = asks_more
                 .iter()
-                .find(|(file, asked, _, _)| *file == name && *asked == control)
+                .find(|(file, asked, _, _)| file == name && *asked == control)
             {
                 // No run of the control is stuck, and the checker refuses
                 // it by the clause that the table names.
                 assert!(!report.stuck_in.contains_key(&control), "{name}: {control}");
                 match verdict {
-                    Some(error) if error.clause == *clause => asks_more += 1,
+                    Some(error) if error.clause == *clause => asked_more += 1,
                     Some(error) => {
                         failures.push(format!("{name}: [{clause}] is expected, and {error}"))
                     }
@@ -2579,7 +2583,7 @@ fn the_rule_files_of_the_data_are_rejected_exactly_where_a_run_is_stuck() {
             let stuck = report
                 .stuck_in
                 .get(&control)
-                .filter(|_| !STUCK_BY_ANOTHER.contains(&(name, control.as_str())));
+                .filter(|_| !stuck_by_another.contains(&(*name, control.as_str())));
             match (stuck, verdict) {
                 (Some(states), None) => failures.push(format!(
                     "{name}: `{control}` is accepted, and a run of it is stuck ({})",
@@ -2594,8 +2598,66 @@ fn the_rule_files_of_the_data_are_rejected_exactly_where_a_run_is_stuck() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert_eq!(asks_more, ASKS_MORE.len());
-    assert_eq!((rejected, accepted), (62, 59));
+    assert_eq!(asked_more, asks_more.len());
+    (rejected, accepted)
+}
+
+/// Every control of the rule files in which a run of the oracle is stuck is
+/// rejected by the checker, and every other control of them is accepted:
+/// the checker draws the line where the instrumented semantics does, clause
+/// by clause ([O1] to [O5], [O3a], [P5], [F1] to [F3]).
+#[test]
+fn the_rule_files_of_the_data_are_rejected_exactly_where_a_run_is_stuck() {
+    let counts = held_against_the_oracle(&RULE_FILES, &ASKS_MORE, &STUCK_BY_ANOTHER);
+    assert_eq!(counts, (62, 59));
+}
+
+/// The statements of `facts_data.core` that are true of every run and that
+/// the checker does not prove: two that the logic leaves out ([A3]), and
+/// three of review finding RC26, which [A4] and [A5] entail.
+const LEFT_OUT: [(&str, &str, &str, &str); 5] = [
+    (
+        "facts_data",
+        "literal_elements",
+        "P1",
+        "the logic knows the length of a vector literal and nothing of its elements",
+    ),
+    (
+        "facts_data",
+        "literal_text_length",
+        "P1",
+        "what `len` counts in a string is for the text library to say",
+    ),
+    (
+        "facts_data",
+        "one_value",
+        "P1",
+        "RC26: a struct without fields has no field that says its values are equal",
+    ),
+    (
+        "facts_data",
+        "one_constructor",
+        "P1",
+        "RC26: a value is known to be of a constructor only where a decision took it apart",
+    ),
+    (
+        "facts_data",
+        "one_of_its_constructors",
+        "P1",
+        "RC26: the same, for a type of three constructors",
+    ),
+];
+
+/// Section 5 of the fact logic, held against the oracle. Each axiom of [A3]
+/// to [A6] is a statement of a program that every run finds true and the
+/// checker proves, and beside it is a statement that some run finds false:
+/// the run is stuck, and the checker refuses the control. So the instances
+/// of the crate decide the axioms as statements ([J1], [J3]), apart from
+/// what `LEFT_OUT` lists.
+#[test]
+fn the_axioms_of_the_data_are_proved_and_what_they_do_not_say_is_not() {
+    let counts = held_against_the_oracle(&["facts_data"], &LEFT_OUT, &[]);
+    assert_eq!(counts, (21, 23));
 }
 
 /// Review finding RC25 ([M2], [M7]): a name of a data type has no number,

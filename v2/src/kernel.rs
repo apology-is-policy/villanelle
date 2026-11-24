@@ -409,14 +409,31 @@ impl Kernel {
         instance: &Instance,
         values: &BTreeMap<TermId, Int>,
     ) -> Result<bool, String> {
-        let formula = self.instance(query, instance)?;
-        let assignment = query
+        let rows = Kernel::rows(query, values);
+        self.instance_holds_for(query, instance, &rows)
+    }
+
+    /// The truth of every row of a query when the terms have the values
+    /// given, by the variable of the row.
+    pub fn rows(query: &Query, values: &BTreeMap<TermId, Int>) -> BTreeMap<usize, bool> {
+        query
             .atoms
             .iter()
             .enumerate()
             .map(|(atom, row)| (query.first_theory_var + atom, row_holds(row, values)))
-            .collect();
-        Ok(self.diagram.evaluate(formula, &assignment))
+            .collect()
+    }
+
+    /// Whether an instance holds when the rows have the truth given
+    /// ([`Kernel::rows`]). An instance has no row that the query has not.
+    pub fn instance_holds_for(
+        &mut self,
+        query: &Query,
+        instance: &Instance,
+        rows: &BTreeMap<usize, bool>,
+    ) -> Result<bool, String> {
+        let formula = self.instance(query, instance)?;
+        Ok(self.diagram.evaluate(formula, rows))
     }
 
     /// Reads what the checker's tables have gained since the last query.
@@ -663,8 +680,8 @@ impl Kernel {
                 Some(
                     AtomTerm::StructCtor(_, _)
                         | AtomTerm::VariantCtor { .. }
-                        | AtomTerm::VecLit(_)
-                        | AtomTerm::EmptyMap
+                        | AtomTerm::VecLit(_, _)
+                        | AtomTerm::EmptyMap(_, _)
                         | AtomTerm::Update { .. }
                 )
             )
@@ -718,11 +735,11 @@ impl Kernel {
             // [A3]: `0 ≤ len(t) ≤ usize.max`.
             AtomTerm::Len(_) => self.within_usize(query, &u),
             // [A3]: `len([t₁, …, tₙ]) = n` and `len(∅) = 0`.
-            AtomTerm::VecLit(items) => {
+            AtomTerm::VecLit(_, items) => {
                 let length = variable(self.find(&AtomTerm::Len(u.clone()))?);
                 self.eq(query, &length, &number(items.len() as i128))
             }
-            AtomTerm::EmptyMap => {
+            AtomTerm::EmptyMap(_, _) => {
                 let length = variable(self.find(&AtomTerm::Len(u.clone()))?);
                 self.eq(query, &length, &number(0))
             }

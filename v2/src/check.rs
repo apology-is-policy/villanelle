@@ -855,13 +855,23 @@ fn translate_term(program: &Program, solver: &mut Solver, expr: &Expr, env: &Env
                 .iter()
                 .map(|item| translate_term(program, solver, item, env))
                 .collect();
-            let id = solver.intern_term(AtomTerm::VecLit(elems));
+            // A literal is a term of its type: `[]` at two types is two
+            // terms, and so is `[1, 0]` beside `[true, false]`.
+            let element = match ty.deref_type() {
+                Type::Vector(element) => element.to_string(),
+                other => other.to_string(),
+            };
+            let id = solver.intern_term(AtomTerm::VecLit(element, elems));
             solver.register_sort(id, ty);
             solver.instantiate_all();
             LinearTerm::var(id)
         }
         Expr::EmptyMap(ty) => {
-            let id = solver.intern_term(AtomTerm::EmptyMap);
+            let (key, value) = match ty.deref_type() {
+                Type::Map(key, value) => (key.to_string(), value.to_string()),
+                other => (other.to_string(), String::new()),
+            };
+            let id = solver.intern_term(AtomTerm::EmptyMap(key, value));
             solver.register_sort(id, ty);
             solver.instantiate_all();
             LinearTerm::var(id)

@@ -1,0 +1,418 @@
+// The axioms of the data in the fact logic ([A1], [A3] to [A6], [S5]), as
+// statements of a program. An obligation `⊢ φ` that a run finds false is
+// stuck ([E-Oblige]), and one that the logic entails is proved. Each axiom
+// is here as a statement that every run finds true, which the checker
+// proves, and beside it a statement that some run finds false, which the
+// checker refuses. The last controls state what is true of every run and
+// is not proved; `v2/tests/checker_slice2.rs` holds the checker against
+// these runs, control by control.
+
+copy struct point {x : u8, y : u8}
+
+struct label {name : string, at : point}
+
+copy variant shape {dot │ circle {r : u8} │ box {w : u8, h : u8}}
+
+copy variant color {red │ green │ blue}
+
+copy struct unit {}
+
+copy struct flag {on : bool}
+
+copy variant one {only}
+
+// [A3] `0 ≤ len(t)`, for a vector, a string and a map.
+control len_range(v : [u8], s : string, m : string ⇀ u8)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ len(v) ≥ 0 ∧ len(s) ≥ 0 ∧ len(m) ≥ 0
+    ⊤ ▷ ■ ok {}
+
+control len_wrong(v : [u8])
+    ■ { ok {} }
+    ⊤ ▷ ⊢ len(v) ≥ 1
+    ⊤ ▷ ■ ok {}
+
+// [A3] `len([t₁, …, tₙ]) = n`, for a name bound to the literal and for the
+// literal in a formula.
+control literal_length(a : u8, b : u8)
+    ■ { ok {} }
+    ⊤ ▷ w : [u8] := [a, b, 3]
+    ⊤ ▷ ⊢ len(w) = 3 ∧ len([a, b]) = 2
+    ⊤ ▷ ■ ok {}
+
+control literal_length_wrong(a : u8, b : u8)
+    ■ { ok {} }
+    ⊤ ▷ w : [u8] := [a, b, 3]
+    ⊤ ▷ ⊢ len(w) = 2
+    ⊤ ▷ ■ ok {}
+
+// [A3] `len(∅) = 0`.
+control empty_map()
+    ■ { ok {} }
+    ⊤ ▷ m : string ⇀ u8 := ∅
+    ⊤ ▷ ⊢ len(m) = 0
+    ⊤ ▷ ■ ok {}
+
+control empty_map_wrong()
+    ■ { ok {} }
+    ⊤ ▷ m : string ⇀ u8 := ∅
+    ⊤ ▷ ⊢ len(m) = 1
+    ⊤ ▷ ■ ok {}
+
+// [A3] Different string literals are different values.
+control strings_differ(s : string) ⊢ s = "a"
+    ■ { ok {} }
+    ⊤ ▷ ⊢ ¬(s = "b") ∧ ¬("a" = "b")
+    ⊤ ▷ ■ ok {}
+
+control strings_differ_wrong(s : string) ⊢ s = "a"
+    ■ { ok {} }
+    ⊤ ▷ ⊢ s = "b"
+    ⊤ ▷ ■ ok {}
+
+// [A4] `S {t̄}.xᵢ = tᵢ`.
+control field_of_constructor(a : u8, b : u8)
+    ■ { ok {} }
+    ⊤ ▷ p : point := point {a, b}
+    ⊤ ▷ ⊢ p.x = a ∧ p.y = b ∧ point {a, b}.x = a
+    ⊤ ▷ ■ ok {}
+
+control field_of_constructor_wrong(a : u8, b : u8)
+    ■ { ok {} }
+    ⊤ ▷ p : point := point {a, b}
+    ⊤ ▷ ⊢ p.x = b
+    ⊤ ▷ ■ ok {}
+
+// [A4] `t = S {t.x₁, …, t.xₙ}`: values with equal fields are equal.
+control extension(p : point, q : point) ⊢ p.x = q.x ∧ p.y = q.y
+    ■ { ok {} }
+    ⊤ ▷ ⊢ p = q ∧ p = point {p.x, p.y}
+    ⊤ ▷ ■ ok {}
+
+// One field of two says nothing of the other.
+control extension_wrong(p : point, q : point) ⊢ p.x = q.x
+    ■ { ok {} }
+    ⊤ ▷ ⊢ p = q
+    ⊤ ▷ ■ ok {}
+
+// [S5] A field is a function: equal values have equal fields.
+control fields_of_equal_values(p : point, q : point) ⊢ p = q
+    ■ { ok {} }
+    ⊤ ▷ ⊢ p.x = q.x ∧ p.y = q.y
+    ⊤ ▷ ■ ok {}
+
+// [A4] A struct value is the tuple of its fields: constructor terms are
+// equal exactly when their arguments are.
+control struct_one_to_one(a : u8, b : u8, c : u8, d : u8) ⊢ point {a, b} = point {c, d}
+    ■ { ok {} }
+    ⊤ ▷ ⊢ a = c ∧ b = d
+    ⊤ ▷ ■ ok {}
+
+control struct_same(a : u8, b : u8, c : u8, d : u8) ⊢ a = c ∧ b = d
+    ■ { ok {} }
+    ⊤ ▷ ⊢ point {a, b} = point {c, d}
+    ⊤ ▷ ■ ok {}
+
+control struct_same_wrong(a : u8, b : u8, c : u8, d : u8) ⊢ a = c
+    ■ { ok {} }
+    ⊤ ▷ ⊢ point {a, b} = point {c, d}
+    ⊤ ▷ ■ ok {}
+
+// [A4] through a field that is a struct.
+control nested_extension(l : label, m : label) ⊢ l.name = m.name ∧ l.at.x = m.at.x ∧ l.at.y = m.at.y
+    ■ { ok {} }
+    ⊤ ▷ ⊢ l.at = m.at ∧ l = m
+    ⊤ ▷ ■ ok {}
+
+control nested_extension_wrong(l : label, m : label) ⊢ l.name = m.name ∧ l.at.x = m.at.x
+    ■ { ok {} }
+    ⊤ ▷ ⊢ l = m
+    ⊤ ▷ ■ ok {}
+
+// [A4] A struct of one truth value has two values: of three, two are equal.
+control two_values(p : flag, q : flag, r : flag)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ p = q ∨ q = r ∨ p = r
+    ⊤ ▷ ■ ok {}
+
+control two_values_wrong(p : flag, q : flag)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ p = q
+    ⊤ ▷ ■ ok {}
+
+// [A4], [I9] A field changes and the others keep their facts.
+control field_write(a : u8, b : u8)
+    ■ { ok {} }
+    ⊤ ▷ ~p : point := point {a, b}
+    ⊤ ▷ p.x ← 9
+    ⊤ ▷ ⊢ p.y = b ∧ p.x = 9 ∧ p = point {9, b}
+    ⊤ ▷ ■ ok {}
+
+control field_write_wrong(a : u8, b : u8)
+    ■ { ok {} }
+    ⊤ ▷ ~p : point := point {a, b}
+    ⊤ ▷ p.x ← 9
+    ⊤ ▷ ⊢ p.x = a
+    ⊤ ▷ ■ ok {}
+
+control nested_write(l : label)
+    ■ { ok {out : label} }
+    ⊤ ▷ ~k : label := l
+    ⊤ ▷ y : u8 := k.at.y
+    ⊤ ▷ n : usize := len(k.name)
+    ⊤ ▷ k.at.x ← 9
+    ⊤ ▷ ⊢ k.at.y = y ∧ k.at.x = 9 ∧ len(k.name) = n ∧ k.at = point {9, y}
+    ⊤ ▷ ■ ok {k}
+
+control nested_write_wrong(l : label)
+    ■ { ok {out : label} }
+    ⊤ ▷ ~k : label := l
+    ⊤ ▷ x : u8 := k.at.x
+    ⊤ ▷ k.at.x ← 9
+    ⊤ ▷ ⊢ k.at.x = x
+    ⊤ ▷ ■ ok {k}
+
+// [A5] `V.c {s̄} ≠ V.c′ {t̄}` for `c ≠ c′`.
+control constructors_differ(a : u8, b : u8)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ ¬(shape.dot = shape.circle {a}) ∧ ¬(shape.circle {a} = shape.box {a, b})
+    ⊤ ▷ ■ ok {}
+
+control constructors_differ_wrong(a : u8)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ shape.dot = shape.circle {a}
+    ⊤ ▷ ■ ok {}
+
+// [A5] `V.c {s̄} = V.c {t̄}` implies `s̄ = t̄`.
+control variant_one_to_one(a : u8, b : u8) ⊢ shape.circle {a} = shape.circle {b}
+    ■ { ok {} }
+    ⊤ ▷ ⊢ a = b
+    ⊤ ▷ ■ ok {}
+
+control variant_same_wrong(a : u8, b : u8)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ shape.circle {a} = shape.circle {b}
+    ⊤ ▷ ■ ok {}
+
+// [A5], [I11] `t is c` holds for one constructor, and then `t = V.c {ū}`:
+// a decision says which, and gives the fields their names.
+control decided(t : shape)
+    ■ { ok {} }
+    ⊤ ▷ d : Δ shape(t) ▸ dot {} │ circle {r} │ box {w, h}
+    d.dot ▷ ⊢ t = shape.dot
+    d.circle ▷ ⊢ t = shape.circle {r} ∧ ¬(t = shape.dot)
+    d.box ▷ ⊢ t = shape.box {w, h} ∧ ¬(t = shape.circle {w})
+    ⊤ ▷ ■ ok {}
+
+control decided_wrong(t : shape)
+    ■ { ok {} }
+    ⊤ ▷ d : Δ shape(t) ▸ dot {} │ circle {r} │ box {w, h}
+    d.circle ▷ ⊢ t = shape.circle {0}
+    ⊤ ▷ ■ ok {}
+
+// Two values taken apart: equal where the constructor and the fields are.
+control decided_alike(t : shape, u : shape)
+    ■ { ok {} }
+    ⊤ ▷ d : Δ shape(t) ▸ dot {} │ circle {r} │ box {w, h}
+    ⊤ ▷ e : Δ shape(u) ▸ dot {} │ circle {q} │ box {a, b}
+    d.dot ∧ e.dot ▷ ⊢ t = u
+    d.circle ∧ e.circle ▷ ⊢ (t = u ∧ r = q) ∨ (¬(t = u) ∧ ¬(r = q))
+    d.dot ∧ e.box ▷ ⊢ ¬(t = u)
+    ⊤ ▷ ■ ok {}
+
+// [A6] `len(t[i ↦ e]) = len(t)`, and `0 ≤ i < len(t)` implies
+// `t[i ↦ e][i] = e`.
+control write_length(v : [u8], i : usize, e : u8) ⊢ i < len(v)
+    ■ { ok {out : [u8]} }
+    ⊤ ▷ n : usize := len(v)
+    ⊤ ▷ ~w : [u8] := v
+    ⊤ ▷ w[i] ← e
+    ⊤ ▷ ⊢ len(w) = n ∧ w[i] = e
+    ⊤ ▷ ■ ok {w}
+
+control write_length_wrong(v : [u8], i : usize, e : u8) ⊢ i < len(v)
+    ■ { ok {out : [u8]} }
+    ⊤ ▷ n : usize := len(v)
+    ⊤ ▷ ~w : [u8] := v
+    ⊤ ▷ w[i] ← e
+    ⊤ ▷ ⊢ len(w) = n + 1
+    ⊤ ▷ ■ ok {w}
+
+control read_back_wrong(v : [u8], i : usize, e : u8) ⊢ i < len(v)
+    ■ { ok {out : [u8]} }
+    ⊤ ▷ ~w : [u8] := v
+    ⊤ ▷ w[i] ← e
+    ⊤ ▷ ⊢ w[i] = e + 1
+    ⊤ ▷ ■ ok {w}
+
+// [A6] `i ≠ j` implies `t[i ↦ e][j] = t[j]`.
+control frame(v : [u8], i : usize, j : usize, e : u8) ⊢ i < len(v) ∧ j < len(v) ∧ ¬(i = j)
+    ■ { ok {out : [u8]} }
+    ⊤ ▷ ~w : [u8] := v
+    ⊤ ▷ before : u8 := w[j]
+    ⊤ ▷ w[i] ← e
+    ⊤ ▷ ⊢ w[j] = before
+    ⊤ ▷ ■ ok {w}
+
+// Without `i ≠ j` the element may be the one that was written.
+control frame_wrong(v : [u8], i : usize, j : usize, e : u8) ⊢ i < len(v) ∧ j < len(v)
+    ■ { ok {out : [u8]} }
+    ⊤ ▷ ~w : [u8] := v
+    ⊤ ▷ before : u8 := w[j]
+    ⊤ ▷ w[i] ← e
+    ⊤ ▷ ⊢ w[j] = before
+    ⊤ ▷ ■ ok {w}
+
+// [A6], [A4] A write of a field of an element: the element is the
+// constructor term, and every other element is as it was.
+control write_in_element(v : [point], i : usize, j : usize) ⊢ i < len(v) ∧ j < len(v) ∧ ¬(i = j)
+    ■ { ok {out : [point]} }
+    ⊤ ▷ ~w : [point] := v
+    ⊤ ▷ n : usize := len(w)
+    ⊤ ▷ y : u8 := w[i].y
+    ⊤ ▷ other : point := w[j]
+    ⊤ ▷ w[i].x ← 9
+    ⊤ ▷ ⊢ len(w) = n ∧ w[i] = point {9, y} ∧ w[j] = other
+    ⊤ ▷ ■ ok {w}
+
+control write_in_element_wrong(v : [point], i : usize, j : usize) ⊢ i < len(v) ∧ j < len(v)
+    ■ { ok {out : [point]} }
+    ⊤ ▷ ~w : [point] := v
+    ⊤ ▷ other : point := w[j]
+    ⊤ ▷ w[i].x ← 9
+    ⊤ ▷ ⊢ w[j].x = other.x
+    ⊤ ▷ ■ ok {w}
+
+// [A6] Two writes: the second is read back, and the first where the second
+// did not replace it.
+control two_writes(v : [u8], i : usize, j : usize, a : u8, b : u8) ⊢ i < len(v) ∧ j < len(v)
+    ■ { ok {out : [u8]} }
+    ⊤ ▷ ~w : [u8] := v
+    ⊤ ▷ w[i] ← a
+    ⊤ ▷ w[j] ← b
+    ⊤ ▷ ⊢ w[j] = b ∧ (i = j ∨ w[i] = a)
+    ⊤ ▷ ■ ok {w}
+
+control two_writes_wrong(v : [u8], i : usize, j : usize, a : u8, b : u8) ⊢ i < len(v) ∧ j < len(v)
+    ■ { ok {out : [u8]} }
+    ⊤ ▷ ~w : [u8] := v
+    ⊤ ▷ w[i] ← a
+    ⊤ ▷ w[j] ← b
+    ⊤ ▷ ⊢ w[i] = a
+    ⊤ ▷ ■ ok {w}
+
+// [A1] A field and an element of a value that a name holds lie in the
+// range of their type. An element out of range is a value of the type too
+// ([E-Formula]).
+control element_range(v : [u8], i : usize, p : point)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ v[i] ≤ 255 ∧ 0 ≤ v[i] ∧ p.x ≤ 255
+    ⊤ ▷ ■ ok {}
+
+control element_range_wrong(v : [u8], i : usize)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ v[i] ≤ 254
+    ⊤ ▷ ■ ok {}
+
+// [S5] `trim`, `len` and an element are functions.
+control symbols(s : string, t : string, v : [u8], i : usize, j : usize) ⊢ s = t ∧ i = j
+    ■ { ok {} }
+    ⊤ ▷ ⊢ trim(s) = trim(t) ∧ len(s) = len(t) ∧ v[i] = v[j]
+    ⊤ ▷ ■ ok {}
+
+control symbols_wrong(s : string, t : string)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ trim(s) = trim(t)
+    ⊤ ▷ ■ ok {}
+
+// True of every run, and not proved.
+
+// [A3] The logic knows the length of a literal and nothing of its elements.
+control literal_elements(a : u8)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ [a, 2][0] = a
+    ⊤ ▷ ■ ok {}
+
+// [A3] What `len` counts in a string is for the text library to say.
+control literal_text_length()
+    ■ { ok {} }
+    ⊤ ▷ ⊢ len("ab") = 2
+    ⊤ ▷ ■ ok {}
+
+// [A4] A struct without fields has one value (review finding RC26).
+control one_value(u : unit, w : unit)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ u = w
+    ⊤ ▷ ■ ok {}
+
+// [A5] A value is of one of the constructors of its type. The checker
+// knows it of a value that a decision has taken apart, as in `decided`,
+// and of no other (RC26).
+control one_constructor(t : one, u : one)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ t = u
+    ⊤ ▷ ■ ok {}
+
+control one_of_its_constructors(c : color)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ c = color.red ∨ c = color.green ∨ c = color.blue
+    ⊤ ▷ ■ ok {}
+
+//! run len_range([], "", {}) => done ok {}
+//! run len_wrong([]) => stuck X7 E-Oblige
+//! run literal_length(1, 2) => done ok {}
+//! run literal_length_wrong(1, 2) => stuck X7 E-Oblige
+//! run empty_map() => done ok {}
+//! run empty_map_wrong() => stuck X7 E-Oblige
+//! run strings_differ("a") => done ok {}
+//! run strings_differ_wrong("a") => stuck X7 E-Oblige
+//! run field_of_constructor(1, 2) => done ok {}
+//! run field_of_constructor_wrong(1, 2) => stuck X7 E-Oblige
+//! run extension(point {1, 2}, point {1, 2}) => done ok {}
+//! run extension_wrong(point {1, 2}, point {1, 3}) => stuck X7 E-Oblige
+//! run fields_of_equal_values(point {1, 2}, point {1, 2}) => done ok {}
+//! run struct_one_to_one(1, 2, 1, 2) => done ok {}
+//! run struct_same(1, 2, 1, 2) => done ok {}
+//! run struct_same_wrong(1, 2, 1, 3) => stuck X7 E-Oblige
+//! run nested_extension(label {"a", point {1, 2}}, label {"a", point {1, 2}}) => done ok {}
+//! run nested_extension_wrong(label {"a", point {1, 2}}, label {"a", point {1, 3}}) => stuck X7 E-Oblige
+//! run two_values(flag {true}, flag {false}, flag {true}) => done ok {}
+//! run two_values_wrong(flag {true}, flag {false}) => stuck X7 E-Oblige
+//! run field_write(1, 2) => done ok {}
+//! run field_write_wrong(1, 2) => stuck X7 E-Oblige
+//! run nested_write(label {"a", point {1, 2}}) => done ok {label {"a", point {9, 2}}}
+//! run nested_write_wrong(label {"a", point {1, 2}}) => stuck X7 E-Oblige
+//! run constructors_differ(1, 2) => done ok {}
+//! run constructors_differ_wrong(1) => stuck X7 E-Oblige
+//! run variant_one_to_one(1, 1) => done ok {}
+//! run variant_same_wrong(1, 2) => stuck X7 E-Oblige
+//! run decided(shape.dot) => done ok {}
+//! run decided(shape.circle {3}) => done ok {}
+//! run decided(shape.box {3, 4}) => done ok {}
+//! run decided_wrong(shape.circle {3}) => stuck X7 E-Oblige
+//! run decided_wrong(shape.dot) => done ok {}
+//! run decided_alike(shape.dot, shape.dot) => done ok {}
+//! run decided_alike(shape.circle {1}, shape.circle {1}) => done ok {}
+//! run decided_alike(shape.circle {1}, shape.circle {2}) => done ok {}
+//! run decided_alike(shape.dot, shape.box {1, 2}) => done ok {}
+//! run write_length([1, 2], 0, 9) => done ok {[9, 2]}
+//! run write_length_wrong([1, 2], 0, 9) => stuck X7 E-Oblige
+//! run read_back_wrong([1, 2], 0, 9) => stuck X7 E-Oblige
+//! run frame([1, 2], 0, 1, 9) => done ok {[9, 2]}
+//! run frame_wrong([1, 2], 0, 0, 9) => stuck X7 E-Oblige
+//! run frame_wrong([1, 2], 0, 1, 9) => done ok {[9, 2]}
+//! run write_in_element([point {1, 2}, point {3, 4}], 0, 1) => done ok {[point {9, 2}, point {3, 4}]}
+//! run write_in_element_wrong([point {1, 2}, point {3, 4}], 0, 0) => stuck X7 E-Oblige
+//! run two_writes([1, 2], 0, 1, 8, 9) => done ok {[8, 9]}
+//! run two_writes([1, 2], 0, 0, 8, 9) => done ok {[9, 2]}
+//! run two_writes_wrong([1, 2], 0, 0, 8, 9) => stuck X7 E-Oblige
+//! run element_range([255], 0, point {255, 0}) => done ok {}
+//! run element_range([255], 7, point {255, 0}) => done ok {}
+//! run element_range_wrong([255], 0) => stuck X7 E-Oblige
+//! run symbols("a ", "a ", [1], 0, 0) => done ok {}
+//! run symbols_wrong("a", "b") => stuck X7 E-Oblige
+//! run literal_elements(1) => done ok {}
+//! run literal_text_length() => done ok {}
+//! run one_value(unit {}, unit {}) => done ok {}
+//! run one_constructor(one.only, one.only) => done ok {}
+//! run one_of_its_constructors(color.green) => done ok {}

@@ -140,8 +140,10 @@ fn term_text(term: &AtomTerm) -> String {
         ),
         AtomTerm::Len(t) => format!("len {}", linear_text(t)),
         AtomTerm::StrLit(text) => format!("str {}", quote(text)),
-        AtomTerm::EmptyMap => "empty-map".to_string(),
-        AtomTerm::VecLit(items) => format!("vec {}", list_text(items)),
+        AtomTerm::EmptyMap(key, value) => format!("empty-map {} {}", quote(key), quote(value)),
+        AtomTerm::VecLit(element, items) => {
+            format!("vec {} {}", quote(element), list_text(items))
+        }
         AtomTerm::StructCtor(structure, arguments) => {
             format!("struct {structure} {}", list_text(arguments))
         }
@@ -702,8 +704,8 @@ impl<'a> Cursor<'a> {
             }
             "len" => AtomTerm::Len(self.linear()?),
             "str" => AtomTerm::StrLit(self.text()?),
-            "empty-map" => AtomTerm::EmptyMap,
-            "vec" => AtomTerm::VecLit(self.linears()?),
+            "empty-map" => AtomTerm::EmptyMap(self.text()?, self.text()?),
+            "vec" => AtomTerm::VecLit(self.text()?, self.linears()?),
             "struct" => AtomTerm::StructCtor(self.count()?, self.linears()?),
             "field" => AtomTerm::Field {
                 base: self.linear()?,

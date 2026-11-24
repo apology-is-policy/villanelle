@@ -24,9 +24,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 enum Content {
     Struct(StructId, Vec<Int>),
     Variant(VariantId, usize, Vec<Int>),
-    Vector(Vec<Int>),
+    /// The type of the elements, and the elements.
+    Vector(String, Vec<Int>),
     Text(String),
-    EmptyMap,
+    /// The types of the keys and of the values.
+    EmptyMap(String, String),
 }
 
 /// The numbers of the contents that no row of the candidate speaks of. A
@@ -99,8 +101,10 @@ impl Solver {
                 *ctor_idx,
                 eval_all(fields, model),
             )),
-            AtomTerm::VecLit(items) => Some(Content::Vector(eval_all(items, model))),
-            AtomTerm::EmptyMap => Some(Content::EmptyMap),
+            AtomTerm::VecLit(element, items) => {
+                Some(Content::Vector(element.clone(), eval_all(items, model)))
+            }
+            AtomTerm::EmptyMap(key, value) => Some(Content::EmptyMap(key.clone(), value.clone())),
             AtomTerm::StrLit(text) => Some(Content::Text(text.clone())),
             _ => None,
         }
@@ -113,8 +117,8 @@ impl Solver {
             self.terms[id],
             AtomTerm::StructCtor(_, _)
                 | AtomTerm::VariantCtor { .. }
-                | AtomTerm::VecLit(_)
-                | AtomTerm::EmptyMap
+                | AtomTerm::VecLit(_, _)
+                | AtomTerm::EmptyMap(_, _)
                 | AtomTerm::StrLit(_)
                 | AtomTerm::Update { .. }
         ) || matches!(
@@ -334,13 +338,13 @@ impl Solver {
                 } => {
                     fixed.ctors.entry((*variant_id, value)).or_insert(*ctor_idx);
                 }
-                AtomTerm::VecLit(items) => {
+                AtomTerm::VecLit(_, items) => {
                     fixed
                         .lens
                         .entry(value)
                         .or_insert_with(|| Int::from_u64(items.len() as u64));
                 }
-                AtomTerm::EmptyMap => {
+                AtomTerm::EmptyMap(_, _) => {
                     fixed.lens.entry(value).or_insert_with(Int::zero);
                 }
                 AtomTerm::Field {
@@ -421,8 +425,8 @@ impl Solver {
                     AtomTerm::Len(base) => base
                         .as_var()
                         .and_then(|bid| match &self.terms[bid] {
-                            AtomTerm::VecLit(items) => Some(Int::from_u64(items.len() as u64)),
-                            AtomTerm::EmptyMap => Some(Int::zero()),
+                            AtomTerm::VecLit(_, items) => Some(Int::from_u64(items.len() as u64)),
+                            AtomTerm::EmptyMap(_, _) => Some(Int::zero()),
                             _ => None,
                         })
                         .or_else(|| fixed.lens.get(&base.eval(int_model)).cloned()),
@@ -465,7 +469,7 @@ impl Solver {
                             .or_insert(*ctor_idx);
                         Some(value)
                     }
-                    AtomTerm::VecLit(items) => {
+                    AtomTerm::VecLit(_, items) => {
                         let value = self.number_of(id, &mut contents, &fixed, int_model);
                         fixed
                             .lens
@@ -473,7 +477,7 @@ impl Solver {
                             .or_insert_with(|| Int::from_u64(items.len() as u64));
                         Some(value)
                     }
-                    AtomTerm::EmptyMap => {
+                    AtomTerm::EmptyMap(_, _) => {
                         let value = self.number_of(id, &mut contents, &fixed, int_model);
                         fixed.lens.entry(value.clone()).or_insert_with(Int::zero);
                         Some(value)

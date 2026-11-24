@@ -316,8 +316,8 @@ impl Solver {
                 self.terms[id],
                 AtomTerm::StructCtor(_, _)
                     | AtomTerm::VariantCtor { .. }
-                    | AtomTerm::VecLit(_)
-                    | AtomTerm::EmptyMap
+                    | AtomTerm::VecLit(_, _)
+                    | AtomTerm::EmptyMap(_, _)
                     | AtomTerm::Update { .. }
             )
         })
@@ -596,14 +596,16 @@ impl Solver {
                 Some(self.bdd.and(low, high))
             }
             AtomTerm::Len(_) => Some(self.usize_range_formula(&u)),
-            AtomTerm::VecLit(items) => {
+            AtomTerm::VecLit(element, items) => {
+                self.term_sorts.insert(idx, SortTag::Vector(element));
                 let len_id = self.intern_derived(AtomTerm::Len(u));
                 Some(self.eq(
                     &LinearTerm::var(len_id),
                     &LinearTerm::from_i128(items.len() as i128),
                 ))
             }
-            AtomTerm::EmptyMap => {
+            AtomTerm::EmptyMap(key, value) => {
+                self.term_sorts.insert(idx, SortTag::Map(key, value));
                 let len_id = self.intern_derived(AtomTerm::Len(u));
                 Some(self.eq(&LinearTerm::var(len_id), &LinearTerm::from_i128(0)))
             }

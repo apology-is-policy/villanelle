@@ -72,7 +72,7 @@ const SLICE2_RULES: [&str; 20] = [
 
 /// The ways of being stuck that the suite of slice 2 reaches, as the row of
 /// the table of section 6.10 and the clause without a successor.
-const SLICE2_STUCK: [&str; 17] = [
+const SLICE2_STUCK: [&str; 18] = [
     "X1 E-End",
     "X2 E-Var",
     "X2 E-Field",
@@ -83,6 +83,7 @@ const SLICE2_STUCK: [&str; 17] = [
     "X5 E-Scope",
     "X5 E-Assign",
     "X5 E-Temp",
+    "X7 E-Oblige",
     "X7 E-Index",
     "X7 E-Arith",
     "X7 E-Call",
@@ -153,10 +154,10 @@ fn slice_two_core_conforms_and_matches_erased() {
     }
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert!(runs >= 300, "{runs} runs");
+    assert!(runs >= 358, "{runs} runs");
     // Every run that is not stuck (the faulted ones with `on fault release`
     // among them) is compared with the erased semantics ([R4], [R5]).
-    assert!(compared >= 199 && compared < runs, "{compared} compared");
+    assert!(compared >= 236 && compared < runs, "{compared} compared");
 }
 
 #[test]

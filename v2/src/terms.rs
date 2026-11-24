@@ -99,10 +99,11 @@ pub enum AtomTerm {
     Len(LinearTerm),
     /// String literal ([A3]).
     StrLit(String),
-    /// Empty map literal `∅` ([A3]).
-    EmptyMap,
-    /// Vector literal `[t₁, …, tₙ]` ([A3]).
-    VecLit(Vec<LinearTerm>),
+    /// Empty map literal `∅` ([A3]), with the types of its keys and of its
+    /// values. A literal at two types is two terms: every term has one sort.
+    EmptyMap(String, String),
+    /// Vector literal `[t₁, …, tₙ]` ([A3]), with the type of its elements.
+    VecLit(String, Vec<LinearTerm>),
     /// Struct constructor `S {t̄}` ([A4]).
     StructCtor(StructId, Vec<LinearTerm>),
     /// Struct field projection `t.xᵢ` ([A4], [A1]).
