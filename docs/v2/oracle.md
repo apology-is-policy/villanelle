@@ -342,7 +342,26 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   integer literal is one greater or one less) and `FlipComparison` (`<` and
   `≤`, `>` and `≥`, `=` and `≠` are replaced by each other). The last two
   change one expression of a control: of its precondition, of the conditions
-  of its contract or of its body ([P1] to [P8], X6, X7). `mutate::classify`
+  of its contract or of its body ([P1] to [P8], X6, X7). Since 24 November
+  2026 there are five more, for the ownership of slice 2:
+  `RemoveStatement` (a statement that is no disposition and holds no body
+  is removed: what it consumed is still owed, [O4], [O5], X5),
+  `SwapStatements` (two statements that follow one another in a body change
+  places: what the second gives away is gone when the first runs, or a
+  fault comes while something is owed, [O2] to [O5], [F2], X2, X5, X8),
+  `ConsumeClone` (`clone(e)` becomes `e`, [O2], X2), `DropFaults` (a control
+  loses `faults`, [F1], X8) and `DropFaultRelease` (a resource loses `on
+  fault release`, [F2], X8). The kinds that change a body reach into the
+  bodies of loops, of the work and the contingency of a boundary, and of a
+  named boundary, and `RemoveDisposition` takes `terminate`, `escalate` and
+  `recover` too. Taking a name out of the care of a boundary or out of what
+  a named boundary retains is no kind: where the contingency mentions the
+  name `resolve` refuses, and where it does not the program means the same
+  (21 such mutants of 8 generated programs: none stuck).
+  `mutations_of_ownership_are_stuck_and_rejected`
+  (`v2/tests/checker_slice2.rs`) has a program with a stuck mutant of each
+  of the five kinds, in the states the kind is for, and requires that the
+  checker rejects every stuck mutant of it. `mutate::classify`
   runs a mutant in the oracle; across 16 sets of numbers of the template,
   the stuck mutants reach all 15 stuck states of slice 1. They are the
   target rejection set for the phase 3 checker.
@@ -487,7 +506,14 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   repaired ([review](review.md), RC12, RC16). Of 5,403 mutants of the
   first 25 programs, `resolve` refuses 285, the checker rejects
   1,052 (a stuck run was found for 761 of them) and accepts
-  4,066, none of which has a stuck run among those tried. The time
+  4,066, none of which has a stuck run among those tried. With the kinds
+  of 24 November these programs have 6,851 mutants: 832 refused, 1,068
+  rejected (769 with a stuck run), 4,951 accepted; the report gives the
+  counts for each kind, and the seven kinds of before have their numbers
+  of before. For slice 2 (`--slice 2 --mutants`, 40 programs): 9,925
+  mutants, 1,197 refused, 1,465 rejected (1,022 with a stuck run), 7,263
+  accepted with no stuck run, and an answer of the checker in ten seconds
+  on every one. The time
   limit of the checker is of the clock. A check that reaches it ends
   (`counts::set_deadline`: the search asks for the time now and then, and
   so does the diagram package as a diagram grows); before 23 November it
@@ -647,7 +673,10 @@ data kernel of slice 2 (`v2/tests/kernels/slice2_data.rails`): 212 queries,
 write 120,731 entries, and 2,375 splits.
 Over the 5,403 mutants of 25 generated programs: 1,116,283 queries,
 1,408,543 candidates, 1,252,564 theory checks of 21,804,605 rows, 239,878
-exchanges that write 7,436,643 entries, and 80,203 splits. One of these
+exchanges that write 7,436,643 entries, and 80,203 splits (over the 6,851
+mutants that the same programs have since 24 November: 1,323,287 queries,
+1,664,289 candidates, 1,480,640 theory checks of 25,703,845 rows, 276,477
+exchanges that write 7,881,928 entries, and 90,888 splits). One of these
 theory checks goes on to the Omega test, which refutes its rows without a
 splinter; it accounts for 4.5 million of the entries. No theory check of
 the surface programs, of the data kernel or of the 300 generated programs

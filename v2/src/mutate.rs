@@ -4,7 +4,15 @@
 //! arm of a decision, removing a disposition (`■`, `□` or `↑`), dropping a
 //! statement's guard selector to `⊤`, dropping a loop's invariant, dropping
 //! an effect from a control's `uses` clause, making an integer literal one
-//! greater or one less, or replacing a comparison by the one beside it.
+//! greater or one less, or replacing a comparison by the one beside it. For
+//! the ownership of slice 2: removing a statement, so that what it consumed
+//! stays and what it wrote is not written; letting two statements that
+//! follow one another change places; consuming where a clone was made; and
+//! removing the permission to fault of a control or the release under a
+//! fault of a resource. Taking a name out of the care of a boundary, or out
+//! of what a named boundary retains, is no mutation here: where the
+//! contingency mentions the name `resolve` refuses the program, and where
+//! it does not the program means the same.
 //!
 //! [`classify`] runs a mutant through `resolve` and the oracle across a set of
 //! inputs. The mutants that are stuck in the oracle are those that the checker
@@ -36,6 +44,21 @@ pub enum Kind {
     /// other, `>` and `≥` by each other, `=` and `≠` by each other ([P1] to
     /// [P8], X6).
     FlipComparison,
+    /// A statement that is no disposition and holds no body is removed: what
+    /// it consumed is still owed, and what it wrote is not written ([O4],
+    /// [O5], X5; [P1] to [P5], X7; [K7], X1 for `fault e` and `⊥`).
+    RemoveStatement,
+    /// `clone(e)` is replaced by `e`, which is consumed ([O2], [O3], X2).
+    ConsumeClone,
+    /// `faults` is removed from a control ([F1], X8).
+    DropFaults,
+    /// `on fault release` is removed from a resource ([F2], X8).
+    DropFaultRelease,
+    /// Two statements that follow one another in a body change places: what
+    /// the second consumes or releases is gone when the first runs, and what
+    /// may fault runs while something is owed ([O2] to [O5], [F2], X2, X5,
+    /// X8).
+    SwapStatements,
 }
 
 #[derive(Clone, Debug)]
@@ -56,55 +79,112 @@ pub enum Class {
     Unstuck,
 }
 
-fn body_mut<'a>(
-    program: &'a mut Program,
+/// The statements of a declaration: the body of a control, or the work or
+/// the contingency of a named boundary.
+#[derive(Clone, Copy)]
+struct Root {
     declaration: usize,
-    loop_path: &[usize],
-) -> &'a mut Vec<Statement> {
-    let Declaration::Control(control) = &mut program.declarations[declaration] else {
-        panic!("expected a control declaration");
+    contingency: bool,
+}
+
+/// A step from a body into one that a statement of it holds.
+#[derive(Clone, Copy)]
+enum Step {
+    Loop(usize),
+    Work(usize),
+    Contingency(usize),
+}
+
+fn body_ref<'a>(program: &'a Program, root: Root, path: &[Step]) -> &'a [Statement] {
+    let mut statements: &[Statement] = match &program.declarations[root.declaration] {
+        Declaration::Control(control) => &control.body,
+        Declaration::Boundary(boundary) if root.contingency => &boundary.contingency,
+        Declaration::Boundary(boundary) => &boundary.body,
+        _ => panic!("expected a declaration with a body"),
     };
-    let mut statements = &mut control.body;
-    for index in loop_path {
-        let Command::Loop { body, .. } = &mut statements[*index].command else {
-            panic!("expected a loop statement");
+    for step in path {
+        statements = match (*step, &statements[step.index()].command) {
+            (Step::Loop(_), Command::Loop { body, .. }) => body,
+            (Step::Work(_), Command::Boundary { body, .. }) => body,
+            (Step::Contingency(_), Command::Boundary { contingency, .. }) => contingency,
+            _ => panic!("expected a statement that holds a body"),
         };
-        statements = body;
     }
     statements
 }
 
+fn body_mut<'a>(program: &'a mut Program, root: Root, path: &[Step]) -> &'a mut Vec<Statement> {
+    let mut statements = match &mut program.declarations[root.declaration] {
+        Declaration::Control(control) => &mut control.body,
+        Declaration::Boundary(boundary) => {
+            if root.contingency {
+                &mut boundary.contingency
+            } else {
+                &mut boundary.body
+            }
+        }
+        _ => panic!("expected a declaration with a body"),
+    };
+    for step in path {
+        statements = match (*step, &mut statements[step.index()].command) {
+            (Step::Loop(_), Command::Loop { body, .. }) => body,
+            (Step::Work(_), Command::Boundary { body, .. }) => body,
+            (Step::Contingency(_), Command::Boundary { contingency, .. }) => contingency,
+            _ => panic!("expected a statement that holds a body"),
+        };
+    }
+    statements
+}
+
+impl Step {
+    fn index(self) -> usize {
+        match self {
+            Step::Loop(index) | Step::Work(index) | Step::Contingency(index) => index,
+        }
+    }
+}
+
+/// The mutant of `program` with the statement `index` of a body removed.
+fn without_statement(program: &Program, root: Root, path: &[Step], index: usize) -> Program {
+    let mut mutated = program.clone();
+    body_mut(&mut mutated, root, path).remove(index);
+    mutated
+}
+
 fn collect_from_body(
     program: &Program,
-    declaration: usize,
+    root: Root,
     control_name: &str,
-    loop_path: &mut Vec<usize>,
+    path: &mut Vec<Step>,
     out: &mut Vec<Mutant>,
 ) {
-    let statements = {
-        let Declaration::Control(control) = &program.declarations[declaration] else {
-            return;
-        };
-        let mut current = &control.body;
-        for index in loop_path.iter() {
-            let Command::Loop { body, .. } = &current[*index].command else {
-                return;
-            };
-            current = body;
-        }
-        current.clone()
+    let statements = body_ref(program, root, path).to_vec();
+    let made = |kind: Kind, detail: String, program: Program| Mutant {
+        kind,
+        control: control_name.to_string(),
+        detail,
+        program,
     };
+
+    for second in 1..statements.len() {
+        let mut mutated = program.clone();
+        body_mut(&mut mutated, root, path).swap(second - 1, second);
+        out.push(made(
+            Kind::SwapStatements,
+            format!("swap statements {} and {second}", second - 1),
+            mutated,
+        ));
+    }
 
     for (index, statement) in statements.iter().enumerate() {
         if !matches!(statement.selector, Selector::Top) {
             let mut mutated = program.clone();
-            body_mut(&mut mutated, declaration, loop_path)[index].selector = Selector::Top;
-            out.push(Mutant {
-                kind: Kind::DropGuard,
-                control: control_name.to_string(),
-                detail: format!("drop guard at statement {index}"),
-                program: mutated,
-            });
+            body_mut(&mut mutated, root, path)[index].selector = Selector::Top;
+            out.push(made(
+                Kind::DropGuard,
+                format!("drop guard at statement {index}"),
+                mutated,
+            ));
         }
 
         match &statement.command {
@@ -112,17 +192,16 @@ fn collect_from_body(
                 for (arm_index, arm) in arms.iter().enumerate() {
                     let mut mutated = program.clone();
                     let Command::Decide { arms: target, .. } =
-                        &mut body_mut(&mut mutated, declaration, loop_path)[index].command
+                        &mut body_mut(&mut mutated, root, path)[index].command
                     else {
                         unreachable!();
                     };
                     target.remove(arm_index);
-                    out.push(Mutant {
-                        kind: Kind::RemoveArm,
-                        control: control_name.to_string(),
-                        detail: format!("remove arm `{}` of `{site}`", arm.alternative),
-                        program: mutated,
-                    });
+                    out.push(made(
+                        Kind::RemoveArm,
+                        format!("remove arm `{}` of `{site}`", arm.alternative),
+                        mutated,
+                    ));
                 }
             }
             Command::Exit { alternative, .. }
@@ -130,39 +209,72 @@ fn collect_from_body(
             | Command::Again {
                 name: alternative, ..
             } => {
-                let mut mutated = program.clone();
-                body_mut(&mut mutated, declaration, loop_path).remove(index);
-                out.push(Mutant {
-                    kind: Kind::RemoveDisposition,
-                    control: control_name.to_string(),
-                    detail: format!("remove disposition `{alternative}` at statement {index}"),
-                    program: mutated,
-                });
+                out.push(made(
+                    Kind::RemoveDisposition,
+                    format!("remove disposition `{alternative}` at statement {index}"),
+                    without_statement(program, root, path, index),
+                ));
+            }
+            Command::Terminate(_) | Command::Escalate | Command::Recover { .. } => {
+                let word = match &statement.command {
+                    Command::Terminate(_) => "terminate",
+                    Command::Escalate => "escalate",
+                    _ => "recover",
+                };
+                out.push(made(
+                    Kind::RemoveDisposition,
+                    format!("remove disposition `{word}` at statement {index}"),
+                    without_statement(program, root, path, index),
+                ));
             }
             Command::Loop {
-                name, invariant, ..
+                name,
+                invariant: Some(_),
+                ..
             } => {
-                if invariant.is_some() {
-                    let mut mutated = program.clone();
-                    let Command::Loop {
-                        invariant: target, ..
-                    } = &mut body_mut(&mut mutated, declaration, loop_path)[index].command
-                    else {
-                        unreachable!();
-                    };
-                    *target = None;
-                    out.push(Mutant {
-                        kind: Kind::DropInvariant,
-                        control: control_name.to_string(),
-                        detail: format!("drop invariant of `{name}`"),
-                        program: mutated,
-                    });
-                }
-                loop_path.push(index);
-                collect_from_body(program, declaration, control_name, loop_path, out);
-                loop_path.pop();
+                let mut mutated = program.clone();
+                let Command::Loop {
+                    invariant: target, ..
+                } = &mut body_mut(&mut mutated, root, path)[index].command
+                else {
+                    unreachable!();
+                };
+                *target = None;
+                out.push(made(
+                    Kind::DropInvariant,
+                    format!("drop invariant of `{name}`"),
+                    mutated,
+                ));
             }
             _ => {}
+        }
+
+        match &statement.command {
+            // A disposition has its own kind, and a statement that holds a
+            // body is mutated inside.
+            Command::Exit { .. }
+            | Command::Leave { .. }
+            | Command::Again { .. }
+            | Command::Terminate(_)
+            | Command::Escalate
+            | Command::Recover { .. } => {}
+            Command::Loop { .. } => {
+                path.push(Step::Loop(index));
+                collect_from_body(program, root, control_name, path, out);
+                path.pop();
+            }
+            Command::Boundary { .. } => {
+                for step in [Step::Work(index), Step::Contingency(index)] {
+                    path.push(step);
+                    collect_from_body(program, root, control_name, path, out);
+                    path.pop();
+                }
+            }
+            _ => out.push(made(
+                Kind::RemoveStatement,
+                format!("remove statement {index}"),
+                without_statement(program, root, path, index),
+            )),
         }
     }
 }
@@ -279,6 +391,19 @@ fn walk_control(control: &mut Control, visit: &mut dyn FnMut(&mut Expr)) {
     walk_statements(&mut control.body, visit);
 }
 
+/// Calls `visit` on every expression of the declaration: of a control, or of
+/// the work and the contingency of a named boundary.
+fn walk_declaration(declaration: &mut Declaration, visit: &mut dyn FnMut(&mut Expr)) {
+    match declaration {
+        Declaration::Control(control) => walk_control(control, visit),
+        Declaration::Boundary(boundary) => {
+            walk_statements(&mut boundary.body, visit);
+            walk_statements(&mut boundary.contingency, visit);
+        }
+        _ => {}
+    }
+}
+
 /// What one expression can become by a mutation of itself, and not of what
 /// is inside it: the kind, the expression, and words for the change.
 fn changes(expr: &Expr) -> Vec<(Kind, Expr, String)> {
@@ -310,29 +435,38 @@ fn changes(expr: &Expr) -> Vec<(Kind, Expr, String)> {
                 detail,
             )]
         }
+        Expr::Clone(inner) => vec![(
+            Kind::ConsumeClone,
+            (**inner).clone(),
+            "a clone to what it copies".to_string(),
+        )],
         _ => Vec::new(),
     }
 }
 
-/// The mutants of a control that change one expression of it.
-fn collect_from_expressions(program: &Program, declaration: usize, out: &mut Vec<Mutant>) {
-    let Declaration::Control(control) = &program.declarations[declaration] else {
-        return;
-    };
+/// The mutants of a control or of a named boundary that change one
+/// expression of it.
+fn collect_from_expressions(
+    program: &Program,
+    declaration: usize,
+    name: &str,
+    out: &mut Vec<Mutant>,
+) {
     // How many changes each expression has, in the order of the walk.
     let mut counts = Vec::new();
-    walk_control(&mut control.clone(), &mut |expr| {
-        counts.push(changes(expr).len());
-    });
+    walk_declaration(
+        &mut program.declarations[declaration].clone(),
+        &mut |expr| {
+            counts.push(changes(expr).len());
+        },
+    );
     for (site, count) in counts.iter().enumerate() {
         for choice in 0..*count {
             let mut mutated = program.clone();
-            let Declaration::Control(target) = &mut mutated.declarations[declaration] else {
-                unreachable!();
-            };
+            let target = &mut mutated.declarations[declaration];
             let mut at = 0;
             let mut made = None;
-            walk_control(target, &mut |expr| {
+            walk_declaration(target, &mut |expr| {
                 if at == site {
                     let (kind, changed, detail) = changes(expr).swap_remove(choice);
                     *expr = changed;
@@ -343,7 +477,7 @@ fn collect_from_expressions(program: &Program, declaration: usize, out: &mut Vec
             let (kind, detail) = made.expect("the expression that was counted");
             out.push(Mutant {
                 kind,
-                control: control.name.clone(),
+                control: name.to_string(),
                 detail: format!("{detail} (expression {site})"),
                 program: mutated,
             });
@@ -355,34 +489,68 @@ fn collect_from_expressions(program: &Program, declaration: usize, out: &mut Vec
 pub fn mutate(program: &Program) -> Vec<Mutant> {
     let mut out = Vec::new();
     for (declaration, item) in program.declarations.iter().enumerate() {
-        let Declaration::Control(control) = item else {
-            continue;
-        };
-        if control.external {
-            continue;
+        match item {
+            Declaration::Control(control) if !control.external => {
+                for (effect_index, effect) in control.uses.iter().enumerate() {
+                    let mut mutated = program.clone();
+                    let Declaration::Control(target) = &mut mutated.declarations[declaration]
+                    else {
+                        unreachable!();
+                    };
+                    target.uses.remove(effect_index);
+                    out.push(Mutant {
+                        kind: Kind::DropEffect,
+                        control: control.name.clone(),
+                        detail: format!("drop effect `{effect}`"),
+                        program: mutated,
+                    });
+                }
+                if control.faults {
+                    let mut mutated = program.clone();
+                    let Declaration::Control(target) = &mut mutated.declarations[declaration]
+                    else {
+                        unreachable!();
+                    };
+                    target.faults = false;
+                    out.push(Mutant {
+                        kind: Kind::DropFaults,
+                        control: control.name.clone(),
+                        detail: "drop `faults`".to_string(),
+                        program: mutated,
+                    });
+                }
+                let root = Root {
+                    declaration,
+                    contingency: false,
+                };
+                collect_from_body(program, root, &control.name, &mut Vec::new(), &mut out);
+                collect_from_expressions(program, declaration, &control.name, &mut out);
+            }
+            Declaration::Boundary(boundary) => {
+                for contingency in [false, true] {
+                    let root = Root {
+                        declaration,
+                        contingency,
+                    };
+                    collect_from_body(program, root, &boundary.name, &mut Vec::new(), &mut out);
+                }
+                collect_from_expressions(program, declaration, &boundary.name, &mut out);
+            }
+            Declaration::Resource(resource) if resource.on_fault_release => {
+                let mut mutated = program.clone();
+                let Declaration::Resource(target) = &mut mutated.declarations[declaration] else {
+                    unreachable!();
+                };
+                target.on_fault_release = false;
+                out.push(Mutant {
+                    kind: Kind::DropFaultRelease,
+                    control: resource.name.clone(),
+                    detail: "drop `on fault release`".to_string(),
+                    program: mutated,
+                });
+            }
+            _ => {}
         }
-        for (effect_index, effect) in control.uses.iter().enumerate() {
-            let mut mutated = program.clone();
-            let Declaration::Control(target) = &mut mutated.declarations[declaration] else {
-                unreachable!();
-            };
-            target.uses.remove(effect_index);
-            out.push(Mutant {
-                kind: Kind::DropEffect,
-                control: control.name.clone(),
-                detail: format!("drop effect `{effect}`"),
-                program: mutated,
-            });
-        }
-        let mut loop_path = Vec::new();
-        collect_from_body(
-            program,
-            declaration,
-            &control.name,
-            &mut loop_path,
-            &mut out,
-        );
-        collect_from_expressions(program, declaration, &mut out);
     }
     out
 }

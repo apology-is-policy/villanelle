@@ -82,6 +82,19 @@ pub struct Finding {
     pub program: String,
 }
 
+/// What became of the mutants of one kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KindCount {
+    pub mutants: u64,
+    /// Those that `resolve` refuses.
+    pub refused: u64,
+    /// Those that the checker rejects, and of them those with a stuck run.
+    pub rejected: u64,
+    pub rejected_stuck: u64,
+    /// Those that the checker accepts and that no tried run leaves stuck.
+    pub survived: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     pub programs: u64,
@@ -105,7 +118,8 @@ pub struct Report {
     pub rejected_stuck: u64,
     /// Mutants that the checker accepts and that no tried run leaves stuck.
     pub survived: u64,
-    pub survivors: BTreeMap<Kind, u64>,
+    /// The same counts for each kind of mutation.
+    pub kinds: BTreeMap<Kind, KindCount>,
     pub coverage: Coverage,
     /// The slice whose constructs the campaign is to reach.
     pub slice: u8,
@@ -470,9 +484,11 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
     }
     for mutant in mutate(&tree) {
         report.mutants += 1;
+        report.kinds.entry(mutant.kind).or_default().mutants += 1;
         let source = mutant.program.print();
         let Ok(typed) = resolve::resolve(&mutant.program) else {
             report.refused += 1;
+            report.kinds.entry(mutant.kind).or_default().refused += 1;
             continue;
         };
         // The first stuck run of the mutant, if a tried run is stuck.
@@ -514,13 +530,16 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
                 Some(run) => find(report, "unsound", format!("{about}; {run}"), &source),
                 None => {
                     report.survived += 1;
-                    *report.survivors.entry(mutant.kind).or_insert(0) += 1;
+                    report.kinds.entry(mutant.kind).or_default().survived += 1;
                 }
             },
             Checked::Rejected(_) => {
+                let of_kind = report.kinds.entry(mutant.kind).or_default();
                 report.rejected += 1;
+                of_kind.rejected += 1;
                 if stuck.is_some() {
                     report.rejected_stuck += 1;
+                    of_kind.rejected_stuck += 1;
                 }
             }
             Checked::Panicked(message) => {
@@ -593,8 +612,15 @@ impl Report {
                 "{} mutants: {} refused by resolve, {} rejected by the checker ({} of them with a stuck run), {} accepted with no stuck run\n",
                 self.mutants, self.refused, self.rejected, self.rejected_stuck, self.survived
             ));
-            for (kind, count) in &self.survivors {
-                out.push_str(&format!("  accepted {kind:?}: {count}\n"));
+            for (kind, count) in &self.kinds {
+                out.push_str(&format!(
+                    "  {kind:?}: {} mutants, {} refused, {} rejected ({} with a stuck run), {} accepted\n",
+                    count.mutants,
+                    count.refused,
+                    count.rejected,
+                    count.rejected_stuck,
+                    count.survived
+                ));
             }
         }
         let mut missing = self.coverage.missing();

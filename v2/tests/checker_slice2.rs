@@ -1992,3 +1992,159 @@ control c(by : u32)
         ),
     );
 }
+
+/// A program for the mutations of ownership: each control owns something
+/// that a statement of it gives back, and a mutation of one statement
+/// leaves it owed, gives it twice, or lets a fault meet it.
+const OWNERSHIP: &str = r#"
+extern resource conn
+
+extern resource lease on fault release
+
+extern control open_conn()
+    ■ { opened {c : conn} }
+    uses net
+
+extern control close_conn(c : conn)
+    ■ { closed {} }
+    uses net
+
+extern control take_lease()
+    ■ { taken {l : lease} }
+    uses net
+
+extern control give_lease(l : lease)
+    ■ { given {} }
+    uses net
+
+extern control keep(s : string)
+    ■ { done {} }
+    uses net
+
+control may(n : u32)
+    ■ { done {} }
+    faults
+    ⊤ ▷ t : ? n = 0
+    t.true ▷ fault "zero"
+    t.false ▷ ■ done {}
+
+pub control owns(s : string)
+    ■ { done {} }
+    uses net
+    ⊤ ▷ d0 : Δ open_conn() ▸ opened {c}
+    ⊤ ▷ d1 : Δ keep(clone(s)) ▸ done {}
+    ⊤ ▷ d2 : Δ keep(▾s) ▸ done {}
+    ⊤ ▷ d3 : Δ close_conn(▾c) ▸ closed {}
+    ⊤ ▷ ■ done {}
+
+pub control leases(n : u32)
+    ■ { done {} }
+    faults
+    uses net
+    ⊤ ▷ d0 : Δ take_lease() ▸ taken {l}
+    ⊤ ▷ d1 : Δ may(n) ▸ done {}
+    ⊤ ▷ d2 : Δ give_lease(▾l) ▸ given {}
+    ⊤ ▷ ■ done {}
+
+pub control guards(n : u32)
+    ■ { done {} }
+    faults
+    uses net
+    ⊤ ▷ d0 : Δ open_conn() ▸ opened {c}
+    ⊤ ▷ d1 : Δ close_conn(▾c) ▸ closed {}
+    ⊤ ▷ d2 : Δ may(n) ▸ done {}
+    ⊤ ▷ ■ done {}
+"#;
+
+/// The runs of [`OWNERSHIP`]: each control, with a fault and without one.
+fn ownership_runs() -> Vec<(String, Vec<villanelle_v2::oracle::Value>)> {
+    use villanelle_v2::int::Int;
+    use villanelle_v2::oracle::Value;
+    let number = |n: u64| vec![Value::Int(Int::from_u64(n))];
+    vec![
+        ("owns".to_string(), vec![Value::String("text".to_string())]),
+        ("leases".to_string(), number(0)),
+        ("leases".to_string(), number(1)),
+        ("guards".to_string(), number(0)),
+        ("guards".to_string(), number(1)),
+    ]
+}
+
+/// The kinds of mutation that slice 2 adds seed the defects of ownership:
+/// each has a mutant of [`OWNERSHIP`] that is stuck in the oracle, in the
+/// state the kind is for, and the checker rejects every mutant that is
+/// stuck. The program itself runs to its ends and is accepted.
+#[test]
+fn mutations_of_ownership_are_stuck_and_rejected() {
+    use std::collections::{BTreeMap, BTreeSet};
+    use villanelle_v2::mutate::{self, Class, Kind};
+    use villanelle_v2::oracle::Config;
+
+    let tree = villanelle_v2::text::parse(OWNERSHIP).expect("the program reads");
+    let typed = villanelle_v2::resolve::resolve(&tree).expect("the program resolves");
+    accept_core("O4", OWNERSHIP);
+    let config = Config::default();
+    let runs = ownership_runs();
+    let whole = mutate::Mutant {
+        kind: Kind::DropGuard,
+        control: String::new(),
+        detail: String::new(),
+        program: tree.clone(),
+    };
+    assert!(
+        matches!(mutate::classify(&whole, &runs, 1, &config), Class::Unstuck),
+        "a run of the program is stuck"
+    );
+    drop(typed);
+
+    let mut stuck: BTreeMap<Kind, BTreeSet<String>> = BTreeMap::new();
+    for mutant in mutate::mutate(&tree) {
+        let Class::Stuck(state) = mutate::classify(&mutant, &runs, 1, &config) else {
+            continue;
+        };
+        stuck
+            .entry(mutant.kind)
+            .or_default()
+            .insert(format!("X{} {}", state.state, state.clause));
+        let resolved = villanelle_v2::resolve::resolve(&mutant.program).expect("it ran");
+        assert!(
+            check::check(&resolved).is_err(),
+            "{:?} in `{}` ({}) is stuck (X{} {}: {}) and the checker accepts it:\n{}",
+            mutant.kind,
+            mutant.control,
+            mutant.detail,
+            state.state,
+            state.clause,
+            state.detail,
+            mutant.program.print()
+        );
+    }
+    let states = |kind: Kind| -> Vec<String> {
+        stuck
+            .get(&kind)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+    // Removed: a body without its end, a connection still owed where its
+    // scope ends, and a fault that meets what is owed.
+    assert_eq!(
+        states(Kind::RemoveStatement),
+        ["X1 E-End", "X5 E-Scope", "X8 E-Unwind"],
+        "{stuck:?}"
+    );
+    // Swapped: the text is given away before its clone is made, the
+    // connection is still owed at the exit, or the fault comes before the
+    // connection is closed.
+    assert_eq!(
+        states(Kind::SwapStatements),
+        ["X2 E-Var", "X5 E-Scope", "X8 E-Unwind"],
+        "{stuck:?}"
+    );
+    assert_eq!(states(Kind::ConsumeClone), ["X2 E-Var"], "{stuck:?}");
+    assert_eq!(
+        states(Kind::DropFaults),
+        ["X8 E-Fault", "X8 E-Unwind"],
+        "{stuck:?}"
+    );
+    assert_eq!(states(Kind::DropFaultRelease), ["X8 E-Unwind"], "{stuck:?}");
+}
