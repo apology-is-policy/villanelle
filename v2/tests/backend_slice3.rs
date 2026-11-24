@@ -8,8 +8,9 @@ use std::process::Command as ProcessCommand;
 use villanelle_v2::codegen::{NativeRunSpec, emit_c_header, emit_llvm, run_native_batch};
 use villanelle_v2::host::{Answer, Script};
 use villanelle_v2::int::Int;
-use villanelle_v2::oracle::{Config, End, Value, run};
+use villanelle_v2::oracle::{Config, End, RuntimeStep, Value, run};
 use villanelle_v2::syntax::{Command as SynCommand, Declaration, Statement as SynStatement};
+use villanelle_v2::typed::BorrowMode;
 use villanelle_v2::{check, erased, expand, resolve, script, surface, text};
 
 fn slice3_surface_files() -> Vec<(String, String)> {
@@ -713,11 +714,9 @@ fn slice_three_core_programs_agree_natively() {
     ];
     verify_native_specs("views_and_variants.core", &views_core, &views_specs, 64);
 
-    // 3. Extern control returning borrowed payload (`&string ∈ m` and `&bool ∈ b`).
-    //    (Tested against `erased::run` + native `-O0`/`-O2` in 64-bit & 32-bit, because the
-    //    instrumented oracle passes dereferenced values to `Host::call` so a scripted host
-    //    cannot synthesize private oracle borrow tags; `[E-Host]` borrow tag rejection is
-    //    tested separately in `tests/slice3.rs`.)
+    // 3. Extern controls that lend from their arguments (`&string ∈ m` and
+    //    `&bool ∈ b`): a host names the place within the argument ([E-Extern],
+    //    RO6), as a value in a map and as the whole of a `bool`.
     let ext_borrow_prog = villanelle_v2::load_surface(
         r#"
 extern control host_lookup(m: &string ⇀ string, key: &string) ■ found {val: &string ∈ m} │ missing uses io
@@ -732,6 +731,11 @@ pub control call_host_borrows(m: &string ⇀ string, b: &bool) ■ out {found: b
     .unwrap();
     let ext_checked = check::check(&ext_borrow_prog).unwrap();
     ext_checked.revalidate().unwrap();
+    let host_value = Value::within(
+        BorrowMode::Shared,
+        0,
+        vec![RuntimeStep::MapValue(Value::String("host".to_string()))],
+    );
     let ext_specs = vec![
         NativeRunSpec {
             entry: "call_host_borrows".to_string(),
@@ -748,11 +752,11 @@ pub control call_host_borrows(m: &string ⇀ string, b: &bool) ■ out {found: b
             ],
             arithmetic: false,
             answers: vec![
-                ("host_flag".to_string(), ans("ok", vec![Value::Bool(true)])),
                 (
-                    "host_lookup".to_string(),
-                    ans("found", vec![Value::String("okval".to_string())]),
+                    "host_flag".to_string(),
+                    ans("ok", vec![Value::within(BorrowMode::Shared, 0, vec![])]),
                 ),
+                ("host_lookup".to_string(), ans("found", vec![host_value])),
             ],
         },
         NativeRunSpec {
@@ -760,46 +764,100 @@ pub control call_host_borrows(m: &string ⇀ string, b: &bool) ■ out {found: b
             arguments: vec![Value::Map(Default::default()), Value::Bool(false)],
             arithmetic: false,
             answers: vec![
-                ("host_flag".to_string(), ans("ok", vec![Value::Bool(false)])),
+                (
+                    "host_flag".to_string(),
+                    ans("ok", vec![Value::within(BorrowMode::Shared, 0, vec![])]),
+                ),
                 ("host_lookup".to_string(), ans("missing", vec![])),
             ],
         },
     ];
     for usize_bits in [64u32, 32u32] {
-        let config = Config {
-            usize_max: Int::power_of_two(usize_bits).minus(&Int::from_u64(1)),
-            fuel: 200_000,
-        };
-        let mut exp_erased = Vec::with_capacity(ext_specs.len());
-        for (idx, spec) in ext_specs.iter().enumerate() {
-            let mut host = Script {
-                answers: spec.answers.iter().cloned().collect(),
-            };
-            let out = erased::run(
-                &ext_borrow_prog,
-                &spec.entry,
-                spec.arguments.clone(),
-                &mut host,
-                &config,
-            );
-            assert!(
-                matches!(out.end, erased::End::Done { .. }),
-                "ext_borrowed_payloads run {idx} (usize={usize_bits}) failed in erased: {}",
-                out.end
-            );
-            exp_erased.push((out.end, out.trace));
-        }
-        let o0 = run_native_batch(&ext_borrow_prog, &ext_specs, usize_bits, 0).unwrap();
-        let o2 = run_native_batch(&ext_borrow_prog, &ext_specs, usize_bits, 2).unwrap();
-        for (i, ((ee, etr), ((o0e, o0tr), (o2e, o2tr)))) in
-            exp_erased.iter().zip(o0.iter().zip(o2.iter())).enumerate()
-        {
-            assert_eq!(format!("{o0e}"), format!("{ee}"), "ext -O0 run {i} outcome");
-            assert_eq!(o0tr, etr, "ext -O0 run {i} trace");
-            assert_eq!(format!("{o2e}"), format!("{ee}"), "ext -O2 run {i} outcome");
-            assert_eq!(o2tr, etr, "ext -O2 run {i} trace");
-        }
+        verify_native_specs(
+            "ext_borrowed_payloads",
+            &ext_borrow_prog,
+            &ext_specs,
+            usize_bits,
+        );
     }
+}
+
+/// Whether `value` holds a borrow that a host names within an argument.
+fn names_a_place(value: &Value) -> bool {
+    match value {
+        Value::Ref { .. } => true,
+        Value::Struct { fields, .. } => fields.iter().any(names_a_place),
+        _ => false,
+    }
+}
+
+/// RO6 and RO11: hosts that lend from their arguments and write behind them,
+/// in compiled code. Every run that ends, of a control that the checker
+/// accepts, in the three files of the suite with such hosts runs natively at
+/// both widths of `usize` and at `-O0` and `-O2`, to the end and the trace
+/// of the oracle and the erased semantics; a run that leaves an allocation
+/// live, or frees one twice, ends otherwise ([R4]). Before, the driver
+/// answered a borrow with a zeroed cell of its own and left the runs whose
+/// host writes out.
+#[test]
+fn hosts_that_lend_from_and_write_behind_arguments_run_natively_ro6_ro11() {
+    let files = [
+        (
+            "checked_host_places.core",
+            include_str!("slice3/checked_host_places.core"),
+        ),
+        (
+            "host_borrows.core",
+            include_str!("slice3/host_borrows.core"),
+        ),
+        (
+            "e_extern_writes.core",
+            include_str!("slice3/e_extern_writes.core"),
+        ),
+    ];
+    let mut ran = Vec::new();
+    for (name, source) in files {
+        let (program, specs) = script::native_runs(source).expect("the runs of the file");
+        let verdicts = check::check_each(&program).expect("the declarations are well formed");
+        let accepted: HashSet<&str> = verdicts
+            .iter()
+            .filter(|(_, error)| error.is_none())
+            .map(|(control, _)| control.as_str())
+            .collect();
+        let specs: Vec<NativeRunSpec> = specs
+            .into_iter()
+            .filter(|spec| accepted.contains(spec.entry.as_str()))
+            .collect();
+        for bits in [64, 32] {
+            verify_native_specs(name, &program, &specs, bits);
+        }
+        let writes = specs
+            .iter()
+            .filter(|spec| spec.answers.iter().any(|(_, a)| !a.writes.is_empty()))
+            .count();
+        let lends = specs
+            .iter()
+            .filter(|spec| {
+                spec.answers
+                    .iter()
+                    .any(|(_, a)| a.payload.iter().any(names_a_place))
+            })
+            .count();
+        ran.push((name, specs.len(), writes, lends));
+    }
+    // The runs, those whose host writes, and those whose host lends. The
+    // checker refuses `writes`, `splits` and `spans` of `host_borrows.core`
+    // by [P5], for an index or a sum over what the call left unknown, and
+    // `write_ends_a_borrow` of `e_extern_writes.core`, whose run is stuck;
+    // the first file has the shapes of the three in a form it proves.
+    assert_eq!(
+        ran,
+        [
+            ("checked_host_places.core", 16, 5, 9),
+            ("host_borrows.core", 6, 0, 5),
+            ("e_extern_writes.core", 6, 5, 1),
+        ]
+    );
 }
 
 #[test]

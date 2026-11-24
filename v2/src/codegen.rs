@@ -27,11 +27,11 @@
 use crate::erased;
 use crate::host::Answer;
 use crate::int::Int;
-use crate::oracle::{Event, Value};
+use crate::oracle::{Event, HOST_SCOPE, RuntimePlace, RuntimeStep, Value};
 use crate::script;
 use crate::typed::{
     Arithmetic, BodyId, BorrowMode, BoundaryId, BuiltinOp, Command, Comparison, Control,
-    ControlBody, ControlId, Expr, Function, FunctionId, IntType, Operation, Place, PlaceStep,
+    ControlBody, ControlId, Expr, Function, FunctionId, IntType, Kind, Operation, Place, PlaceStep,
     Program, Selector, SiteId, Type, VarId, VarRef,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -4729,17 +4729,10 @@ fn emit_operation_call(
             for (i, param) in callee.parameters.iter().enumerate() {
                 let raw = results[i].take().unwrap();
                 if matches!(param.ty, Type::Ref(_, _)) {
-                    if is_extern && *param.ty.deref_type() == Type::Bool {
-                        let b = em.fresh_reg();
-                        let _ = writeln!(em.code, "  {b} = load i1, ptr {raw}");
-                        let b8 = em.fresh_reg();
-                        let _ = writeln!(em.code, "  {b8} = zext i1 {b} to i8");
-                        let tmpb = em.alloc_temp("i8");
-                        let _ = writeln!(em.code, "  store i8 {b8}, ptr {tmpb}");
-                        call_args.push(format!("ptr {tmpb}"));
-                    } else {
-                        call_args.push(format!("ptr {raw}"));
-                    }
+                    // A borrow is the place itself, a `bool` among the
+                    // rest: a byte that holds 0 or 1. A host writes behind
+                    // it, and what it lends from it is that place ([E-Extern]).
+                    call_args.push(format!("ptr {raw}"));
                 } else if is_extern && param.ty == Type::Bool {
                     let ext = em.fresh_reg();
                     let _ = writeln!(em.code, "  {ext} = zext i1 {raw} to i8");
@@ -5699,16 +5692,20 @@ fn next_tmp(tmp_id: &mut usize) -> usize {
     id
 }
 
-/// A place that a host of the harness lends: a global, written when the
-/// answer that lends it is given. What it holds when the run has ended is
-/// freed by `main`, so that the allocation count of a run comes out even.
-struct Lent {
-    global: String,
-    ty: Type,
+/// What a borrow in a value that the harness writes refers to.
+#[derive(Clone, Copy)]
+enum Refs<'a> {
+    /// A slot of `main`, which holds what the borrow refers to: the
+    /// arguments of the entry are given as values.
+    Slots,
+    /// A place within an argument of the host of this extern control: a
+    /// borrow in a payload is a reborrow of one ([E-Extern], [E-Host]).
+    Within(&'a Control),
+    /// None: a key of a map, or what a host leaves behind an argument.
+    Nothing,
 }
 
-/// Writes `val` to `dst_ptr`. What a reference in it refers to is a global
-/// of the harness, entered in `lent`, or with no list a slot of `main`.
+/// Writes `val` to `dst_ptr`, with the borrows in it as `refs` says.
 #[allow(clippy::too_many_arguments)]
 fn emit_harness_value_into(
     ir: &mut String,
@@ -5718,35 +5715,36 @@ fn emit_harness_value_into(
     ty: &Type,
     dst_ptr: &str,
     tmp_id: &mut usize,
-    mut lent: Option<&mut Vec<Lent>>,
+    refs: Refs<'_>,
 ) {
     let u = reg.usize_ty;
     if let Type::Ref(_, inner) = ty {
-        let inner_ll = llvm_ty(program, inner, reg.usize_bits);
-        let id = next_tmp(tmp_id);
-        let backing = match lent.as_deref_mut() {
-            Some(list) => {
-                let global = format!("@h_lent_{id}");
-                list.push(Lent {
-                    global: global.clone(),
-                    ty: (**inner).clone(),
-                });
-                global
+        match (refs, val) {
+            (Refs::Within(control), Value::Ref { place, .. }) if place.scope == HOST_SCOPE => {
+                let at = emit_host_place(ir, program, reg, control, place, tmp_id);
+                let _ = writeln!(ir, "  store ptr {at}, ptr {dst_ptr}");
             }
-            None => {
-                let slot = format!("%href_{id}");
+            (Refs::Slots, _) => {
+                let inner_ll = llvm_ty(program, inner, reg.usize_bits);
+                let slot = format!("%href_{}", next_tmp(tmp_id));
+                let zero = if **inner == Type::Bool {
+                    "false"
+                } else {
+                    "zeroinitializer"
+                };
                 let _ = writeln!(ir, "  {slot} = alloca {inner_ll}");
-                slot
+                let _ = writeln!(ir, "  store {inner_ll} {zero}, ptr {slot}");
+                emit_harness_value_into(ir, program, reg, val, inner, &slot, tmp_id, refs);
+                let _ = writeln!(ir, "  store ptr {slot}, ptr {dst_ptr}");
             }
-        };
-        let zero = if **inner == Type::Bool {
-            "false"
-        } else {
-            "zeroinitializer"
-        };
-        let _ = writeln!(ir, "  store {inner_ll} {zero}, ptr {backing}");
-        emit_harness_value_into(ir, program, reg, val, inner, &backing, tmp_id, lent);
-        let _ = writeln!(ir, "  store ptr {backing}, ptr {dst_ptr}");
+            // The oracle accepts no other answer, and the native driver is
+            // given only the runs that the oracle ends.
+            (Refs::Within(control), _) => panic!(
+                "a host of `{}` answered {val} for a borrow, which names no place within an argument",
+                control.name
+            ),
+            (Refs::Nothing, _) => panic!("{val} stands where no borrow is written"),
+        }
         return;
     }
     match (val, ty.deref_type()) {
@@ -5817,7 +5815,7 @@ fn emit_harness_value_into(
                     &fparam.ty,
                     &format!("%hsf_{id}"),
                     tmp_id,
-                    lent.as_deref_mut(),
+                    refs,
                 );
             }
         }
@@ -5864,7 +5862,7 @@ fn emit_harness_value_into(
                             &fparam.ty,
                             &format!("%hvf_{fid}"),
                             tmp_id,
-                            lent.as_deref_mut(),
+                            refs,
                         );
                     }
                 }
@@ -5896,7 +5894,7 @@ fn emit_harness_value_into(
                         elem_ty,
                         &format!("%he_{eid}"),
                         tmp_id,
-                        lent.as_deref_mut(),
+                        refs,
                     );
                 }
                 let _ = writeln!(
@@ -5954,7 +5952,7 @@ fn emit_harness_value_into(
                         k_ty,
                         &format!("%mk_{eid}"),
                         tmp_id,
-                        lent.as_deref_mut(),
+                        refs,
                     );
                     emit_harness_value_into(
                         ir,
@@ -5964,7 +5962,7 @@ fn emit_harness_value_into(
                         v_ty,
                         &format!("%mv_{eid}"),
                         tmp_id,
-                        lent.as_deref_mut(),
+                        refs,
                     );
                 }
                 let _ = writeln!(
@@ -6030,7 +6028,7 @@ fn emit_harness_value_into(
                             &fparam.ty,
                             &format!("%hof_{fid}"),
                             tmp_id,
-                            lent.as_deref_mut(),
+                            refs,
                         );
                     }
                 }
@@ -6038,6 +6036,120 @@ fn emit_harness_value_into(
         }
         _ => {}
     }
+}
+
+/// The address of the place that a host names within one of the arguments
+/// of `control` ([E-Extern], `Value::within`), in its stub, whose arguments
+/// are `%p0`, `%p1`, …. As `oracle::lent_within` takes them, the steps go
+/// through the fields of a view to a borrow that it holds, and from there
+/// into what the borrow refers to: a step from a place that holds a borrow
+/// goes through the borrow. Only an answer that the oracle accepts reaches
+/// the native driver, so every step is one that the place has.
+fn emit_host_place(
+    ir: &mut String,
+    program: &Program,
+    reg: &mut RuntimeRegistry<'_>,
+    control: &Control,
+    place: &RuntimePlace,
+    tmp_id: &mut usize,
+) -> String {
+    let u = reg.usize_ty;
+    // A borrow is passed as the place itself, and a view by its address.
+    let mut at = format!("%p{}", place.var);
+    let mut ty = control.parameters[place.var].ty.deref_type().clone();
+    for step in &place.steps {
+        if let Type::Ref(_, referent) = &ty {
+            let id = next_tmp(tmp_id);
+            let _ = writeln!(ir, "  %hpr_{id} = load ptr, ptr {at}");
+            at = format!("%hpr_{id}");
+            ty = (**referent).clone();
+        }
+        let id = next_tmp(tmp_id);
+        ty = match (step, &ty) {
+            (RuntimeStep::Field(index), Type::Struct(sid, _)) => {
+                let _ = writeln!(
+                    ir,
+                    "  %hpf_{id} = getelementptr %vn2.struct.{sid}, ptr {at}, i32 0, i32 {index}"
+                );
+                program.structs[*sid].fields[*index].ty.clone()
+            }
+            (RuntimeStep::VariantField(constructor, index), Type::Variant(vid, _)) => {
+                let _ = writeln!(
+                    ir,
+                    "  %hpp_{id} = getelementptr %vn2.variant.{vid}, ptr {at}, i32 0, i32 1"
+                );
+                let _ = writeln!(
+                    ir,
+                    "  %hpf_{id} = getelementptr %vn2.variant.{vid}.c{constructor}, ptr %hpp_{id}, i32 0, i32 {index}"
+                );
+                program.variants[*vid].constructors[*constructor].fields[*index]
+                    .ty
+                    .clone()
+            }
+            (RuntimeStep::Index(index), Type::Vector(element)) => {
+                let e_ll = llvm_ty(program, element, reg.usize_bits);
+                let _ = writeln!(
+                    ir,
+                    "  %hpd_{id} = getelementptr %vn2.vec, ptr {at}, i32 0, i32 0"
+                );
+                let _ = writeln!(ir, "  %hpb_{id} = load ptr, ptr %hpd_{id}");
+                let _ = writeln!(
+                    ir,
+                    "  %hpf_{id} = getelementptr {e_ll}, ptr %hpb_{id}, {u} {index}"
+                );
+                (**element).clone()
+            }
+            (RuntimeStep::MapValue(key) | RuntimeStep::MapKey(key), Type::Map(k_ty, v_ty)) => {
+                let mid = reg.intern_map(k_ty, v_ty);
+                let k_ll = llvm_ty(program, k_ty, reg.usize_bits);
+                let _ = writeln!(ir, "  %hpk_{id} = alloca {k_ll}");
+                emit_harness_value_into(
+                    ir,
+                    program,
+                    reg,
+                    key,
+                    k_ty,
+                    &format!("%hpk_{id}"),
+                    tmp_id,
+                    Refs::Nothing,
+                );
+                let _ = writeln!(ir, "  %hpq_{id} = alloca i1");
+                let _ = writeln!(
+                    ir,
+                    "  %hpi_{id} = call fastcc {u} @vn2_map_find_{mid}(ptr {at}, ptr %hpk_{id}, ptr %hpq_{id})"
+                );
+                if needs_drop(program, k_ty) {
+                    let ktid = reg.intern_type(k_ty);
+                    reg.require_drop(ktid);
+                    let _ = writeln!(ir, "  call fastcc void @vn2_drop_{ktid}(ptr %hpk_{id})");
+                }
+                let _ = writeln!(
+                    ir,
+                    "  %hpd_{id} = getelementptr %vn2.map, ptr {at}, i32 0, i32 0"
+                );
+                let _ = writeln!(ir, "  %hpb_{id} = load ptr, ptr %hpd_{id}");
+                let _ = writeln!(
+                    ir,
+                    "  %hpe_{id} = getelementptr %vn2.map_entry.{mid}, ptr %hpb_{id}, {u} %hpi_{id}"
+                );
+                let (field, ty) = match step {
+                    RuntimeStep::MapKey(_) => (0, k_ty),
+                    _ => (1, v_ty),
+                };
+                let _ = writeln!(
+                    ir,
+                    "  %hpf_{id} = getelementptr %vn2.map_entry.{mid}, ptr %hpe_{id}, i32 0, i32 {field}"
+                );
+                (**ty).clone()
+            }
+            (step, ty) => panic!(
+                "a host named the step {step:?} within argument {} of `{}`, where the place has the type {ty}",
+                place.var, control.name
+            ),
+        };
+        at = format!("%hpf_{id}");
+    }
+    at
 }
 
 fn emit_printers(
@@ -6442,17 +6554,6 @@ pub fn emit_native_harness_llvm(
     specs: &[NativeRunSpec],
     usize_bits: u32,
 ) -> String {
-    // The driver answers a borrowed payload with a cell of its own and
-    // writes nothing behind an argument (RO6, RO11 of the review): a run
-    // whose host writes is left out of the compiled runs, not compiled
-    // with the write lost.
-    assert!(
-        specs.iter().all(|spec| spec
-            .answers
-            .iter()
-            .all(|(_, answer)| answer.writes.is_empty())),
-        "the native driver does not write behind an argument: leave runs whose host writes out"
-    );
     let mut reg = RuntimeRegistry::new(program, usize_bits);
     let term_tys = compute_control_terminate_tys(program);
     let mut body_out = String::new();
@@ -6501,15 +6602,6 @@ pub fn emit_native_harness_llvm(
 
     let mut h_tmp = 0usize;
     let mut ext_code = String::new();
-    // What the answers of each run lend, and the globals for it.
-    let mut run_of_answer = vec![0usize; flat_ctrl_ids.len()];
-    for (run, (start, end)) in run_offsets.iter().enumerate() {
-        for slot in &mut run_of_answer[*start..*end] {
-            *slot = run;
-        }
-    }
-    let mut lent_of_run: Vec<Vec<Lent>> = specs.iter().map(|_| Vec::new()).collect();
-    let mut lent_globals = String::new();
     for res in &program.resources {
         if res.on_fault_release {
             let rg = reg.str_literal_map[res.name.as_bytes()].clone();
@@ -6672,53 +6764,9 @@ pub fn emit_native_harness_llvm(
                 .position(|a| a.name == ans.alternative)
                 .expect("known alternative");
             let alt = &control.contract[alt_idx];
-            for (fi, (val, field)) in ans.payload.iter().zip(&alt.fields).enumerate() {
-                if field.ty == Type::Bool {
-                    let b = matches!(val, Value::Bool(true));
-                    let _ = writeln!(
-                        ext_code,
-                        "  store i8 {}, ptr %out_{alt_idx}_{fi}",
-                        i32::from(b)
-                    );
-                } else if matches!(&field.ty, Type::Ref(_, inner) if **inner == Type::Bool) {
-                    let b = matches!(val, Value::Bool(true));
-                    let id = next_tmp(&mut h_tmp);
-                    let _ = writeln!(lent_globals, "@h_lent_{id} = internal global i8 0");
-                    let _ = writeln!(ext_code, "  store i8 {}, ptr @h_lent_{id}", i32::from(b));
-                    let _ = writeln!(
-                        ext_code,
-                        "  store ptr @h_lent_{id}, ptr %out_{alt_idx}_{fi}"
-                    );
-                } else {
-                    let mut lent = Vec::new();
-                    emit_harness_value_into(
-                        &mut ext_code,
-                        program,
-                        &mut reg,
-                        val,
-                        &field.ty,
-                        &format!("%out_{alt_idx}_{fi}"),
-                        &mut h_tmp,
-                        Some(&mut lent),
-                    );
-                    for place in &lent {
-                        let ll = llvm_ty(program, &place.ty, usize_bits);
-                        let zero = if place.ty == Type::Bool {
-                            "false"
-                        } else {
-                            "zeroinitializer"
-                        };
-                        let _ = writeln!(
-                            lent_globals,
-                            "{} = internal global {ll} {zero}",
-                            place.global
-                        );
-                    }
-                    lent_of_run[run_of_answer[*idx]].append(&mut lent);
-                }
-            }
+            // The event holds the arguments as they were at the call, so
+            // they are written out before the host writes behind any.
             if !pure {
-                let alt_g = reg.str_literal_map[alt.name.as_bytes()].clone();
                 let _ = writeln!(
                     ext_code,
                     "  call i32 (ptr, ...) @printf(ptr @h_fmt_ev_hdr, ptr {ctrl_g})"
@@ -6729,21 +6777,8 @@ pub fn emit_native_harness_llvm(
                     }
                     let ptid = reg.type_ids[param.ty.deref_type()];
                     if matches!(param.ty, Type::Ref(_, _)) {
-                        if *param.ty.deref_type() == Type::Bool {
-                            let id = h_tmp;
-                            h_tmp += 1;
-                            let _ = writeln!(ext_code, "  %pb8_{id} = load i8, ptr %p{pi}");
-                            let _ = writeln!(ext_code, "  %pb_{id} = icmp ne i8 %pb8_{id}, 0");
-                            let _ = writeln!(ext_code, "  %pbt_{id} = alloca i1");
-                            let _ = writeln!(ext_code, "  store i1 %pb_{id}, ptr %pbt_{id}");
-                            let _ = writeln!(
-                                ext_code,
-                                "  call void @vn2_print_val_{ptid}(ptr %pbt_{id})"
-                            );
-                        } else {
-                            let _ =
-                                writeln!(ext_code, "  call void @vn2_print_val_{ptid}(ptr %p{pi})");
-                        }
+                        // The place itself, a `bool` among the rest.
+                        let _ = writeln!(ext_code, "  call void @vn2_print_val_{ptid}(ptr %p{pi})");
                     } else if param.ty == Type::Bool {
                         let id = h_tmp;
                         h_tmp += 1;
@@ -6761,9 +6796,85 @@ pub fn emit_native_harness_llvm(
                         let _ =
                             writeln!(ext_code, "  call void @vn2_print_val_{ptid}(ptr %pt_{id})");
                     } else {
+                        // An aggregate, passed by its address.
                         let _ = writeln!(ext_code, "  call void @vn2_print_val_{ptid}(ptr %p{pi})");
                     }
                 }
+            }
+            // [E-Extern]: what the host leaves behind each argument lent
+            // exclusively is written there, the value it replaces released,
+            // before the borrows of the payload are made. Nothing is written
+            // behind a value of kind `must`: the host leaves it as it was.
+            for (position, value) in &ans.writes {
+                let Type::Ref(BorrowMode::Exclusive, referent) = &control.parameters[*position].ty
+                else {
+                    panic!("a host writes only behind an argument lent exclusively");
+                };
+                if program.kind(referent) == Kind::Must {
+                    continue;
+                }
+                let behind = format!("%p{position}");
+                if !needs_drop(program, referent) {
+                    emit_harness_value_into(
+                        &mut ext_code,
+                        program,
+                        &mut reg,
+                        value,
+                        referent,
+                        &behind,
+                        &mut h_tmp,
+                        Refs::Nothing,
+                    );
+                    continue;
+                }
+                // The new value is made while the old one is still held,
+                // so that the two never share an address: a borrow left
+                // pointing into the old one does not find the new one there.
+                let ll = llvm_ty(program, referent, usize_bits);
+                let id = next_tmp(&mut h_tmp);
+                let _ = writeln!(ext_code, "  %hwn_{id} = alloca {ll}");
+                emit_harness_value_into(
+                    &mut ext_code,
+                    program,
+                    &mut reg,
+                    value,
+                    referent,
+                    &format!("%hwn_{id}"),
+                    &mut h_tmp,
+                    Refs::Nothing,
+                );
+                let rtid = reg.intern_type(referent);
+                reg.require_drop(rtid);
+                let _ = writeln!(
+                    ext_code,
+                    "  call fastcc void @vn2_drop_{rtid}(ptr {behind})"
+                );
+                let _ = writeln!(ext_code, "  %hwv_{id} = load {ll}, ptr %hwn_{id}");
+                let _ = writeln!(ext_code, "  store {ll} %hwv_{id}, ptr {behind}");
+            }
+            for (fi, (val, field)) in ans.payload.iter().zip(&alt.fields).enumerate() {
+                if field.ty == Type::Bool {
+                    let b = matches!(val, Value::Bool(true));
+                    let _ = writeln!(
+                        ext_code,
+                        "  store i8 {}, ptr %out_{alt_idx}_{fi}",
+                        i32::from(b)
+                    );
+                } else {
+                    emit_harness_value_into(
+                        &mut ext_code,
+                        program,
+                        &mut reg,
+                        val,
+                        &field.ty,
+                        &format!("%out_{alt_idx}_{fi}"),
+                        &mut h_tmp,
+                        Refs::Within(control),
+                    );
+                }
+            }
+            if !pure {
+                let alt_g = reg.str_literal_map[alt.name.as_bytes()].clone();
                 let _ = writeln!(
                     ext_code,
                     "  call i32 (ptr, ...) @printf(ptr @h_fmt_ev_mid, ptr {alt_g})"
@@ -6862,7 +6973,7 @@ pub fn emit_native_harness_llvm(
                     param.ty.deref_type(),
                     &islot,
                     &mut h_tmp,
-                    None,
+                    Refs::Slots,
                 );
                 call_args.push(format!("ptr {islot}"));
             } else {
@@ -6886,7 +6997,7 @@ pub fn emit_native_harness_llvm(
                     &param.ty,
                     &slot,
                     &mut h_tmp,
-                    None,
+                    Refs::Slots,
                 );
                 let lr = format!("%r{run_idx}_iv_{pi}");
                 let _ = writeln!(main_out, "  {lr} = load {ll}, ptr {slot}");
@@ -7010,9 +7121,9 @@ pub fn emit_native_harness_llvm(
         }
         let _ = writeln!(main_out, "{end_lbl}:");
         // The harness frees what it kept: the places it lent to the entry
-        // control and those its hosts lent. Then every allocation of the
-        // run has been freed ([R4]), and a count that is not zero is
-        // written for the reader of the output.
+        // control. Then every allocation of the run has been freed ([R4]),
+        // and a count that is not zero is written for the reader of the
+        // output.
         for (pi, param) in control.parameters.iter().enumerate() {
             if let Type::Ref(_, inner) = &param.ty
                 && needs_drop(program, inner)
@@ -7022,17 +7133,6 @@ pub fn emit_native_harness_llvm(
                 let _ = writeln!(
                     main_out,
                     "  call fastcc void @vn2_drop_{tid}(ptr %r{run_idx}_rin_{pi})"
-                );
-            }
-        }
-        for place in &lent_of_run[run_idx] {
-            if needs_drop(program, &place.ty) {
-                let tid = reg.intern_type(&place.ty);
-                reg.require_drop(tid);
-                let _ = writeln!(
-                    main_out,
-                    "  call fastcc void @vn2_drop_{tid}(ptr {})",
-                    place.global
                 );
             }
         }
@@ -7114,7 +7214,6 @@ pub fn emit_native_harness_llvm(
 
     out.push_str(&printers);
     out.push_str(&harness_globals);
-    out.push_str(&lent_globals);
     out.push_str(&helpers);
     out.push_str(&ext_code);
     out.push_str(&body_out);

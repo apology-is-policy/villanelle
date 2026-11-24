@@ -790,22 +790,3 @@ fn the_seeded_host_answers_borrowed_payloads_with_places_within_its_arguments() 
         assert!(ended[entry].len() > 1, "`{entry}` ended one way only");
     }
 }
-
-/// RO11: the native driver answers a borrowed payload with a cell of its own
-/// and writes nothing behind an argument (RO6), so the runs whose host writes
-/// are left out of the compiled runs of a file rather than compiled with the
-/// write lost. Of the six runs of `e_extern_writes.core` that end, one has a
-/// host that writes nothing.
-#[test]
-fn runs_whose_host_writes_are_left_out_of_compiled_code_ro11() {
-    let source = include_str!("slice3/e_extern_writes.core");
-    let (_, specs) = script::native_runs(source).expect("the runs of the file");
-    let entries: Vec<&str> = specs.iter().map(|spec| spec.entry.as_str()).collect();
-    assert_eq!(entries, ["renames"]);
-    assert!(
-        specs[0]
-            .answers
-            .iter()
-            .all(|(_, answer)| answer.writes.is_empty())
-    );
-}

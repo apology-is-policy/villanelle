@@ -1102,10 +1102,9 @@ Three of them are about borrows and have their tests with slice 3.
   `tests/slice3/host_borrows.core` has 11 runs that end and 10 violations,
   and `the_seeded_host_answers_borrowed_payloads_with_places_within_its_arguments`
   (`tests/slice3.rs`) runs its controls under 60 seeds in both semantics.
-  The native driver of the backend still answers a borrowed payload with a
-  value in a cell of its own, which is no place within an argument; the one
-  backend test that does so compares compiled code with the erased
-  interpreter alone.
+  The native driver of the backend answered a borrowed payload with a
+  value in a cell of its own, which is no place within an argument, until
+  24 November (section 17.1).
 - **Pure operations** ([I10], RO8): a resource inside a struct or a variant
   of the payload makes an extern control impure, so two calls may give two
   resources. `tests/slice2/pure_operations.core`, with the violation of a
@@ -1613,10 +1612,9 @@ pure control (`Machine.answers`) has the values at completion beside the
 answer, so a host that writes otherwise on equal arguments is a
 violation. `erased.rs` writes the same values at its
 three calls of a host. `e_extern_writes.core` holds it: 21 files, 143 runs,
-73 compared, and 40 dead borrows with their causes. The native driver
-writes nothing behind an argument, as it answers a borrowed payload with a
-cell of its own (RO6), and `emit_native_harness_llvm` refuses a run whose
-host writes; `script::native_runs` leaves such runs out.
+73 compared, and 40 dead borrows with their causes. Until 24 November
+the native driver wrote nothing behind an argument, and those runs were
+left out of compiled code; section 17.1 says how it writes them.
 
 ## 16. Slice 3 Phase 3: Static ROBDD Loan Checking and Borrow/View Fact Logic
 
@@ -1777,6 +1775,59 @@ consumption (`erased.rs`), and direct typed LLVM IR and C ABI code generation
   unsigned `mod` constant strength-reduction). This is one synthetic kernel
   written inside the test, not the measurement of the phase 4 exit
   ([review](review.md), RB6).
+
+### 17.1 Hosts that lend and write, in compiled code, 24 November 2026
+
+RO6 and RO11 of the review are closed for compiled code, and RB13 is found
+and closed with them. The native driver answered a borrow in a payload with
+a value in a cell of its own, which is no place within an argument, and
+wrote nothing behind an argument: `emit_native_harness_llvm` refused a run
+whose host writes and `script::native_runs` left such runs out. The one
+test of a borrowed payload gave values and compared compiled code with the
+erased semantics alone. What changed, in `codegen.rs`:
+
+- `emit_host_place` is the address of the place that a host names within an
+  argument of its stub (`%p0`, `%p1`, …), along the steps of
+  `oracle::lent_within`: a step from a place that holds a borrow goes
+  through it (the fields of a view, then what its borrow refers to), and
+  struct fields, variant fields, vector elements and map values and keys
+  (by `@vn2_map_find_<mid>` on a key the stub writes and releases) follow.
+- `emit_harness_value_into` takes `Refs`: `Slots` for the arguments of the
+  entry (a slot of `main`), `Within(control)` for a host's payload (a place
+  within an argument, and nothing else: the cell is gone, and a value where
+  a borrow belongs stops the driver, as [E-Host] stops the run), and
+  `Nothing` for a key and for a write. `Lent` and the globals `@h_lent_N`
+  are gone.
+- The stub of a host prints the event first, with the arguments as they
+  were at the call; then it writes what the host leaves behind each
+  argument lent exclusively (nothing behind a value of kind `must`), making
+  the new value before it releases the old one, so that the two never share
+  an address; then it makes the payload, and prints it.
+- RB13: an argument `&bool` of an extern control was passed as a byte in a
+  temporary that held a copy. The place itself is passed now, as for every
+  other type behind a borrow: a `bool` is a byte that holds 0 or 1.
+
+`tests/slice3/checked_host_places.core` (16 runs; the checker accepts every
+control) has a host that writes behind a `bool` and one that lends it, a
+value of a map by its key, a borrow through the borrow of a view, shared
+and exclusive, two exclusive borrows of one payload, a view of two borrows,
+a write that releases a vector and one after which the payload is made in
+the new vector, two writes in one answer, and four hosts with `uses io`, so
+their calls are events. `hosts_that_lend_from_and_write_behind_arguments_run_natively_ro6_ro11`
+(`tests/backend_slice3.rs`) compiles the runs of the controls that the
+checker accepts in that file, `host_borrows.core` and
+`e_extern_writes.core`, 28 runs, at both widths of `usize` and at `-O0`
+and `-O2`, and compares the end, the trace and the allocations with the
+oracle and the erased semantics. Each of five mutants of the driver fails
+it: the temporary of RB13, no release of the old value, a null pointer for
+the place, the event printed after the write, and the payload made before
+it. ASan and `leaks` by hand on the emitted code: 73 runs, no error and no
+leak. The checker refuses `writes`, `splits` and `spans` of
+`host_borrows.core` by [P5] (an index or a sum over what the call left
+unknown) where no run is stuck, so those three run in compiled code in the
+forms of the first file. No test reaches a step into a variant field or to
+a map key in compiled code: a directive has no step for either (the seeded
+host draws variant fields), and the generator of slice 3 is to.
 
 ## 18. Slice 4 Phase 2: Second Review of Task Rules, Instrumented/Erased Task Scheduler, and Rails Task Surface
 

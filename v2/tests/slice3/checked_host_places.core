@@ -1,0 +1,156 @@
+// Slice 3, compiled: hosts that lend from their arguments and write behind
+// them ([E-Extern], RO6, RO11). The checker accepts every control, so the
+// runs of this file run in compiled code too: a borrow in a payload points
+// at the place that the host names within an argument, and what the host
+// leaves behind an argument lent exclusively is written there, the value it
+// replaces released, before the borrows of the payload are made. A host that
+// `uses io` has an effect, so each call of it is an event of the trace, with
+// the arguments as they were at the call and the payload after the write.
+
+struct pair {left : u32, right : [u32]}
+
+view struct window {items : &[u32], start : usize}
+
+view struct cursor {items : &~[u32], at : usize}
+
+view struct span {first : &u32, last : &u32}
+
+extern control set_flag(b : &~bool)
+    ■ { set {} }
+    uses io
+
+extern control flag_slot(b : &~bool)
+    ■ { slot {out : &~bool ∈ b} }
+
+extern control lookup(m : &string ⇀ u32)
+    ■ { found {out : &u32 ∈ m} │ none {} }
+
+extern control in_window(w : window)
+    ■ { item {out : &u32 ∈ w} }
+
+extern control at_cursor(c : cursor)
+    ■ { slot {out : &~u32 ∈ c} }
+
+extern control both(p : &~pair)
+    ■ { two {x : &~u32 ∈ p, y : &~u32 ∈ p} }
+
+extern control ends(xs : &[u32])
+    ■ { whole {s : span ∈ xs} }
+
+extern control refill(p : &~pair)
+    ■ { done {} }
+    uses io
+
+extern control regrow(v : &~[u32])
+    ■ { slot {out : &~u32 ∈ v} }
+    uses io
+
+extern control swap(a : &~u32, b : &~u32)
+    ■ { done {} }
+    uses io
+
+// A host writes behind a `bool`, and lends one.
+control flips()
+    ■ { ok {v : bool} }
+    uses io
+    ⊤ ▷ ~b : bool := false
+    ⊤ ▷ d : Δ set_flag(&~b) ▸ set {}
+    ⊤ ▷ ■ ok {b}
+
+control flips_through_a_slot()
+    ■ { ok {v : bool} }
+    ⊤ ▷ ~b : bool := false
+    ⊤ ▷ d : Δ flag_slot(&~b) ▸ slot {s}
+    ⊤ ▷ s ← true
+    ⊤ ▷ ■ ok {b}
+
+// A value in a map, by its key.
+control finds(m : string ⇀ u32)
+    ■ { ok {v : u32} }
+    ⊤ ▷ d : Δ lookup(&m) ▸ found {r} │ none {}
+    d.found ▷ ■ ok {r}
+    d.none ▷ ■ ok {0}
+
+// Through the borrow that a view holds.
+control looks_in_a_window()
+    ■ { ok {v : u32} }
+    ⊤ ▷ xs : [u32] := [4, 5, 6]
+    ⊤ ▷ w : window := window {&xs, 1}
+    ⊤ ▷ d : Δ in_window(w) ▸ item {r}
+    ⊤ ▷ ■ ok {r}
+
+control writes_through_a_cursor()
+    ■ { ok {v : [u32]} }
+    ⊤ ▷ ~xs : [u32] := [1, 2, 3]
+    ⊤ ▷ c : cursor := cursor {&~xs, 0}
+    ⊤ ▷ d : Δ at_cursor(c) ▸ slot {s}
+    ⊤ ▷ s ← 7
+    ⊤ ▷ ■ ok {xs}
+
+// Two exclusive borrows of one payload, and a view of two borrows.
+control splits()
+    ■ { ok {p : pair} }
+    ⊤ ▷ ~p : pair := pair {1, [2, 3]}
+    ⊤ ▷ d : Δ both(&~p) ▸ two {x, y}
+    ⊤ ▷ x ← 5
+    ⊤ ▷ y ← 6
+    ⊤ ▷ ■ ok {p}
+
+control spans()
+    ■ { ok {v : u32, w : u32} }
+    ⊤ ▷ xs : [u32] := [4, 5, 6]
+    ⊤ ▷ d : Δ ends(&xs) ▸ whole {s}
+    ⊤ ▷ ■ ok {s.first, s.last}
+
+// The vector of the pair is the program's and the new one the host's; the
+// write releases the first, and the entry the second.
+control refills()
+    ■ { ok {p : pair} }
+    uses io
+    ⊤ ▷ ~p : pair := pair {1, [2, 3]}
+    ⊤ ▷ d : Δ refill(&~p) ▸ done {}
+    ⊤ ▷ ■ ok {p}
+
+// The borrow of the payload is made after the write, in the vector that the
+// host left.
+control regrows()
+    ■ { ok {v : [u32]} }
+    uses io
+    ⊤ ▷ ~v : [u32] := [1]
+    ⊤ ▷ d : Δ regrow(&~v) ▸ slot {s}
+    ⊤ ▷ s ← 9
+    ⊤ ▷ ■ ok {v}
+
+// Two writes in one answer, behind two names and behind two places within
+// one struct.
+control swaps(a : u32, b : u32)
+    ■ { ok {first : u32, second : u32} }
+    uses io
+    ⊤ ▷ ~x : u32 := a
+    ⊤ ▷ ~y : u32 := b
+    ⊤ ▷ d : Δ swap(&~x, &~y) ▸ done {}
+    ⊤ ▷ ■ ok {x, y}
+
+control writes_two_fields()
+    ■ { ok {p : pair} }
+    uses io
+    ⊤ ▷ ~p : pair := pair {1, [2]}
+    ⊤ ▷ d : Δ swap(&~p.left, &~p.right[0]) ▸ done {}
+    ⊤ ▷ ■ ok {p}
+
+//! run flips() with [set_flag -> set ~b <- true] => done ok {true}
+//! run flips() with [set_flag -> set] => done ok {false}
+//! run flips_through_a_slot() with [flag_slot -> slot {&~b}] => done ok {true}
+//! run finds({"a" ↦ 1, "b" ↦ 2}) with [lookup -> found {&m["b"]}] => done ok {2}
+//! run finds({"a" ↦ 1, "b" ↦ 2}) with [lookup -> found {&m["a"]}] => done ok {1}
+//! run finds({"a" ↦ 1}) with [lookup -> none] => done ok {0}
+//! run looks_in_a_window() with [in_window -> item {&w.items[2]}] => done ok {6}
+//! run writes_through_a_cursor() with [at_cursor -> slot {&~c.items[1]}] => done ok {[1, 7, 3]}
+//! run splits() with [both -> two {&~p.left, &~p.right[1]}] => done ok {pair {5, [2, 6]}}
+//! run spans() with [ends -> whole {span {&xs[0], &xs[2]}}] => done ok {4, 6}
+//! run refills() with [refill -> done ~p <- pair {5, [6, 7, 8]}] => done ok {pair {5, [6, 7, 8]}}
+//! run refills() with [refill -> done] => done ok {pair {1, [2, 3]}}
+//! run regrows() with [regrow -> slot {&~v[2]} ~v <- [4, 5, 6]] => done ok {[4, 5, 9]}
+//! run regrows() with [regrow -> slot {&~v[0]}] => done ok {[9]}
+//! run swaps(1, 2) with [swap -> done ~a <- 2 ~b <- 1] => done ok {2, 1}
+//! run writes_two_fields() with [swap -> done ~a <- 7 ~b <- 8] => done ok {pair {7, [8]}}

@@ -1080,10 +1080,6 @@ pub fn native_runs(source: &str) -> Result<(Program, Vec<NativeRunSpec>), String
         }
         let (arguments, answers) =
             call_of(&program, raw_spec).map_err(|err| format!("line {}: {err}", raw_spec.line))?;
-        // The native driver writes nothing behind an argument (RO6, RO11).
-        if answers.iter().any(|(_, answer)| !answer.writes.is_empty()) {
-            continue;
-        }
         specs.push(NativeRunSpec {
             entry: raw_spec.entry.clone(),
             arguments,
