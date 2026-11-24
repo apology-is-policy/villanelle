@@ -4,7 +4,9 @@
 ┄ `push(~values, x)`. `len`, `clone` and indexing are expressions.
 ┄
 ┄ A condition reads an `&~` parameter as its value at completion and `old` of
-┄ it as its value at entry. Memory exhaustion is not an outcome, as in v1.
+┄ it as its value at entry. Memory exhaustion is not an outcome, as in v1:
+┄ a step that runs out of storage, or that would make a length greater than
+┄ usize.max, ends the execution `exhausted` ([E-Exhaust] of the core).
 
 ┄ Vectors
 push(values: &~[t], value: t)

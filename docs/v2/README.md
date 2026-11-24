@@ -11,7 +11,7 @@ v1, the language and compiler at 0.306, is described by the
 
 | Document | Deliverable | State |
 | --- | --- | --- |
-| [Core calculus](core.md) | The core language, its instrumented semantics, the checker's judgments, and the claims to test and mechanize | Draft 2, accepted. The synchronous language has two reviews folded in. Tasks and named boundaries were read by the combined review, which found four programs that the task rules accepted and the semantics left stuck, and no checking rule for named boundaries; the implementation of slice 4 folded three further repairs into `[W11]`, `[E-AwaitHost]`, `[TK6]` and `[I10]` (`core.md` section 12). The independent second review of the task rules ([task-review.md](task-review.md), 23 November 2026) found them right and four further defects open. Records the decisions on Q1 to Q5 and Q18. |
+| [Core calculus](core.md) | The core language, its instrumented semantics, the checker's judgments, and the claims to test and mechanize | Draft 2, accepted. The synchronous language has two reviews folded in. Tasks and named boundaries were read by the combined review, which found four programs that the task rules accepted and the semantics left stuck, and no checking rule for named boundaries; the implementation of slice 4 folded three further repairs into `[W11]`, `[E-AwaitHost]`, `[TK6]` and `[I10]` (`core.md` section 12). The independent second review of the task rules ([task-review.md](task-review.md), 23 November 2026) found them right and four further defects, which the rules answer since 24 November 2026; RT1 and RT3 by the author's choices. Records the decisions on Q1 to Q5, Q18, RT1 and RT3. |
 | [Fact logic](facts.md) | The interpreted fragment behind `⊨`, the decision procedure, certificates, counterexamples, worked examples | Draft 1, accepted; two reviews folded in. Records the decisions on Q6 to Q10. The corpus added the length of a vector literal. |
 | [Reference model](references.md) | Second-class borrows and views: the model, 36 worked examples in Rails and core form with verdicts, the tag semantics on an example | Draft 1, accepted; one review folded in, which found the 36 verdicts to agree with their clauses. Records the decisions on Q16 and Q17. |
 | [Surface](surface.md) | The Rails grammar, layout, and the elaboration into the core, including the acknowledgement rule and outcome groups | Draft 1, accepted, with the task forms of the core's draft 2 and the forms the corpus needed (traits, named boundaries, `copy` types); one review folded in. Records the decisions on Q11 to Q15 and Q19. |
@@ -41,7 +41,10 @@ Three things were open at acceptance, and the author accepted with them named:
   stay, but they were made by the implementation and no review was written
   ([review](review.md), RD2). The independent review was made on 23
   November 2026 ([task-review.md](task-review.md)): the repairs hold up,
-  and four findings of its own, RT1 to RT4, are open for slice 4.
+  and it made four findings of its own, RT1 to RT4. The rules answer them
+  since 24 November 2026 (`core.md` section 12; RT1 and RT3 by choices of
+  the author, section 11); the implementation of slice 4 does not hold
+  them yet ([review](review.md), section 9).
 - **Workarounds.** The plan's exit asks that the corpus show no construct that
   v2 cannot express without a workaround. Three of the thirteen open limits of
   the [corpus](corpus.md) (section 6.2) are workarounds until phase 5:

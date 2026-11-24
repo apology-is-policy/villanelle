@@ -25,9 +25,12 @@ implementation of the task slice folded three further repairs into [W11],
 source a second review, but it was made by the implementation and left no
 written record. The independent second review of the task rules was made on
 23 November 2026 ([task-review.md](task-review.md)); it found the repairs
-right and four further defects, RT1 to RT4, which are open
-([review](review.md), section 9). The author has answered the five questions
-that draft 1 raised (section 11).
+right and four further defects, RT1 to RT4. The rules answer them since 24
+November 2026, in [E-Run], [TK4], [E-MemberFault], [E-Exhaust] and Theorem 4
+(section 12); RT1 and RT3 by choices of the author (section 11). Whether the
+implementation holds them is for the [review](review.md) to say, in its
+section 9. The author has answered the five questions that draft 1 raised
+(section 11).
 
 [Index of the v2 design](README.md) · [Fact logic](facts.md) ·
 [Reference model](references.md) · [Surface](surface.md) ·
@@ -613,6 +616,18 @@ that the contract takes as `&~` is written `&~p` or is a name of that borrow
 type, which passes the borrow itself ([W8]). `trim` of the prelude is a
 function and not one of them.
 
+Storage is the host's, and running out of it is not an outcome.
+
+- **[E-Exhaust]** A step that makes a value or a task may instead end the
+  execution, at the host's choice, with the final result `exhausted`. It
+  does so where it would make a length or a count greater than `usize.max`
+  ([fact logic](facts.md), [A3]): `push` or `insert` on a collection that has
+  `usize.max` elements, `spawn` into a set that has `usize.max` members. No
+  scope ends, nothing is released, no contingency runs and no permission is
+  asked: the execution stops as a process does when its system stops it, and
+  leaves what it holds to the host. The instrumented profile lets a script give the
+  largest length and count that a step may make.
+
 Effects are checked against allowances. Each activation carries the effect set
 its control declares.
 
@@ -757,12 +772,13 @@ excludes.
 | **X9** | An effect occurs outside an allowance | [E-Effect] | Effects [F3] |
 | **X10** | A value has the wrong shape, or a decision meets an unlisted alternative | [E-Decide] and typing | Typing [C1], acknowledgement [C2] |
 
-Running forever is not stuck. `host-violation` is not stuck.
+Running forever is not stuck. `host-violation` is not stuck, and neither is
+`exhausted` ([E-Exhaust]).
 
 ### 6.11 Observations
 
 The observation of an execution is its event trace together with how it ends:
-`done(a, v̄)`, `faulted(message)`, `terminated(n)`, or divergence. Scope identities, tags, slot
+`done(a, v̄)`, `faulted(message)`, `terminated(n)`, `exhausted`, or divergence. Scope identities, tags, slot
 states and histories are not observable. Given the host's choices, which
 include the order of turns ([E-Turn]), execution is deterministic.
 
@@ -783,7 +799,16 @@ do: the activation that started a run waits at its `run` decision.
   tasks of the run take turns until the root is `done(a, v̄)`, and the decision
   completes with `a` and `v̄`. If the root's last activation is popped in mode
   `fault`, the decision completes with no alternative and the fault continues
-  in the caller ([E-Unwind]).
+  in the caller ([E-Unwind]). When `f` is an `extern async control`, the root
+  task has no activation. It waits for the operation of `f` on `v̄`, as a task
+  that awaits `f` does ([E-AwaitHost]), with the precondition and the
+  allowance checked first: if the root is cancelled and `f` is cancellable,
+  the root is `done(cancelled)` at once, the host is not asked, and the
+  arguments given by value are released as [E-Unwind] releases them;
+  otherwise the host starts the operation. When the host completes it, the
+  root is `done(a, v̄′)`. When the root becomes cancelled while it waits and
+  `f` is cancellable, the host withdraws the operation, its arguments given by
+  value are released in the same way, and the root is `done(cancelled)`.
 - **[E-Turn]** When no task of the innermost run has the turn, the host gives
   it to a task of that run that is `ready`. That task runs until it awaits,
   is done, or faults; nothing interrupts it in between. If no task of the run
@@ -811,7 +836,8 @@ do: the activation that started a run waits at its `run` decision.
 - **[E-Spawn]** `spawn f(ō) into x`. Evaluate `ō` and check the precondition of
   `f`. A new task with one activation of `f` on those arguments becomes a
   member of the set in `x`, in state `ready`. It does not run yet: `spawn`
-  does not pass the turn.
+  does not pass the turn. A spawn that would give the set more than
+  `usize.max` members ends the execution instead ([E-Exhaust]).
 - **[E-Next]** `d : Δ await next(x) ▸ a₁ {x̄₁} │ … │ empty {}`. The task gives up
   its turn. It is `ready` when the set in `x` has no members, or has a member
   that is `done`. With no members the decision completes with `empty`, and the
@@ -833,7 +859,11 @@ do: the activation that started a run waits at its `run` decision.
   `fault(message)`, the member is removed, and no task takes a turn before the
   fault is delivered. Let `A` be the owner of its set. The owner task waits at
   an `await`, in `A` or in an activation that `A` awaits. Every activation of
-  that task above `A` is stopped ([E-Stop]). The await at which `A` waits
+  that task above `A` is stopped ([E-Stop]). When `A` itself waits at an
+  await of an `extern async control` whose operation the host has started,
+  the host withdraws that operation ([E-AwaitHost]): it has no completion and
+  no event, and the arguments it was given by value are released as
+  [E-Unwind] releases them. The await at which `A` waits
   completes with no alternative, and the owner task continues in mode
   `fault(message)`, as when a callee faults ([E-Unwind]).
 - **[E-Stop]** Stopping an activation ends its scopes, innermost first, as
@@ -1301,7 +1331,12 @@ the set that owns it.
   name in the care of a lexical boundary that encloses the `await` has a
   fault-releasable type. The operands that `await f(ō)` and `spawn f(ō)` pass
   by value have fault-releasable types: `f` holds them while it waits for
-  its first turn, or the host does ([E-Await], [E-AwaitHost]). The payloads
+  its first turn, or the host does ([E-Await], [E-AwaitHost]). So do the
+  operands that `run f(ō)` passes by value where `f` is a cancellable
+  `extern async control`: the host releases them when the run is cancelled
+  ([E-Run]). The root of a run is a member of no set and is never stopped,
+  so the operands of a `run` of any other control are free of this rule:
+  the checks at the awaits of the control that is run cover them. The payloads
   of a producer and of an `extern async control` have fault-releasable types:
   a payload can reach a task that is stopped before it runs again.
 - **[TK5] Faults from members.** An `await` at statement `i` may fault, in the
@@ -1320,6 +1355,10 @@ the set that owns it.
   | `spawn f(ō) into x` at statement `i` | `Rᵢ ⇒ count(x′) = count(x) + 1`, for the fresh name `x′` |
   | `d : Δ await next(x)`, an alternative `a` of `f` | `d.a ⇒ count(x′) = count(x) - 1`, and the condition `φₐ` of `f` with a fresh name for each parameter and a separate fresh name for `old(y)` of each `&~` parameter `y` |
   | `d : Δ await next(x)`, `empty` | `d.empty ⇒ count(x) = 0` |
+
+  A spawn that would make the count greater than `usize.max` ends the
+  execution ([E-Exhaust]), so the fact of a spawn holds wherever the history
+  goes on, and [A3] bounds `count(x′)`.
 
   `await f(ō)` and `run f(ō)` give the facts of a call of `f` ([N4]). No
   operation that is awaited or run is pure, and neither is a control whose
@@ -1353,16 +1392,24 @@ conflicts; no obligation is destroyed; no `⊥` is reached; no stated condition
 fails; no fault or effect occurs where it is not permitted.
 
 **Theorem 2 (resources).** In every finite execution of a checked program under
-a faithful host, each resource the host created has been closed by exactly one
+a faithful host that does not end `exhausted` ([E-Exhaust]), each resource the
+host created has been closed by exactly one
 completing operation, or released by its declared fault disposition, or is part
 of the final payload.
 
 **Theorem 3 (erasure).** See section 9.
 
-**Theorem 4 (expansion).** Expanding a decision on a defined control in place
-(the control's body with fresh names and sites, its parameters bound to the
-arguments, and each exit replaced by the caller's continuation for that
-alternative) yields a checked program with the same observations.
+**Theorem 4 (expansion).** Expanding a decision on a defined control that is
+not `async` in place (the control's body with fresh names and sites, its
+parameters bound to the arguments, and each exit replaced by the caller's
+continuation for that alternative) yields a checked program with the same
+observations.
+
+The theorem says nothing of `await f` and `run f`. `await f` on a defined
+control passes the turn before the first statement of `f` ([E-Await]), so a
+member of a set of the caller may run there, and `run f` starts a run with a
+pool and a root of its own ([E-Run]). The body put in place keeps neither,
+and the core has no statement that would.
 
 The proofs rest on five invariants of reachable configurations, each relating a
 scope at statement `i` to the checker's state there:
@@ -1426,6 +1473,8 @@ removed. It is what release code implements.
   names.
 - **[R6]** Tasks, sets, turns and cancellation flags are behavior and remain.
   Each task has its own histories.
+- **[R7]** A step ends the execution `exhausted` where [E-Exhaust] says, with
+  the same choices of the host. Release code stops the process there.
 
 **Theorem 3 (erasure).** For a checked program and a faithful host, the
 instrumented and the erased semantics yield the same observation from the same
@@ -1576,6 +1625,14 @@ took the recommendation.
 | --- | --- | --- |
 | Q18 | Does v2.0 keep v1's single task handles (`child := spawn f(…)`, `await child`), deferred tasks (`defer`) and `yield`? | **No.** Task sets only, as the plan's list of words has it (`spawn … into`, `await`, `next`, `cancel`, `run`). A handle is a set with one member, a deferred task is a call made later, and `yield` only made schedules observable. One form means one ownership rule and one loan rule for all concurrency. |
 
+The second review of the task rules raised two questions. The author answered
+them on 24 November 2026 and took the recommendation in each case.
+
+| | Question | Decision |
+| --- | --- | --- |
+| RT1 | May `run` start an `extern async control` directly, and what happens to the arguments it was given by value when that run is cancelled? | **Yes, with a rule** ([E-Run], [TK4]). The root of such a run has no activation and waits for the operation as an awaiting task does; a cancelled root takes `cancelled` and its arguments given by value are released. Where the extern control is cancellable, those arguments have fault-releasable types. Synchronous code calls one host operation without a wrapper. The other choice was to admit only defined controls to `run`. |
+| RT3 | What happens at a `spawn` that would take `count` past `usize.max`, and at a `push` or an `insert` that would take `len` past it? | **The execution ends `exhausted`** ([E-Exhaust]). It is not stuck and not a fault: nothing is released and no contingency runs, as a process that runs out of storage is stopped. The host may end any step that makes a value so, which is how memory exhaustion is written. No program changes. The other choices were a proof obligation at every such step, which asks an invariant of every loop that grows a collection or a set, and a fault, which asks a permission of every control that cannot prove the bound. |
+
 ## 12. Changes after acceptance
 
 The author accepted this document on 20 November 2026. What changed afterwards,
@@ -1609,3 +1666,7 @@ and what asked for it:
 | 24 November 2026 | [C1] says that a name of exclusive borrow type where a borrow is expected may carry the move mark, and a name of shared borrow type may not. | The checker against the rule files of the borrows (review findings RO18 and RC27): the reader took a bare place given for an `&~` parameter of an operation as `&~p`, and refused `▾r` there, although the name moves and [O3] allows the mark on a name that is consumed. A name of shared borrow type is read there, as RC7 has it for `len(▾v)`. |
 | 24 November 2026 | [L2] says that a function applied in an operand, and `len`, use a borrow among their arguments where they are applied, and that their arguments are accesses while the borrows of the operands before them are live. | The clause tests of the loans (review findings RC28 and RC29). The checker held the borrow in `len(&v)` as used by the command, so `■ ok {len(&v)}` conflicted with the end of the scope at the exit, and it checked the arguments of a function in an operand as if the statement lent nothing, so `two(r, id(x))` was accepted where `r` lends `x` exclusively. The rule already gave both answers; the sentence says how it reads for a value computed from a borrow. |
 | 24 November 2026 | [L5] says that a use of a view uses each borrow field in its own mode, where it said that the view is used as one borrow, exclusive if any of its borrows is. | The same tests. The checker uses each field in its own mode: a shared field can be read through by whoever holds the view and written through by no one, so moving or passing the view does not end a borrow made through that field, and the oracle runs such a program to its end. The rule as it stood refused it. What a mention of a view keeps live is unchanged. |
+| 24 November 2026 | [E-Run] says how a run of an `extern async control` asks the host: its root has no activation and waits for the operation as [E-AwaitHost] says, and is `done(cancelled)` when it is cancelled and the operation is cancellable. [TK4] asks fault-releasable types of the operands that such a run passes by value. | The second review of the task rules (finding RT1) and the author's choice of 24 November (section 11). [W10] allowed the run, and nothing said how it starts; the draft oracle released the arguments of a cancelled one, and a lock that is not `on fault release` made it stuck (`X8 E-Unwind`) where the checker had nothing to refuse. |
+| 24 November 2026 | [E-MemberFault] withdraws the operation that the owner itself awaits when the fault of a member reaches it, and releases its arguments given by value. | The same review (RT2). The rule stopped the activations above the owner, whose operations [E-Stop] withdraws, and said nothing of an operation the owner awaits: the lease it holds would have been neither released nor completed, against Theorem 2. The oracle withdrew it already. |
+| 24 November 2026 | [E-Exhaust] (section 6.6): a step that makes a value or a task may end the execution with the final result `exhausted`, and does where a length or a count would pass `usize.max`. [E-Spawn], [TK6], sections 6.10 and 6.11, Theorem 2 and [R7] refer to it. | The same review (RT3) and the author's choice of 24 November (section 11). A loop that spawns without an await could give a set `usize.max + 1` members, and [TK6] and [A3] then had no valuation on a reachable history; `push` and `insert` had the same gap for `len`, and the prelude said only that memory exhaustion is not an outcome. |
+| 24 November 2026 | Theorem 4 is about decisions on controls that are not `async`, and says why `await f` and `run f` are not expanded. | The same review (RT4). Putting the body of an awaited control in place drops the turn that [E-Await] gives up before its first statement, so a member that would have run first runs later, which is a different trace. |

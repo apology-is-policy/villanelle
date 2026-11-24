@@ -349,7 +349,11 @@ apply to (section 6).
   32 and 64 bits.
 - **[A3] Measures.** `len` applies to vectors, strings and maps, and
   `0 ≤ len(t) ≤ usize.max`. `count` applies to task sets, with the same
-  bounds; the core says how the task forms change it ([TK6]). A vector
+  bounds; the core says how the task forms change it ([TK6]). A step that
+  would make a length or a count greater than `usize.max` ends the
+  execution instead (core, [E-Exhaust]), so the bound holds in every
+  configuration that is reached, and a fact that adds one to a measure holds
+  wherever the history goes on. A vector
   literal has the length it shows, `len([t₁, …, tₙ]) = n`, and the empty map
   has none, `len(∅) = 0`. A vector literal and `∅` in program text denote
   these terms, and the logic knows nothing else about a literal: its elements
@@ -1089,3 +1093,12 @@ it.
    why none is (finding RC17). The note on the instances for constructors
    says what the examination found (finding RC26, open). No clause
    changed.
+15. **24 November 2026, [A3]: the bound of a measure is kept by the
+   semantics.** The second review of the task rules (finding RT3) found a
+   loop that spawns without an await and gives a set `usize.max + 1`
+   members: [TK6] of the core then says `count(x′) = count(x) + 1` and
+   [A3] bounds `count(x′)` by `usize.max`, and the facts of a reachable
+   history had no valuation. `push` and `insert` had the same gap for
+   `len`. The author chose that such a step ends the execution `exhausted`
+   ([E-Exhaust] of the core); [A3] says that its bound holds in every
+   configuration that is reached for that reason. No axiom changed.
