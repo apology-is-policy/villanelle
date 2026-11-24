@@ -105,12 +105,13 @@ again.
 - Stage by explicit path. Never use `git add -A` or `git add .`. Never read,
   stage or copy an untracked file you did not create. The files and directories
   that `CLAUDE.local.md` protects are out of bounds.
-- Push to `main` only if the author has authorized you by name, and then only
-  validated checkpoints. Without that authorization, work on a branch of your
-  own and hand it over. It lands after another agent has rebased it, read the
-  diff, rerun the gate, and recorded in the review what it closes. Force
-  pushes, history rewrites, tags and releases need the author's explicit
-  request.
+- Every agent working here may push to `main`, and only validated
+  checkpoints: the gate passed, the documents brought up to date, the
+  workflow run read after the push. Work that has not passed the gate stays
+  on a branch of your own. Before you build on what another agent pushed,
+  read it as a reviewer would, and record in the review what you find wrong.
+  Force pushes, history rewrites, tags and releases need the author's
+  explicit request.
 - Before you change a file, claim it on Yip. Stay off files that another agent
   has claimed.
 - Sign the shared cross-agent log that `CLAUDE.local.md` names with your own
