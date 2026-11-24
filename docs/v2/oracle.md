@@ -377,7 +377,27 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   `mutations_of_ownership_are_stuck_and_rejected`
   (`v2/tests/checker_slice2.rs`) has a program with a stuck mutant of each
   of the five kinds, in the states the kind is for, and requires that the
-  checker rejects every stuck mutant of it. `mutate::classify`
+  checker rejects every stuck mutant of it. Since 24 November 2026 there are
+  four more, for the borrows of slice 3, each aimed at a run that uses a
+  borrow after it ended: `FlipBorrow` (a borrow `&p` that a name or a loop
+  parameter is bound to becomes `&~p`, or the reverse, and the declared
+  type of the name with it, [B1] to [B3], X4), `ConflictingBorrow` (before
+  a statement that mentions a name that holds a borrow of `p`, a borrow of
+  `p` in the other mode is bound to a fresh name, [B2], [B3], X4),
+  `AccessLent` (there, the root of `p` is bound to a fresh name, which reads
+  a value that is copied and moves one that is not, [B2], [B4], X4) and
+  `ExtendBorrow` (a name of borrow type is borrowed again after a later
+  statement of its body, [B1], [L2], X4, and [O2], X2 where a statement
+  between moved it). Which names are of borrow type is read from the program
+  as `resolve` types it. A name holds a borrow of `p` where it is bound to
+  `&p` or `&~p`, or where it is a payload name that the contract derives
+  from a parameter (`∈ y`) for which the argument is `&p` or `&~p`. A write
+  through a shared borrow name is no kind: `resolve` refuses it.
+  `mutations_of_borrows_are_stuck_and_rejected`
+  (`v2/tests/checker_slice3.rs`) has a program of eight controls in which
+  each of the four kinds has a stuck mutant in the controls where it meets a
+  conflict and in no other, and requires that the checker rejects every
+  stuck mutant of it (section 16.4). `mutate::classify`
   runs a mutant in the oracle; across 16 sets of numbers of the template,
   the stuck mutants reach all 15 stuck states of slice 1. They are the
   target rejection set for the phase 3 checker.
@@ -1785,6 +1805,30 @@ is `var_in_body_tree` now.
 and is accepted, and one that carries the borrow on through a parameter of
 the loop, which is stuck and refused. The checker accepts all of 900
 generated programs with borrows (36,396 runs, none stuck).
+
+### 16.4 Mutants of the borrows, 24 November 2026
+
+The four kinds of mutation of the borrows (section 8, "Mutations") and the
+twelve before them, on the first 40 generated programs of slice 3
+(`vn2 fuzz --slice 3 --seed 1 --count 40 --mutants --seconds 10`):
+11,088 mutants; `resolve` refuses 1,408, the checker rejects 1,732 (1,261
+of them with a stuck run) and accepts 7,948 with none. No mutant with a
+stuck run was accepted, and the checker gave an answer in ten seconds on
+every one. The twelve kinds before give, kind for kind, the lines they gave
+before. Of the four kinds: `FlipBorrow` 83 mutants (47 refused, one
+rejected and stuck, 35 accepted), `ConflictingBorrow` 16 (8 refused, 7
+rejected, 5 of them stuck, one accepted), `AccessLent` 16 (5 rejected, 3 of
+them stuck, 11 accepted), `ExtendBorrow` 393 (11 rejected and stuck, 382
+accepted). They meet few conflicts in generated programs: the generator ends a borrow where
+it stops mentioning the names that hold it, and most of its borrows are of
+names that nothing writes or moves afterwards (of the 83 borrows bound to
+names in these 40 programs, 19 are mentioned after the statement that binds
+them). The program of `mutations_of_borrows_are_stuck_and_rejected` has the
+conflicts that the generated programs lack: in it each kind is stuck in the
+controls where it meets one (X4 B1, and X2 E-Var where a statement before
+moved the borrow name), and in no other; the test fails with a conflicting
+borrow made in the same mode, with payload names that hold no place, and
+with a checker that allows a read beside an exclusive loan.
 
 ## 17. Slice 3 Phase 4: Theorem 4 Expansion and Typed LLVM IR / C ABI Backend for Borrows and Views
 

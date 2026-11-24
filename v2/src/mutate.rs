@@ -14,9 +14,20 @@
 //! contingency mentions the name `resolve` refuses the program, and where
 //! it does not the program means the same.
 //!
+//! For the borrows of slice 3, each aimed at a borrow that a run uses after
+//! it ended: a borrow made in the other mode, with the type of the name it
+//! is bound to; a borrow of the same place in the other mode, or an access
+//! of its root, before a statement that mentions the name that holds it;
+//! and a borrow of a name of borrow type after a later statement, so that
+//! the name lives longer. Which names are of borrow type is read from the
+//! program as `resolve` types it. A write through a shared borrow name is
+//! no mutation here: `resolve` refuses it ([C1]).
+//!
 //! [`classify`] runs a mutant through `resolve` and the oracle across a set of
 //! inputs. The mutants that are stuck in the oracle are those that the checker
 //! of phase 3 must reject.
+
+use std::collections::BTreeMap;
 
 use crate::host::{Arithmetic, Seeded};
 use crate::int::Int;
@@ -25,6 +36,7 @@ use crate::resolve;
 use crate::syntax::{
     Binary, Command, Control, Declaration, Expr, PlaceStep, Program, Selector, Statement,
 };
+use crate::typed::{self, BorrowMode, Type};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
@@ -59,6 +71,24 @@ pub enum Kind {
     /// may fault runs while something is owed ([O2] to [O5], [F2], X2, X5,
     /// X8).
     SwapStatements,
+    /// A borrow `&p` that a name or a loop parameter is bound to is made
+    /// `&~p`, or `&~p` is made `&p`, and the declared type of the name with
+    /// it: an exclusive borrow ends the borrows of the place, and a read of
+    /// the place ends it ([B1] to [B3], X4; [C1], [W8]).
+    FlipBorrow,
+    /// Before a statement that mentions a name bound to `&p` or `&~p`, a
+    /// borrow of `p` in the other mode is bound to a fresh name: it ends
+    /// the borrow that the name holds ([B2], [B3], X4).
+    ConflictingBorrow,
+    /// Before a statement that mentions a name bound to a borrow of `p`, the
+    /// root of `p` is bound to a fresh name: a value that is copied is read,
+    /// which ends an exclusive borrow of it, and one that is not is moved,
+    /// which ends every borrow of it ([B2], [B4], X4).
+    AccessLent,
+    /// A name of borrow type is borrowed again after a later statement of
+    /// its body, so that the borrow it holds lives over what the statements
+    /// between do ([B1], [L2], X4; [O2], X2 where one of them moved it).
+    ExtendBorrow,
 }
 
 #[derive(Clone, Debug)]
@@ -485,9 +515,443 @@ fn collect_from_expressions(
     }
 }
 
+/// The type of each name of the variables, where the name has one type.
+fn types_of<'a>(vars: impl Iterator<Item = &'a typed::Var>) -> BTreeMap<String, Type> {
+    let mut seen: BTreeMap<String, Option<Type>> = BTreeMap::new();
+    for var in vars {
+        seen.entry(var.name.clone())
+            .and_modify(|ty| {
+                if ty.as_ref() != Some(&var.ty) {
+                    *ty = None;
+                }
+            })
+            .or_insert_with(|| Some(var.ty.clone()));
+    }
+    seen.into_iter()
+        .filter_map(|(name, ty)| Some((name, ty?)))
+        .collect()
+}
+
+/// The types of the names of each control and named boundary, by the name
+/// of the declaration; a name bound at two types in one is left out.
+fn name_types(typed: &typed::Program) -> BTreeMap<String, BTreeMap<String, Type>> {
+    let mut out = BTreeMap::new();
+    for control in &typed.controls {
+        if let Some(body) = &control.body {
+            out.insert(control.name.clone(), types_of(body.vars.iter()));
+        }
+    }
+    for boundary in &typed.boundaries {
+        let vars = boundary.body.vars.iter().chain(&boundary.contingency.vars);
+        out.insert(boundary.name.clone(), types_of(vars));
+    }
+    out
+}
+
+/// A name of borrow type that a body holds after a statement of it, or from
+/// its start: the selector of the histories on which it is bound, and the
+/// borrow it holds where the text says of which place: `x := &p`, or a
+/// payload name of a control whose contract derives it from a parameter
+/// (`∈ y`) for which the argument is `&p` or `&~p`; then the place of the
+/// borrow is within `p`.
+struct Holder {
+    name: String,
+    selector: Selector,
+    borrow: Option<(BorrowMode, Expr)>,
+}
+
+/// The place that the payload name at `position` of `alternative` borrows
+/// within, where the contract of `operation` derives it from one parameter
+/// and the argument for that parameter is a borrow.
+fn payload_borrow(
+    program: &Program,
+    operation: &str,
+    arguments: &[Expr],
+    alternative: &str,
+    position: usize,
+) -> Option<(BorrowMode, Expr)> {
+    let control = program
+        .declarations
+        .iter()
+        .find_map(|declaration| match declaration {
+            Declaration::Control(control) if control.name == operation => Some(control),
+            _ => None,
+        })?;
+    let field = control
+        .contract
+        .iter()
+        .find(|candidate| candidate.name == alternative)?
+        .fields
+        .get(position)?;
+    let (Type::Ref(mode, _), [origin]) = (&field.ty, field.origins.as_slice()) else {
+        return None;
+    };
+    let index = control
+        .parameters
+        .iter()
+        .position(|parameter| &parameter.name == origin)?;
+    match arguments.get(index)? {
+        Expr::Borrow(_, place) => Some((*mode, (**place).clone())),
+        _ => None,
+    }
+}
+
+/// The names of borrow type that `statement` binds.
+fn holders_of(
+    program: &Program,
+    statement: &Statement,
+    types: &BTreeMap<String, Type>,
+) -> Vec<Holder> {
+    let borrowed = |name: &String| matches!(types.get(name), Some(Type::Ref(..)));
+    let of_arms = |site: &str, arms: &[crate::syntax::Arm], call: Option<(&str, &[Expr])>| {
+        let mut holders = Vec::new();
+        for arm in arms {
+            for (position, name) in arm.names.iter().enumerate() {
+                if !borrowed(name) {
+                    continue;
+                }
+                holders.push(Holder {
+                    name: name.clone(),
+                    selector: Selector::Atom(site.to_string(), arm.alternative.clone()),
+                    borrow: call.and_then(|(operation, arguments)| {
+                        payload_borrow(program, operation, arguments, &arm.alternative, position)
+                    }),
+                });
+            }
+        }
+        holders
+    };
+    match &statement.command {
+        Command::Bind { name, value, .. } if borrowed(name) => vec![Holder {
+            name: name.clone(),
+            selector: statement.selector.clone(),
+            borrow: match value {
+                Expr::Borrow(mode, place) => Some((*mode, (**place).clone())),
+                _ => None,
+            },
+        }],
+        Command::Unpack { names, .. } => names
+            .iter()
+            .filter(|name| borrowed(name))
+            .map(|name| Holder {
+                name: name.clone(),
+                selector: statement.selector.clone(),
+                borrow: None,
+            })
+            .collect(),
+        Command::Decide {
+            site,
+            operation,
+            arguments,
+            arms,
+            ..
+        } => of_arms(site, arms, Some((operation, arguments))),
+        Command::Loop { site, arms, .. } => of_arms(site, arms, None),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether one of the statements mentions `name`.
+fn mentions(statements: &[Statement], name: &str) -> bool {
+    let mut found = false;
+    walk_statements(&mut statements.to_vec(), &mut |expr| {
+        if let Expr::Name(seen) | Expr::Old(seen) = expr {
+            found |= seen == name;
+        }
+    });
+    found
+        || statements.iter().any(|statement| match &statement.command {
+            Command::Assign { name: target, .. } => target == name,
+            Command::AssignPlace { target, .. } => target.root == name,
+            Command::Cancel { set } | Command::Spawn { set, .. } => set == name,
+            Command::Loop { body, .. } => mentions(body, name),
+            Command::Boundary {
+                body,
+                captures,
+                contingency,
+                ..
+            } => {
+                captures.iter().any(|capture| capture == name)
+                    || mentions(body, name)
+                    || mentions(contingency, name)
+            }
+            _ => false,
+        })
+}
+
+/// Whether a statement ends the histories that its selector takes.
+fn is_disposition(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Exit { .. }
+            | Command::Leave { .. }
+            | Command::Again { .. }
+            | Command::Terminate(_)
+            | Command::Escalate
+            | Command::Recover { .. }
+            | Command::Impossible
+            | Command::Fault { .. }
+    )
+}
+
+/// The name at the root of a place.
+fn root_name(place: &Expr) -> Option<&str> {
+    match place {
+        Expr::Name(name) => Some(name),
+        Expr::Field(inner, _) | Expr::Index(inner, _) => root_name(inner),
+        _ => None,
+    }
+}
+
+fn other(mode: BorrowMode) -> BorrowMode {
+    match mode {
+        BorrowMode::Shared => BorrowMode::Exclusive,
+        BorrowMode::Exclusive => BorrowMode::Shared,
+    }
+}
+
+fn sign(mode: BorrowMode) -> &'static str {
+    match mode {
+        BorrowMode::Shared => "&",
+        BorrowMode::Exclusive => "&~",
+    }
+}
+
+/// The type of a name bound to a borrow made in the other mode.
+fn flipped(ty: &Option<Type>) -> Option<Type> {
+    match ty {
+        Some(Type::Ref(mode, inner)) => Some(Type::Ref(other(*mode), inner.clone())),
+        other => other.clone(),
+    }
+}
+
+/// What the mutants of the borrows of one declaration share: the program,
+/// the statements of the declaration, its name, the types of its names and
+/// a name that the program does not use.
+struct Lending<'a> {
+    program: &'a Program,
+    root: Root,
+    control: &'a str,
+    types: &'a BTreeMap<String, Type>,
+    fresh: &'a str,
+}
+
+/// The mutants of the borrows of a body and of the bodies within it.
+/// `entry` holds the names of borrow type bound at the start of the body
+/// (the parameters of a loop).
+fn collect_borrows(
+    lending: &Lending,
+    path: &mut Vec<Step>,
+    entry: Vec<Holder>,
+    out: &mut Vec<Mutant>,
+) {
+    let Lending {
+        program,
+        root,
+        control: control_name,
+        types,
+        fresh,
+    } = *lending;
+    let statements = body_ref(program, root, path).to_vec();
+    let at = |index: usize| {
+        statements
+            .get(index)
+            .or(statements.last())
+            .map_or(0, |s| s.line)
+    };
+    let insert = |index: usize, selector: &Selector, value: Expr| {
+        let mut mutated = program.clone();
+        body_mut(&mut mutated, root, path).insert(
+            index,
+            Statement {
+                selector: selector.clone(),
+                command: Command::Bind {
+                    mutable: false,
+                    name: fresh.to_string(),
+                    ty: None,
+                    value,
+                },
+                line: at(index),
+            },
+        );
+        mutated
+    };
+    let mut push = |kind: Kind, detail: String, program: Program| {
+        out.push(Mutant {
+            kind,
+            control: control_name.to_string(),
+            detail,
+            program,
+        })
+    };
+
+    // Each holder with the index of the first statement after its binding.
+    let mut holders: Vec<(usize, Holder)> = entry.into_iter().map(|h| (0, h)).collect();
+    for (index, statement) in statements.iter().enumerate() {
+        holders.extend(
+            holders_of(program, statement, types)
+                .into_iter()
+                .map(|holder| (index + 1, holder)),
+        );
+    }
+
+    for (from, holder) in &holders {
+        let name = &holder.name;
+        if let Some((mode, place)) = &holder.borrow {
+            for index in *from..statements.len() {
+                if !mentions(&statements[index..=index], name) {
+                    continue;
+                }
+                let made = Expr::Borrow(other(*mode), Box::new(place.clone()));
+                push(
+                    Kind::ConflictingBorrow,
+                    format!(
+                        "`{}{place}` before statement {index}, which mentions `{name}`",
+                        sign(other(*mode)),
+                    ),
+                    insert(index, &holder.selector, made),
+                );
+                if let Some(lent) = root_name(place) {
+                    push(
+                        Kind::AccessLent,
+                        format!("`{lent}` before statement {index}, which mentions `{name}`"),
+                        insert(index, &holder.selector, Expr::Name(lent.to_string())),
+                    );
+                }
+            }
+        }
+        // After statement `index - 1`; not after the last one where it ends
+        // every history, and not just after the binding.
+        for index in (from + 1).max(1)..=statements.len() {
+            if index == statements.len() && is_disposition(&statements[index - 1].command) {
+                continue;
+            }
+            let read = Expr::Borrow(BorrowMode::Shared, Box::new(Expr::Name(name.clone())));
+            push(
+                Kind::ExtendBorrow,
+                format!("`&{name}` after statement {}", index - 1),
+                insert(index, &holder.selector, read),
+            );
+        }
+    }
+
+    for (index, statement) in statements.iter().enumerate() {
+        match &statement.command {
+            Command::Bind {
+                value: Expr::Borrow(mode, place),
+                ty,
+                ..
+            } => {
+                let mut mutated = program.clone();
+                let Command::Bind {
+                    value, ty: target, ..
+                } = &mut body_mut(&mut mutated, root, path)[index].command
+                else {
+                    unreachable!();
+                };
+                *value = Expr::Borrow(other(*mode), place.clone());
+                *target = flipped(ty);
+                push(
+                    Kind::FlipBorrow,
+                    format!(
+                        "`{}` to `{}` at statement {index}",
+                        sign(*mode),
+                        sign(other(*mode))
+                    ),
+                    mutated,
+                );
+            }
+            Command::Loop { parameters, .. } => {
+                for (number, parameter) in parameters.iter().enumerate() {
+                    let Expr::Borrow(mode, place) = &parameter.initial else {
+                        continue;
+                    };
+                    let mut mutated = program.clone();
+                    let Command::Loop {
+                        parameters: target, ..
+                    } = &mut body_mut(&mut mutated, root, path)[index].command
+                    else {
+                        unreachable!();
+                    };
+                    target[number].initial = Expr::Borrow(other(*mode), place.clone());
+                    if let Some(ty) = flipped(&Some(parameter.ty.clone())) {
+                        target[number].ty = ty;
+                    }
+                    push(
+                        Kind::FlipBorrow,
+                        format!(
+                            "`{}` to `{}` for `{}` at statement {index}",
+                            sign(*mode),
+                            sign(other(*mode)),
+                            parameter.name
+                        ),
+                        mutated,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (index, statement) in statements.iter().enumerate() {
+        match &statement.command {
+            Command::Loop { parameters, .. } => {
+                let entry = parameters
+                    .iter()
+                    .filter(|parameter| matches!(parameter.ty, Type::Ref(..)))
+                    .map(|parameter| Holder {
+                        name: parameter.name.clone(),
+                        selector: Selector::Top,
+                        borrow: match &parameter.initial {
+                            Expr::Borrow(mode, place) => Some((*mode, (**place).clone())),
+                            _ => None,
+                        },
+                    })
+                    .collect();
+                path.push(Step::Loop(index));
+                collect_borrows(lending, path, entry, out);
+                path.pop();
+            }
+            Command::Boundary { .. } => {
+                for step in [Step::Work(index), Step::Contingency(index)] {
+                    path.push(step);
+                    collect_borrows(lending, path, Vec::new(), out);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A name that no part of the program's text holds.
+fn fresh_name(program: &Program) -> String {
+    let text = program.print();
+    (0..)
+        .map(|number| format!("z{number}"))
+        .find(|name| !text.contains(name.as_str()))
+        .expect("a fresh name")
+}
+
 /// Produces all single-step mutants of `program`.
 pub fn mutate(program: &Program) -> Vec<Mutant> {
     let mut out = Vec::new();
+    let types = resolve::resolve(program)
+        .map(|typed| name_types(&typed))
+        .unwrap_or_default();
+    let fresh = fresh_name(program);
+    let borrows = |declaration: &str, root: Root, out: &mut Vec<Mutant>| {
+        if let Some(names) = types.get(declaration) {
+            let lending = Lending {
+                program,
+                root,
+                control: declaration,
+                types: names,
+                fresh: &fresh,
+            };
+            collect_borrows(&lending, &mut Vec::new(), Vec::new(), out);
+        }
+    };
     for (declaration, item) in program.declarations.iter().enumerate() {
         match item {
             Declaration::Control(control) if !control.external => {
@@ -525,6 +989,7 @@ pub fn mutate(program: &Program) -> Vec<Mutant> {
                 };
                 collect_from_body(program, root, &control.name, &mut Vec::new(), &mut out);
                 collect_from_expressions(program, declaration, &control.name, &mut out);
+                borrows(&control.name, root, &mut out);
             }
             Declaration::Boundary(boundary) => {
                 for contingency in [false, true] {
@@ -535,6 +1000,13 @@ pub fn mutate(program: &Program) -> Vec<Mutant> {
                     collect_from_body(program, root, &boundary.name, &mut Vec::new(), &mut out);
                 }
                 collect_from_expressions(program, declaration, &boundary.name, &mut out);
+                for contingency in [false, true] {
+                    let root = Root {
+                        declaration,
+                        contingency,
+                    };
+                    borrows(&boundary.name, root, &mut out);
+                }
             }
             Declaration::Resource(resource) if resource.on_fault_release => {
                 let mut mutated = program.clone();

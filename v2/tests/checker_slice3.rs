@@ -1851,3 +1851,186 @@ fn a_name_bound_within_the_restarted_loop_is_not_live_after_recover_l2a() {
     done_and_accepted("L2a", RC30_DONE);
     stuck_and_rejected("L3", RC30_STUCK);
 }
+
+/// A program for the kinds of mutation of the borrows. Each control runs to
+/// its end and is accepted; `put` moves the exclusive borrow it is given.
+const BORROWING: &str = r#"
+struct pair {a : u32, b : u32}
+
+control flips(n : u32)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := n
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ a : u32 := r
+    ⊤ ▷ b : u32 := s
+    ⊤ ▷ ■ ok {a}
+
+control extends(n : u32)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := n
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ a : u32 := r
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ■ ok {a}
+
+control reads_lent(n : u32)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~y : u32 := n
+    ⊤ ▷ w : &~u32 := &~y
+    ⊤ ▷ w ← 3
+    ⊤ ▷ ■ ok {y}
+
+control put(c : &~u32)
+    ■ { ok {} }
+    ⊤ ▷ c ← 7
+    ⊤ ▷ ■ ok {}
+
+control moves_borrow(n : u32)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~y : u32 := n
+    ⊤ ▷ w : &~u32 := &~y
+    ⊤ ▷ d : Δ put(▾w) ▸ ok {}
+    ⊤ ▷ ■ ok {y}
+
+control moves_lent(t : string)
+    ■ { ok {v : string} }
+    ⊤ ▷ r : &string := &t
+    ⊤ ▷ u : string := clone(r)
+    ⊤ ▷ ■ ok {u}
+
+control first_of(p : &pair)
+    ■ { got {r : &u32 ∈ p} }
+    ⊤ ▷ ■ got {&p.a}
+
+control payloads(n : u32)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~q : pair := pair {n, 1}
+    ⊤ ▷ d : Δ first_of(&q) ▸ got {r}
+    ⊤ ▷ a : u32 := r
+    ⊤ ▷ ■ ok {a}
+"#;
+
+/// The runs of [`BORROWING`], one for each control that is an entry.
+fn borrowing_runs() -> Vec<(String, Vec<villanelle_v2::oracle::Value>)> {
+    use villanelle_v2::int::Int;
+    use villanelle_v2::oracle::Value;
+    let number = |n: u64| vec![Value::Int(Int::from_u64(n))];
+    vec![
+        ("flips".to_string(), number(5)),
+        ("extends".to_string(), number(5)),
+        ("reads_lent".to_string(), number(5)),
+        ("moves_borrow".to_string(), number(5)),
+        (
+            "moves_lent".to_string(),
+            vec![Value::String("text".to_string())],
+        ),
+        ("payloads".to_string(), number(5)),
+    ]
+}
+
+/// The kinds of mutation that slice 3 adds seed a use of a borrow after it
+/// ended: each has a mutant of [`BORROWING`] that is stuck in the oracle by a
+/// dead borrow (X4 B1), or by a borrow name that moved (X2 E-Var), in the
+/// controls where the kind meets a conflict, and the checker rejects every
+/// mutant that is stuck. The program itself runs to its ends and is
+/// accepted.
+#[test]
+fn mutations_of_borrows_are_stuck_and_rejected() {
+    use std::collections::{BTreeMap, BTreeSet};
+    use villanelle_v2::mutate::{self, Class, Kind};
+    use villanelle_v2::oracle::Config;
+
+    let tree = villanelle_v2::text::parse(BORROWING).expect("the program reads");
+    accept_core("B1", BORROWING);
+    let config = Config::default();
+    let runs = borrowing_runs();
+    let whole = mutate::Mutant {
+        kind: Kind::FlipBorrow,
+        control: String::new(),
+        detail: String::new(),
+        program: tree.clone(),
+    };
+    assert!(
+        matches!(mutate::classify(&whole, &runs, 1, &config), Class::Unstuck),
+        "a run of the program is stuck"
+    );
+
+    let mut stuck: BTreeMap<Kind, BTreeSet<String>> = BTreeMap::new();
+    let mut made: BTreeMap<Kind, usize> = BTreeMap::new();
+    for mutant in mutate::mutate(&tree) {
+        *made.entry(mutant.kind).or_default() += 1;
+        let Class::Stuck(state) = mutate::classify(&mutant, &runs, 1, &config) else {
+            continue;
+        };
+        stuck.entry(mutant.kind).or_default().insert(format!(
+            "{} X{} {}",
+            mutant.control, state.state, state.clause
+        ));
+        let resolved = villanelle_v2::resolve::resolve(&mutant.program).expect("it ran");
+        assert!(
+            check::check(&resolved).is_err(),
+            "{:?} in `{}` ({}) is stuck (X{} {}: {}) and the checker accepts it:\n{}",
+            mutant.kind,
+            mutant.control,
+            mutant.detail,
+            state.state,
+            state.clause,
+            state.detail,
+            mutant.program.print()
+        );
+    }
+    let states = |kind: Kind| -> Vec<String> {
+        stuck
+            .get(&kind)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+    // Six borrows bound to names and one payload name that borrows within
+    // `q`, each mentioned once after; eleven places after a later statement
+    // that is no last disposition.
+    let kinds = [
+        Kind::FlipBorrow,
+        Kind::ConflictingBorrow,
+        Kind::AccessLent,
+        Kind::ExtendBorrow,
+    ];
+    let counts: Vec<usize> = kinds.iter().map(|kind| made[kind]).collect();
+    assert_eq!(counts, [6, 7, 7, 11], "{made:?}");
+    // Flipped: `&~x` ends the borrow of `x` that `r` holds in `flips`; the
+    // others write through a shared borrow, pass one for an exclusive one,
+    // or borrow a parameter exclusively, and are refused. Conflicting:
+    // `&~x` ends `r` or `s`, `&y` ends `w` (in `moves_borrow` the run is
+    // stuck in `put`, which writes through it), and `&~q` ends the payload
+    // name `r` that borrows within `q`. Accessed: `y` is read while `w`
+    // holds it, and `t` and `q` move while `r` borrows them; a read of `x`
+    // while `r` and `s` share it ends neither. Extended: `r` after `x ← 2`,
+    // and `w` after `put` took it.
+    assert_eq!(states(Kind::FlipBorrow), ["flips X4 B1"], "{stuck:?}");
+    assert_eq!(
+        states(Kind::ConflictingBorrow),
+        [
+            "extends X4 B1",
+            "flips X4 B1",
+            "moves_borrow X4 B1",
+            "payloads X4 B1",
+            "reads_lent X4 B1"
+        ],
+        "{stuck:?}"
+    );
+    assert_eq!(
+        states(Kind::AccessLent),
+        [
+            "moves_borrow X4 B1",
+            "moves_lent X4 B1",
+            "payloads X4 B1",
+            "reads_lent X4 B1"
+        ],
+        "{stuck:?}"
+    );
+    assert_eq!(
+        states(Kind::ExtendBorrow),
+        ["extends X4 B1", "moves_borrow X2 E-Var"],
+        "{stuck:?}"
+    );
+}
