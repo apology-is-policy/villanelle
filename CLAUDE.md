@@ -13,7 +13,8 @@ The language was called **Path** (to 0.35), then **Tellur** (0.36–0.284), and
 `tellurc`, `pathc` and friends remain as compatibility commands. Do not rename
 these in passing. Sources are `.vn`; `.tellur`/`.path` files are legacy snapshots.
 
-Source style and the native performance rule are in `AGENTS.md`:
+The conduct that binds every agent, Claude included, the source style and the
+native performance rule are in `AGENTS.md`:
 
 @AGENTS.md
 
