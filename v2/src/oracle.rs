@@ -2315,12 +2315,15 @@ impl<'a> Machine<'a> {
         };
         // [E-Temp]: A temporary value that was read and not consumed is
         // destroyed when its reader is done; if it contains an obligation, stuck.
-        if !consumed && is_temp && self.contains_obligation(&value) {
-            return fail(
-                5,
-                "E-Temp",
-                "a temporary value containing an obligation was not consumed",
-            );
+        if !consumed && is_temp {
+            if self.contains_obligation(&value) {
+                return fail(
+                    5,
+                    "E-Temp",
+                    "a temporary value containing an obligation was not consumed",
+                );
+            }
+            self.count("E-Temp");
         }
         Ok(value)
     }
@@ -2475,7 +2478,15 @@ impl<'a> Machine<'a> {
         clause: &'static str,
         release_boundary_captures: bool,
     ) -> Result<(), Fail> {
-        for (_, slot, owner_tag) in scope.slots.iter().rev() {
+        // [E-Unwind]: the names of a body are visited in the reverse of the
+        // order in which its text first binds them, which is the order of
+        // their ids. The order in which this run bound them is not that
+        // order where a name has two binders, and the erased semantics does
+        // not keep it ([R4]).
+        let mut order: Vec<usize> = (0..scope.slots.len()).collect();
+        order.sort_by_key(|&index| std::cmp::Reverse(scope.slots[index].0));
+        for index in order {
+            let (_, slot, owner_tag) = &scope.slots[index];
             if let Slot::Available(val) = slot {
                 self.unwind_value_with_clause(val, clause)?;
             }

@@ -1,0 +1,81 @@
+// The built-in operations on vectors (section 6.6), with the contracts of
+// the corpus prelude:
+//   push(values : &~[t], value : t) ■ done ⇐ len(values) = len(old(values)) + 1
+//   pop(values : &~[t]) ■ item {value : t} ⇐ len(values) + 1 = len(old(values))
+//                       │ empty ⇐ len(old(values)) = 0 ∧ len(values) = 0
+//   take(values : [t])  ■ item {head : t, tail : [t]} ⇐ len(tail) + 1 = len(values)
+//                       │ empty ⇐ len(values) = 0
+// `push` and `pop` change the shape of the vector they are lent ([B5]);
+// `take` consumes its vector.
+
+struct label {name : string, count : u32}
+
+// `push` puts the value at the end, and the value is consumed.
+control pushes(s : string)
+    ■ { ok {v : [string], n : usize} }
+    ⊤ ▷ ~v : [string] := []
+    ⊤ ▷ p1 : Δ push(&~v, "first") ▸ done {}
+    ⊤ ▷ ⊢ len(v) = 1
+    ⊤ ▷ p2 : Δ push(&~v, s) ▸ done {}
+    ⊤ ▷ n : usize := len(v)
+    ⊤ ▷ ■ ok {v, n}
+
+// X2: the pushed name was moved.
+control push_consumes(s : string)
+    ■ { ok {n : usize} }
+    ⊤ ▷ ~v : [string] := []
+    ⊤ ▷ p : Δ push(&~v, s) ▸ done {}
+    ⊤ ▷ ■ ok {len(s)}
+
+// `pop` takes the last element out and gives it by value; on an empty
+// vector it completes with `empty` and leaves it empty.
+control pops(v0 : [label])
+    ■ { item {last : label, rest : [label]} │ empty {n : usize} }
+    ⊤ ▷ ~v : [label] := v0
+    ⊤ ▷ before : usize := len(v)
+    ⊤ ▷ p : Δ pop(&~v) ▸ item {last} │ empty {}
+    p.item ▷ ⊢ len(v) + 1 = before
+    p.item ▷ ■ item {last, v}
+    ⊤ ▷ ⊢ before = 0 ∧ len(v) = 0
+    ⊤ ▷ ■ empty {len(v)}
+
+// `take` gives the first element and the rest, in their order; on an empty
+// vector it completes with `empty`.
+control takes(v : [label])
+    ■ { item {head : label, tail : [label]} │ empty {} }
+    ⊤ ▷ n : usize := len(v)
+    ⊤ ▷ t : Δ take(v) ▸ item {head, tail} │ empty {}
+    t.item ▷ ⊢ len(tail) + 1 = n
+    t.item ▷ ■ item {head, tail}
+    ⊤ ▷ ⊢ n = 0
+    ⊤ ▷ ■ empty {}
+
+// X2: `take` consumed the vector.
+control take_consumes(v : [u32])
+    ■ { ok {n : usize} }
+    ⊤ ▷ t : Δ take(v) ▸ item {head, tail} │ empty {}
+    ⊤ ▷ ■ ok {len(v)}
+
+// The vector is walked to its end by `take`, and built again by `push`.
+control reverse(v0 : [u32])
+    ■ { ok {v : [u32]} }
+    ⊤ ▷ lp : ↻ walk(~rest : [u32] := v0, out : [u32] := []) {
+        ⊤ ▷ p : Δ pop(&~rest) ▸ item {x} │ empty {}
+        p.empty ▷ □ done {out}
+        ⊤ ▷ ~next : [u32] := out
+        ⊤ ▷ q : Δ push(&~next, x) ▸ done {}
+        ⊤ ▷ ↑ walk(rest, next)
+    } ▸ done {v}
+    ⊤ ▷ ■ ok {v}
+
+//! run pushes("second") => done ok {["first", "second"], 2}
+//! run push_consumes("a") => stuck X2 E-Var
+//! run pops([label {"a", 1}, label {"b", 2}]) => done item {label {"b", 2}, [label {"a", 1}]}
+//! run pops([label {"a", 1}]) => done item {label {"a", 1}, []}
+//! run pops([]) => done empty {0}
+//! run takes([label {"a", 1}, label {"b", 2}, label {"c", 3}]) => done item {label {"a", 1}, [label {"b", 2}, label {"c", 3}]}
+//! run takes([label {"a", 1}]) => done item {label {"a", 1}, []}
+//! run takes([]) => done empty
+//! run take_consumes([1]) => stuck X2 E-Var
+//! run reverse([1, 2, 3]) => done ok {[3, 2, 1]}
+//! run reverse([]) => done ok {[]}

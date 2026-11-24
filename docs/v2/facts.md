@@ -688,7 +688,9 @@ that [A1] allows (finding RC17).
   checked evidence as a yes is.
 - **[M2]** The report gives the obligation and where it arises; the history, as
   the alternatives taken at the sites reached, in program order; and the values
-  of the program names the obligation depends on.
+  of the program names the obligation depends on. A name of a data type has
+  no value that the model holds ([M7]): the report gives its length, where
+  the model has one, and nothing else of it.
 - **[M3] Assumed values.** A value the model chose for a symbol application is
   marked as assumed. The compiler then computes the real operation on the
   model's arguments where it has one (a product, a wrapping sum, a function of
@@ -1048,3 +1050,7 @@ it.
    [J6], and that the Omega test is asked before the splits take turns:
    one candidate of a fifth program kept the splits for 26,213 tableaus
    and was refuted by the test in seven splinters. No clause changed.
+13. **24 November 2026, [M2]: a name of a data type in a counterexample.**
+   The report gives its length where the model has one, and no number
+   for the name. The crate printed the number that the model of its
+   search gives the term (review finding RC25).

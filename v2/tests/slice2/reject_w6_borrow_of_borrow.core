@@ -1,0 +1,6 @@
+// [W6]: a borrow does not refer to a borrow.
+control c(v : &&u32)
+    ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+//! reject W6

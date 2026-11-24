@@ -1,0 +1,68 @@
+// [E-Unwind], [T3] In mode `fault` a scope is ended by a variant of
+// [E-Scope] that follows [T3] through each value: an open resource of a
+// type declared `on fault release` is released; an open resource of any
+// other type makes the configuration stuck, wherever in a value it is; a
+// captured outcome and an aggregate are released part by part; everything
+// else is destroyed. (The releases, and their order, are in
+// `checked_release_order.core`.)
+
+extern resource lock
+
+struct guarded {l : lock, note : string}
+
+variant slot {full {l : lock} │ free {}}
+
+extern control open_lock()
+    ■ { opened {l : lock} }
+    uses lock.io
+
+extern control grab()
+    ■ { held {l : lock} │ busy {} }
+    uses lock.io
+
+// X8: a fault meets an open resource that is not fault-releasable: in a
+// name, in a struct, in a vector, in a variant and in a map.
+control fault_with(which : u32)
+    ■ { ok {} }
+    faults
+    uses lock.io
+    ⊤ ▷ o : Δ open_lock() ▸ opened {l}
+    ⊤ ▷ a : ? which = 1
+    ⊤ ▷ b : ? which = 2
+    ⊤ ▷ c : ? which = 3
+    ⊤ ▷ d : ? which = 4
+    a.true ▷ g : guarded := guarded {▾l, "n"}
+    b.true ▷ v : [lock] := [▾l]
+    c.true ▷ s : slot := slot.full {▾l}
+    d.true ▷ ~m : string ⇀ lock := ∅
+    d.true ▷ i : Δ insert(&~m, "k", ▾l) ▸ inserted {} │ replaced {old}
+    ⊤ ▷ fault "held"
+
+// X8: the same in a captured outcome. One whose alternative carries no
+// resource is released, and the fault goes on.
+control fault_with_outcome()
+    ■ { ok {} }
+    faults
+    uses lock.io
+    ⊤ ▷ r := capture grab()
+    ⊤ ▷ fault "captured"
+
+// Everything else is destroyed: a string, a vector, a struct of them, and
+// values of resource types that hold no resource.
+control fault_with_plain(s : string)
+    ■ { ok {} }
+    faults
+    ⊤ ▷ v : [string] := [s, "b"]
+    ⊤ ▷ none : [lock] := []
+    ⊤ ▷ free : slot := slot.free {}
+    ⊤ ▷ m : string ⇀ lock := ∅
+    ⊤ ▷ fault "plain"
+
+//! run fault_with(0) with [open_lock -> opened {lock#1}] => stuck X8 E-Unwind
+//! run fault_with(1) with [open_lock -> opened {lock#1}] => stuck X8 E-Unwind
+//! run fault_with(2) with [open_lock -> opened {lock#1}] => stuck X8 E-Unwind
+//! run fault_with(3) with [open_lock -> opened {lock#1}] => stuck X8 E-Unwind
+//! run fault_with(4) with [open_lock -> opened {lock#1}] => stuck X8 E-Unwind
+//! run fault_with_outcome() with [grab -> held {lock#1}] => stuck X8 E-Unwind
+//! run fault_with_outcome() with [grab -> busy] => faulted "captured" trace [grab() -> busy]
+//! run fault_with_plain("a") => faulted "plain"

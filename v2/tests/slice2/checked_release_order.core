@@ -1,0 +1,125 @@
+// [E-Unwind] The order of release under a fault. The scopes of an
+// activation end innermost first. The slots of a scope are visited in the
+// reverse of the order in which the text of its body first binds their
+// names, the parameters before the other names: not in the order in which
+// the run bound them, which the erased semantics does not keep ([R4]). The
+// parts of a value are visited in their order: fields and elements from the
+// first, the entries of a map by key. Every control here is accepted by the
+// checker, and the file runs in compiled code as well.
+
+extern resource conn on fault release
+
+struct pair {a : conn, b : conn}
+
+variant slot {full {c : conn} │ free {}}
+
+extern control open_conn()
+    ■ { opened {c : conn} }
+    uses net
+
+extern control open_two()
+    ■ { both {x : conn, y : conn} │ swapped {y : conn, x : conn} }
+    uses net
+
+extern control dial()
+    ■ { up {c : conn} │ down {code : u32} }
+    uses net
+
+extern control close_conn(c : conn)
+    ■ { closed {} }
+    uses net
+
+// The names of one scope, last bound first.
+control names()
+    ■ { ok {} }
+    faults
+    uses net
+    ⊤ ▷ o1 : Δ open_conn() ▸ opened {c1}
+    ⊤ ▷ o2 : Δ open_conn() ▸ opened {c2}
+    ⊤ ▷ o3 : Δ open_conn() ▸ opened {c3}
+    ⊤ ▷ fault "names"
+
+// `a` has two binders. On the history of the second one the run binds `b`
+// before `a`, and the order of release is still that of the text: `b`,
+// then `a`.
+control either(first : bool)
+    ■ { ok {} }
+    faults
+    uses net
+    ⊤ ▷ t : ? first
+    t.true ▷ o1 : Δ open_conn() ▸ opened {a}
+    ⊤ ▷ o2 : Δ open_conn() ▸ opened {b}
+    t.false ▷ o3 : Δ open_conn() ▸ opened {a}
+    ⊤ ▷ fault "either"
+
+// The payload names of one decision: the second alternative binds `b`
+// before `a`.
+control payload_names()
+    ■ { ok {} }
+    faults
+    uses net
+    ⊤ ▷ d : Δ open_two() ▸ both {a, b} │ swapped {b, a}
+    ⊤ ▷ fault "payload"
+
+// The fields of a struct and the elements of a vector, from the first.
+control parts()
+    ■ { ok {} }
+    faults
+    uses net
+    ⊤ ▷ o1 : Δ open_conn() ▸ opened {c1}
+    ⊤ ▷ o2 : Δ open_conn() ▸ opened {c2}
+    ⊤ ▷ o3 : Δ open_conn() ▸ opened {c3}
+    ⊤ ▷ o4 : Δ open_conn() ▸ opened {c4}
+    ⊤ ▷ v : [conn] := [▾c3, ▾c4]
+    ⊤ ▷ p : pair := pair {▾c1, ▾c2}
+    ⊤ ▷ fault "parts"
+
+// The entries of a map by key, whatever the order in which they came.
+control in_map()
+    ■ { ok {} }
+    faults
+    uses net
+    ⊤ ▷ o1 : Δ open_conn() ▸ opened {c1}
+    ⊤ ▷ o2 : Δ open_conn() ▸ opened {c2}
+    ⊤ ▷ ~m : string ⇀ conn := ∅
+    ⊤ ▷ i1 : Δ insert(&~m, "b", ▾c1) ▸ inserted {} │ replaced {old1}
+    ⊤ ▷ i2 : Δ insert(&~m, "a", ▾c2) ▸ inserted {} │ replaced {old2}
+    ⊤ ▷ fault "map"
+
+// A variant and a captured outcome are released part by part.
+control in_variant_and_outcome()
+    ■ { ok {} }
+    faults
+    uses net
+    ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    ⊤ ▷ s : slot := slot.full {▾c}
+    ⊤ ▷ r := capture dial()
+    ⊤ ▷ fault "held"
+
+// The scope of a loop body, then that of the control body, and in it the
+// parameter last.
+control scopes(c0 : conn)
+    ■ { ok {} }
+    faults
+    uses net
+    ⊤ ▷ o1 : Δ open_conn() ▸ opened {c1}
+    ⊤ ▷ lp : ↻ walk(i : u32 := 0) {
+        ⊤ ▷ t : ? i = 9
+        t.true ▷ □ out {}
+        ⊤ ▷ o2 : Δ open_conn() ▸ opened {c2}
+        ⊤ ▷ fault "scopes"
+    } ▸ out {}
+    ⊤ ▷ k1 : Δ close_conn(▾c1) ▸ closed {}
+    ⊤ ▷ k0 : Δ close_conn(▾c0) ▸ closed {}
+    ⊤ ▷ ■ ok {}
+
+//! run names() with [open_conn -> opened {conn#1}; open_conn -> opened {conn#2}; open_conn -> opened {conn#3}] => faulted "names" trace [open_conn() -> opened {conn#1}; open_conn() -> opened {conn#2}; open_conn() -> opened {conn#3}; conn.release(conn#3) -> released; conn.release(conn#2) -> released; conn.release(conn#1) -> released]
+//! run either(true) with [open_conn -> opened {conn#1}; open_conn -> opened {conn#2}] => faulted "either" trace [open_conn() -> opened {conn#1}; open_conn() -> opened {conn#2}; conn.release(conn#2) -> released; conn.release(conn#1) -> released]
+//! run either(false) with [open_conn -> opened {conn#1}; open_conn -> opened {conn#2}] => faulted "either" trace [open_conn() -> opened {conn#1}; open_conn() -> opened {conn#2}; conn.release(conn#1) -> released; conn.release(conn#2) -> released]
+//! run payload_names() with [open_two -> both {conn#1, conn#2}] => faulted "payload" trace [open_two() -> both {conn#1, conn#2}; conn.release(conn#2) -> released; conn.release(conn#1) -> released]
+//! run payload_names() with [open_two -> swapped {conn#1, conn#2}] => faulted "payload" trace [open_two() -> swapped {conn#1, conn#2}; conn.release(conn#1) -> released; conn.release(conn#2) -> released]
+//! run parts() with [open_conn -> opened {conn#1}; open_conn -> opened {conn#2}; open_conn -> opened {conn#3}; open_conn -> opened {conn#4}] => faulted "parts" trace [open_conn() -> opened {conn#1}; open_conn() -> opened {conn#2}; open_conn() -> opened {conn#3}; open_conn() -> opened {conn#4}; conn.release(conn#1) -> released; conn.release(conn#2) -> released; conn.release(conn#3) -> released; conn.release(conn#4) -> released]
+//! run in_map() with [open_conn -> opened {conn#1}; open_conn -> opened {conn#2}] => faulted "map" trace [open_conn() -> opened {conn#1}; open_conn() -> opened {conn#2}; conn.release(conn#2) -> released; conn.release(conn#1) -> released]
+//! run in_variant_and_outcome() with [open_conn -> opened {conn#1}; dial -> up {conn#2}] => faulted "held" trace [open_conn() -> opened {conn#1}; dial() -> up {conn#2}; conn.release(conn#2) -> released; conn.release(conn#1) -> released]
+//! run in_variant_and_outcome() with [open_conn -> opened {conn#1}; dial -> down {7}] => faulted "held" trace [open_conn() -> opened {conn#1}; dial() -> down {7}; conn.release(conn#1) -> released]
+//! run scopes(conn#9) with [open_conn -> opened {conn#1}; open_conn -> opened {conn#2}] => faulted "scopes" trace [open_conn() -> opened {conn#1}; open_conn() -> opened {conn#2}; conn.release(conn#2) -> released; conn.release(conn#1) -> released; conn.release(conn#9) -> released]

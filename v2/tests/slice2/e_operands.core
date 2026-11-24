@@ -1,0 +1,50 @@
+// [E-Operands] Where a command takes several operands, those that do not
+// lend are evaluated first, left to right, and those that lend afterwards,
+// left to right ([O0]). Every read of a statement comes before any place is
+// lent by it.
+
+extern control both(a : string, b : string)
+    ■ { done {} }
+    uses net
+
+extern control mixed(a : &string, b : string)
+    ■ { done {} }
+    uses net
+
+// The length and the element are read before the vector is lent.
+control reads_before_lends()
+    ■ { ok {v : [usize], m : string ⇀ usize} }
+    ⊤ ▷ ~v : [usize] := [10, 20]
+    ⊤ ▷ p1 : Δ push(&~v, len(v)) ▸ done {}
+    ⊤ ▷ p2 : Δ push(&~v, v[0]) ▸ done {}
+    ⊤ ▷ ~m : string ⇀ usize := ∅
+    ⊤ ▷ i1 : Δ insert(&~m, "a", len(m)) ▸ inserted {} │ replaced {p}
+    ⊤ ▷ i2 : Δ insert(&~m, "b", len(m)) ▸ inserted {} │ replaced {q}
+    ⊤ ▷ ■ ok {v, m}
+
+// X2: the operands that do not lend are consumed left to right.
+control values_in_order(s : string)
+    ■ { ok {} }
+    uses net
+    ⊤ ▷ d : Δ both(s, s) ▸ done {}
+    ⊤ ▷ ■ ok {}
+
+// X2: an operand that lends comes after one that does not, wherever it is
+// written: the name is moved when the borrow is made.
+control lends_last(s : string)
+    ■ { ok {} }
+    uses net
+    ⊤ ▷ d : Δ mixed(&s, s) ▸ done {}
+    ⊤ ▷ ■ ok {}
+
+// A clone for the operand that is consumed.
+control lends_last_with_clone(s : string)
+    ■ { ok {back : string} }
+    uses net
+    ⊤ ▷ d : Δ mixed(&s, clone(s)) ▸ done {}
+    ⊤ ▷ ■ ok {s}
+
+//! run reads_before_lends() => done ok {[10, 20, 2, 10], {"a" ↦ 0, "b" ↦ 1}}
+//! run values_in_order("a") => stuck X2 E-Var
+//! run lends_last("a") => stuck X2 E-Var
+//! run lends_last_with_clone("a") with [mixed -> done] => done ok {"a"} trace [mixed("a", "a") -> done]

@@ -1,0 +1,96 @@
+// The built-in operations on maps (section 6.6), with the contracts of the
+// corpus prelude:
+//   get(map : &k ⇀ v, key : &k) ■ found {value : &v ∈ map} │ missing
+//   insert(map : &~k ⇀ v, key : k, value : v)
+//       ■ inserted ⇐ len(map) = len(old(map)) + 1
+//       │ replaced {previous : v} ⇐ len(map) = len(old(map)) ∧ len(map) > 0
+//   remove(map : &~k ⇀ v, key : &k) ■ removed {previous : v} │ missing
+//   entry_at(map : &k ⇀ v, position : usize)
+//       ■ item {key : &k ∈ map, value : &v ∈ map, next : usize} │ finished
+// Entries are ordered by key. `insert` and `remove` change the shape of the
+// map they are lent ([B5]).
+
+struct label {name : string, count : u32}
+
+// `insert` adds an entry, or replaces the value of a key that is there and
+// gives the value that was.
+control inserts(k : string, first : label, second : label)
+    ■ { replaced {was : label, m : string ⇀ label} │ inserted {m : string ⇀ label} }
+    ⊤ ▷ ~m : string ⇀ label := ∅
+    ⊤ ▷ i1 : Δ insert(&~m, clone(k), first) ▸ inserted {} │ replaced {p1}
+    i1.replaced ▷ ⊥
+    ⊤ ▷ ⊢ len(m) = 1
+    ⊤ ▷ i2 : Δ insert(&~m, "other", label {"o", 0}) ▸ inserted {} │ replaced {p2}
+    i2.inserted ▷ ⊢ len(m) = 2
+    i2.replaced ▷ ⊢ len(m) = 1
+    ⊤ ▷ i3 : Δ insert(&~m, k, second) ▸ inserted {} │ replaced {was}
+    i3.replaced ▷ ■ replaced {was, m}
+    ⊤ ▷ ■ inserted {m}
+
+// `get` lends the value of a key, or completes with `missing`. The map is
+// as it was.
+control gets(m : string ⇀ u32, k : string)
+    ■ { found {v : u32, n : usize} │ missing {n : usize} }
+    ⊤ ▷ g : Δ get(&m, &k) ▸ found {value} │ missing {}
+    g.found ▷ ■ found {value, len(m)}
+    ⊤ ▷ ■ missing {len(m)}
+
+// `remove` takes the entry of a key out and gives its value, or completes
+// with `missing` and leaves the map as it was.
+control removes(m0 : string ⇀ label, k : string)
+    ■ { removed {was : label, m : string ⇀ label} │ missing {m : string ⇀ label} }
+    ⊤ ▷ ~m : string ⇀ label := m0
+    ⊤ ▷ r : Δ remove(&~m, &k) ▸ removed {was} │ missing {}
+    r.removed ▷ ■ removed {was, m}
+    ⊤ ▷ ■ missing {m}
+
+// `entry_at` lends the entry at a position and gives the next position, or
+// completes with `finished`. The entries come in the order of their keys,
+// whatever the order in which they were inserted.
+control walks(a : u32, b : u32, c : u32)
+    ■ { ok {keys : [u32], values : [u32]} }
+    ⊤ ▷ ~m : u32 ⇀ u32 := ∅
+    ⊤ ▷ i1 : Δ insert(&~m, a, 1) ▸ inserted {} │ replaced {p1}
+    ⊤ ▷ i2 : Δ insert(&~m, b, 10) ▸ inserted {} │ replaced {p2}
+    ⊤ ▷ i3 : Δ insert(&~m, c, 100) ▸ inserted {} │ replaced {p3}
+    ⊤ ▷ lp : ↻ walk(at : usize := 0, keys : [u32] := [], seen : [u32] := []) {
+        ⊤ ▷ e : Δ entry_at(&m, at) ▸ item {key, value, next} │ finished {}
+        e.finished ▷ □ out {keys, seen}
+        ⊤ ▷ ~more : [u32] := keys
+        ⊤ ▷ p : Δ push(&~more, key) ▸ done {}
+        ⊤ ▷ ~found : [u32] := seen
+        ⊤ ▷ q : Δ push(&~found, value) ▸ done {}
+        ⊤ ▷ ↑ walk(next, more, found)
+    } ▸ out {all, held}
+    ⊤ ▷ ■ ok {all, held}
+
+// A position past the last entry is `finished`, as the first position of
+// an empty map is.
+control entry_past_end(m : string ⇀ u32, at : usize)
+    ■ { item {k : string, v : u32, next : usize} │ finished {} }
+    ⊤ ▷ e : Δ entry_at(&m, at) ▸ item {key, value, next} │ finished {}
+    e.item ▷ ■ item {clone(key), value, next}
+    ⊤ ▷ ■ finished {}
+
+// X2: the key and the value of `insert` are consumed.
+control insert_consumes(k : string)
+    ■ { ok {n : usize} }
+    ⊤ ▷ ~m : string ⇀ u32 := ∅
+    ⊤ ▷ i : Δ insert(&~m, k, 1) ▸ inserted {} │ replaced {p}
+    ⊤ ▷ ■ ok {len(k)}
+
+//! run inserts("k", label {"a", 1}, label {"b", 2}) => done replaced {label {"a", 1}, {"k" ↦ label {"b", 2}, "other" ↦ label {"o", 0}}}
+//! run inserts("other", label {"a", 1}, label {"b", 2}) => done replaced {label {"o", 0}, {"other" ↦ label {"b", 2}}}
+//! run gets({"a" ↦ 1, "b" ↦ 2}, "b") => done found {2, 2}
+//! run gets({"a" ↦ 1, "b" ↦ 2}, "c") => done missing {2}
+//! run gets(∅, "c") => done missing {0}
+//! run removes({"a" ↦ label {"x", 1}, "b" ↦ label {"y", 2}}, "a") => done removed {label {"x", 1}, {"b" ↦ label {"y", 2}}}
+//! run removes({"a" ↦ label {"x", 1}}, "b") => done missing {{"a" ↦ label {"x", 1}}}
+//! run removes(∅, "b") => done missing {∅}
+//! run walks(3, 1, 2) => done ok {[1, 2, 3], [10, 100, 1]}
+//! run walks(2, 2, 1) => done ok {[1, 2], [100, 10]}
+//! run entry_past_end({"a" ↦ 1}, 0) => done item {"a", 1, 1}
+//! run entry_past_end({"a" ↦ 1}, 1) => done finished
+//! run entry_past_end({"a" ↦ 1}, 7) => done finished
+//! run entry_past_end(∅, 0) => done finished
+//! run insert_consumes("k") => stuck X2 E-Var

@@ -2488,3 +2488,138 @@ control c(p : u32)
         .concat(),
     );
 }
+
+/// The files of the suite that hold a rule of the data each, with the runs
+/// that apply it and the runs that are stuck by it.
+const RULE_FILES: [&str; 14] = [
+    "e_var",
+    "e_field_index",
+    "e_build",
+    "e_temp",
+    "e_bind_unpack",
+    "e_assign",
+    "e_operands",
+    "e_outcome",
+    "e_resource_scope",
+    "e_unwind_values",
+    "op_vectors",
+    "op_maps",
+    "op_text",
+    "checked_release_order",
+];
+
+/// The controls of the rule files that the checker refuses although no run
+/// of them is stuck, with the clause and the reason. The checker goes by
+/// the type of a name where the instrumented semantics looks at the value,
+/// and by the allowance of the caller where the run is stuck at the effect.
+const ASKS_MORE: [(&str, &str, &str, &str); 3] = [
+    (
+        "e_resource_scope",
+        "nothing_owed",
+        "O5",
+        "an empty vector of resources holds no obligation, and its type has kind `must`",
+    ),
+    (
+        "e_unwind_values",
+        "fault_with_plain",
+        "F2",
+        "an empty vector of locks is destroyed under a fault, and its type is not fault-releasable",
+    ),
+    (
+        "op_text",
+        "caller_unallowed",
+        "F3",
+        "the run is stuck in `says`, at the effect, and the control that does not allow it is this one",
+    ),
+];
+
+/// The controls in which a run is stuck although the checker accepts them:
+/// the statement that is stuck is theirs, and the clause is broken by a
+/// control further out on the stack ([E-Effect]).
+const STUCK_BY_ANOTHER: [(&str, &str); 1] = [("op_text", "says")];
+
+/// Every control of the rule files in which a run of the oracle is stuck is
+/// rejected by the checker, and every other control of them is accepted:
+/// the checker draws the line where the instrumented semantics does, clause
+/// by clause ([O1] to [O5], [O3a], [P5], [F1] to [F3]).
+#[test]
+fn the_rule_files_of_the_data_are_rejected_exactly_where_a_run_is_stuck() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/slice2");
+    let mut failures = Vec::new();
+    let mut rejected = 0;
+    let mut accepted = 0;
+    let mut asks_more = 0;
+    for name in RULE_FILES {
+        let source = std::fs::read_to_string(dir.join(format!("{name}.core"))).unwrap();
+        let report = villanelle_v2::script::check(&source);
+        assert!(
+            report.failures.is_empty(),
+            "{name}: {}",
+            report.failures.join("\n")
+        );
+        let program = load(&source).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let verdicts = check::check_each(&program).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (control, verdict) in verdicts {
+            if let Some((_, _, clause, _)) = ASKS_MORE
+                .iter()
+                .find(|(file, asked, _, _)| *file == name && *asked == control)
+            {
+                // No run of the control is stuck, and the checker refuses
+                // it by the clause that the table names.
+                assert!(!report.stuck_in.contains_key(&control), "{name}: {control}");
+                match verdict {
+                    Some(error) if error.clause == *clause => asks_more += 1,
+                    Some(error) => {
+                        failures.push(format!("{name}: [{clause}] is expected, and {error}"))
+                    }
+                    None => failures.push(format!("{name}: `{control}` is accepted")),
+                }
+                continue;
+            }
+            let stuck = report
+                .stuck_in
+                .get(&control)
+                .filter(|_| !STUCK_BY_ANOTHER.contains(&(name, control.as_str())));
+            match (stuck, verdict) {
+                (Some(states), None) => failures.push(format!(
+                    "{name}: `{control}` is accepted, and a run of it is stuck ({})",
+                    states.iter().cloned().collect::<Vec<_>>().join(", ")
+                )),
+                (None, Some(error)) => {
+                    failures.push(format!("{name}: no run is stuck, and {error}"))
+                }
+                (Some(_), Some(_)) => rejected += 1,
+                (None, None) => accepted += 1,
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!(asks_more, ASKS_MORE.len());
+    assert_eq!((rejected, accepted), (62, 59));
+}
+
+/// Review finding RC25 ([M2], [M7]): a name of a data type has no number,
+/// and a counterexample gives none. It gives the length of such a name
+/// where the model has one, and the values of the integer names as before.
+#[test]
+fn a_counterexample_gives_no_number_for_a_name_of_a_data_type_m2() {
+    let error = reject_core(
+        "P5",
+        r#"
+struct label {name : string, count : u32}
+
+control c(l : label, v : [u32], s : string, n : u32)
+    ■ { r {x : u32, k : usize} }
+    1  ⊤ ▷ k : usize := len(s)
+    2  ⊤ ▷ ■ r {v[0], k}
+"#,
+    );
+    let values = &error.counterexample.as_ref().expect("a model").values;
+    for name in ["l", "v", "s"] {
+        assert!(!values.contains_key(name), "{name} = {}", values[name]);
+    }
+    assert_eq!(values.get("len(v)").map(String::as_str), Some("0"));
+    assert!(values.contains_key("n") && values.contains_key("k"));
+    let text = error.to_string();
+    assert!(text.contains("len(v) = 0"), "{text}");
+}

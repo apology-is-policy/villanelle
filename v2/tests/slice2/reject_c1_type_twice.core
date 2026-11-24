@@ -1,0 +1,10 @@
+// [C1]: a type is declared once.
+struct a {x : u32}
+
+struct a {y : u32}
+
+control c()
+    ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+//! reject C1

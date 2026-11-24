@@ -1,0 +1,21 @@
+// [C1]: an index has the type `usize`.
+extern resource file_handle
+
+struct label {name : string, count : u32}
+
+variant shape {circle {radius : u32} │ rect {w : u32, h : u32}}
+
+extern control open_file()
+    ■ { opened {f : file_handle} }
+    uses file.read
+
+extern control fetch(id : u32)
+    ■ { ok {value : u32} │ failed {code : u32} }
+
+control c(i : u32)
+    ■ { ok {} }
+    ⊤ ▷ v : [u32] := [1]
+    ⊤ ▷ n : u32 := v[i]
+    ⊤ ▷ ■ ok {}
+
+//! reject C1

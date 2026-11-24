@@ -1,0 +1,7 @@
+// [W8]: a name of borrow type is never assigned, so it is not mutable.
+control c(v : &u32)
+    ■ { ok {} }
+    ⊤ ▷ ~r : &u32 := v
+    ⊤ ▷ ■ ok {}
+
+//! reject W8

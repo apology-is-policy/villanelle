@@ -1,0 +1,36 @@
+// Text (section 6.6): `emit` is a built-in operation with the effect
+// `console.write`, and an effect is stuck in an activation that does not
+// allow it ([E-Effect], [F3]). `trim` is a function of the prelude, and
+// `len` applies to a string as to a vector ([A3]).
+
+// `emit` reads the text it is lent and adds an event to the trace.
+control says(s : string)
+    ■ { ok {back : string} }
+    uses console.write
+    ⊤ ▷ e1 : Δ emit(&s) ▸ done {}
+    ⊤ ▷ e2 : Δ emit(&s) ▸ done {}
+    ⊤ ▷ ■ ok {s}
+
+// X9: `emit` in a control that does not allow the effect.
+control says_unallowed(s : string)
+    ■ { ok {} }
+    ⊤ ▷ e : Δ emit(&s) ▸ done {}
+    ⊤ ▷ ■ ok {}
+
+// X9: the caller's allowance is asked as well as the callee's.
+control caller_unallowed(s : string)
+    ■ { ok {} }
+    ⊤ ▷ d : Δ says(s) ▸ ok {back}
+    ⊤ ▷ ■ ok {}
+
+// `trim` reads its argument and builds a string; `len` reads.
+control trims(s : string)
+    ■ { ok {t : string, before : usize, after : usize} }
+    ⊤ ▷ t : string := trim(s)
+    ⊤ ▷ ■ ok {clone(t), len(s), len(t)}
+
+//! run says("hi") => done ok {"hi"} trace [emit("hi") -> done; emit("hi") -> done]
+//! run says_unallowed("hi") => stuck X9 E-Effect
+//! run caller_unallowed("hi") => stuck X9 E-Effect
+//! run trims("  a b\t\n") => done ok {"a b", 7, 3}
+//! run trims("") => done ok {"", 0, 0}

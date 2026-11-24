@@ -1056,11 +1056,12 @@ fn checked_core_programs_of_slice_two_run_natively_as_the_oracle_does() {
         [
             "checked_faults_and_boundaries.core",
             "checked_nested_boundaries.core",
+            "checked_release_order.core",
             "checked_skipped_bodies.core",
             "erased_nested_ownership.core"
         ]
     );
-    assert_eq!(runs, 58);
+    assert_eq!(runs, 68);
 }
 
 /// `ir` with no string freed by the program: the calls that release a
@@ -1115,9 +1116,9 @@ fn a_run_of_compiled_code_that_leaves_an_allocation_live_is_seen() {
             }
         }
     }
-    assert_eq!((runs, seen), (116, 40));
-    // The allocations of the four files, at `-O0` and at `-O2`.
-    assert_eq!(made, [21, 21, 50, 50, 7, 7, 0, 0]);
+    assert_eq!((runs, seen), (136, 40));
+    // The allocations of the five files, at `-O0` and at `-O2`.
+    assert_eq!(made, [21, 21, 50, 50, 2, 2, 7, 7, 0, 0]);
 }
 
 #[test]

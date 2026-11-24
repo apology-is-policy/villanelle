@@ -1,0 +1,8 @@
+// [T6]: `outcome⟨K⟩` is allowed only when no payload of `K` contains a borrow.
+outcome bad {found {r : &u32} │ missing {}}
+
+control c()
+    ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+//! reject T6

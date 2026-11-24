@@ -1,0 +1,197 @@
+// [E-Assign] `p ← e` evaluates `e` and then writes its value at the place of
+// `p`. The value that was there is destroyed: if it contains an obligation,
+// the configuration is stuck ([O4]). A moved slot may be assigned as a whole
+// and becomes available. A name that has no slot in this run cannot be
+// assigned. A component is written within the value of its root, so the
+// root is looked up as [E-Var] says: it is stuck where the root has no slot
+// or was moved ([O4] asks [O2] of the root).
+
+extern resource file_handle
+
+struct holder {h : file_handle, note : string}
+
+struct label {name : string, count : u32}
+
+extern control open_file()
+    ■ { opened {f : file_handle} }
+    uses file.read
+
+extern control close_file(f : file_handle)
+    ■ { closed {} }
+    uses file.read
+
+extern control fetch(id : u32)
+    ■ { ok {value : u32} │ failed {code : u32} }
+
+// A name, a field, an element and a longer place are written.
+control assigns(s : string)
+    ■ { ok {v : [label], t : string} }
+    ⊤ ▷ ~l : label := label {s, 1}
+    ⊤ ▷ l.name ← "new"
+    ⊤ ▷ l.count ← l.count + 1
+    ⊤ ▷ ~v : [label] := [l, label {"b", 5}]
+    ⊤ ▷ v[1].count ← 7
+    ⊤ ▷ v[0] ← label {"c", 9}
+    ⊤ ▷ ~t : string := "first"
+    ⊤ ▷ t ← "second"
+    ⊤ ▷ ■ ok {v, t}
+
+// The source is evaluated before the place is written.
+control source_first()
+    ■ { ok {v : [u32]} }
+    ⊤ ▷ ~v : [u32] := [1, 2]
+    ⊤ ▷ v[0] ← v[1]
+    ⊤ ▷ v[1] ← 5
+    ⊤ ▷ ■ ok {v}
+
+// The source is evaluated before the place is looked at: a source that is
+// stuck is stuck first, and then an index that is out of range.
+control source_before_place(i : usize, d : u32)
+    ■ { ok {v : [u32]} }
+    ⊤ ▷ ~v : [u32] := [1, 2]
+    ⊤ ▷ v[i] ← 10 ÷ d
+    ⊤ ▷ ■ ok {v}
+
+// X2: the source consumed the name that the index of the place reads.
+control source_moves_index(s : string)
+    ■ { ok {v : [string]} }
+    ⊤ ▷ ~v : [string] := ["a", "b"]
+    ⊤ ▷ v[len(s)] ← s
+    ⊤ ▷ ■ ok {v}
+
+// A moved slot is assigned as a whole and is available again, also when
+// the source is the name itself.
+control moved_then_assigned(s : string)
+    ■ { ok {a : string, b : string} }
+    ⊤ ▷ ~a : string := s
+    ⊤ ▷ b : string := a
+    ⊤ ▷ a ← "again"
+    ⊤ ▷ a ← a
+    ⊤ ▷ ■ ok {a, b}
+
+// X2 [E-Var]: a field of a moved name.
+control field_of_moved(s : string)
+    ■ { ok {m : label} }
+    ⊤ ▷ ~l : label := label {s, 1}
+    ⊤ ▷ m : label := l
+    ⊤ ▷ l.count ← 2
+    ⊤ ▷ ■ ok {m}
+
+// X2 [E-Var]: an element of a moved name.
+control element_of_moved()
+    ■ { ok {w : [u32]} }
+    ⊤ ▷ ~v : [u32] := [1]
+    ⊤ ▷ w : [u32] := v
+    ⊤ ▷ v[0] ← 2
+    ⊤ ▷ ■ ok {w}
+
+// X2 [E-Assign]: a name that has no slot on this history is assigned as a
+// whole.
+control whole_of_unbound(a : u32)
+    ■ { ok {t : string} }
+    ⊤ ▷ t : ? a < 10
+    t.true ▷ ~s : string := "a"
+    ⊤ ▷ s ← "b"
+    ⊤ ▷ ■ ok {s}
+
+// X2 [E-Var]: a field of a name that has no slot on this history.
+control field_of_unbound(a : u32)
+    ■ { ok {n : u32} }
+    ⊤ ▷ t : ? a < 10
+    t.true ▷ ~l : label := label {"a", a}
+    ⊤ ▷ l.count ← 5
+    ⊤ ▷ ■ ok {l.count}
+
+// X5: a name that holds an open resource is overwritten.
+control overwrite_resource()
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o1 : Δ open_file() ▸ opened {~f}
+    ⊤ ▷ o2 : Δ open_file() ▸ opened {g}
+    ⊤ ▷ f ← ▾g
+    ⊤ ▷ c : Δ close_file(▾f) ▸ closed {}
+    ⊤ ▷ ■ ok {}
+
+// The name is completed first, and what is written is a moved slot.
+control overwrite_after_completion()
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o1 : Δ open_file() ▸ opened {~f}
+    ⊤ ▷ o2 : Δ open_file() ▸ opened {g}
+    ⊤ ▷ c1 : Δ close_file(▾f) ▸ closed {}
+    ⊤ ▷ f ← ▾g
+    ⊤ ▷ c2 : Δ close_file(▾f) ▸ closed {}
+    ⊤ ▷ ■ ok {}
+
+// X5: a field that holds an open resource is overwritten.
+control overwrite_field()
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o1 : Δ open_file() ▸ opened {f}
+    ⊤ ▷ o2 : Δ open_file() ▸ opened {g}
+    ⊤ ▷ ~hd : holder := holder {▾f, "n"}
+    ⊤ ▷ hd.h ← ▾g
+    ⊤ ▷ holder {h, note} := hd
+    ⊤ ▷ c : Δ close_file(▾h) ▸ closed {}
+    ⊤ ▷ ■ ok {}
+
+// X5: an element that holds an open resource is overwritten.
+control overwrite_element()
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o1 : Δ open_file() ▸ opened {f}
+    ⊤ ▷ o2 : Δ open_file() ▸ opened {g}
+    ⊤ ▷ ~v : [file_handle] := [▾f]
+    ⊤ ▷ v[0] ← ▾g
+    ⊤ ▷ ⊥
+
+// X5: a struct with an open resource in it is overwritten as a whole.
+control overwrite_owner()
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o1 : Δ open_file() ▸ opened {f}
+    ⊤ ▷ o2 : Δ open_file() ▸ opened {g}
+    ⊤ ▷ ~hd : holder := holder {▾f, "n"}
+    ⊤ ▷ hd ← holder {▾g, "m"}
+    ⊤ ▷ ⊥
+
+// A field beside the resource is written, and the resource is not touched.
+control write_beside_resource()
+    ■ { ok {text : string} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ ~hd : holder := holder {▾f, "n"}
+    ⊤ ▷ hd.note ← "m"
+    ⊤ ▷ holder {h, note} := hd
+    ⊤ ▷ c : Δ close_file(▾h) ▸ closed {}
+    ⊤ ▷ ■ ok {note}
+
+// X5: a captured outcome is overwritten.
+control overwrite_outcome(id : u32)
+    ■ { ok {} }
+    ⊤ ▷ first := capture fetch(id)
+    ⊤ ▷ second := capture fetch(id + 1)
+    ⊤ ▷ ~v : [outcome⟨fetch⟩] := [▾first]
+    ⊤ ▷ v[0] ← ▾second
+    ⊤ ▷ ⊥
+
+//! run assigns("a") => done ok {[label {"c", 9}, label {"b", 7}], "second"}
+//! run source_first() => done ok {[2, 5]}
+//! run source_before_place(0, 2) => done ok {[5, 2]}
+//! run source_before_place(2, 2) => stuck X7 E-Index
+//! run source_before_place(2, 0) => stuck X7 E-Arith
+//! run source_moves_index("a") => stuck X2 E-Var
+//! run moved_then_assigned("a") => done ok {"again", "a"}
+//! run field_of_moved("a") => stuck X2 E-Var
+//! run element_of_moved() => stuck X2 E-Var
+//! run whole_of_unbound(3) => done ok {"b"}
+//! run whole_of_unbound(30) => stuck X2 E-Assign
+//! run field_of_unbound(3) => done ok {5}
+//! run field_of_unbound(30) => stuck X2 E-Var
+//! run overwrite_resource() with [open_file -> opened {file_handle#1}; open_file -> opened {file_handle#2}] => stuck X5 E-Assign
+//! run overwrite_after_completion() with [open_file -> opened {file_handle#1}; open_file -> opened {file_handle#2}; close_file -> closed; close_file -> closed] => done ok trace [open_file() -> opened {file_handle#1}; open_file() -> opened {file_handle#2}; close_file(file_handle#1) -> closed; close_file(file_handle#2) -> closed]
+//! run overwrite_field() with [open_file -> opened {file_handle#1}; open_file -> opened {file_handle#2}] => stuck X5 E-Assign
+//! run overwrite_element() with [open_file -> opened {file_handle#1}; open_file -> opened {file_handle#2}] => stuck X5 E-Assign
+//! run overwrite_owner() with [open_file -> opened {file_handle#1}; open_file -> opened {file_handle#2}] => stuck X5 E-Assign
+//! run write_beside_resource() with [open_file -> opened {file_handle#1}; close_file -> closed] => done ok {"m"}
+//! run overwrite_outcome(1) with [fetch -> ok {1}; fetch -> ok {2}] => stuck X5 E-Assign

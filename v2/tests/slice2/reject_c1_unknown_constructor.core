@@ -1,0 +1,20 @@
+// [C1]: a variant value names a constructor of its type.
+extern resource file_handle
+
+struct label {name : string, count : u32}
+
+variant shape {circle {radius : u32} │ rect {w : u32, h : u32}}
+
+extern control open_file()
+    ■ { opened {f : file_handle} }
+    uses file.read
+
+extern control fetch(id : u32)
+    ■ { ok {value : u32} │ failed {code : u32} }
+
+control c()
+    ■ { ok {} }
+    ⊤ ▷ s : shape := shape.square {1}
+    ⊤ ▷ ■ ok {}
+
+//! reject C1

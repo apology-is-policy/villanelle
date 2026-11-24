@@ -1,0 +1,6 @@
+// [W6]: a borrow type does not occur inside `[τ]`.
+control c(v : [&u32])
+    ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+//! reject W6

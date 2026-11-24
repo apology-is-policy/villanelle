@@ -1,0 +1,22 @@
+// [T6]: an operation whose payload lends has no outcome type, so it is not
+// captured.
+extern resource file_handle
+
+struct label {name : string, count : u32}
+
+variant shape {circle {radius : u32} │ rect {w : u32, h : u32}}
+
+extern control open_file()
+    ■ { opened {f : file_handle} }
+    uses file.read
+
+extern control fetch(id : u32)
+    ■ { ok {value : u32} │ failed {code : u32} }
+
+control c()
+    ■ { ok {} }
+    ⊤ ▷ ~m : string ⇀ u32 := ∅
+    ⊤ ▷ r := capture get(&m, "a")
+    ⊤ ▷ ⊥
+
+//! reject T6

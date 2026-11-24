@@ -1464,6 +1464,30 @@ impl Solver {
             if name.starts_with('_') {
                 continue;
             }
+            // [M2], [M7]: a name of a data type has no number to show, and
+            // the report prints no contents that the model does not have.
+            // What the model says of such a name is its length, where the
+            // query has one.
+            if self
+                .term_sorts
+                .get(term_id)
+                .is_some_and(|sort| !matches!(sort, SortTag::Bool | SortTag::Int))
+            {
+                let length = self
+                    .terms
+                    .iter()
+                    .enumerate()
+                    .find_map(|(id, term)| match term {
+                        AtomTerm::Len(base) if base.as_var() == Some(*term_id) => {
+                            int_model.get(&id).cloned()
+                        }
+                        _ => None,
+                    });
+                if let Some(length) = length {
+                    values.insert(format!("len({name})"), length.to_string());
+                }
+                continue;
+            }
             let val = int_model.get(term_id).cloned().unwrap_or_default();
             let shown = if *is_bool {
                 (!val.is_zero()).to_string()

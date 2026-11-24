@@ -1,0 +1,107 @@
+// [E-Bind], [E-Unpack] A bind gives a name a slot. A name that has a slot in
+// this run of its body is not bound again, by a bind, by an unpack or as a
+// payload name ([O1]). An unpack consumes a struct and binds a name to each
+// component: it is how a component that is not `copy` leaves its owner.
+
+extern resource file_handle
+
+struct holder {h : file_handle, note : string}
+
+struct label {name : string, count : u32}
+
+copy struct point {x : u32, y : u32}
+
+variant shape {circle {radius : u32} │ rect {w : u32, h : u32}}
+
+extern control open_file()
+    ■ { opened {f : file_handle} }
+    uses file.read
+
+extern control close_file(f : file_handle)
+    ■ { closed {} }
+    uses file.read
+
+// A struct is taken apart; one of kind `copy` stays as it was.
+control unpacks(l : label, p : point)
+    ■ { ok {text : string, n : u32, px : u32, py : u32, back : point} }
+    ⊤ ▷ label {name, count} := l
+    ⊤ ▷ point {x, y} := p
+    ⊤ ▷ ■ ok {name, count, x, y, p}
+
+// The source may be a value that no name holds, and a name of an unpack may
+// be mutable.
+control unpacks_a_value(s : string)
+    ■ { ok {text : string, n : u32} }
+    ⊤ ▷ label {~name, count} := label {s, 3}
+    ⊤ ▷ name ← trim(name)
+    ⊤ ▷ ■ ok {name, count}
+
+// X2: the unpack consumed the struct.
+control unpack_consumes(l : label)
+    ■ { ok {n : usize} }
+    ⊤ ▷ label {name, count} := l
+    ⊤ ▷ ■ ok {len(l.name)}
+
+// A resource leaves the struct that held it, and is completed under its
+// own name.
+control unpack_resource()
+    ■ { ok {text : string} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ hd : holder := holder {▾f, "kept"}
+    ⊤ ▷ holder {g, note} := hd
+    ⊤ ▷ c : Δ close_file(▾g) ▸ closed {}
+    ⊤ ▷ ■ ok {note}
+
+// X5: the obligation is the name's now, and the name's scope ends with it.
+control unpack_keeps_obligation()
+    ■ { ok {text : string} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ hd : holder := holder {▾f, "kept"}
+    ⊤ ▷ holder {g, note} := hd
+    ⊤ ▷ ■ ok {note}
+
+// X3: an unpack binds a name that has a slot.
+control bound_twice_by_unpack(a : label, b : label)
+    ■ { ok {n : u32} }
+    ⊤ ▷ label {name, first} := a
+    ⊤ ▷ label {name, second} := b
+    ⊤ ▷ ■ ok {first + second}
+
+// X3: a payload name is bound by two decisions of one history. Where the
+// alternatives differ the name is bound once.
+control bound_twice_by_payload(a : shape, b : shape)
+    ■ { ok {n : u32} }
+    ⊤ ▷ d1 : Δ shape(a) ▸ circle {r} │ rect {w1, h1}
+    ⊤ ▷ d2 : Δ shape(b) ▸ circle {r} │ rect {w2, h2}
+    d1.circle ∨ d2.circle ▷ ■ ok {r}
+    ⊤ ▷ ■ ok {0}
+
+// One name in two alternatives of one decision is bound once on every
+// history.
+control one_name_two_alternatives(s : shape)
+    ■ { ok {n : u32} }
+    ⊤ ▷ d : Δ shape(s) ▸ circle {side} │ rect {side, h}
+    ⊤ ▷ ■ ok {side}
+
+// X3: a moved slot is still a slot.
+control bound_after_move(s : string)
+    ■ { ok {a : string, b : string} }
+    ⊤ ▷ x : string := s
+    ⊤ ▷ y : string := x
+    ⊤ ▷ x : string := "again"
+    ⊤ ▷ ■ ok {x, y}
+
+//! run unpacks(label {"a", 1}, point {2, 3}) => done ok {"a", 1, 2, 3, point {2, 3}}
+//! run unpacks_a_value(" a ") => done ok {"a", 3}
+//! run unpack_consumes(label {"a", 1}) => stuck X2 E-Var
+//! run unpack_resource() with [open_file -> opened {file_handle#1}; close_file -> closed] => done ok {"kept"} trace [open_file() -> opened {file_handle#1}; close_file(file_handle#1) -> closed]
+//! run unpack_keeps_obligation() with [open_file -> opened {file_handle#1}] => stuck X5 E-Scope
+//! run bound_twice_by_unpack(label {"a", 1}, label {"b", 2}) => stuck X3 E-Bind
+//! run bound_twice_by_payload(shape.circle {1}, shape.rect {2, 3}) => done ok {1}
+//! run bound_twice_by_payload(shape.rect {2, 3}, shape.rect {2, 3}) => done ok {0}
+//! run bound_twice_by_payload(shape.circle {1}, shape.circle {2}) => stuck X3 E-Bind
+//! run one_name_two_alternatives(shape.circle {4}) => done ok {4}
+//! run one_name_two_alternatives(shape.rect {5, 6}) => done ok {5}
+//! run bound_after_move("a") => stuck X3 E-Bind

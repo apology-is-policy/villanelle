@@ -1,0 +1,8 @@
+// [T1]: a `copy variant` with a field whose type is not `copy` is refused.
+copy variant bad {some {s : string} │ none {}}
+
+control c()
+    ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+//! reject T1

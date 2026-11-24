@@ -1,0 +1,127 @@
+// [E-Var] A read yields the value and leaves the slot as it is, and so does
+// a consumed name whose type has kind `copy`. A consumed name of any other
+// kind is moved: its slot becomes `◌`. A name without a slot, or whose slot
+// is `◌`, is stuck wherever it is read, moved or borrowed ([O2], [O3]).
+
+copy struct point {x : u32, y : u32}
+
+struct label {name : string, count : u32}
+
+variant shape {circle {radius : u32} │ rect {w : u32, h : u32}}
+
+extern control keep(s : string)
+    ■ { kept {} }
+    uses net
+
+// A read leaves the slot: the string is read twice and then consumed.
+control read_leaves(s : string)
+    ■ { ok {text : string, first : usize, second : usize} }
+    ⊤ ▷ n : usize := len(s)
+    ⊤ ▷ m : usize := len(s)
+    ⊤ ▷ ■ ok {s, n, m}
+
+// A consumed name of kind `copy` stays: `p` is consumed twice and read.
+control copy_stays(p : point)
+    ■ { all {a : u32, b : u32, c : u32} }
+    ⊤ ▷ q : point := p
+    ⊤ ▷ r : point := p
+    ⊤ ▷ ■ all {p.x, q.y, r.x}
+
+// A consumed name of kind `drop` moves, with the move mark or without it.
+control moves(s : string, t : string)
+    ■ { ok {a : string, b : string} }
+    ⊤ ▷ a : string := s
+    ⊤ ▷ b : string := ▾t
+    ⊤ ▷ ■ ok {a, b}
+
+// X2: a read of a moved name.
+control read_after_move(s : string)
+    ■ { ok {n : usize} }
+    ⊤ ▷ t : string := s
+    ⊤ ▷ ■ ok {len(s)}
+
+// X2: a move of a moved name.
+control move_after_move(s : string)
+    ■ { ok {a : string, b : string} }
+    ⊤ ▷ t : string := s
+    ⊤ ▷ u : string := s
+    ⊤ ▷ ■ ok {t, u}
+
+// X2: a borrow of a moved name.
+control borrow_after_move(s : string)
+    ■ { ok {} }
+    uses console.write
+    ⊤ ▷ t : string := s
+    ⊤ ▷ e : Δ emit(&s) ▸ done {}
+    ⊤ ▷ ■ ok {}
+
+// X2: a formula reads every name it mentions ([E-Formula], [O2]).
+control formula_after_move(s : string)
+    ■ { ok {t : string} }
+    ⊤ ▷ t : string := s
+    ⊤ ▷ ⊢ len(s) = len(t)
+    ⊤ ▷ ■ ok {t}
+
+// X2: the base of a field is a read of the name.
+control field_after_move(l : label)
+    ■ { ok {n : u32, m : label} }
+    ⊤ ▷ m : label := l
+    ⊤ ▷ ■ ok {l.count, m}
+
+// The payload names of an alternative have slots only where it occurred.
+control other_alternative(s : shape)
+    ■ { ok {r : u32} }
+    ⊤ ▷ d : Δ shape(s) ▸ circle {r} │ rect {w, h}
+    ⊤ ▷ ■ ok {r}
+
+// A name is moved on one history and available on the other.
+control moved_on_one_history(s : string, give : bool)
+    ■ { ok {n : usize} }
+    uses net
+    ⊤ ▷ t : ? give
+    t.true ▷ k : Δ keep(s) ▸ kept {}
+    ⊤ ▷ ■ ok {len(s)}
+
+// A loop body moves a name of the body around it. One round is a run; the
+// second round meets the moved slot ([O6] is what the checker asks instead).
+control moved_in_loop(s : string, n : u32)
+    ■ { ok {} }
+    uses net
+    ⊤ ▷ lp : ↻ walk(i : u32 := 0) {
+        ⊤ ▷ end : ? i = n
+        end.true ▷ □ out {}
+        ⊤ ▷ k : Δ keep(s) ▸ kept {}
+        ⊤ ▷ ↑ walk(i + 1)
+    } ▸ out {}
+    ⊤ ▷ ■ ok {}
+
+// X2: the fields of a payload are consumed left to right ([O0]).
+control payload_twice(s : string)
+    ■ { ok {a : string, b : string} }
+    ⊤ ▷ ■ ok {s, s}
+
+// X2: the value of a loop parameter is consumed.
+control parameter_value(s : string)
+    ■ { ok {n : usize} }
+    ⊤ ▷ lp : ↻ once(t : string := s) {
+        ⊤ ▷ □ out {len(t)}
+    } ▸ out {n}
+    ⊤ ▷ ■ ok {n + len(s)}
+
+//! run read_leaves("abc") => done ok {"abc", 3, 3}
+//! run copy_stays(point {3, 4}) => done all {3, 4, 3}
+//! run moves("a", "b") => done ok {"a", "b"}
+//! run read_after_move("a") => stuck X2 E-Var
+//! run move_after_move("a") => stuck X2 E-Var
+//! run borrow_after_move("a") => stuck X2 E-Var
+//! run formula_after_move("a") => stuck X2 E-Var
+//! run field_after_move(label {"a", 1}) => stuck X2 E-Var
+//! run other_alternative(shape.circle {4}) => done ok {4}
+//! run other_alternative(shape.rect {4, 5}) => stuck X2 E-Var
+//! run moved_on_one_history("abc", false) => done ok {3}
+//! run moved_on_one_history("abc", true) with [keep -> kept] => stuck X2 E-Var trace [keep("abc") -> kept]
+//! run moved_in_loop("a", 0) => done ok
+//! run moved_in_loop("a", 1) with [keep -> kept] => done ok trace [keep("a") -> kept]
+//! run moved_in_loop("a", 2) with [keep -> kept] => stuck X2 E-Var trace [keep("a") -> kept]
+//! run payload_twice("a") => stuck X2 E-Var
+//! run parameter_value("a") => stuck X2 E-Var

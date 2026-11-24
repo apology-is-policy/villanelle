@@ -222,6 +222,48 @@ pub fn check(program: &Program) -> Result<CheckedProgram, Error> {
     })
 }
 
+/// The verdict on each defined control of `program`, in the order of the
+/// program: `None` where the control is accepted, and the error where it is
+/// refused. A control is checked against the signatures of the others
+/// ([T5]), so one that is refused does not hide the next. The functions and
+/// the named boundaries are checked first, as `check` does, and an error in
+/// one of them is the error of the whole.
+pub fn check_each(program: &Program) -> Result<Vec<(String, Option<Error>)>, Error> {
+    let mut certificates = Proofs::default();
+    let mut warnings = Vec::new();
+    for (id, function) in program.functions.iter().enumerate() {
+        check_function(program, id, function, &mut certificates)?;
+    }
+    let mut boundary_may_fault: Vec<bool> =
+        program.boundaries.iter().map(|b| b.may_fault).collect();
+    for (bid, boundary) in program.boundaries.iter().enumerate() {
+        let may_fault = check_boundary(
+            program,
+            boundary,
+            &boundary_may_fault,
+            &mut certificates,
+            &mut warnings,
+        )?;
+        boundary_may_fault[bid] = may_fault;
+    }
+    let mut verdicts = Vec::new();
+    for control in &program.controls {
+        if control.body.is_some() {
+            let mut certificates = Proofs::default();
+            let verdict = check_control(
+                program,
+                control,
+                &boundary_may_fault,
+                &mut certificates,
+                &mut warnings,
+            )
+            .err();
+            verdicts.push((control.name.clone(), verdict));
+        }
+    }
+    Ok(verdicts)
+}
+
 #[derive(Clone)]
 struct Env {
     locals: BTreeMap<VarId, LinearTerm>,

@@ -1,0 +1,8 @@
+// [W4]: the fields of a struct have different names.
+struct a {x : u32, x : u32}
+
+control c()
+    ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+//! reject W4

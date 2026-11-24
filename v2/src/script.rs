@@ -1071,6 +1071,9 @@ pub struct Report {
     pub failures: Vec<String>,
     pub rules: BTreeMap<&'static str, u64>,
     pub stuck: BTreeSet<String>,
+    /// The controls in which a run was stuck, each with the states it was
+    /// stuck in (`X2 E-Var`).
+    pub stuck_in: BTreeMap<String, BTreeSet<String>>,
     pub rejected: Option<String>,
 }
 
@@ -1412,9 +1415,13 @@ fn check_with(source: &str, is_surface: bool) -> Report {
             (Expect::Faulted(m1), End::Faulted(m2)) => m1 == m2,
             (Expect::Terminated(n1), End::Terminated(n2)) => n1 == n2,
             (Expect::Stuck { state, clause }, End::Stuck(stuck)) => {
+                let label = format!("X{} {}", stuck.state, stuck.clause);
                 report
-                    .stuck
-                    .insert(format!("X{} {}", stuck.state, stuck.clause));
+                    .stuck_in
+                    .entry(stuck.control.clone())
+                    .or_default()
+                    .insert(label.clone());
+                report.stuck.insert(label);
                 *state == format!("X{}", stuck.state) && clause == stuck.clause
             }
             (Expect::Other(expected), end) => *expected == kind(end),

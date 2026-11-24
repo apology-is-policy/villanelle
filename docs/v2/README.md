@@ -114,6 +114,8 @@ Items 9 to 16 were written on 21 and 22 November. The [review](review.md) of
     operations; the findings by which the checker accepted stuck programs
     of this slice (RC2 to RC8) and compiled code freed a value twice (RB1)
     are closed, every compiled run is counted for allocations left live,
+    the oracle has a test for each clause of the rules of the data since
+    24 November 2026, with the checker held against it control by control,
     and the review lists the open findings and what the slice still owes).
 13. Phase 2 for slice 3: second-class borrows `&τ`/`&~τ`, `view struct`,
     payload origins `∈`, well-formedness (`[W5a]`, `[W6]`, `[W8]`, `[W9]`,

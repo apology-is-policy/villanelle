@@ -1,0 +1,116 @@
+// [E-Field], [E-Index] `e.x` and `p[e]` read a component after a read of its
+// place. A consumed component has kind `copy` ([O3]): there are no partial
+// moves. An indexed place is stuck, wherever it is evaluated (read, borrowed
+// or assigned), when the index is not less than the length.
+
+copy struct point {x : u32, y : u32}
+
+struct label {name : string, count : u32}
+
+struct shelf {items : [label], tags : [string], corner : point}
+
+// A component of kind `copy` is consumed and a component of another kind is
+// read; the owners stay as they were.
+control reads_components(l : label, v : [u32]) ⊢ len(v) > 1
+    ■ { ok {count : u32, x : u32, n : usize, back : label, rest : [u32]} }
+    ⊤ ▷ c : u32 := l.count
+    ⊤ ▷ k : usize := len(l.name)
+    ⊤ ▷ x : u32 := v[1]
+    ⊤ ▷ ■ ok {c, x, k, l, v}
+
+// A path of fields and indexes, and a component that is a `copy` struct.
+control nested(s : shelf, i : usize) ⊢ i < len(s.items) ∧ i < len(s.tags)
+    ■ { ok {count : u32, x : u32, n : usize, corner : point} }
+    ⊤ ▷ q : point := s.corner
+    ⊤ ▷ ■ ok {s.items[i].count, s.corner.x, len(s.tags[i]), q}
+
+// X2: a field that is not `copy` is consumed.
+control consume_field(l : label)
+    ■ { ok {first : string} }
+    ⊤ ▷ first : string := l.name
+    ⊤ ▷ ■ ok {first}
+
+// X2: an element that is not `copy` is consumed.
+control consume_element(v : [string])
+    ■ { ok {first : string} }
+    ⊤ ▷ first : string := v[0]
+    ⊤ ▷ ■ ok {first}
+
+// X2: the same at the end of a longer path.
+control consume_nested(s : shelf)
+    ■ { ok {one : label} }
+    ⊤ ▷ one : label := s.items[0]
+    ⊤ ▷ ■ ok {one}
+
+// `clone` reads the component, and the owner stays whole.
+control clone_instead(l : label, v : [string]) ⊢ len(v) > 0
+    ■ { ok {a : string, b : string, back : label, rest : [string]} }
+    ⊤ ▷ a : string := clone(l.name)
+    ⊤ ▷ b : string := clone(v[0])
+    ⊤ ▷ ■ ok {a, b, l, v}
+
+// X7: an index that is read.
+control index_read(v : [u32], i : usize)
+    ■ { ok {x : u32} }
+    ⊤ ▷ ■ ok {v[i]}
+
+// X7: an index of a place that is borrowed.
+control index_borrowed(v : [string], i : usize)
+    ■ { ok {} }
+    uses console.write
+    ⊤ ▷ e : Δ emit(&v[i]) ▸ done {}
+    ⊤ ▷ ■ ok {}
+
+// X7: an index of a place that is assigned.
+control index_assigned(i : usize)
+    ■ { ok {v : [u32]} }
+    ⊤ ▷ ~v : [u32] := [1, 2]
+    ⊤ ▷ v[i] ← 9
+    ⊤ ▷ ■ ok {v}
+
+// X7: an index in the base of a longer place.
+control index_in_base(s : shelf, i : usize)
+    ■ { ok {n : u32, k : usize} }
+    ⊤ ▷ ■ ok {s.items[i].count, len(s.tags[i])}
+
+// The index is an expression, and is stuck as one ([E-Arith]) before the
+// place is looked at.
+control index_is_evaluated(v : [u32], i : usize)
+    ■ { ok {x : u32} }
+    ⊤ ▷ ■ ok {v[i - 1]}
+
+// X2: the base of an index is a read of the name.
+control index_after_move(v : [u32])
+    ■ { ok {x : u32, w : [u32]} }
+    ⊤ ▷ w : [u32] := v
+    ⊤ ▷ ■ ok {v[0], w}
+
+// [E-Formula]: a term of a formula that indexes out of range has a value,
+// the same wherever the term is evaluated on equal operands. It is not
+// stuck.
+control formula_index(v : [u32], i : usize)
+    ■ { ok {} }
+    ⊤ ▷ ⊢ v[i] = v[i]
+    ⊤ ▷ ■ ok {}
+
+//! run reads_components(label {"abc", 4}, [1, 2]) => done ok {4, 2, 3, label {"abc", 4}, [1, 2]}
+//! run nested(shelf {[label {"a", 1}, label {"b", 2}], ["x", "yz"], point {5, 6}}, 1) => done ok {2, 5, 2, point {5, 6}}
+//! run consume_field(label {"abc", 4}) => stuck X2 E-Field
+//! run consume_element(["a", "b"]) => stuck X2 E-Index
+//! run consume_nested(shelf {[label {"a", 1}], [], point {5, 6}}) => stuck X2 E-Index
+//! run clone_instead(label {"abc", 4}, ["a", "b"]) => done ok {"abc", "a", label {"abc", 4}, ["a", "b"]}
+//! run index_read([1, 2], 1) => done ok {2}
+//! run index_read([1, 2], 2) => stuck X7 E-Index
+//! run index_read([], 0) => stuck X7 E-Index
+//! run index_borrowed(["a", "b"], 1) => done ok trace [emit("b") -> done]
+//! run index_borrowed(["a", "b"], 2) => stuck X7 E-Index
+//! run index_assigned(1) => done ok {[1, 9]}
+//! run index_assigned(2) => stuck X7 E-Index
+//! run index_in_base(shelf {[label {"a", 1}], ["x"], point {5, 6}}, 0) => done ok {1, 1}
+//! run index_in_base(shelf {[label {"a", 1}], ["x", "y"], point {5, 6}}, 1) => stuck X7 E-Index
+//! run index_in_base(shelf {[label {"a", 1}, label {"b", 2}], ["x"], point {5, 6}}, 1) => stuck X7 E-Index
+//! run index_is_evaluated([1, 2], 1) => done ok {1}
+//! run index_is_evaluated([1, 2], 0) => stuck X7 E-Arith
+//! run index_after_move([1, 2]) => stuck X2 E-Var
+//! run formula_index([1, 2], 1) => done ok
+//! run formula_index([1, 2], 5) => done ok

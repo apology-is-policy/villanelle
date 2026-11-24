@@ -1110,6 +1110,68 @@ Three of them are about borrows and have their tests with slice 3.
   `tests/slice3/builtin_operands.core` the runs, with example 6.3 of the
   reference model, whose `insert` gives back the value it replaced.
 
+### 12.3 The rules of the data, as requalified on 24 November 2026
+
+Every rule that the data of slice 2 applies has a file of its own in
+`tests/slice2`, as the rules of slice 1 have: the runs that apply the
+rule, and a run for each way of being stuck by it. A comment over each
+control says which sentence of the rule it holds.
+
+| File | Rule | Stuck states it reaches |
+| --- | --- | --- |
+| `e_var.core` | [E-Var]: a read leaves the slot, a consumed name of kind `copy` stays, any other moves | `X2 E-Var` for a read, a move, a borrow, a formula, a base of a field, a payload name of another alternative, a second round of a loop, a second payload field and a loop parameter |
+| `e_field_index.core` | [E-Field], [E-Index], and a term of a formula that indexes out of range | `X2 E-Field`, `X2 E-Index`, `X7 E-Index` (read, borrowed, assigned, in a base), `X7 E-Arith`, `X2 E-Var` |
+| `e_build.core` | [E-Build]: the constructors, `∅`, `clone` | `X2 E-Var` (a field or an element consumed twice), `X7 E-Index` |
+| `e_temp.core` | [E-Temp] | `X5 E-Temp` with a resource and with a captured outcome |
+| `e_bind_unpack.core` | [E-Bind], [E-Unpack] | `X3 E-Bind` by an unpack, by a payload name and after a move; `X2 E-Var`; `X5 E-Scope` |
+| `e_assign.core` | [E-Assign] | `X2 E-Assign`, `X2 E-Var` (a component of a moved or unbound root), `X5 E-Assign` (a name, a field, an element, an owner, a captured outcome), `X7 E-Index`, `X7 E-Arith` |
+| `e_operands.core` | [E-Operands] | `X2 E-Var` |
+| `e_outcome.core` | [E-Capture], [E-Outcome] | `X2 E-Var`, `X5 E-Scope`, `X7 E-Call` |
+| `e_resource_scope.core` | [E-Resource], [E-Scope] | `X5 E-Scope` in a name, a parameter, a struct, a vector, a variant, a map, and at `↑` and `□` |
+| `e_unwind_values.core` | [E-Unwind] through a value ([T3]) | `X8 E-Unwind` in a name, a struct, a vector, a variant, a map and a captured outcome |
+| `checked_release_order.core` | [E-Unwind]: the order of release | none; the checker accepts it and it runs in compiled code |
+| `op_vectors.core`, `op_maps.core`, `op_text.core` | The built-in operations, every alternative of each, and `trim` | `X2 E-Var`, `X9 E-Effect` |
+
+38 more files `reject_*.core` hold a refusal of the reader each: the kinds
+([T1], [T6]), the forms of types ([W4] to [W8]), the typing of
+constructors, fields, indexes, unpacks, assignments and built-in operands
+([C1], [C2], [C4]) and the move mark on a read ([O3]). The test
+`slice_two_core_conforms_and_matches_erased` asks that 20 rules are
+applied, 17 stuck labels reached and 15 clauses of refusal met; the suite
+of slice 2 has 99 files and 300 runs, 199 of them compared with the erased
+semantics. The oracle counts an application of [E-Temp] now.
+
+What the files found:
+
+- **The order of release** (RO12). `Machine::unwind_scope_with_clause`
+  visited the slots of a scope in the reverse of the order in which the
+  run had bound them. It visits them by the ids of their names now, which
+  `resolve` gives in the order in which the text of a body first binds
+  them; [E-Unwind] of the core states that order.
+- **A component of a moved root** is `X2 E-Var`, and [E-Assign] of the
+  core says that the root is looked up.
+- **An outcome type that names a control** is refused in a declaration
+  (RO13, open).
+
+The checker is held against the same files control by control.
+`check::check_each` gives the verdict on every defined control of a
+program, each checked against the signatures of the others, and
+`script::Report::stuck_in` the controls in which a run was stuck.
+`the_rule_files_of_the_data_are_rejected_exactly_where_a_run_is_stuck`
+(`tests/checker_slice2.rs`) asks that the two agree: of the 124 controls
+of the fourteen files the checker refuses the 62 in which a run is stuck
+and accepts 59. The other three are in a table of the test with the
+reason: an empty vector of resources holds no obligation and its type has
+kind `must` ([O5]); an empty vector of locks is destroyed under a fault
+and its type is not fault-releasable ([F2]); and an effect is stuck in the
+control that has it, where the control that does not allow it is its
+caller ([F3]).
+
+A counterexample gives no number for a name of a data type (RC25): the
+model of the search has one for every term, and it is no value of the
+name. `Solver::counterexample` leaves such a name out and gives its
+length where the model has one.
+
 ## 13. Slice 2 Phase 3: Ownership, Faults, Boundaries, and Data Fact Logic
 
 Slice 2 Phase 3 extends the checker (`check.rs`), fact logic (`facts.rs`), and

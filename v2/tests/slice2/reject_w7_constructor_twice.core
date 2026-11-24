@@ -1,0 +1,9 @@
+// [W7]: a variant lists each constructor once, as a contract lists each
+// alternative.
+variant a {x {} │ x {}}
+
+control c()
+    ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+//! reject W7

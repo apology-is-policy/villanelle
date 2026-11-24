@@ -1,0 +1,6 @@
+// [C1]: a type name is declared.
+control c(v : thing)
+    ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+//! reject C1

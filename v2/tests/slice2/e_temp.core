@@ -1,0 +1,70 @@
+// [E-Temp] A value that was read and not consumed, and that no slot holds
+// (the result of a constructor, a function or `clone`), is destroyed when
+// its reader is done. If it contains an obligation, the configuration is
+// stuck ([O3a]).
+
+extern resource file_handle
+
+struct holder {h : file_handle}
+
+struct label {name : string, count : u32}
+
+outcome fetched {ok {value : u32} │ failed {code : u32}}
+
+extern control open_file()
+    ■ { opened {f : file_handle} }
+    uses file.read
+
+extern control close_file(f : file_handle)
+    ■ { closed {} }
+    uses file.read
+
+extern control fetch(id : u32)
+    ■ { ok {value : u32} │ failed {code : u32} }
+
+copy struct point {x : u32, y : u32}
+
+function first(p : point) : u32 := p.x
+
+// The result of `clone`, of a constructor and of a function is read and
+// destroyed.
+control temporaries(s : string)
+    ■ { ok {la : usize, lb : usize, lc : usize, count : u32, x : u32, back : string} }
+    ⊤ ▷ a : usize := len(clone(s))
+    ⊤ ▷ b : usize := len([1, 2, 3])
+    ⊤ ▷ c : usize := len(trim(s))
+    ⊤ ▷ d : u32 := label {clone(s), 7}.count
+    ⊤ ▷ ■ ok {a, b, c, d, first(point {3, 4}), s}
+
+// X5: a vector that holds an open resource is read and not consumed.
+control temporary_with_resource()
+    ■ { ok {n : usize} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ ■ ok {len([holder {▾f}])}
+
+// The same value held by a name, taken apart and completed.
+control held_and_completed()
+    ■ { ok {n : usize} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ v : [holder] := [holder {▾f}]
+    ⊤ ▷ n : usize := len(v)
+    ⊤ ▷ t : Δ take(v) ▸ item {first, rest} │ empty {}
+    t.empty ▷ ⊥
+    ⊤ ▷ holder {g} := first
+    ⊤ ▷ c : Δ close_file(g) ▸ closed {}
+    ⊤ ▷ t2 : Δ take(rest) ▸ item {more, others} │ empty {}
+    t2.item ▷ ⊥
+    ⊤ ▷ ■ ok {n}
+
+// X5: a captured outcome in a temporary.
+control temporary_with_outcome(id : u32)
+    ■ { ok {n : usize} }
+    ⊤ ▷ res := capture fetch(id)
+    ⊤ ▷ ■ ok {len([res])}
+
+//! run temporaries("  ab ") => done ok {5, 3, 2, 7, 3, "  ab "}
+//! run temporary_with_resource() with [open_file -> opened {file_handle#1}] => stuck X5 E-Temp
+//! run held_and_completed() with [open_file -> opened {file_handle#1}; close_file -> closed] => done ok {1} trace [open_file() -> opened {file_handle#1}; close_file(file_handle#1) -> closed]
+//! run temporary_with_outcome(1) with [fetch -> ok {42}] => stuck X5 E-Temp

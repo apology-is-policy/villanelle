@@ -1,0 +1,73 @@
+// [E-Build] `S {ē}`, `V.c {ē}`, `[ē]`, `∅` and `clone(p)` build values. The
+// fields of a constructor are consumed, left to right. `clone` reads its
+// place.
+
+copy struct point {x : u32, y : u32}
+
+struct label {name : string, count : u32}
+
+struct pair {a : string, b : string}
+
+variant shape {circle {radius : u32} │ rect {w : u32, h : u32} │ named {l : label}}
+
+// A struct, a variant, a vector with elements and without, and the empty
+// map; a constructor in a field of another.
+control builds(s : string, n : u32) ⊢ n < 100
+    ■ { ok {labels : [label], sh : shape, held : shape, none : [u32], entries : usize} }
+    ⊤ ▷ l : label := label {s, n}
+    ⊤ ▷ sh : shape := shape.rect {n, n + 1}
+    ⊤ ▷ v : [label] := [l, label {"x", point {2, 3}.y}]
+    ⊤ ▷ none : [u32] := []
+    ⊤ ▷ m : string ⇀ u32 := ∅
+    ⊤ ▷ ■ ok {v, sh, shape.named {label {"in", 0}}, none, len(m)}
+
+// `clone` reads its place: the place stays, and the copy is a value of its
+// own.
+control clones(l : label, v : [string], m : string ⇀ u32, sh : shape, p : point)
+    ■ { ok {l1 : label, l2 : label, v1 : [string], v2 : [string], m1 : string ⇀ u32, m2 : string ⇀ u32, s1 : shape, s2 : shape, p1 : point} }
+    ⊤ ▷ ~c : label := clone(l)
+    ⊤ ▷ c.count ← 7
+    ⊤ ▷ ■ ok {c, l, clone(v), v, clone(m), m, clone(sh), sh, clone(p)}
+
+// X2: a field of a constructor is consumed.
+control constructor_consumes(s : string)
+    ■ { ok {n : usize, l : label} }
+    ⊤ ▷ l : label := label {s, 1}
+    ⊤ ▷ ■ ok {len(s), l}
+
+// X2: the fields are consumed left to right, and the second meets a moved
+// name ([O0]).
+control fields_in_order(s : string)
+    ■ { ok {p : pair} }
+    ⊤ ▷ ■ ok {pair {s, s}}
+
+// X2: so are the elements of a vector.
+control elements_in_order(s : string)
+    ■ { ok {v : [string]} }
+    ⊤ ▷ ■ ok {[s, s]}
+
+// A clone for the second one.
+control fields_with_clone(s : string)
+    ■ { ok {p : pair} }
+    ⊤ ▷ ■ ok {pair {clone(s), s}}
+
+// X2: `clone` reads, and a moved name cannot be read.
+control clone_after_move(s : string)
+    ■ { ok {a : string, b : string} }
+    ⊤ ▷ t : string := s
+    ⊤ ▷ ■ ok {clone(s), t}
+
+// X7: the place of a `clone` is evaluated as any place.
+control clone_element(v : [string], i : usize)
+    ■ { ok {s : string} }
+    ⊤ ▷ ■ ok {clone(v[i])}
+
+//! run builds("a", 7) => done ok {[label {"a", 7}, label {"x", 3}], shape.rect {7, 8}, shape.named {label {"in", 0}}, [], 0}
+//! run clones(label {"a", 1}, ["x"], {"k" ↦ 2}, shape.circle {3}, point {4, 5}) => done ok {label {"a", 7}, label {"a", 1}, ["x"], ["x"], {"k" ↦ 2}, {"k" ↦ 2}, shape.circle {3}, shape.circle {3}, point {4, 5}}
+//! run constructor_consumes("a") => stuck X2 E-Var
+//! run fields_in_order("a") => stuck X2 E-Var
+//! run elements_in_order("a") => stuck X2 E-Var
+//! run fields_with_clone("a") => done ok {pair {"a", "a"}}
+//! run clone_after_move("a") => stuck X2 E-Var
+//! run clone_element(["a", "b"], 1) => done ok {"b"}
+//! run clone_element(["a", "b"], 2) => stuck X7 E-Index

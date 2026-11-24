@@ -1,0 +1,191 @@
+// [E-Capture], [E-Outcome] `x := capture ω(ō)` runs `ω` as a decision does
+// and binds `x` to its outcome. The operation `outcome` takes a captured
+// outcome by value and completes with its alternative and payload. The
+// operation `V` takes a variant value and completes with its constructor
+// and fields: a decision on it is how a variant is taken apart. A captured
+// outcome is an obligation ([T1], section 6.8).
+
+extern resource file_handle
+
+copy variant op {add {} │ sub {}}
+
+struct label {name : string, count : u32}
+
+variant item {text {l : label} │ number {n : u32} │ none {}}
+
+variant slot {full {f : file_handle} │ free {}}
+
+extern control open_file()
+    ■ { opened {f : file_handle} }
+    uses file.read
+
+extern control close_file(f : file_handle)
+    ■ { closed {} }
+    uses file.read
+
+extern control fetch(id : u32)
+    ■ { ok {value : u32} │ failed {code : u32} }
+
+control half(n : u32) ⊢ n > 0
+    ■ { even {h : u32} │ odd {} }
+    ⊤ ▷ t : ? n mod 2 = 0
+    t.true ▷ ■ even {n ÷ 2}
+    ⊤ ▷ ■ odd {}
+
+// A decision on a variant binds the fields of the constructor it has. A
+// field that is not `copy` leaves the variant with them.
+control takes_apart(i : item)
+    ■ { ok {text : string, n : u32} }
+    ⊤ ▷ d : Δ item(i) ▸ text {l} │ number {n} │ none {}
+    d.text ▷ label {name, count} := l
+    d.text ▷ ■ ok {name, count}
+    d.number ▷ ■ ok {"number", n}
+    ⊤ ▷ ■ ok {"none", 0}
+
+// X2: the decision consumed the variant.
+control variant_consumed(i : item)
+    ■ { ok {} }
+    ⊤ ▷ d1 : Δ item(i) ▸ text {l1} │ number {n1} │ none {}
+    ⊤ ▷ d2 : Δ item(i) ▸ text {l2} │ number {n2} │ none {}
+    ⊤ ▷ ■ ok {}
+
+// A variant of kind `copy` stays, and a clone leaves any variant where it
+// was.
+control variant_stays(k : op, i : item)
+    ■ { ok {n : u32, back : item} }
+    ⊤ ▷ d1 : Δ op(k) ▸ add {} │ sub {}
+    ⊤ ▷ d2 : Δ op(k) ▸ add {} │ sub {}
+    ⊤ ▷ d3 : Δ item(clone(i)) ▸ text {l} │ number {n} │ none {}
+    d1.add ∧ d2.add ▷ ■ ok {1, i}
+    d1.sub ∧ d2.sub ▷ ■ ok {2, i}
+    ⊤ ▷ ⊥
+
+// A resource in a variant leaves it by a decision and is completed.
+control resource_in_variant()
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ s : slot := slot.full {▾f}
+    ⊤ ▷ d : Δ slot(▾s) ▸ full {g} │ free {}
+    d.full ▷ c : Δ close_file(▾g) ▸ closed {}
+    ⊤ ▷ ■ ok {}
+
+// X5: the payload name holds the obligation when its scope ends.
+control resource_left_in_payload()
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ s : slot := slot.full {▾f}
+    ⊤ ▷ d : Δ slot(▾s) ▸ full {g} │ free {}
+    ⊤ ▷ ■ ok {}
+
+// A capture of an extern control, of a defined control and of a built-in
+// operation, each decided by `outcome`.
+control captures(id : u32, n : u32) ⊢ n > 0
+    ■ { ok {a : u32, b : u32, c : u32} }
+    ⊤ ▷ r1 := capture fetch(id)
+    ⊤ ▷ r2 := capture half(n)
+    ⊤ ▷ ~v : [u32] := [7]
+    ⊤ ▷ r3 := capture pop(&~v)
+    ⊤ ▷ d1 : Δ outcome(▾r1) ▸ ok {value} │ failed {code}
+    ⊤ ▷ d2 : Δ outcome(▾r2) ▸ even {h} │ odd {}
+    ⊤ ▷ d3 : Δ outcome(▾r3) ▸ item {x} │ empty {}
+    d3.empty ▷ ⊥
+    d1.ok ∧ d2.even ▷ ■ ok {value, h, x}
+    d1.ok ∧ d2.odd ▷ ■ ok {value, 0, x}
+    d1.failed ∧ d2.even ▷ ■ ok {code, h, x}
+    ⊤ ▷ ■ ok {code, 0, x}
+
+// X5: a captured outcome that nothing decides.
+control capture_dropped(id : u32)
+    ■ { ok {} }
+    ⊤ ▷ r := capture fetch(id)
+    ⊤ ▷ ■ ok {}
+
+// X2: `outcome` consumed it.
+control capture_decided_twice(id : u32)
+    ■ { ok {} }
+    ⊤ ▷ r := capture fetch(id)
+    ⊤ ▷ d1 : Δ outcome(r) ▸ ok {v1} │ failed {c1}
+    ⊤ ▷ d2 : Δ outcome(r) ▸ ok {v2} │ failed {c2}
+    ⊤ ▷ ■ ok {}
+
+// A captured outcome moves as any value of kind `must` does: to another
+// name, into a vector and out of it.
+control capture_moves(id : u32)
+    ■ { ok {n : u32} }
+    ⊤ ▷ r := capture fetch(id)
+    ⊤ ▷ s : outcome⟨fetch⟩ := ▾r
+    ⊤ ▷ v : [outcome⟨fetch⟩] := [▾s]
+    ⊤ ▷ t : Δ take(▾v) ▸ item {first, rest} │ empty {}
+    t.empty ▷ ⊥
+    ⊤ ▷ t2 : Δ take(▾rest) ▸ item {more, others} │ empty {}
+    t2.item ▷ ⊥
+    ⊤ ▷ d : Δ outcome(▾first) ▸ ok {value} │ failed {code}
+    d.ok ▷ ■ ok {value}
+    ⊤ ▷ ■ ok {code}
+
+// X5: the vector holds it when the scope ends.
+control capture_left_in_vector(id : u32)
+    ■ { ok {} }
+    ⊤ ▷ r := capture fetch(id)
+    ⊤ ▷ v : [outcome⟨fetch⟩] := [▾r]
+    ⊤ ▷ ■ ok {}
+
+// A captured outcome is a payload and an argument.
+control relay(id : u32)
+    ■ { held {o : outcome⟨fetch⟩} }
+    ⊤ ▷ r := capture fetch(id)
+    ⊤ ▷ ■ held {▾r}
+
+control settle(o : outcome⟨fetch⟩)
+    ■ { got {v : u32} │ err {c : u32} }
+    ⊤ ▷ d : Δ outcome(▾o) ▸ ok {value} │ failed {code}
+    d.ok ▷ ■ got {value}
+    ⊤ ▷ ■ err {code}
+
+control capture_crosses(id : u32)
+    ■ { ok {n : u32} }
+    ⊤ ▷ a : Δ relay(id) ▸ held {o}
+    ⊤ ▷ b : Δ settle(▾o) ▸ got {v} │ err {c}
+    b.got ▷ ■ ok {v}
+    ⊤ ▷ ■ ok {c}
+
+// X5: a parameter that holds one, at the exit.
+control capture_parameter_dropped(id : u32)
+    ■ { ok {} }
+    ⊤ ▷ a : Δ relay(id) ▸ held {o}
+    ⊤ ▷ b : Δ ignores(▾o) ▸ done {}
+    ⊤ ▷ ■ ok {}
+
+control ignores(o : outcome⟨fetch⟩)
+    ■ { done {} }
+    ⊤ ▷ ■ done {}
+
+// X7: a capture runs its operation, precondition and all ([E-Call]).
+control capture_runs(n : u32)
+    ■ { ok {} }
+    ⊤ ▷ r := capture half(n)
+    ⊤ ▷ d : Δ outcome(▾r) ▸ even {h} │ odd {}
+    ⊤ ▷ ■ ok {}
+
+//! run takes_apart(item.text {label {"a", 3}}) => done ok {"a", 3}
+//! run takes_apart(item.number {5}) => done ok {"number", 5}
+//! run takes_apart(item.none) => done ok {"none", 0}
+//! run variant_consumed(item.none) => stuck X2 E-Var
+//! run variant_stays(op.add, item.number {5}) => done ok {1, item.number {5}}
+//! run variant_stays(op.sub, item.text {label {"a", 3}}) => done ok {2, item.text {label {"a", 3}}}
+//! run resource_in_variant() with [open_file -> opened {file_handle#1}; close_file -> closed] => done ok trace [open_file() -> opened {file_handle#1}; close_file(file_handle#1) -> closed]
+//! run resource_left_in_payload() with [open_file -> opened {file_handle#1}] => stuck X5 E-Scope
+//! run captures(1, 6) with [fetch -> ok {42}] => done ok {42, 3, 7}
+//! run captures(1, 7) with [fetch -> failed {404}] => done ok {404, 0, 7}
+//! run capture_dropped(1) with [fetch -> ok {42}] => stuck X5 E-Scope
+//! run capture_decided_twice(1) with [fetch -> ok {42}] => stuck X2 E-Var
+//! run capture_moves(1) with [fetch -> ok {42}] => done ok {42}
+//! run capture_moves(1) with [fetch -> failed {9}] => done ok {9}
+//! run capture_left_in_vector(1) with [fetch -> ok {42}] => stuck X5 E-Scope
+//! run capture_crosses(1) with [fetch -> ok {42}] => done ok {42}
+//! run capture_crosses(1) with [fetch -> failed {9}] => done ok {9}
+//! run capture_parameter_dropped(1) with [fetch -> ok {42}] => stuck X5 E-Scope
+//! run capture_runs(4) => done ok
+//! run capture_runs(0) => stuck X7 E-Call

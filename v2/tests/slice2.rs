@@ -45,34 +45,57 @@ fn surface_files() -> Vec<(String, String)> {
     out
 }
 
-const SLICE2_RULES: [&str; 9] = [
+/// The rules of section 6 that the data of slice 2 applies, beside those of
+/// slice 1, and the rules of faults and boundaries.
+const SLICE2_RULES: [&str; 20] = [
+    "E-Var",
+    "E-Field",
+    "E-Index",
+    "E-Build",
+    "E-Temp",
+    "E-Operands",
+    "E-Bind",
     "E-Unpack",
+    "E-Assign",
     "E-Capture",
     "E-Outcome",
+    "E-Resource",
+    "E-Scope",
+    "B5",
     "E-Fault",
     "E-Unwind",
     "E-Boundary",
     "E-Contingency",
     "E-Supervise",
-    "E-Assign",
+    "E-Decide",
 ];
 
-const SLICE2_STUCK: [&str; 12] = [
+/// The ways of being stuck that the suite of slice 2 reaches, as the row of
+/// the table of section 6.10 and the clause without a successor.
+const SLICE2_STUCK: [&str; 17] = [
     "X1 E-End",
-    "X7 E-Again",
-    "X8 E-Unwind",
     "X2 E-Var",
     "X2 E-Field",
     "X2 E-Index",
+    "X2 E-Assign",
     "X2 E-Supervise",
+    "X3 E-Bind",
     "X5 E-Scope",
     "X5 E-Assign",
     "X5 E-Temp",
     "X7 E-Index",
+    "X7 E-Arith",
+    "X7 E-Call",
+    "X7 E-Again",
     "X8 E-Fault",
+    "X8 E-Unwind",
+    "X9 E-Effect",
 ];
 
-const SLICE2_REFUSALS: [&str; 10] = ["T1", "W5a", "W6", "W7", "W8", "F5", "F6", "W2", "W3", "C1"];
+/// The clauses by which `resolve` refuses a program of the suite.
+const SLICE2_REFUSALS: [&str; 15] = [
+    "T1", "T6", "W2", "W3", "W4", "W5a", "W6", "W7", "W8", "C1", "C2", "C4", "O3", "F5", "F6",
+];
 
 /// Review finding RO5: under a fault the erased semantics releases what is
 /// available at the statement that faulted, and what a loop or the work of
@@ -130,10 +153,10 @@ fn slice_two_core_conforms_and_matches_erased() {
     }
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert!(runs >= 25);
-    // Every non-stuck run (including faulted runs with `on fault release`) is
-    // differentially checked against the erased semantics ([R4], [R5]).
-    assert!(compared >= 15 && compared < runs);
+    assert!(runs >= 300, "{runs} runs");
+    // Every run that is not stuck (the faulted ones with `on fault release`
+    // among them) is compared with the erased semantics ([R4], [R5]).
+    assert!(compared >= 199 && compared < runs, "{compared} compared");
 }
 
 #[test]

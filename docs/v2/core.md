@@ -496,7 +496,9 @@ Otherwise `c` runs:
   `p`: a write access by [B1]. If the value being replaced contains an
   obligation (section 6.8), stuck. A moved slot may be assigned as a whole and
   becomes available. A name that has no slot in this run cannot be assigned:
-  stuck.
+  stuck. A component is written within the value of its root, so the root
+  of `p.x` or `p[e]` is looked up as [E-Var] says, and the configuration is
+  stuck where it has no slot or was moved.
 - **[E-Oblige]** `⊢ φ`. If `φ` is false in the current state, stuck.
 - **[E-Formula]** A formula is evaluated on current values, over the
   mathematical integers, and makes no access: it reads through borrows and
@@ -638,7 +640,17 @@ not an outcome and cannot be converted into one.
   type is declared `on fault release` is released by the host, which appends a
   release event; an open resource of any other type makes the configuration
   stuck; a captured outcome and an aggregate are released part by part;
-  everything else is destroyed. When an activation has no scopes
+  everything else is destroyed. A release is an event of the trace, so the
+  order is part of the meaning. The slots of a scope are visited in the
+  reverse of the order in which the text of its body first binds their
+  names, its parameters before its other names and the names of one
+  statement as it writes them. That is not always the order in which the
+  run bound them: a name may have a binder on each of two histories, and the
+  alternatives of one decision may name their payloads in different orders.
+  The parts of a value are visited in their order: the fields of a struct,
+  of a constructor and of a payload from the first, the elements of a vector
+  from the first, and the entries of a map by key, each key before its
+  value. When an activation has no scopes
   left it is popped, and the unwinding continues in the caller, whose waiting
   decision completes with no alternative. An activation that does not permit
   `faults` is stuck when a fault reaches it, unless a boundary encloses the
@@ -1371,7 +1383,9 @@ removed. It is what release code implements.
   as it was before the statement on the others. No value carries a flag of
   its own.
 - **[R5]** Under a fault, resources declared `on fault release` are released
-  under the same condition.
+  under the same condition, in the order of [E-Unwind]. That order is read
+  off the text, so it needs no record of the order in which a run bound its
+  names.
 - **[R6]** Tasks, sets, turns and cancellation flags are behavior and remain.
   Each task has its own histories.
 
@@ -1547,3 +1561,5 @@ and what asked for it:
 | 23 November 2026 | [R3] says what the erased semantics keeps of a history beside its atoms: the `□` at which a loop ended and the statement of `B₁` at which a fault occurred, where the availability of a name around the loop or the boundary depends on it. [R4] says that a scope is ended by the formulas of the statement at which it ends. | The erased interpreter and the backend (review findings RO5 and RB1): both ended an outer scope by the formulas of the statement that holds the loop or the boundary, which do not see what the body inside did, and compiled code freed a moved value a second time. |
 | 23 November 2026 | [R4] says what a name of the bodies around a boundary or a loop is after the statement, on a history on which the statement did not run: as it was before. | The layout of the erased semantics and the backend (review finding RB12): it gave the name the state in which the body left it on every history. The allocation count of the native harness found it. |
 | 24 November 2026 | [E-Host] says which values of an outcome type an operation gives, and section 8 asks that the answers of a faithful host and the arguments of the entry hold no other. | The generator of slice 2 (review finding RG7). [I12] lets a checked program assume the conditions of the operation of a value whose capture it does not see, and nothing said that a value from outside the execution has them: Theorem 1 was false as stated. A checked control that is given `out(low, 7)` of an operation whose `low` says `v ≤ 4` is stuck by `X7` at the exit that rests on it. The precondition is part of the definition because every captured value has it; [I12] uses the condition alone. |
+| 24 November 2026 | [E-Unwind] gives the order in which the slots of a scope and the parts of a value are released under a fault: the names of a body in the reverse of the order in which its text first binds them, the parts of a value from the first. [R5] refers to it. | The clause tests of the data rules (review finding RO12). The order was not stated, and a release is an event of the trace: the oracle released in the reverse of the order in which the run had bound the names, the erased semantics and compiled code in the order of the text, and the three differed on a program in which a name has a binder on each of two histories. The order of the text is the one an implementation has without a record of each run ([R4]). |
+| 24 November 2026 | [E-Assign] says that an assignment to a component looks its root up as [E-Var] does. | The same tests: [O4] asks [O2] of the root, and the semantics named the stuck state only for a whole name without a slot. The oracle reports it as `X2 E-Var`. |

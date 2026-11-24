@@ -1,0 +1,211 @@
+// [E-Resource], [E-Scope] A resource is created by the host, which records
+// it as open. An extern control that takes it by value completes it, unless
+// it returns it in its payload. To end a scope each of its slots is
+// visited: a moved slot is passed over, a value that contains an obligation
+// is stuck, and any other value is destroyed. A value contains an
+// obligation when it contains an open resource or a captured outcome, at
+// any depth ([T1], [O5]).
+
+extern resource file_handle
+
+struct holder {h : file_handle, note : string}
+
+variant slot {full {f : file_handle} │ free {}}
+
+extern control open_file()
+    ■ { opened {f : file_handle} }
+    uses file.read
+
+extern control read_file(f : &file_handle)
+    ■ { data {text : string} }
+    uses file.read
+
+extern control renew(f : file_handle)
+    ■ { renewed {g : file_handle} }
+    uses file.read
+
+extern control close_file(f : file_handle)
+    ■ { closed {} }
+    uses file.read
+
+extern control close_all(v : [file_handle])
+    ■ { closed {} }
+    uses file.read
+
+extern control close_map(m : string ⇀ file_handle)
+    ■ { closed {} }
+    uses file.read
+
+// A resource that is borrowed stays open, and one that is taken by value
+// is completed: its slot is moved and the scope ends.
+control opens_and_closes()
+    ■ { ok {text : string} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ r : Δ read_file(&f) ▸ data {text}
+    ⊤ ▷ c : Δ close_file(▾f) ▸ closed {}
+    ⊤ ▷ ■ ok {text}
+
+// X5: a name that holds an open resource when its scope ends.
+control left_in_name()
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ ■ ok {}
+
+// An extern control that returns the resource it took leaves it open. The
+// run that does not complete the returned one is stuck (X5).
+control returned_stays_open(close : bool)
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ n : Δ renew(▾f) ▸ renewed {g}
+    ⊤ ▷ t : ? close
+    t.true ▷ c : Δ close_file(▾g) ▸ closed {}
+    ⊤ ▷ ■ ok {}
+
+// A resource moves through a defined control as an argument and as a
+// payload, and the control that ends up with it completes it.
+control make()
+    ■ { made {f : file_handle} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ ■ made {▾f}
+
+control shut(f : file_handle)
+    ■ { done {} }
+    uses file.read
+    ⊤ ▷ c : Δ close_file(▾f) ▸ closed {}
+    ⊤ ▷ ■ done {}
+
+control crosses_controls()
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ m : Δ make() ▸ made {f}
+    ⊤ ▷ s : Δ shut(▾f) ▸ done {}
+    ⊤ ▷ ■ ok {}
+
+// X5: a parameter that holds one, at the exit.
+control keeps(f : file_handle)
+    ■ { done {} }
+    ⊤ ▷ ■ done {}
+
+control left_in_parameter()
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ m : Δ make() ▸ made {f}
+    ⊤ ▷ s : Δ keeps(▾f) ▸ done {}
+    ⊤ ▷ ■ ok {}
+
+// The payload of an exit is evaluated before the scopes end, so a resource
+// in it has left its slot: the entry gives it to whoever ran it.
+control exits_with_resource()
+    ■ { made {f : file_handle} }
+    uses file.read
+    ⊤ ▷ m : Δ make() ▸ made {f}
+    ⊤ ▷ ■ made {▾f}
+
+// A struct, a vector, a variant and a map that hold a resource are taken
+// apart, or given whole, and the resource is completed.
+control held_and_completed()
+    ■ { ok {text : string} }
+    uses file.read
+    ⊤ ▷ o1 : Δ open_file() ▸ opened {f1}
+    ⊤ ▷ o2 : Δ open_file() ▸ opened {f2}
+    ⊤ ▷ o3 : Δ open_file() ▸ opened {f3}
+    ⊤ ▷ o4 : Δ open_file() ▸ opened {f4}
+    ⊤ ▷ hd : holder := holder {▾f1, "kept"}
+    ⊤ ▷ v : [file_handle] := [▾f2]
+    ⊤ ▷ s : slot := slot.full {▾f3}
+    ⊤ ▷ ~m : string ⇀ file_handle := ∅
+    ⊤ ▷ i : Δ insert(&~m, "k", ▾f4) ▸ inserted {} │ replaced {old}
+    i.replaced ▷ ⊥
+    ⊤ ▷ holder {g1, note} := hd
+    ⊤ ▷ c1 : Δ close_file(▾g1) ▸ closed {}
+    ⊤ ▷ c2 : Δ close_all(▾v) ▸ closed {}
+    ⊤ ▷ d : Δ slot(▾s) ▸ full {g3} │ free {}
+    d.free ▷ ⊥
+    ⊤ ▷ c3 : Δ close_file(▾g3) ▸ closed {}
+    ⊤ ▷ r : Δ remove(&~m, "k") ▸ removed {g4} │ missing {}
+    r.removed ▷ c4 : Δ close_file(▾g4) ▸ closed {}
+    ⊤ ▷ cm : Δ close_map(▾m) ▸ closed {}
+    ⊤ ▷ ■ ok {note}
+
+// X5: the scope ends with the resource in a struct, in a vector, in a
+// variant and in a map.
+control left_in(which : u32)
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ a : ? which = 0
+    ⊤ ▷ b : ? which = 1
+    ⊤ ▷ c : ? which = 2
+    a.true ▷ hd : holder := holder {▾f, "kept"}
+    a.true ▷ ■ ok {}
+    b.true ▷ v : [file_handle] := [▾f]
+    b.true ▷ ■ ok {}
+    c.true ▷ s : slot := slot.full {▾f}
+    c.true ▷ ■ ok {}
+    ⊤ ▷ ~m : string ⇀ file_handle := ∅
+    ⊤ ▷ i : Δ insert(&~m, "k", ▾f) ▸ inserted {} │ replaced {old}
+    i.replaced ▷ ⊥
+    ⊤ ▷ ■ ok {}
+
+// A value without an obligation is destroyed with its scope, whatever its
+// shape: an empty vector of resources and a variant without one.
+control nothing_owed()
+    ■ { ok {} }
+    ⊤ ▷ v : [file_handle] := []
+    ⊤ ▷ s : slot := slot.free {}
+    ⊤ ▷ m : string ⇀ file_handle := ∅
+    ⊤ ▷ ■ ok {}
+
+// The scope of a loop body ends at `↑` and at `□` ([E-Again], [E-Leave]).
+// A resource opened in the body is completed in each round; `left` says in
+// which round it is not (X5), and whether the round goes round or leaves.
+control rounds(n : u32, left : u32)
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ lp : ↻ walk(i : u32 := 0) {
+        ⊤ ▷ o : Δ open_file() ▸ opened {f}
+        ⊤ ▷ skip : ? i = left
+        skip.false ▷ c : Δ close_file(▾f) ▸ closed {}
+        ⊤ ▷ end : ? i + 1 = n
+        end.true ▷ □ out {}
+        ⊤ ▷ ↑ walk(i + 1)
+    } ▸ out {}
+    ⊤ ▷ ■ ok {}
+
+// A loop parameter holds the resource from round to round, and the last
+// round completes it.
+control carried(n : u32)
+    ■ { ok {} }
+    uses file.read
+    ⊤ ▷ o : Δ open_file() ▸ opened {f}
+    ⊤ ▷ lp : ↻ walk(i : u32 := 0, g : file_handle := ▾f) {
+        ⊢ i ≤ n
+        ⊤ ▷ end : ? i = n
+        end.true ▷ c : Δ close_file(▾g) ▸ closed {}
+        end.true ▷ □ out {}
+        ⊤ ▷ ↑ walk(i + 1, ▾g)
+    } ▸ out {}
+    ⊤ ▷ ■ ok {}
+
+//! run opens_and_closes() with [open_file -> opened {file_handle#1}; read_file -> data {"ok"}; close_file -> closed] => done ok {"ok"} trace [open_file() -> opened {file_handle#1}; read_file(file_handle#1) -> data {"ok"}; close_file(file_handle#1) -> closed]
+//! run left_in_name() with [open_file -> opened {file_handle#1}] => stuck X5 E-Scope
+//! run returned_stays_open(true) with [open_file -> opened {file_handle#1}; renew -> renewed {file_handle#1}; close_file -> closed] => done ok trace [open_file() -> opened {file_handle#1}; renew(file_handle#1) -> renewed {file_handle#1}; close_file(file_handle#1) -> closed]
+//! run returned_stays_open(false) with [open_file -> opened {file_handle#1}; renew -> renewed {file_handle#1}] => stuck X5 E-Scope
+//! run returned_stays_open(true) with [open_file -> opened {file_handle#1}; renew -> renewed {file_handle#2}; close_file -> closed] => done ok trace [open_file() -> opened {file_handle#1}; renew(file_handle#1) -> renewed {file_handle#2}; close_file(file_handle#2) -> closed]
+//! run crosses_controls() with [open_file -> opened {file_handle#1}; close_file -> closed] => done ok
+//! run left_in_parameter() with [open_file -> opened {file_handle#1}] => stuck X5 E-Scope
+//! run exits_with_resource() with [open_file -> opened {file_handle#1}] => done made {file_handle#1}
+//! run held_and_completed() with [open_file -> opened {file_handle#1}; open_file -> opened {file_handle#2}; open_file -> opened {file_handle#3}; open_file -> opened {file_handle#4}; close_file -> closed; close_all -> closed; close_file -> closed; close_file -> closed; close_map -> closed] => done ok {"kept"} trace [open_file() -> opened {file_handle#1}; open_file() -> opened {file_handle#2}; open_file() -> opened {file_handle#3}; open_file() -> opened {file_handle#4}; close_file(file_handle#1) -> closed; close_all([file_handle#2]) -> closed; close_file(file_handle#3) -> closed; close_file(file_handle#4) -> closed; close_map(∅) -> closed]
+//! run left_in(0) with [open_file -> opened {file_handle#1}] => stuck X5 E-Scope
+//! run left_in(1) with [open_file -> opened {file_handle#1}] => stuck X5 E-Scope
+//! run left_in(2) with [open_file -> opened {file_handle#1}] => stuck X5 E-Scope
+//! run left_in(3) with [open_file -> opened {file_handle#1}] => stuck X5 E-Scope
+//! run nothing_owed() => done ok
+//! run rounds(2, 9) with [open_file -> opened {file_handle#1}; close_file -> closed; open_file -> opened {file_handle#2}; close_file -> closed] => done ok
+//! run rounds(2, 0) with [open_file -> opened {file_handle#1}] => stuck X5 E-Scope
+//! run rounds(2, 1) with [open_file -> opened {file_handle#1}; close_file -> closed; open_file -> opened {file_handle#2}] => stuck X5 E-Scope
+//! run carried(2) with [open_file -> opened {file_handle#1}; close_file -> closed] => done ok trace [open_file() -> opened {file_handle#1}; close_file(file_handle#1) -> closed]
