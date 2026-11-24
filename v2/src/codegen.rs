@@ -5984,6 +5984,58 @@ fn emit_harness_value_into(
                 let _ = writeln!(ir, "  store {u} {n}, ptr %mp2_{did}");
             }
         }
+        // A value of an outcome type that an entry is given or a host
+        // answers with: the alternative and its payload, laid out as a
+        // capture lays them out.
+        (
+            Value::Outcome {
+                alternative,
+                payload,
+                ..
+            },
+            Type::Outcome(oid, _),
+        ) => {
+            if is_unit_outcome(program, *oid) {
+                let _ = writeln!(ir, "  store i32 {alternative}, ptr {dst_ptr}");
+            } else {
+                let ll = format!("%vn2.outcome.{oid}");
+                let _ = writeln!(ir, "  store {ll} zeroinitializer, ptr {dst_ptr}");
+                let tid = next_tmp(tmp_id);
+                let _ = writeln!(
+                    ir,
+                    "  %ho_t_{tid} = getelementptr {ll}, ptr {dst_ptr}, i32 0, i32 0"
+                );
+                let _ = writeln!(ir, "  store i32 {alternative}, ptr %ho_t_{tid}");
+                if !payload.is_empty() {
+                    let sub_ll = format!("%vn2.outcome.{oid}.a{alternative}");
+                    let _ = writeln!(
+                        ir,
+                        "  %ho_p_{tid} = getelementptr {ll}, ptr {dst_ptr}, i32 0, i32 1"
+                    );
+                    for (fi, (fval, fparam)) in payload
+                        .iter()
+                        .zip(&program.outcomes[*oid].alternatives[*alternative].fields)
+                        .enumerate()
+                    {
+                        let fid = next_tmp(tmp_id);
+                        let _ = writeln!(
+                            ir,
+                            "  %hof_{fid} = getelementptr {sub_ll}, ptr %ho_p_{tid}, i32 0, i32 {fi}"
+                        );
+                        emit_harness_value_into(
+                            ir,
+                            program,
+                            reg,
+                            fval,
+                            &fparam.ty,
+                            &format!("%hof_{fid}"),
+                            tmp_id,
+                            lent.as_deref_mut(),
+                        );
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }

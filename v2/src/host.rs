@@ -259,7 +259,9 @@ pub fn draw_value(rng: &mut Rng, ty: &Type, arguments: &[Value], config: &Config
     }
 }
 
-/// Draws a value of any slice 1 or slice 2 type `ty` using `program` definitions.
+/// Draws a value of any slice 1 or slice 2 type `ty` using `program`
+/// definitions. `None` where the type holds an outcome type and no value of
+/// it was found ([`draw_outcome`]).
 pub fn draw_value_in_program(
     program: &Program,
     rng: &mut Rng,
@@ -267,8 +269,8 @@ pub fn draw_value_in_program(
     arguments: &[Value],
     config: &Config,
     next_res: &mut u64,
-) -> Value {
-    match ty.deref_type() {
+) -> Option<Value> {
+    Some(match ty.deref_type() {
         Type::Bool => Value::Bool(rng.chance(1, 2)),
         Type::Int(int_ty) => Value::Int(draw_int(rng, *int_ty, arguments, config)),
         Type::String => {
@@ -280,7 +282,7 @@ pub fn draw_value_in_program(
                 .fields
                 .iter()
                 .map(|f| draw_value_in_program(program, rng, &f.ty, arguments, config, next_res))
-                .collect();
+                .collect::<Option<Vec<Value>>>()?;
             Value::Struct {
                 ty: *sid,
                 name: name.clone(),
@@ -295,7 +297,7 @@ pub fn draw_value_in_program(
                 .fields
                 .iter()
                 .map(|f| draw_value_in_program(program, rng, &f.ty, arguments, config, next_res))
-                .collect();
+                .collect::<Option<Vec<Value>>>()?;
             Value::Variant {
                 ty: *vid,
                 name: name.clone(),
@@ -308,15 +310,15 @@ pub fn draw_value_in_program(
             let len = rng.below(4) as usize;
             let items = (0..len)
                 .map(|_| draw_value_in_program(program, rng, elem_ty, arguments, config, next_res))
-                .collect();
+                .collect::<Option<Vec<Value>>>()?;
             Value::Vector(items)
         }
         Type::Map(k_ty, v_ty) => {
             let len = rng.below(3) as usize;
             let mut entries = BTreeMap::new();
             for _ in 0..len {
-                let k = draw_value_in_program(program, rng, k_ty, arguments, config, next_res);
-                let v = draw_value_in_program(program, rng, v_ty, arguments, config, next_res);
+                let k = draw_value_in_program(program, rng, k_ty, arguments, config, next_res)?;
+                let v = draw_value_in_program(program, rng, v_ty, arguments, config, next_res)?;
                 entries.insert(k, v);
             }
             Value::Map(entries)
@@ -329,24 +331,169 @@ pub fn draw_value_in_program(
                 id: *next_res,
             }
         }
-        Type::Outcome(oid, _) => {
-            let odef = &program.outcomes[*oid];
-            let aidx = rng.index(odef.alternatives.len());
-            let alt = &odef.alternatives[aidx];
-            let payload = alt
+        Type::Outcome(oid, _) => draw_outcome(program, rng, *oid, config, next_res)?,
+        _ => Value::Int(Int::zero()),
+    })
+}
+
+/// What each condition of the contract of `control` says of each field of
+/// its alternative in plain bounds, for `arguments`. A value drawn within
+/// them most often satisfies the condition.
+fn field_bounds(control: &Control, arguments: &[Value]) -> Vec<Vec<(Option<i128>, Option<i128>)>> {
+    control
+        .contract
+        .iter()
+        .map(|alternative| match &alternative.condition {
+            Some(condition) => plain_bounds(
+                condition,
+                arguments,
+                alternative.fields.len(),
+                &|name| match name {
+                    VarRef::Field(index) => Some(*index),
+                    _ => None,
+                },
+            ),
+            None => Vec::new(),
+        })
+        .collect()
+}
+
+/// A payload for `alternative`, each integer field within its plain bounds
+/// where it has some. Whether the condition holds of it is for the caller.
+fn draw_payload(
+    program: &Program,
+    rng: &mut Rng,
+    alternative: &typed::Alternative,
+    bounds: &[(Option<i128>, Option<i128>)],
+    arguments: &[Value],
+    config: &Config,
+    next_res: &mut u64,
+) -> Option<Vec<Value>> {
+    alternative
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let bounded = match (&field.ty, bounds.get(index)) {
+                (Type::Int(int_ty), Some((low, high))) if low.is_some() || high.is_some() => {
+                    draw_int_between(rng, *int_ty, *low, *high, config)
+                }
+                _ => None,
+            };
+            match bounded {
+                Some(number) => Some(Value::Int(number)),
+                None => draw_value_in_program(program, rng, &field.ty, arguments, config, next_res),
+            }
+        })
+        .collect()
+}
+
+/// A value of the outcome type `oid` as the operation of that name could
+/// have given it ([I12]): for some arguments that satisfy the precondition
+/// of the operation, an alternative and a payload of which its condition
+/// holds. A checked program may assume that much of a value of the type
+/// that it did not capture itself, so a host and an entry give no other.
+/// A declared outcome type has no conditions. `None` where the attempts
+/// found no such value.
+pub fn draw_outcome(
+    program: &Program,
+    rng: &mut Rng,
+    oid: usize,
+    config: &Config,
+    next_res: &mut u64,
+) -> Option<Value> {
+    let odef = &program.outcomes[oid];
+    let made = |alternative: usize, payload: Vec<Value>| Value::Outcome {
+        ty: oid,
+        alternative,
+        alternative_name: odef.alternatives[alternative].name.clone(),
+        payload,
+    };
+    let Some(control) = program
+        .controls
+        .iter()
+        .find(|control| control.name == odef.name)
+    else {
+        let alternative = rng.index(odef.alternatives.len());
+        let payload = odef.alternatives[alternative]
+            .fields
+            .iter()
+            .map(|f| draw_value_in_program(program, rng, &f.ty, &[], config, next_res))
+            .collect::<Option<Vec<Value>>>()?;
+        return Some(made(alternative, payload));
+    };
+    let hints = hints_of(control.precondition.as_ref(), &[]);
+    let of_parameters = match &control.precondition {
+        Some(pre) => plain_bounds(pre, &[], control.parameters.len(), &|name| match name {
+            VarRef::Parameter(index) => Some(*index),
+            _ => None,
+        }),
+        None => vec![(None, None); control.parameters.len()],
+    };
+    let count = control.contract.len();
+    for _ in 0..24 {
+        // The arguments are imagined: what they hold is no value of the
+        // execution, and a resource among them has no number of its own.
+        let mut imagined = *next_res;
+        let arguments: Option<Vec<Value>> = control
+            .parameters
+            .iter()
+            .zip(&of_parameters)
+            .map(|(parameter, (low, high))| match parameter.ty.deref_type() {
+                Type::Int(ty) => Some(Value::Int(
+                    draw_int_between(rng, *ty, *low, *high, config)
+                        .unwrap_or_else(|| draw_int_near(rng, *ty, &hints, config)),
+                )),
+                other => draw_value_in_program(program, rng, other, &[], config, &mut imagined),
+            })
+            .collect();
+        let Some(arguments) = arguments else {
+            continue;
+        };
+        if let Some(pre) = &control.precondition
+            && !signature_holds(program, config, pre, &arguments, &[])
+        {
+            continue;
+        }
+        let bounds = field_bounds(control, &arguments);
+        let start = rng.index(count);
+        for attempt in 0..count * 8 {
+            let which = (start + attempt) % count;
+            let alternative = &control.contract[which];
+            // A borrow in a payload names a place of an argument, and here
+            // there is none.
+            if alternative
                 .fields
                 .iter()
-                .map(|f| draw_value_in_program(program, rng, &f.ty, arguments, config, next_res))
-                .collect();
-            Value::Outcome {
-                ty: *oid,
-                alternative: aidx,
-                alternative_name: alt.name.clone(),
-                payload,
+                .any(|field| program.contains_borrow_or_view(&field.ty))
+            {
+                continue;
+            }
+            let mut resources = *next_res;
+            let Some(payload) = draw_payload(
+                program,
+                rng,
+                alternative,
+                &bounds[which],
+                &arguments,
+                config,
+                &mut resources,
+            ) else {
+                continue;
+            };
+            let valid = match &alternative.condition {
+                None => true,
+                Some(condition) => {
+                    signature_holds(program, config, condition, &arguments, &payload)
+                }
+            };
+            if valid {
+                *next_res = resources;
+                return Some(made(which, payload));
             }
         }
-        _ => Value::Int(Int::zero()),
     }
+    None
 }
 
 fn draw_int(rng: &mut Rng, ty: IntType, arguments: &[Value], config: &Config) -> Int {
@@ -883,7 +1030,7 @@ impl Seeded<'_> {
                             lending.arguments,
                             lending.config,
                             next_res,
-                        );
+                        )?;
                         (value.clone(), value)
                     };
                     answered.push(value);
@@ -924,55 +1071,25 @@ impl Host for Seeded<'_> {
         };
         let count = control.contract.len();
         let start = rng.index(count);
-        // What each condition says of each field in plain bounds. A value
-        // drawn within them most often satisfies the condition; whether it
-        // does is decided below, by the condition itself.
-        let bounds: Vec<Vec<(Option<i128>, Option<i128>)>> = control
-            .contract
-            .iter()
-            .map(|alternative| match &alternative.condition {
-                Some(condition) => plain_bounds(
-                    condition,
-                    arguments,
-                    alternative.fields.len(),
-                    &|name| match name {
-                        VarRef::Field(index) => Some(*index),
-                        _ => None,
-                    },
-                ),
-                None => Vec::new(),
-            })
-            .collect();
+        // A value drawn within the plain bounds of a condition most often
+        // satisfies it; whether it does is decided below, by the condition
+        // itself.
+        let bounds = field_bounds(control, arguments);
         for attempt in 0..192 {
             let which = (start + attempt) % count;
             let alternative = &control.contract[which];
             let mut res_counter = self.next_res;
-            let mut payload: Vec<Value> = alternative
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    let bounded = match (&field.ty, bounds[which].get(index)) {
-                        (Type::Int(int_ty), Some((low, high)))
-                            if low.is_some() || high.is_some() =>
-                        {
-                            draw_int_between(&mut rng, *int_ty, *low, *high, config)
-                        }
-                        _ => None,
-                    };
-                    match bounded {
-                        Some(number) => Value::Int(number),
-                        None => draw_value_in_program(
-                            self.program,
-                            &mut rng,
-                            &field.ty,
-                            arguments,
-                            config,
-                            &mut res_counter,
-                        ),
-                    }
-                })
-                .collect();
+            let Some(mut payload) = draw_payload(
+                self.program,
+                &mut rng,
+                alternative,
+                &bounds[which],
+                arguments,
+                config,
+                &mut res_counter,
+            ) else {
+                continue;
+            };
             // A borrow of the payload names a place within an origin; the
             // condition reads the value there.
             let mut referred = payload.clone();

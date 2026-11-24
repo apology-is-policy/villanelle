@@ -397,3 +397,127 @@ fn the_checker_accepts_generated_valid_programs() {
     assert!(findings.is_empty(), "{}", findings.join("\n"));
     assert_eq!(report.accepted, 40);
 }
+
+/// A program in which a value of an outcome type crosses contracts: `taker`
+/// is given one, and `asker` receives one in the answer of a host. The
+/// checker accepts both controls by what the conditions of `scale` say of
+/// the payload, over names for arguments that it does not see ([I12]).
+const OUTCOMES_ACROSS_CONTRACTS: &str = r#"
+extern control scale(by : u32)
+    ⊢ by ≤ 9
+    ■ { low {v : u32} ⇐ by ≤ 4 ∧ v ≤ by │ high {v : u32} ⇐ by > 4 ∧ by ≤ 9 ∧ v ≥ 100 ∧ v ≤ 100 + by }
+
+extern control source(n : u32)
+    ■ { given {o : outcome⟨scale⟩, k : u32} ⇐ k ≤ n │ none {} }
+    uses net
+
+control taker(o : outcome⟨scale⟩)
+    ■ { small {v : u32} ⇐ v ≤ 4 │ large {v : u32} ⇐ v ≥ 100 ∧ v ≤ 109 }
+    1  ⊤ ▷ d : Δ outcome(▾o) ▸ low {v} │ high {v}
+    2  d.low ▷ ■ small {v}
+    3  d.high ▷ ■ large {v}
+
+control asker(n : u32)
+    ■ { small {v : u32} ⇐ v ≤ 4 │ large {v : u32} ⇐ v ≥ 100 ∧ v ≤ 109 │ none {} }
+    uses net
+    1  ⊤ ▷ s : Δ source(n) ▸ given {o, k} │ none {}
+    2  s.none ▷ ■ none {}
+    3  s.given ▷ d : Δ outcome(▾o) ▸ low {v} │ high {v}
+    4  d.low ▷ ■ small {v}
+    5  d.high ▷ ■ large {v}
+"#;
+
+/// Review finding RG7. A value of an outcome type that an entry is given or
+/// that a host answers with is one that the operation could have given: its
+/// alternative and payload satisfy the condition of the alternative for
+/// some arguments. A checked program may assume that much of a value whose
+/// capture it does not see, so a harness that drew any value of the type
+/// would report a stuck run of a program that the checker rightly accepts.
+#[test]
+fn a_drawn_value_of_an_outcome_type_is_one_that_its_operation_gives_i12() {
+    use villanelle_v2::generate::entry_runs;
+    use villanelle_v2::oracle::Value;
+
+    let program = villanelle_v2::load(OUTCOMES_ACROSS_CONTRACTS).expect("resolved");
+    let checked = villanelle_v2::check::check(&program);
+    assert!(checked.is_ok(), "the checker accepts the program");
+    let config = Config::default();
+    // What the conditions of `scale` allow: `low` up to 4, `high` from 100
+    // to 109.
+    let allowed = |value: &Value| {
+        let Value::Outcome {
+            alternative_name,
+            payload,
+            ..
+        } = value
+        else {
+            return false;
+        };
+        let Some(Value::Int(number)) = payload.first() else {
+            return false;
+        };
+        let number = number.to_i128().expect("a small number");
+        match alternative_name.as_str() {
+            "low" => number <= 4,
+            "high" => (100..=109).contains(&number),
+            _ => false,
+        }
+    };
+
+    // The entries of `taker`.
+    let mut rng = Rng::new(7);
+    let entries = entry_runs(&mut rng, &program, &config, 60);
+    let mut alternatives = BTreeSet::new();
+    let mut taken = 0;
+    for (entry, arguments) in &entries {
+        if entry != "taker" {
+            continue;
+        }
+        taken += 1;
+        assert!(allowed(&arguments[0]), "{:?}", arguments[0]);
+        if let Value::Outcome {
+            alternative_name, ..
+        } = &arguments[0]
+        {
+            alternatives.insert(alternative_name.clone());
+        }
+        let mut host = Seeded::new(&program, taken);
+        let outcome = compare(&program, entry, arguments.clone(), &mut host, &config);
+        assert!(
+            matches!(outcome.oracle.end, End::Done { .. }),
+            "{:?}",
+            outcome.oracle.end
+        );
+        assert_eq!(outcome.verdict, Verdict::Same);
+    }
+    assert_eq!(taken, 60);
+    assert_eq!(alternatives.len(), 2, "{alternatives:?}");
+
+    // The answers of the host of `asker`.
+    let mut ends = BTreeSet::new();
+    for seed in 0..200u64 {
+        let mut host = Seeded::new(&program, seed);
+        let arguments = vec![Value::Int(villanelle_v2::int::Int::from_u64(seed % 12))];
+        let outcome = compare(&program, "asker", arguments, &mut host, &config);
+        let End::Done { alternative, .. } = &outcome.oracle.end else {
+            panic!("seed {seed}: {:?}", outcome.oracle.end);
+        };
+        ends.insert(alternative.clone());
+        assert_eq!(outcome.verdict, Verdict::Same);
+    }
+    assert_eq!(ends.len(), 3, "{ends:?}");
+
+    // A value that the operation could not have given leaves the program
+    // stuck, which the checker accepted: that is what the harness must not
+    // draw.
+    let stuck = villanelle_v2::script::check(&format!(
+        "{OUTCOMES_ACROSS_CONTRACTS}
+//! run taker(outcome.low {{3}}) => done small {{3}}
+//! run taker(outcome.high {{105}}) => done large {{105}}
+//! run taker(outcome.low {{7}}) => stuck X7 E-Exit
+//! run asker(1) with [source -> given {{outcome.high {{300}}, 1}}] => stuck X7 E-Exit
+"
+    ));
+    assert!(stuck.failures.is_empty(), "{:?}", stuck.failures);
+    assert_eq!(stuck.runs, 4);
+}

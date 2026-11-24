@@ -1421,6 +1421,269 @@ control c(start : string)
 }
 
 #[test]
+fn a_loop_further_out_is_restarted_as_the_one_around_is_o2_o5_o6() {
+    // The shapes that the generator of slice 2 writes since 24 November: a
+    // boundary in the work of another, and `recover ↑ ℓ` for a loop further
+    // out than the body in which the boundary stands. The restart ends
+    // every body from that of `ℓ` to the contingency ([O5]), it reads the
+    // parameters of `ℓ` ([O2]) and it leaves the names around `ℓ` as the
+    // loop found them ([O6]), all in the state of the fault, also where the
+    // fault came through a contingency that passed it on. The programs that
+    // the checker accepts are in
+    // `tests/slice2/checked_nested_boundaries.core`.
+
+    // The work around holds a connection where the work inside it faults,
+    // and the contingency of that one restarts the loop.
+    stuck_and_rejected(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c(first : bool)
+    ■ { ok {} }
+    faults
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(~i : u32 := 0) {
+           ⊢ i ≤ 2
+           1  ⊤ ▷ t : ? i < 2
+           2  t.false ▷ □ done {}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ outer : boundary {
+                  1  ⊤ ▷ o : Δ open_conn() ▸ opened {x}
+                  2  ⊤ ▷ inner : boundary {
+                         1  ⊤ ▷ r : Δ risky(first) ▸ fine {}
+                     } contingency (m : string) {
+                         1  ⊤ ▷ recover ↑ retry
+                     }
+                  3  ⊤ ▷ k : Δ close_conn(x) ▸ closed {}
+              } contingency (m2 : string) {
+                  1  ⊤ ▷ escalate
+              }
+           5  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! run c(true) with [open_conn -> opened {conn#1}] => stuck X5 E-Scope
+//! run c(false) with [open_conn -> opened {conn#1}; close_conn -> closed] => done ok
+"#,
+        ),
+    );
+    // The body of a loop between holds it.
+    stuck_and_rejected(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c(first : bool)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(~i : u32 := 0) {
+           ⊢ i ≤ 2
+           1  ⊤ ▷ t : ? i < 2
+           2  t.false ▷ □ done {}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ l2 : ↻ within(j : u32 := 0) {
+                  1  ⊤ ▷ o : Δ open_conn() ▸ opened {x}
+                  2  ⊤ ▷ b : boundary {
+                         1  ⊤ ▷ r : Δ risky(first) ▸ fine {}
+                     } contingency (m : string) {
+                         1  ⊤ ▷ recover ↑ retry
+                     }
+                  3  ⊤ ▷ k : Δ close_conn(x) ▸ closed {}
+                  4  ⊤ ▷ □ end {}
+              } ▸ end {}
+           5  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! run c(true) with [open_conn -> opened {conn#1}] => stuck X5 E-Scope
+//! run c(false) with [open_conn -> opened {conn#1}; close_conn -> closed] => done ok
+"#,
+        ),
+    );
+    // The inner contingency passes the fault on and the outer one restarts
+    // the loop, whose body holds the connection where the inner work
+    // faults.
+    stuck_and_rejected(
+        "O5",
+        &with_fault_prelude(
+            r#"
+control c(first : bool)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(~i : u32 := 0) {
+           ⊢ i ≤ 2
+           1  ⊤ ▷ t : ? i < 2
+           2  t.false ▷ □ done {}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ o : Δ open_conn() ▸ opened {x}
+           5  ⊤ ▷ outer : boundary {
+                  1  ⊤ ▷ inner : boundary {
+                         1  ⊤ ▷ r : Δ risky(first) ▸ fine {}
+                         2  ⊤ ▷ k : Δ close_conn(x) ▸ closed {}
+                     } contingency (m : string) {
+                         1  ⊤ ▷ escalate
+                     }
+              } contingency (m2 : string) {
+                  1  ⊤ ▷ recover ↑ retry
+              }
+           6  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! run c(true) with [open_conn -> opened {conn#1}] => stuck X5 E-Scope
+//! run c(false) with [open_conn -> opened {conn#1}; close_conn -> closed] => done ok
+"#,
+        ),
+    );
+    // The work, in the body of a loop between, moves a name from around the
+    // loop that is restarted, and the next iteration finds it gone.
+    stuck_and_rejected(
+        "O6",
+        &with_fault_prelude(
+            r#"
+control c(start : string)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(~i : u32 := 0) {
+           ⊢ i ≤ 2
+           1  ⊤ ▷ t : ? i < 2
+           2  t.false ▷ □ done {}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ l2 : ↻ within(j : u32 := 0) {
+                  1  ⊤ ▷ b : boundary {
+                         1  ⊤ ▷ k : Δ keep(start) ▸ kept {}
+                         2  ⊤ ▷ fault "again"
+                     } contingency (m : string) {
+                         1  ⊤ ▷ recover ↑ retry
+                     }
+                  2  ⊤ ▷ □ end {}
+              } ▸ end {}
+           5  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! run c("a") with [keep -> kept] => stuck X2 E-Var
+"#,
+        ),
+    );
+    // The same where the fault comes through a contingency that passes it
+    // on.
+    stuck_and_rejected(
+        "O6",
+        &with_fault_prelude(
+            r#"
+control c(start : string)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(~i : u32 := 0) {
+           ⊢ i ≤ 2
+           1  ⊤ ▷ t : ? i < 2
+           2  t.false ▷ □ done {}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ outer : boundary {
+                  1  ⊤ ▷ inner : boundary {
+                         1  ⊤ ▷ k : Δ keep(start) ▸ kept {}
+                         2  ⊤ ▷ fault "again"
+                     } contingency (m : string) {
+                         1  ⊤ ▷ escalate
+                     }
+              } contingency (m2 : string) {
+                  1  ⊤ ▷ recover ↑ retry
+              }
+           5  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! run c("a") with [keep -> kept] => stuck X2 E-Var
+"#,
+        ),
+    );
+    // The body of a loop between consumes a parameter of the loop that is
+    // restarted, and `recover` reads it.
+    stuck_and_rejected(
+        "O2",
+        &with_fault_prelude(
+            r#"
+control c(start : string)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ lp : ↻ retry(~i : u32 := 0, s : string := start) {
+           ⊢ i ≤ 2
+           1  ⊤ ▷ t : ? i < 2
+           2  t.false ▷ □ done {}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ l2 : ↻ within(j : u32 := 0) {
+                  1  ⊤ ▷ k : Δ keep(s) ▸ kept {}
+                  2  ⊤ ▷ b : boundary {
+                         1  ⊤ ▷ fault "again"
+                     } contingency (m : string) {
+                         1  ⊤ ▷ recover ↑ retry
+                     }
+                  3  ⊤ ▷ □ end {}
+              } ▸ end {}
+           5  ⊤ ▷ □ done {}
+       } ▸ done {}
+    2  ⊤ ▷ ■ ok {}
+
+//! run c("a") with [keep -> kept] => stuck X2 E-Var
+"#,
+        ),
+    );
+}
+
+#[test]
+fn a_name_in_the_care_of_a_boundary_is_the_constant_it_was_i3() {
+    // Review finding RC24. A name with a single binder that is bound to a
+    // constant expression is a constant expression ([I3]), and the care
+    // list of a boundary binds nothing: in the contingency the name is the
+    // one that the boundary took. The checker held it for a name of which
+    // only the value is known, so a product with it was no linear term and
+    // a valid program was refused.
+    done_and_accepted(
+        "I3",
+        &with_fault_prelude(
+            r#"
+control c(first : bool)
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ k : u32 := 2 + 1
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ r : Δ risky(first) ▸ fine {}
+       } contingency [k] (m : string) {
+           1  ⊤ ▷ twice : u32 := k + k
+           2  ⊤ ▷ ⊢ k * (k mod 2) = 3 ∧ twice * k = 18
+           3  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ■ ok {}
+
+//! run c(true) => faulted "risk"
+//! run c(false) => done ok
+"#,
+        ),
+    );
+    // The constant is the one that the name has.
+    stuck_and_rejected(
+        "P1",
+        &with_fault_prelude(
+            r#"
+control c(first : bool)
+    ■ { ok {} }
+    faults
+    1  ⊤ ▷ k : u32 := 2 + 1
+    2  ⊤ ▷ b : boundary {
+           1  ⊤ ▷ r : Δ risky(first) ▸ fine {}
+       } contingency [k] (m : string) {
+           1  ⊤ ▷ ⊢ k * (k mod 2) = 4
+           2  ⊤ ▷ escalate
+       }
+    3  ⊤ ▷ ■ ok {}
+
+//! run c(true) => stuck X7 E-Oblige
+"#,
+        ),
+    );
+}
+
+#[test]
 fn what_a_boundary_has_in_its_care_ends_with_its_work_o5() {
     // Review finding RC5 ([E-Boundary]): when `B₁` ends otherwise than by a
     // fault, what the boundary took into its care ends with it.

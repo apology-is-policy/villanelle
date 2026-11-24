@@ -1,0 +1,70 @@
+// Open finding RC22 of docs/v2/review.md: a valid program, written by the
+// generator of slice 2 (seed 287 on 24 November 2026, with a boundary in
+// the work of another), which the checker accepts after about a minute, in
+// 275 theory checks: the time goes into memory and not into the search. No
+// run of it is stuck. No test reads this file.
+┄ seed 287
+copy struct st0 {m0 : bool}
+
+variant vt0 { low {} │ ok {m0 : u8} }
+
+extern control e0() ■ { left {r0 : u32, r1 : usize} ⇐ r0 ≤ 7 ∧ r1 ≥ 36 │ low {} │ stop {r0 : [u8]} }
+
+contingent extern control e1(p0 : usize, p1 : [u8], p2 : bool) ⊢ p0 ≥ 4294967295 ∧ p0 ≤ 4294967295 ∧ len(p1) ≥ 1 ■ { high {r0 : u64} │ left {} }
+
+control c0() ■ { done {r0 : u8} │ some {} │ hit {} } faults
+⊤ ▷ ~v1 : usize := 7
+⊤ ▷ ⊢ v1 = 7
+⊤ ▷ v2 := v1 mod 2 mod 4
+⊤ ▷ v3 : outcome⟨e0⟩ := capture e0()
+⊤ ▷ d4 : Δ e0() ▸ left {v5, v6} │ low {} │ stop {v7}
+⊤ ▷ ~v8 : st0 := st0 {v1 + 6 ≥ 13}
+d4.stop ▷ v1 ← len(v7) mod 9 * 0 mod 2
+d4.stop ▷ b11 : boundary {
+    ⊤ ▷ v8.m0 ← 0 ≤ 1
+    ⊤ ▷ ~v9 : usize := 0 mod 3 * (2 mod 2) mod 9 mod 7
+    ⊤ ▷ st0 {v10} := v8
+    ⊤ ▷ fault ""
+} contingency [v1, v3] (m12 : string) {
+    ⊤ ▷ ~v13 := v1 mod 6
+    ⊤ ▷ ⊢ v13 = v1 mod 6
+    ⊤ ▷ v14 := capture e1(4294967295, [3 * 1], 4294967295 ≤ len(m12) ∨ 5 < 4 * 0)
+    ⊤ ▷ ~v15 : string ⇀ usize := ∅
+    ⊤ ▷ escalate
+}
+⊤ ▷ t16 : ? 1 ÷ 9 = 4294967294 + 0
+⊤ ▷ d17 : Δ e1(4294967295, [6 mod 7, 1 ÷ 8], 7 < v2 ∨ 2 * 0 > 5 + 0) ▸ high {v18} │ left {}
+⊤ ▷ s19 : ↻ l20(~i21 : u8 := 0) {
+    ⊢ 1 ≥ i21
+    ⊤ ▷ t22 : ? i21 < 1
+    ¬t22.false ∧ t16.false ▷ i21 ← i21 + 1
+    ¬t22.false ∧ t16.false ▷ b29 : boundary {
+        ⊤ ▷ ⊢ v2 < 2 ∨ v1 ≥ 6 ÷ 7
+        ⊤ ▷ b25 : boundary {
+            ⊤ ▷ t23 : ? 13 ≠ 2 + v1 + 5
+            t23.true ∧ t22.true ▷ v24 : i64 := 6 ÷ -4
+            t23.true ∧ t22.true ▷ ⊢ v24 = 6 ÷ -4
+            ¬t23.false ▷ ⊢ v1 ≤ 7
+            ⊤ ▷ fault "a"
+        } contingency [v1] {
+            ⊤ ▷ t26 : ? v1 + 1 * v1 ≥ 3
+            t26.true ▷ st0 {v27} := st0 {v1 mod v1 = v1 mod 5}
+            t26.true ∨ t26.true ▷ st0 {v28} := st0 {4 * 3 ≥ 8}
+            ⊤ ▷ recover ↑ l20
+        }
+        b25.done ▷ ⊥
+    } contingency (m30 : string) {
+        ⊤ ▷ ⊥
+    }
+    ¬t22.false ∧ t16.false ∧ b29.done ▷ ⊥
+    ⊤ ▷ v31 : i64 := -6 mod 7 * ((-3 - 9) mod 3)
+    ⊤ ▷ v32 : st0 := st0 {8 ≤ 5 * 1 ∨ v2 > 2}
+    ⊤ ▷ v33 : usize := 5
+    ⊤ ▷ □ hit {v32, v33}
+} ▸ hit {v34, v35}
+⊤ ▷ d36 : Δ e1(4294967295, [0, 255], v2 + 8 ≥ 10) ▸ high {v37} │ left {}
+d17.left ▷ d41 : Δ outcome(v3) ▸ left {v38, v39} │ low {} │ stop {v40}
+d17.left ▷ ■ some {}
+⊤ ▷ d45 : Δ outcome(v3) ▸ left {v42, v43} │ low {} │ stop {v44}
+⊤ ▷ ■ some {}
+

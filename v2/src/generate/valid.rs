@@ -64,6 +64,11 @@ const COMPARISONS: [Binary; 6] = [
 const MAX_HISTORIES: usize = 24;
 /// The control body and at most two loops inside each other.
 const MAX_BODIES: usize = 3;
+/// With the data of slice 2, the bodies of loops and the works of boundaries
+/// that stand in each other, the body of the control among them.
+const MAX_DEPTH: usize = 5;
+/// The works of lexical boundaries that stand in each other.
+const MAX_WORKS: usize = 2;
 const MAX_LOOPS: usize = 3;
 /// How deep the calls of functions nest in one expression. The arguments of
 /// a call are expressions of their own, with a budget of their own.
@@ -248,6 +253,10 @@ struct Slot {
     definition: Option<Expr>,
     /// Whether the value has moved out of the name on this history ([O3]).
     gone: bool,
+    /// For the counter of a loop: whether an assignment has moved it on
+    /// this history since the loop went round. The loop can then go round
+    /// with the counter as it is, and that is what `recover ↑ ℓ` does.
+    turned: bool,
     /// The body that binds the name, as an index into the bodies being
     /// written.
     home: usize,
@@ -651,6 +660,7 @@ impl Lib<'_> {
                     know,
                     definition: None,
                     gone: false,
+                    turned: false,
                     home: 0,
                 },
             );
@@ -1016,6 +1026,7 @@ fn merge(paths: &[&Path]) -> Env {
             Some(theirs) if theirs.ty == slot.ty && theirs.mutable == slot.mutable => {
                 slot.know = slot.know.hull(&theirs.know);
                 slot.gone |= theirs.gone;
+                slot.turned &= theirs.turned;
                 let same = match (&slot.definition, &theirs.definition) {
                     (Some(ours), Some(theirs)) => ours.to_string() == theirs.to_string(),
                     _ => false,
@@ -1708,7 +1719,14 @@ impl Generator<'_> {
             if callable {
                 choices.push((4, Step::Decide));
             }
-            if self.scopes.len() < MAX_BODIES && self.loops < MAX_LOOPS {
+            // The works of boundaries do not count among the bodies of
+            // loops that stand in each other.
+            let loops = self
+                .scopes
+                .iter()
+                .filter(|scope| scope.looping.is_some())
+                .count();
+            if loops + 1 < MAX_BODIES && self.scopes.len() < MAX_DEPTH && self.loops < MAX_LOOPS {
                 choices.push((2, Step::Loop));
             }
         }
@@ -1718,7 +1736,8 @@ impl Generator<'_> {
         if self.data {
             choices.push((9, Step::Data));
             if room && self.boundary_fits() {
-                choices.push((2, Step::Boundary));
+                let weight = if self.recoverable(running) { 5 } else { 2 };
+                choices.push((weight, Step::Boundary));
             }
             if !self.boundaries.is_empty() {
                 choices.push((2, Step::Supervise));
@@ -1810,6 +1829,7 @@ impl Generator<'_> {
             know,
             definition,
             gone: false,
+            turned: false,
             home: self.scopes.len() - 1,
         };
         for &index in running {
@@ -2008,6 +2028,7 @@ impl Generator<'_> {
                             know,
                             definition: None,
                             gone: false,
+                            turned: false,
                             home: self.scopes.len() - 1,
                         },
                     );
@@ -2143,6 +2164,9 @@ impl Generator<'_> {
         } else {
             running
         };
+        if self.data {
+            self.prime(selector, running);
+        }
         let env = self.running_env(running);
         self.loops += 1;
         let site = self.fresh("s");
@@ -2154,7 +2178,7 @@ impl Generator<'_> {
         let counter_invariant = self.rng.chance(1, 2).then(|| Range::new(0, bound));
         // `recover ↑ ℓ` goes round with the counter as it is, so a body
         // with such a boundary moves it by an assignment.
-        let turning = self.data && self.rng.chance(1, 2);
+        let turning = self.data && self.rng.chance(3, 4);
         let mut parameters = vec![LoopParameter {
             mutable: turning,
             name: counter.clone(),
@@ -2265,6 +2289,7 @@ impl Generator<'_> {
                     know,
                     definition: None,
                     gone: false,
+                    turned: false,
                     home,
                 },
             );
@@ -2398,6 +2423,7 @@ impl Generator<'_> {
                             know,
                             definition: None,
                             gone: false,
+                            turned: false,
                             home: self.scopes.len() - 1,
                         },
                     );
@@ -2664,6 +2690,7 @@ impl Generator<'_> {
         let Some(Slot {
             know: Know::Int(counter),
             ty: Type::Int(counter_ty),
+            turned,
             ..
         }) = env.get(&info.counter)
         else {
@@ -2674,16 +2701,26 @@ impl Generator<'_> {
         } else {
             counter.flow.lo
         };
-        if room < 1 || !counter.flow.bounded() {
+        // A counter that an assignment has moved may go round as it is.
+        let still = *turned && room >= 0 && (room < 1 || self.rng.chance(1, 2));
+        if !still && room < 1 || !counter.flow.bounded() {
             return false;
         }
-        let pace = 1 + self.rng.range(0, (room - 1).min(1));
+        let pace = if still {
+            0
+        } else {
+            1 + self.rng.range(0, (room - 1).min(1))
+        };
         let operator = if info.up {
             Binary::Add
         } else {
             Binary::Subtract
         };
-        let moved = bin(operator, name(&info.counter), int(pace));
+        let moved = if still {
+            name(&info.counter)
+        } else {
+            bin(operator, name(&info.counter), int(pace))
+        };
         if self.lib().int(&moved, &env, Some(*counter_ty)).is_none() {
             return false;
         }
@@ -2785,6 +2822,7 @@ impl Generator<'_> {
                     know,
                     definition: None,
                     gone: false,
+                    turned: false,
                     home: 0,
                 },
             );
@@ -3095,6 +3133,7 @@ impl Generator<'_> {
                     know,
                     definition: None,
                     gone: false,
+                    turned: false,
                     home: 0,
                 },
             );

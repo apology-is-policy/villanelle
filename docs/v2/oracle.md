@@ -227,7 +227,13 @@ derives its generator from the host's seed, the control's name and the
 arguments (`rng::mix`), so two calls with the same arguments get the same
 answer. For a borrow it draws one of the places of the wanted type within
 the origins of the field, and passes over an alternative for which the
-arguments hold none.
+arguments hold none. A value of an outcome type, in an answer or among the
+arguments that `generate::entry_runs` draws for an entry, is one that its
+operation gives ([E-Host]): `draw_outcome` draws arguments that satisfy the
+precondition of the operation, and then an alternative and a payload as for
+an answer. The oracle does not test this of a host, and a checked program
+relies on it ([I12]); the native harness writes such a value as a capture
+lays it out.
 
 ## 6. Directives
 
@@ -394,13 +400,13 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   `&~τ` parameters of extern controls. A program of slice 1 is unchanged by
   this: the generator draws nothing more for it, and the programs of 600
   seeds were compared text for text. `generate::DATA_CONSTRUCTS` lists the
-  52 constructs of the slice, and a campaign names those it did not reach.
+  56 constructs of the slice, and a campaign names those it did not reach.
   `v2/tests/harness.rs` runs 240 seeds in the two semantics and asks the
   checker about 30; over 900 seeds `vn2 fuzz --slice 2` gives
-  35,984 runs with no stuck run and no difference, of which 3,526 end in a
-  fault and 977 with `terminate n`, and the
-  checker accepts 899 programs and does not answer on
-  one in ten seconds (review finding RC22).
+  36,348 runs with no stuck run and no difference, of which 3,732 end in a
+  fault and 1,338 with `terminate n`, and the
+  checker accepts 896 programs and does not answer on
+  four in ten seconds (review finding RC22).
 - **Obligations in generated programs.** A program with data declares up to
   two resources, and for each a contingent extern control that takes a
   value of it and ends it. A value of kind `must` ([T1]) is a resource, a
@@ -429,8 +435,12 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   capture; a decision on it gives each alternative what the conditions of
   the captured operation say over them ([I12]), and what they say over
   names of which nothing is known once the outcome has passed through a
-  loop. No value of an outcome type crosses a contract (review finding
-  RG7).
+  loop. A parameter or a payload field of a control, of an extern control
+  or of a named boundary has, now and then, the outcome type of an
+  operation declared before it. Such a value is decided where its capture
+  is not visible, by what the conditions say over names of which nothing is
+  known. The hosts and the entries give only values of the type that its
+  operation gives (`host::draw_outcome`, review finding RG7).
 - **Faults and boundaries in generated programs
   (`v2/src/generate/valid/faults.rs`).** A control of a program with data
   may say `faults`, may be `contingent`, and may be an entry control, which
@@ -448,12 +458,18 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   A lexical boundary is written with the end of its contingency chosen
   first: none (no statement of the work may fault, and the contingency is
   `⊥`), `escalate` or a new `fault` (where a fault is permitted around the
-  boundary), `terminate n` (in an entry control), or `recover ↑ ℓ` for the
-  loop whose body the boundary stands in. For `recover` the counter of the
-  loop is declared `~` and an assignment moves it just before the boundary,
-  so that a fault that comes again does not come for ever; the parameters of
-  the loop are available and within the invariant there, none holds what a
-  fault does not release, and the work does not see them ([F5](c)). The work
+  boundary), `terminate n` (in an entry control), or `recover ↑ ℓ` for a
+  loop around the boundary that the bodies between let end (`recoveries`).
+  For `recover` an assignment has moved the counter of the loop since the
+  loop went round, so that a fault that comes again does not come for ever.
+  The counter is declared `~` in three of four loops, and an assignment
+  moves it just before the boundary; or it has moved on these histories
+  already, before another boundary or before a loop between (`prime`),
+  whose body does not assign the counters of the loops around it; or a work
+  around the boundary restarts the same loop. A counter that has moved may
+  go round as it is (`↑ ℓ(i)`). The parameters of the loop are available
+  and within the invariant at the boundary, none holds what a fault does not
+  release, and the work does not see them ([F5](c)). The work
   is a body that sees the names around it and may consume them; it may end
   with the terminators of the bodies around it, with `fault`, or by falling
   off its end, before which it ends its own obligations and makes those of
@@ -472,9 +488,14 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   with `escalate` or a new `fault` when it is drawn to let faults out, which
   makes `supervise` a statement that may fault. A campaign counts the runs
   that end in a fault that leaves the entry and with `terminate n`: both
-  are ends, compared with the erased semantics as an outcome is. Not
-  written: a boundary in the work of another, and `recover ↑ ℓ` of a loop
-  further out.
+  are ends, compared with the erased semantics as an outcome is.
+  A boundary may stand in the work of another, to two works and five bodies
+  in all. A fault then goes to the contingency of the inner one and, where
+  that passes it on, to the next one around, so a statement that may fault
+  answers for the ends of all the contingencies on its way (`settled`):
+  what `recover` or `terminate n` of an outer one ends is given up before a
+  statement of the inner work that may fault. `terminate n` belongs to a
+  boundary that stands in the work of no other ([F5](e)).
 - **Fuzzing (`fuzz`, `vn2 fuzz`).** `vn2 fuzz --seed N --count N` takes the
   program of each seed through the reader, the oracle and the erased
   semantics on entries that satisfy its precondition, and asks the checker.
@@ -489,9 +510,9 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   `undefined` and so differs from the oracle ([R4]); the report says how
   many allocations the compiled runs made. With
   `VN2_KEEP_IR=DIR` in the environment the text of every
-  compiled module is kept in `DIR`. For slice 2 on 23 November 2026:
-  300 programs, 23,520 runs of compiled programs with no difference, which
-  make 24,862 allocations.
+  compiled module is kept in `DIR`. For slice 2 on 24 November 2026:
+  300 programs, 23,424 runs of compiled programs with no difference, which
+  make 26,752 allocations.
   `--mutants` tries every mutant too, where a
   mutant that the checker accepts must have no stuck run. A run of a mutant
   has 20,000 steps (`--mutant-fuel`), a tenth of the steps of a run of a
@@ -510,10 +531,9 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   of 24 November these programs have 6,851 mutants: 832 refused, 1,068
   rejected (769 with a stuck run), 4,951 accepted; the report gives the
   counts for each kind, and the seven kinds of before have their numbers
-  of before. For slice 2 (`--slice 2 --mutants`, 40 programs): 9,925
-  mutants, 1,197 refused, 1,465 rejected (1,022 with a stuck run), 7,263
-  accepted with no stuck run, and an answer of the checker in ten seconds
-  on every one. The time
+  of before. For slice 2 (`--slice 2 --mutants`, 40 programs): 13,073
+  mutants, 1,608 refused, 2,080 rejected (1,454 with a stuck run), 9,385
+  accepted with no stuck run, and gives an answer in ten seconds on every one. The time
   limit of the checker is of the clock. A check that reaches it ends
   (`counts::set_deadline`: the search asks for the time now and then, and
   so does the diagram package as a diagram grows); before 23 November it
@@ -1275,12 +1295,15 @@ paired native-performance suite (`v2/tests/backend_slice2.rs`):
   compiles every file of `v2/tests/slice2/` that the checker accepts whole
   and compares each run with the oracle at `-O0` and `-O2`. Most files of
   the suite hold a control that is there to be stuck, so the checker
-  refuses them; the three it accepts are `erased_nested_ownership.core`,
+  refuses them; the four it accepts are `erased_nested_ownership.core`,
   `checked_faults_and_boundaries.core`, which is written for this (the ends
   of a contingency with messages that own memory, care lists, a boundary in
-  the work of another, a named boundary), and `checked_skipped_bodies.core`
+  the work of another, a named boundary), `checked_skipped_bodies.core`
   (RB12: a boundary or a loop that does not run, and what the names around
-  it still own). Where a batch of runs fails, the test runs each run alone
+  it still own), and `checked_nested_boundaries.core` (the shapes that the
+  generator writes since 24 November: boundaries in the work of boundaries,
+  and contingencies that restart a loop further out than the body their
+  boundary stands in). Where a batch of runs fails, the test runs each run alone
   and names those that differ.
 - **Verification (`v2/tests/backend_slice2.rs`).** Verifies Theorem 4 expansion
   plus `check::check` and `kernel::validate` across all 4 Slice 2 `.rails`

@@ -225,6 +225,8 @@ piece of program text denotes at a statement.
   and not a payload name, bound to a constant expression; or `+`, `-`, `*`,
   negation, `÷` and `mod` with a nonzero divisor, or a conversion between
   integer types, applied to constant expressions. Nothing else is constant.
+  The care list of a boundary is no binder: a name that the boundary takes
+  is, in the contingency, the name it was, and constant if it was.
   The order is fixed: functions are unfolded first ([I8]), constant
   expressions are then folded to literals, and only then are divisions and
   products classified ([I4], [I5]). Whether a product is linear is therefore
@@ -305,7 +307,10 @@ piece of program text denotes at a statement.
   captured operation over those terms. Where the capture is not visible (the
   value arrived as a parameter or a payload), the arguments are fresh names:
   one for each parameter, of the type of the parameter, and for an `&~`
-  parameter a second one for its value at completion.
+  parameter a second one for its value at completion. That there are such
+  arguments is what makes a value one of the type: a capture gives no
+  other, and the core asks the same of the arguments of the entry and of
+  the answers of the host ([E-Host], section 8 of the core).
   The operation runs at the capture ([E-Capture]), so an `&~` argument has
   two terms in the record: its value at the capture, and a fresh name for
   its value at completion, which the place holds from the capture on
@@ -985,3 +990,17 @@ it.
    of that type, and a parameter that is not `&~` has one name for the
    argument at the capture and at completion, since the two are one value
    ([P4]).
+10. **24 November 2026, [I12]: why the fresh names stand for something.**
+   The clause assumes of a value that arrived as a parameter or a payload
+   that arguments exist for which the condition of its alternative holds.
+   A capture gives only such values, but the generator of slice 2 asked
+   what a host and an entry may give (review finding RG7), and nothing
+   said. The core says it now ([E-Host], section 8), and the clause points
+   there. The precondition of the operation holds of those arguments too;
+   the clause does not use it.
+11. **24 November 2026, [I3]: a name in the care of a boundary.** The
+   clause counts the binders of a name, and did not say whether the care
+   list `[x̄]` of a boundary is one. The checker read it as one, so a
+   constant was no constant in the contingency, and it refused a program
+   of the generator in which a product with such a name decides a test
+   (review finding RC24). The care list moves the value and binds nothing.

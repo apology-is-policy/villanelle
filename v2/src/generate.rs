@@ -105,7 +105,7 @@ const ENTRY_RESOURCES: u64 = 1_000_000;
 
 /// The constructs that slice 2 adds: the data, its operations, resources,
 /// captured outcomes, faults and boundaries.
-pub const DATA_CONSTRUCTS: [&str; 52] = [
+pub const DATA_CONSTRUCTS: [&str; 56] = [
     "struct",
     "copy-struct",
     "variant",
@@ -139,12 +139,16 @@ pub const DATA_CONSTRUCTS: [&str; 52] = [
     "emit",
     "capture",
     "decide-outcome",
+    "outcome-parameter",
+    "outcome-payload",
     "boundary",
     "boundary-care",
+    "boundary-in-work",
     "supervise",
     "fault",
     "escalate",
     "recover",
+    "recover-outer",
     "terminate-status",
     "terminate",
     "expr-string",
@@ -199,6 +203,12 @@ pub struct Coverage {
     pub counts: BTreeMap<&'static str, u64>,
     /// The declared types of the program being observed, by name.
     named: BTreeMap<String, &'static str>,
+    /// The bodies around the statement being observed: the name of a loop,
+    /// or `None` for the work of a boundary.
+    bodies: Vec<Option<String>>,
+    /// In a contingency, the loop in whose body its boundary stands, where
+    /// it stands in the body of a loop.
+    stands: Option<String>,
 }
 
 impl Coverage {
@@ -432,8 +442,19 @@ impl Coverage {
                     if !captures.is_empty() {
                         self.hit("boundary-care");
                     }
+                    if self.bodies.iter().any(Option::is_none) {
+                        self.hit("boundary-in-work");
+                    }
+                    let stands = self.bodies.last().cloned().flatten();
+                    self.bodies.push(None);
                     self.observe_statements(body);
+                    self.bodies.pop();
+                    // A contingency is a body that nothing encloses.
+                    let bodies = std::mem::take(&mut self.bodies);
+                    let before = std::mem::replace(&mut self.stands, stands);
                     self.observe_statements(contingency);
+                    self.stands = before;
+                    self.bodies = bodies;
                 }
                 Command::Supervise { arguments, .. } => {
                     self.hit("supervise");
@@ -446,13 +467,20 @@ impl Coverage {
                     self.observe_expr(message);
                 }
                 Command::Escalate => self.hit("escalate"),
-                Command::Recover { .. } => self.hit("recover"),
+                Command::Recover { loop_name } => {
+                    self.hit("recover");
+                    // A loop further out than the body the boundary stands in.
+                    if self.stands.as_ref() != Some(loop_name) {
+                        self.hit("recover-outer");
+                    }
+                }
                 Command::Terminate(status) => self.hit(if status.is_some() {
                     "terminate-status"
                 } else {
                     "terminate"
                 }),
                 Command::Loop {
+                    name,
                     parameters,
                     invariant,
                     body,
@@ -470,7 +498,9 @@ impl Coverage {
                         self.hit("loop-invariant");
                         self.observe_expr(invariant);
                     }
+                    self.bodies.push(Some(name.clone()));
                     self.observe_statements(body);
+                    self.bodies.pop();
                 }
                 Command::Again { arguments, .. } => {
                     self.hit("again");
@@ -550,6 +580,9 @@ impl Coverage {
                     }
                     for parameter in &decl.parameters {
                         self.observe_type(&parameter.ty);
+                        if matches!(parameter.ty, Type::OutcomeNamed(_)) {
+                            self.hit("outcome-parameter");
+                        }
                     }
                     self.observe_statements(&decl.body);
                     self.observe_statements(&decl.contingency);
@@ -590,6 +623,10 @@ impl Coverage {
                     }
                     for parameter in &control.parameters {
                         self.observe_type(&parameter.ty);
+                        // A value of an outcome type crosses the contract.
+                        if matches!(parameter.ty, Type::OutcomeNamed(_)) {
+                            self.hit("outcome-parameter");
+                        }
                     }
                     if let Some(precondition) = &control.precondition {
                         self.hit("control-where");
@@ -601,6 +638,9 @@ impl Coverage {
                         } else {
                             self.hit("alt-payload");
                             for field in &alternative.fields {
+                                if matches!(field.ty, Type::OutcomeNamed(_)) {
+                                    self.hit("outcome-payload");
+                                }
                                 self.observe_type(&field.ty);
                             }
                         }
@@ -1486,7 +1526,7 @@ pub fn entry_runs(
             if found == each {
                 break;
             }
-            let candidate: Vec<Value> = control
+            let candidate: Option<Vec<Value>> = control
                 .parameters
                 .iter()
                 .zip(&bounds)
@@ -1494,18 +1534,24 @@ pub fn entry_runs(
                     // Within what the precondition says of the parameter
                     // alone, most often; anywhere near its literals, else.
                     Type::Int(ty) if rng.chance(3, 4) => {
-                        match draw_int_between(rng, *ty, *low, *high, config) {
+                        Some(match draw_int_between(rng, *ty, *low, *high, config) {
                             Some(number) => Value::Int(number),
                             None => Value::Int(draw_int_near(rng, *ty, &hints, config)),
-                        }
+                        })
                     }
-                    Type::Int(ty) => Value::Int(draw_int_near(rng, *ty, &hints, config)),
-                    Type::Bool => draw_value(rng, &Type::Bool, &[], config),
+                    Type::Int(ty) => Some(Value::Int(draw_int_near(rng, *ty, &hints, config))),
+                    Type::Bool => Some(draw_value(rng, &Type::Bool, &[], config)),
+                    // A value of an outcome type is one that its operation
+                    // could have given ([I12]).
                     other => {
                         draw_value_in_program(program, rng, other, &[], config, &mut resources)
                     }
                 })
                 .collect();
+            // No value was found for a parameter of an outcome type.
+            let Some(candidate) = candidate else {
+                continue;
+            };
             let holds = match &control.precondition {
                 None => true,
                 Some(pre) => signature_holds(program, config, pre, &candidate, &[]),

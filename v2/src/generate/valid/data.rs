@@ -401,6 +401,7 @@ impl Generator<'_> {
             know,
             definition: None,
             gone: false,
+            turned: false,
             home: self.here(),
         }
     }
@@ -433,10 +434,16 @@ impl Generator<'_> {
     }
 
     /// A type for a parameter or for a payload field: a resource now and
-    /// then, which is how one comes to a body and leaves it.
+    /// then, which is how one comes to a body and leaves it, or the outcome
+    /// type of an operation declared before, so that a captured outcome
+    /// crosses a contract and is decided where its capture is not visible
+    /// ([I12]).
     pub(super) fn payload_type(&mut self) -> Type {
         if self.data && !self.types.resources.is_empty() && self.rng.chance(1, 8) {
             self.resource_type().expect("a resource")
+        } else if self.data && !self.callables.is_empty() && self.rng.chance(1, 10) {
+            let index = self.rng.index(self.callables.len());
+            Type::OutcomeNamed(self.callables[index].name.clone())
         } else {
             self.value_type()
         }
@@ -648,7 +655,8 @@ impl Generator<'_> {
     /// `&~τ` now and then.
     pub(super) fn lend_parameters(&mut self, params: &mut [(String, Type)]) {
         for (_, ty) in params.iter_mut() {
-            if ty.is_scalar() {
+            // An outcome is decided by the body that owns it.
+            if ty.is_scalar() || matches!(ty, Type::OutcomeNamed(_)) {
                 continue;
             }
             match self.rng.below(8) {

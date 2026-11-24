@@ -565,6 +565,18 @@ world, an alternative and a payload.
   ends in `host-violation`. So it does when the host answers an extern control
   that is pure ([fact logic](facts.md), [I10]) differently on equal arguments. This is a fault of the trusted host and not a stuck
   state: the claims of section 8 assume a host that respects its contracts.
+
+  A value of an outcome type in a payload is to be one that its operation
+  **gives**. `out(a, v̄)` of type `outcome⟨g⟩` is given by `g` when there are
+  arguments of the parameter types of `g` that satisfy its precondition and
+  of which, together with `v̄`, the condition of `a` in the contract of `g`
+  is true (with some value at completion for an `&~` parameter), and when
+  every value of an outcome type within `v̄` is given by its own operation.
+  A capture makes no other value: [E-Call] and [E-Extern] test the
+  precondition, and [E-Exit] and this clause the condition. The fact logic
+  relies on it where it does not see the capture ([I12]). The step of the
+  host does not test it, since the test would have to find the arguments:
+  it is part of what section 8 asks of a host.
 - **[E-Resource]** A resource value `res(r)` is created only by the host, which
   records `r` as open. An extern control that takes a resource by value
   completes it: the host records `r` as closed, unless it returns `res(r)` in
@@ -1276,9 +1288,11 @@ alternative of `await next`.
 ## 8. Claims
 
 A program is **checked** when every declaration satisfies sections 3, 4 and 7. A
-host is **faithful** when it never yields `host-violation`. An execution starts
-with one activation of an entry control, on arguments of its parameter types
-that satisfy its precondition.
+host is **faithful** when it never yields `host-violation` and every value of
+an outcome type in its answers is one that its operation gives ([E-Host]). An
+execution starts with one activation of an entry control, on arguments of its
+parameter types that satisfy its precondition and in which every value of an
+outcome type is one that its operation gives.
 
 **Theorem 1 (safety).** No execution of a checked program under a faithful host
 reaches a stuck configuration, whatever order of turns the host chooses.
@@ -1532,3 +1546,4 @@ and what asked for it:
 | 23 November 2026 | [F5] says on which histories a contingency runs: those of the statements of `B₁` that may fault, and none where there is no such statement. | The generator of slice 2 (review finding RC21): the checker gave a contingency every history of its boundary and refused `⊥` in the contingency of work that cannot fault, which the oracle never runs. |
 | 23 November 2026 | [R3] says what the erased semantics keeps of a history beside its atoms: the `□` at which a loop ended and the statement of `B₁` at which a fault occurred, where the availability of a name around the loop or the boundary depends on it. [R4] says that a scope is ended by the formulas of the statement at which it ends. | The erased interpreter and the backend (review findings RO5 and RB1): both ended an outer scope by the formulas of the statement that holds the loop or the boundary, which do not see what the body inside did, and compiled code freed a moved value a second time. |
 | 23 November 2026 | [R4] says what a name of the bodies around a boundary or a loop is after the statement, on a history on which the statement did not run: as it was before. | The layout of the erased semantics and the backend (review finding RB12): it gave the name the state in which the body left it on every history. The allocation count of the native harness found it. |
+| 24 November 2026 | [E-Host] says which values of an outcome type an operation gives, and section 8 asks that the answers of a faithful host and the arguments of the entry hold no other. | The generator of slice 2 (review finding RG7). [I12] lets a checked program assume the conditions of the operation of a value whose capture it does not see, and nothing said that a value from outside the execution has them: Theorem 1 was false as stated. A checked control that is given `out(low, 7)` of an operation whose `low` says `v ≤ 4` is stuck by `X7` at the exit that rests on it. The precondition is part of the definition because every captured value has it; [I12] uses the condition alone. |

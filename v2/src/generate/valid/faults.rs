@@ -17,11 +17,19 @@
 //! that fall off its end go on after the boundary. A contingency is written
 //! as a body that nothing encloses: it sees what the boundary took into its
 //! care and the message.
+//!
+//! A boundary may stand in the work of another. A fault then goes to the
+//! contingency of the inner one, and where that passes it on (`escalate`, or
+//! a new `fault`), to the contingency of the next one around: a statement
+//! that may fault answers for the ends of all of them ([`Generator::settled`]).
+//! A contingency may restart any loop around its boundary that the bodies
+//! between let end ([`Generator::recoveries`]).
 
 use super::data::{Ctx, Due, Kind};
 use super::{
-    BTreeSet, Binary, Command, Env, Expr, Generator, Know, MAX_BODIES, POS, Path, Range, Scope,
-    Selector, Sig, SiteInfo, Slot, Type, Val, and_selector, bin, int, merge, name, parameter, stmt,
+    BTreeSet, Binary, Command, Env, Expr, Generator, Know, LoopInfo, MAX_DEPTH, MAX_WORKS, POS,
+    Path, Range, Scope, Selector, Sig, SiteInfo, Slot, Type, Val, and_selector, bin, int, merge,
+    name, parameter, stmt,
 };
 use crate::syntax::{BoundaryDecl, Statement};
 
@@ -86,6 +94,19 @@ pub(super) enum Route {
     Work(usize, Plan),
 }
 
+/// A loop that the contingency of a boundary may restart.
+struct Recovery {
+    /// The body of the loop, as an index into the bodies being written.
+    target: usize,
+    loop_name: String,
+    /// The expression that moves the counter before the boundary, where it
+    /// has not moved since the loop went round.
+    advance: Option<Expr>,
+    /// Whether the parameters of the loop are names at the boundary. Where
+    /// a work around restarts the same loop they are not.
+    visible: bool,
+}
+
 /// A named boundary that a control may supervise.
 #[derive(Clone)]
 pub(super) struct BoundarySig {
@@ -118,6 +139,7 @@ fn owned(ty: &Type, know: Know) -> Slot {
         know,
         definition: None,
         gone: false,
+        turned: false,
         home: 0,
     }
 }
@@ -144,12 +166,42 @@ impl Generator<'_> {
         if matches!(self.unit, Unit::Contingency(_)) {
             return None;
         }
-        for index in (0..self.scopes.len()).rev() {
+        self.route_within(self.scopes.len())
+    }
+
+    /// Where a fault goes from a statement of the innermost of the bodies
+    /// before the index `top`.
+    fn route_within(&self, top: usize) -> Option<Route> {
+        for index in (0..top).rev() {
             if let Some(work) = &self.scopes[index].work {
                 return (work.plan != Plan::Quiet).then(|| Route::Work(index, work.plan.clone()));
             }
         }
         self.faults.then_some(Route::Out)
+    }
+
+    /// Where a fault that goes along `route` comes to rest: a contingency
+    /// that passes it on sends it along the route of the body in which its
+    /// boundary stands ([F5]: its statement that may fault is one of the
+    /// work around).
+    fn settled(&self, route: &Route) -> Route {
+        let mut route = route.clone();
+        while let Route::Work(work, Plan::Escalate) = &route {
+            match self.route_within(*work) {
+                Some(next) => route = next,
+                None => break,
+            }
+        }
+        route
+    }
+
+    /// The number of works of lexical boundaries among the bodies being
+    /// written.
+    fn works(&self) -> usize {
+        self.scopes
+            .iter()
+            .filter(|scope| scope.work.is_some())
+            .count()
     }
 
     /// The outermost body that a terminator here may end.
@@ -173,14 +225,14 @@ impl Generator<'_> {
             return false;
         }
         let stays = self.releasable(&slot.ty);
-        match route {
+        match self.settled(route) {
             Route::Out | Route::Work(_, Plan::Escalate) => !stays,
             // `recover ↑ ℓ` ends the bodies from `ℓ` to the boundary.
             Route::Work(work, Plan::Recover(target, _)) => {
-                !stays || (*target..*work).contains(&slot.home)
+                !stays || (target..work).contains(&slot.home)
             }
             // `terminate n` ends every body around the boundary.
-            Route::Work(work, Plan::Status) => !stays || slot.home < *work,
+            Route::Work(work, Plan::Status) => !stays || slot.home < work,
             Route::Work(..) => false,
         }
     }
@@ -192,8 +244,8 @@ impl Generator<'_> {
         if !ends {
             return slot.home >= self.floor();
         }
-        match route {
-            Route::Work(_, Plan::Recover(target, _)) => slot.home >= *target,
+        match self.settled(route) {
+            Route::Work(_, Plan::Recover(target, _)) => slot.home >= target,
             _ => true,
         }
     }
@@ -226,17 +278,18 @@ impl Generator<'_> {
         }
         self.apply(running, ctx);
         self.discharge(selector, &Due::Fault(route.clone()));
-        match route {
-            Route::Out => self.faulted = true,
-            Route::Work(index, plan) => {
-                if let Some(work) = &mut self.scopes[index].work {
-                    work.faulted = true;
-                }
-                if plan == Plan::Escalate {
-                    self.faulted = true;
-                }
+        // The fault may come to every contingency on its way.
+        let mut way = Some(route);
+        while let Some(Route::Work(index, plan)) = way {
+            if let Some(work) = &mut self.scopes[index].work {
+                work.faulted = true;
             }
+            if plan != Plan::Escalate {
+                return true;
+            }
+            way = self.route_within(index);
         }
+        self.faulted = true;
         true
     }
 
@@ -346,21 +399,46 @@ impl Generator<'_> {
     }
 
     /// Whether a boundary may be written here: not in a contingency
-    /// ([F5](a)), and in the work of no other.
+    /// ([F5](a)), and in the work of one other at most.
     pub(super) fn boundary_fits(&self) -> bool {
         !matches!(self.unit, Unit::Contingency(_))
-            && self.scopes.len() < MAX_BODIES
-            && self.scopes.iter().all(|scope| scope.work.is_none())
+            && self.scopes.len() < MAX_DEPTH
+            && self.works() < MAX_WORKS
     }
 
-    /// Whether a contingency here may restart the loop whose body this is,
-    /// and then the name of the loop and the expression that moves its
-    /// counter. The loop goes round with the parameters as they are at the
-    /// boundary: each is available there and within the invariant, and none
-    /// holds what a fault does not release. The counter moves before the
-    /// boundary, or a fault that comes again would come for ever.
-    fn recovery(&self, env: &Env) -> Option<(String, Expr)> {
-        let info = self.scope().looping.as_ref()?;
+    /// Whether the loop `info` can go round with its parameters as `env`
+    /// has them and its counter within `counter`: each is available and
+    /// within the invariant, and none holds what a fault does not release.
+    fn restarts(&self, info: &LoopInfo, env: &Env, counter: Range) -> bool {
+        info.params.iter().all(|parameter| {
+            let Some(slot) = env.get(&parameter.name) else {
+                return false;
+            };
+            if slot.gone || self.types.kind(&slot.ty) == Kind::Must && !self.releasable(&slot.ty) {
+                return false;
+            }
+            let Some(invariant) = parameter.invariant else {
+                return true;
+            };
+            let flow = if parameter.name == info.counter {
+                counter
+            } else {
+                match &slot.know {
+                    Know::Int(val) => val.flow,
+                    _ => return true,
+                }
+            };
+            flow.lo >= invariant.lo && flow.hi <= invariant.hi
+        })
+    }
+
+    /// Whether a contingency here may restart the loop of the body
+    /// `target` once the counter of that loop has moved, and then the
+    /// expression that moves it. The loop goes round with the parameters as
+    /// they are at the boundary. The counter moves before the boundary, or
+    /// a fault that comes again would come for ever.
+    fn recovery(&self, target: usize, env: &Env) -> Option<Expr> {
+        let info = self.scopes[target].looping.as_ref()?;
         let Some(Slot {
             know: Know::Int(counter),
             ty: Type::Int(counter_ty),
@@ -386,27 +464,126 @@ impl Generator<'_> {
         };
         let moved = bin(operator, name(&info.counter), int(1));
         let after = self.lib().int(&moved, env, Some(*counter_ty))?;
-        for parameter in &info.params {
-            let slot = env.get(&parameter.name)?;
-            if slot.gone || self.types.kind(&slot.ty) == Kind::Must && !self.releasable(&slot.ty) {
-                return None;
-            }
-            let Some(invariant) = parameter.invariant else {
+        self.restarts(info, env, after.flow).then_some(moved)
+    }
+
+    /// The loops that the contingency of a boundary here may restart: those
+    /// around that a terminator here may end ([`Generator::reach`]). For
+    /// each, the counter has moved since the loop went round, or can move
+    /// here: a work around restarts the same loop, and then the parameters
+    /// are no names of that work and are what they were when it began; or
+    /// an assignment has moved the counter on these histories, before
+    /// another boundary or before a loop between ([`Generator::prime`]); or
+    /// it is a name that may be assigned here.
+    fn recoveries(&self, env: &Env) -> Vec<Recovery> {
+        let here = self.scopes.len() - 1;
+        let mut found = Vec::new();
+        for target in self.reach()..=here {
+            let Some(info) = &self.scopes[target].looping else {
                 continue;
             };
-            let flow = if parameter.name == info.counter {
-                after.flow
-            } else {
-                match &slot.know {
-                    Know::Int(val) => val.flow,
-                    _ => continue,
-                }
+            let inside = &self.scopes[target + 1..];
+            let recovery = |advance, visible| Recovery {
+                target,
+                loop_name: info.name.clone(),
+                advance,
+                visible,
             };
-            if flow.lo < invariant.lo || flow.hi > invariant.hi {
-                return None;
+            let restarted = inside.iter().any(|scope| {
+                matches!(&scope.work, Some(work) if matches!(work.plan, Plan::Recover(index, _) if index == target))
+            });
+            if restarted {
+                found.push(recovery(None, false));
+            } else if let Some(Slot {
+                know: Know::Int(counter),
+                gone: false,
+                turned: true,
+                ..
+            }) = env.get(&info.counter)
+            {
+                if self.restarts(info, env, counter.flow) {
+                    found.push(recovery(None, true));
+                }
+            } else if let Some(moved) = self.recovery(target, env) {
+                found.push(recovery(Some(moved), true));
             }
         }
-        Some((info.name.clone(), moved))
+        found
+    }
+
+    /// Whether the contingency of a boundary on the histories `running`
+    /// might restart a loop: a boundary is written more often there.
+    pub(super) fn recoverable(&self, running: &[usize]) -> bool {
+        if matches!(self.unit, Unit::Contingency(_)) {
+            return false;
+        }
+        let env = self.running_env(running);
+        (self.reach()..self.scopes.len()).any(|target| {
+            let Some(info) = &self.scopes[target].looping else {
+                return false;
+            };
+            self.scopes[target + 1..].iter().any(|scope| {
+                matches!(&scope.work, Some(work) if matches!(work.plan, Plan::Recover(index, _) if index == target))
+            }) || env
+                .get(&info.counter)
+                .is_some_and(|slot| !slot.gone && (slot.mutable || slot.turned))
+        })
+    }
+
+    /// Moves the counter of the loop of the body `target`, on the histories
+    /// `running` of `selector`.
+    fn advance(&mut self, selector: &Selector, running: &[usize], target: usize, moved: &Expr) {
+        let counter = self.scopes[target]
+            .looping
+            .as_ref()
+            .map(|info| info.counter.clone());
+        let counter = counter.expect("the loop that the contingency restarts");
+        self.push(
+            selector,
+            Command::Assign {
+                name: counter.clone(),
+                value: moved.clone(),
+            },
+        );
+        let here = self.scopes.len() - 1;
+        for &index in running {
+            let env = &self.scopes[here].live[index].env;
+            let Some(Type::Int(counter_ty)) = env.get(&counter).map(|slot| slot.ty.clone()) else {
+                continue;
+            };
+            let Some(val) = self.lib().int(moved, env, Some(counter_ty)) else {
+                continue;
+            };
+            if let Some(slot) = self.scopes[here].live[index].env.get_mut(&counter) {
+                slot.know = Know::Int(Val::value(counter_ty, val.flow));
+                slot.definition = None;
+                slot.turned = true;
+            }
+        }
+    }
+
+    /// Before a loop in whose body a boundary fits: now and then the
+    /// counter of a loop around moves, so that a contingency in the new
+    /// body can restart that loop. The body of the new loop does not assign
+    /// the counters of the loops around it.
+    pub(super) fn prime(&mut self, selector: &Selector, running: &[usize]) {
+        if matches!(self.unit, Unit::Contingency(_))
+            || self.scopes.len() + 1 >= MAX_DEPTH
+            || self.works() >= MAX_WORKS
+            || !self.rng.chance(2, 3)
+        {
+            return;
+        }
+        let env = self.running_env(running);
+        let here = self.scopes.len() - 1;
+        let targets: Vec<(usize, Expr)> = (self.reach()..=here)
+            .filter_map(|target| Some((target, self.recovery(target, &env)?)))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let (target, moved) = self.rng.pick(&targets).clone();
+        self.advance(selector, running, target, &moved);
     }
 
     /// `d : boundary {B₁} contingency [x̄] (m : string) {B₂}` ([E-Boundary]).
@@ -415,6 +592,7 @@ impl Generator<'_> {
         // counter has room, and the first test of the body says which those
         // are: most often the boundary stands under that test.
         let mut narrowed = selector.clone();
+        let here = self.scopes.len() - 1;
         if self.scope().looping.is_some() && self.rng.chance(2, 3) {
             let env = self.running_env(&self.running(selector));
             let first = self.scope().sites.first();
@@ -424,11 +602,17 @@ impl Generator<'_> {
                     .map(|alternative| Selector::Atom(site.name.clone(), alternative.clone()))
                     .collect()
             });
-            if self.recovery(&env).is_none() {
-                for atom in atoms {
-                    let under = and_selector(selector, atom);
+            if self.recovery(here, &env).is_none() {
+                // Within the selector, or else in its place.
+                let within: Vec<Selector> = atoms
+                    .iter()
+                    .map(|atom| and_selector(selector, atom.clone()))
+                    .collect();
+                for under in within.into_iter().chain(atoms) {
                     let picked = self.running(&under);
-                    if !picked.is_empty() && self.recovery(&self.running_env(&picked)).is_some() {
+                    if !picked.is_empty()
+                        && self.recovery(here, &self.running_env(&picked)).is_some()
+                    {
                         narrowed = under;
                         break;
                     }
@@ -443,27 +627,38 @@ impl Generator<'_> {
         if running.is_empty() {
             return false;
         }
-        let here = self.scopes.len() - 1;
         let env = self.running_env(&running);
 
-        let recovery = self.recovery(&env);
-        let mut plans = vec![Plan::Quiet];
-        if self.faults {
-            plans.extend([Plan::Escalate, Plan::Escalate]);
+        // How the contingency ends. It passes a fault on where a fault may
+        // go on from here: out of the control, or to the contingency of a
+        // boundary around. `terminate n` belongs to a boundary that stands
+        // in the work of no other ([F5](e)).
+        let recoveries = self.recoveries(&env);
+        let mut plans: Vec<(Plan, Option<usize>)> = vec![(Plan::Quiet, None)];
+        if self.route().is_some() {
+            plans.extend(vec![(Plan::Escalate, None); 2]);
         }
-        if self.entry {
-            plans.extend([Plan::Status, Plan::Status]);
+        if self.entry && self.works() == 0 {
+            plans.extend(vec![(Plan::Status, None); 2]);
         }
-        if let Some((loop_name, _)) = &recovery {
-            let plan = Plan::Recover(here, loop_name.clone());
-            plans.extend(vec![plan; 6]);
+        for (index, recovery) in recoveries.iter().enumerate() {
+            let plan = Plan::Recover(recovery.target, recovery.loop_name.clone());
+            // A loop further out is the rarer one to be had.
+            let weight = if recovery.target == here { 6 } else { 9 };
+            plans.extend(vec![(plan, Some(index)); weight]);
         }
-        let plan = self.rng.pick(&plans).clone();
+        let (plan, chosen) = self.rng.pick(&plans).clone();
+        let recovery = chosen.map(|index| &recoveries[index]);
         let route = Route::Work(here + 1, plan.clone());
-        let parameters: BTreeSet<String> = match (&plan, &self.scope().looping) {
-            (Plan::Recover(..), Some(info)) => {
-                info.params.iter().map(|info| info.name.clone()).collect()
-            }
+        // The work mentions no parameter of the loop that the contingency
+        // restarts ([F5](c)).
+        let parameters: BTreeSet<String> = match recovery {
+            Some(recovery) if recovery.visible => self.scopes[recovery.target]
+                .looping
+                .iter()
+                .flat_map(|info| &info.params)
+                .map(|info| info.name.clone())
+                .collect(),
             _ => BTreeSet::new(),
         };
         let held = parameters
@@ -532,34 +727,13 @@ impl Generator<'_> {
             }
         }
         self.apply(&running, &ctx);
-        if let (Plan::Recover(..), Some((_, moved))) = (&plan, &recovery) {
-            let counter = self
-                .scope()
-                .looping
-                .as_ref()
-                .map(|info| info.counter.clone());
-            let counter = counter.expect("the loop that the contingency restarts");
-            self.push(
-                selector,
-                Command::Assign {
-                    name: counter.clone(),
-                    value: moved.clone(),
-                },
-            );
-            for &index in &running {
-                let env = &self.scopes[here].live[index].env;
-                let Some(Type::Int(counter_ty)) = env.get(&counter).map(|slot| slot.ty.clone())
-                else {
-                    continue;
-                };
-                let Some(val) = self.lib().int(moved, env, Some(counter_ty)) else {
-                    continue;
-                };
-                if let Some(slot) = self.scopes[here].live[index].env.get_mut(&counter) {
-                    slot.know = Know::Int(Val::value(counter_ty, val.flow));
-                    slot.definition = None;
-                }
-            }
+        if let Some(Recovery {
+            target,
+            advance: Some(moved),
+            ..
+        }) = recovery
+        {
+            self.advance(selector, &running, *target, moved);
         }
 
         // The work sees the names around it.
@@ -681,7 +855,14 @@ impl Generator<'_> {
             if running.is_empty() {
                 continue;
             }
-            if ends == Ends::Inside {
+            // A contingency that no fault reaches is not run: where the
+            // work has none yet, some of its histories end in one.
+            let quiet = self
+                .scope()
+                .work
+                .as_ref()
+                .is_some_and(|work| !work.faulted && work.plan != Plan::Quiet);
+            if ends == Ends::Inside || quiet && self.rng.chance(1, 2) {
                 self.fault(&selector, &running);
             } else {
                 self.terminate(&selector, &running);

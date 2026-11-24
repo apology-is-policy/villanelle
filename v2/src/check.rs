@@ -1946,6 +1946,9 @@ fn find_constant_locals(
 ) -> BTreeMap<VarId, Int> {
     let mut bind_counts: BTreeMap<VarId, usize> = BTreeMap::new();
     let mut bind_exprs: BTreeMap<VarId, Expr> = BTreeMap::new();
+    // A name in the care of a boundary, as its contingency has it, with the
+    // name of the body around that the boundary took.
+    let mut cared: Vec<(VarId, VarId)> = Vec::new();
     for (idx, _) in body.vars.iter().enumerate() {
         bind_counts.insert(idx, 0);
     }
@@ -1977,12 +1980,14 @@ fn find_constant_locals(
                     *bind_counts.entry(*var).or_insert(0) += 2;
                 }
                 Command::Boundary {
+                    captures,
                     contingency_vars,
                     message_var,
                     ..
                 } => {
-                    for &v in contingency_vars {
+                    for (&v, &taken) in contingency_vars.iter().zip(captures) {
                         *bind_counts.entry(v).or_insert(0) += 2;
+                        cared.push((v, taken));
                     }
                     if let Some(mv) = message_var {
                         *bind_counts.entry(*mv).or_insert(0) += 2;
@@ -2029,6 +2034,16 @@ fn find_constant_locals(
                     constants.insert(var, val);
                     changed = true;
                 }
+            }
+        }
+        // The care list is no binder: in the contingency the name is the
+        // one that the boundary took, with its single binder ([I3]).
+        for &(inside, taken) in &cared {
+            if !constants.contains_key(&inside)
+                && let Some(val) = constants.get(&taken).cloned()
+            {
+                constants.insert(inside, val);
+                changed = true;
             }
         }
     }

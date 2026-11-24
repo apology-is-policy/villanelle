@@ -1,0 +1,199 @@
+// Slice 2 core conformance for a checked program ([R1] to [R5]). The checker
+// accepts every control of this file, so the file is compiled, and each run
+// is compared in the oracle, the erased semantics and compiled code. The
+// controls are boundaries in the work of boundaries, and contingencies that
+// restart a loop further out than the body their boundary stands in
+// ([E-Contingency], [F5]): a fault of the inner work ends the scopes that
+// the contingencies on its way end, and each name of those scopes is ended
+// once, where it is still held.
+
+extern resource conn on fault release
+
+extern control open_conn()
+    ■ { opened {c : conn} }
+    uses net
+
+extern control close_conn(c : conn)
+    ■ { closed {} }
+    uses net
+
+contingent extern control note(n : u32)
+    ■ { done {} }
+    uses net
+
+extern control keep(s : string)
+    ■ { done {} }
+    uses net
+
+control may(n : u32, k : u32)
+    ■ { done {} }
+    faults
+    1  ⊤ ▷ t : ? n = k
+    2  t.true ▷ fault "hit"
+    3  t.false ▷ ■ done {}
+
+// The inner contingency restarts a loop around the outer boundary. Its
+// counter moves in the outer work, which may mention it: the inner work may
+// not ([F5](c)). The restart ends the outer work, with the text it holds.
+control far_recover(n : u32)
+    ■ { done {tries : u32} }
+    faults
+    uses net
+    1  ⊤ ▷ lp : ↻ go(~i : u32 := 0) {
+           ⊢ i ≤ 3
+           1  ⊤ ▷ t : ? i < 3
+           2  t.false ▷ □ fin {i}
+           3  ⊤ ▷ v : string := trim(" heap text of the body ")
+           4  ⊤ ▷ outer : boundary {
+                  1  ⊤ ▷ w : string := ▾v
+                  2  ⊤ ▷ i ← i + 1
+                  3  ⊤ ▷ j : u32 := i
+                  4  ⊤ ▷ inner : boundary {
+                         1  ⊤ ▷ d : Δ may(n, j) ▸ done {}
+                     } contingency (m : string) {
+                         1  ⊤ ▷ recover ↑ go
+                     }
+                  5  ⊤ ▷ d2 : Δ keep(▾w) ▸ done {}
+              } contingency (m2 : string) {
+                  1  ⊤ ▷ escalate
+              }
+           5  ⊤ ▷ ↑ go(i)
+       } ▸ fin {k}
+    2  ⊤ ▷ ■ done {k}
+
+// The contingency restarts the outer of two loops from the body of the
+// inner one, and ends that body with the vector it holds.
+control across_loop(n : u32)
+    ■ { done {tries : u32} }
+    uses net
+    1  ⊤ ▷ lp : ↻ go(~i : u32 := 0) {
+           ⊢ i ≤ 3
+           1  ⊤ ▷ t : ? i < 3
+           2  t.false ▷ □ fin {i}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ v : string := trim(" text ")
+           5  ⊤ ▷ l2 : ↻ in(j : u32 := 0) {
+                  ⊢ j ≤ 2
+                  1  ⊤ ▷ t2 : ? j < 2
+                  2  t2.false ▷ □ end {}
+                  3  ⊤ ▷ w : [u32] := [j, j]
+                  4  ⊤ ▷ b : boundary {
+                         1  ⊤ ▷ d : Δ may(n, j) ▸ done {}
+                     } contingency (m : string) {
+                         1  ⊤ ▷ recover ↑ go
+                     }
+                  5  ⊤ ▷ ↑ in(j + 1)
+              } ▸ end {}
+           6  ⊤ ▷ d2 : Δ keep(▾v) ▸ done {}
+           7  ⊤ ▷ ↑ go(i)
+       } ▸ fin {k}
+    2  ⊤ ▷ ■ done {k}
+
+// Both contingencies restart the same loop, and neither work mentions its
+// parameters. One of them owns memory and stays through both.
+control both_recover(n : u32)
+    ■ { done {tries : u32} }
+    uses net
+    1  ⊤ ▷ lp : ↻ go(~i : u32 := 0, ~acc : [u32] := [7]) {
+           ⊢ i ≤ 3
+           1  ⊤ ▷ t : ? i < 3
+           2  t.false ▷ □ fin {i}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ j : u32 := i
+           5  ⊤ ▷ outer : boundary {
+                  1  ⊤ ▷ w : string := trim(" a ")
+                  2  ⊤ ▷ inner : boundary {
+                         1  ⊤ ▷ d : Δ may(n, j) ▸ done {}
+                     } contingency (m : string) {
+                         1  ⊤ ▷ recover ↑ go
+                     }
+                  3  ⊤ ▷ d3 : Δ may(n, j + 1) ▸ done {}
+              } contingency (m2 : string) {
+                  1  ⊤ ▷ recover ↑ go
+              }
+           6  ⊤ ▷ ↑ go(i, ▾acc)
+       } ▸ fin {k}
+    2  ⊤ ▷ ■ done {k}
+
+// The inner contingency passes the fault on, and the outer one restarts
+// the loop. The inner work consumes names of the loop's body and of the
+// outer work before it faults, and the message is one of them.
+control inner_passes_on(n : u32)
+    ■ { done {tries : u32} }
+    uses net
+    1  ⊤ ▷ lp : ↻ go(~i : u32 := 0) {
+           ⊢ i ≤ 3
+           1  ⊤ ▷ t : ? i < 3
+           2  t.false ▷ □ fin {i}
+           3  ⊤ ▷ i ← i + 1
+           4  ⊤ ▷ j : u32 := i
+           5  ⊤ ▷ v : string := trim(" text ")
+           6  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+           7  ⊤ ▷ outer : boundary {
+                  1  ⊤ ▷ u : string := trim(" more ")
+                  2  ⊤ ▷ inner : boundary {
+                         1  ⊤ ▷ t2 : ? n = j
+                         2  t2.true ▷ cl : Δ close_conn(▾c) ▸ closed {}
+                         3  t2.true ▷ d : Δ keep(▾v) ▸ done {}
+                         4  t2.true ▷ fault ▾u
+                     } contingency (m : string) {
+                         1  ⊤ ▷ a : Δ note(1) ▸ done {}
+                         2  ⊤ ▷ escalate
+                     }
+              } contingency (m2 : string) {
+                  1  ⊤ ▷ a2 : Δ note(2) ▸ done {}
+                  2  ⊤ ▷ recover ↑ go
+              }
+           8  ⊤ ▷ cl2 : Δ close_conn(▾c) ▸ closed {}
+           9  ⊤ ▷ ↑ go(i)
+       } ▸ fin {k}
+    2  ⊤ ▷ ■ done {k}
+
+// No statement of the inner work may fault, so no history runs its
+// contingency, and none the outer one, whose work has no other statement
+// that may fault ([F5]).
+control quiet_inner(n : u32)
+    ■ { done {} }
+    1  ⊤ ▷ outer : boundary {
+           1  ⊤ ▷ inner : boundary {
+                  1  ⊤ ▷ x : u32 := n
+              } contingency (m : string) {
+                  1  ⊤ ▷ escalate
+              }
+       } contingency (m2 : string) {
+           1  ⊤ ▷ ⊥
+       }
+    2  ⊤ ▷ ■ done {}
+
+// The inner contingency passes the fault on with what it has in its care,
+// and the outer one ends the execution.
+pub control stops_nested(n : u32)
+    ■ { ok {} }
+    uses net
+    1  ⊤ ▷ v : [u32] := [n, n]
+    2  ⊤ ▷ o : Δ open_conn() ▸ opened {c}
+    3  ⊤ ▷ outer : boundary {
+           1  ⊤ ▷ w : [u32] := ▾v
+           2  ⊤ ▷ inner : boundary {
+                  1  ⊤ ▷ cl : Δ close_conn(▾c) ▸ closed {}
+                  2  ⊤ ▷ d : Δ may(n, 0) ▸ done {}
+              } contingency [w] (m : string) {
+                  1  ⊤ ▷ escalate
+              }
+       } contingency {
+           1  ⊤ ▷ terminate 9
+       }
+    4  ⊤ ▷ ■ ok {}
+
+//! run far_recover(2) with [keep -> done; keep -> done] => done done {3}
+//! run far_recover(9) with [keep -> done; keep -> done; keep -> done] => done done {3}
+//! run across_loop(1) with [] => done done {3}
+//! run across_loop(5) with [keep -> done; keep -> done; keep -> done] => done done {3}
+//! run both_recover(1) with [] => done done {3}
+//! run both_recover(3) with [] => done done {3}
+//! run both_recover(9) with [] => done done {3}
+//! run inner_passes_on(2) with [open_conn -> opened {conn#1}; close_conn -> closed; open_conn -> opened {conn#2}; close_conn -> closed; keep -> done; note -> done; note -> done; open_conn -> opened {conn#3}; close_conn -> closed] => done done {3}
+//! run inner_passes_on(9) with [open_conn -> opened {conn#1}; close_conn -> closed; open_conn -> opened {conn#2}; close_conn -> closed; open_conn -> opened {conn#3}; close_conn -> closed] => done done {3}
+//! run quiet_inner(1) with [] => done done
+//! run stops_nested(0) with [open_conn -> opened {conn#1}; close_conn -> closed] => terminated 9
+//! run stops_nested(1) with [open_conn -> opened {conn#1}; close_conn -> closed] => done ok
