@@ -37,9 +37,10 @@ use crate::facts::{AtomTerm, Certificate, Counterexample, Decision, LinearTerm, 
 use crate::int::Int;
 use crate::kernel::Kernel;
 use crate::typed::{
-    Alternative, Arithmetic, BodyId, BorrowMode, BoundaryDef, BuiltinOp, Command, Comparison,
-    Control, ControlBody, ControlId, Expr, Function, FunctionId, IntType, Kind, Operation,
-    OutcomeId, Place, PlaceStep, Program, Selector, SiteId, StructId, Type, VarId, VarRef,
+    Alternative, Arithmetic, Arm, BodyId, BorrowMode, BoundaryDef, BoundaryId, BuiltinOp, Command,
+    Comparison, Control, ControlBody, ControlId, Expr, Function, FunctionId, IntType, Kind,
+    LoopHead, Operation, OutcomeId, Place, PlaceStep, Program, Selector, SiteId, Statement,
+    StructId, Type, VarId, VarRef,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -2124,15 +2125,69 @@ struct FrozenPlace {
 
 type VisibleVars = Vec<(String, TermId, bool)>;
 
-type LeaveRecord = (
-    usize,
-    Formula,
-    Vec<LinearTerm>,
-    Vec<Vec<(Formula, TermId)>>,
-    Vec<Formula>,
-    Vec<Formula>,
-    Vec<Vec<(Formula, VarId)>>,
-);
+/// `D(x)`, `M(x)` and the terms of every name at one point of a body.
+#[derive(Clone)]
+struct Names {
+    defined: Vec<Formula>,
+    moved: Vec<Formula>,
+    versions: Vec<Vec<(Formula, TermId)>>,
+}
+
+/// A statement that leaves a loop, as the end of the loop reads it ([K8]).
+struct Leave {
+    alternative: usize,
+    /// `Rⱼ` of the statement.
+    reach: Formula,
+    /// The terms of the payload.
+    payload: Vec<LinearTerm>,
+    /// The names where the statement left.
+    names: Names,
+    /// The names that each borrow of the payload was lent from ([I9]).
+    roots: Vec<Vec<(Formula, VarId)>>,
+}
+
+/// A statement as the rules of a body read it.
+struct Point {
+    line: u32,
+    /// The selector `gᵢ` of the statement.
+    guard: Formula,
+    /// `Rᵢ = Lᵢ ∧ gᵢ`: the histories that run the statement ([K2]).
+    reach: Formula,
+    /// The terms of the names that those histories see.
+    env: Env,
+    /// The same names, for a counterexample ([M2]).
+    visible: VisibleVars,
+    /// Whether the statement is in the body of a loop.
+    in_loop: bool,
+}
+
+/// What a statement leaves of the histories `Lᵢ` for the statement after it
+/// ([K3]).
+enum Flow {
+    /// The statement decides nothing and ends nothing: `Lᵢ₊₁ = Lᵢ`.
+    On,
+    /// A decision with the disjunction of its alternatives:
+    /// `Lᵢ₊₁ = Lᵢ ∧ (gᵢ → d.a₁ ∨ … ∨ d.aₙ)`.
+    Decided(Formula),
+    /// A terminator: `Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ`.
+    Ended,
+}
+
+/// A decision while its alternatives are checked.
+struct Deciding<'d> {
+    operation: &'d Operation,
+    arguments: &'d [Expr],
+    contract: Vec<Alternative>,
+    /// The terms of the operands before the operation ran.
+    old: Vec<LinearTerm>,
+    /// The same after it ran: they differ where it wrote through an `&~`
+    /// operand.
+    post: Vec<LinearTerm>,
+    /// The control, where the operation is a pure one ([S5]).
+    pure: Option<ControlId>,
+    /// Where the decided value is a captured outcome: its captures ([I12]).
+    captures: Option<Vec<(Formula, CapturedInfo)>>,
+}
 
 /// The ownership of every name where a statement of the `B₁` of a lexical
 /// boundary may fault ([F5]).
@@ -2181,6 +2236,9 @@ struct BodyChecker<'a> {
     loop_entry_avail: BTreeMap<BodyId, Vec<Formula>>,
     /// Stack of enclosing active body scopes (outermost first).
     active_scopes: Vec<BodyId>,
+    /// The leaves found so far in each loop whose body is being checked
+    /// ([K8]).
+    leaves: BTreeMap<BodyId, Vec<Leave>>,
     /// Whether this scope permits faults (`faults` signature or inside `B₁`).
     permits_faults: bool,
     /// Whether currently checking a `contingency` body `B₂` ([F5], [F6]).
@@ -3700,1684 +3758,50 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    fn check_body(
-        &mut self,
-        body_id: BodyId,
-        live: Formula,
-        in_loop: bool,
-        loop_leaves: &mut BTreeMap<BodyId, Vec<LeaveRecord>>,
-    ) -> Result<(), Error> {
-        self.check_body_inner(body_id, live, in_loop, loop_leaves, false)
+    fn check_body(&mut self, body_id: BodyId, live: Formula, in_loop: bool) -> Result<(), Error> {
+        self.check_body_inner(body_id, live, in_loop, false)
             .map(|_| ())
     }
 
+    /// Checks the statements of a body in their order with `L₁ = live`, and
+    /// gives `Lₙ₊₁`: the histories that reach the end of the body. There
+    /// must be none ([K7]) unless `allow_fallthrough`.
     fn check_body_inner(
         &mut self,
         body_id: BodyId,
         mut live: Formula,
         in_loop: bool,
-        loop_leaves: &mut BTreeMap<BodyId, Vec<LeaveRecord>>,
         allow_fallthrough: bool,
     ) -> Result<Formula, Error> {
         let statements = self.body.bodies[body_id].statements.clone();
         let last_line = statements.last().map_or(1, |s| s.line);
 
         for (stmt_idx, statement) in statements.iter().enumerate() {
-            let line = statement.line;
-            self.at_line = line;
-            let g_i = self.selector(&statement.selector);
+            self.at_line = statement.line;
+            let guard = self.selector(&statement.selector);
             // [K2]: Rᵢ = Lᵢ ∧ gᵢ
-            let r_i = self.solver.bdd.and(live, g_i);
-            let (env, visible_vars) = self.current_env();
-            self.stmt_r.insert((body_id, stmt_idx), r_i);
+            let reach = self.solver.bdd.and(live, guard);
+            let (env, visible) = self.current_env();
+            self.stmt_r.insert((body_id, stmt_idx), reach);
             self.stmt_visible
-                .insert((body_id, stmt_idx), visible_vars.clone());
-
-            match &statement.command {
-                Command::Spawn { .. } | Command::Cancel { .. } => {
-                    return Err(Error {
-                        control: self.owner_name.clone(),
-                        line,
-                        clause: "TK1",
-                        message: "static checking for Slice 4 tasks is scheduled for Phase 3"
-                            .to_string(),
-                        counterexample: None,
-                    });
+                .insert((body_id, stmt_idx), visible.clone());
+            let at = Point {
+                line: statement.line,
+                guard,
+                reach,
+                env,
+                visible,
+                in_loop,
+            };
+            // [K3]: what the statement leaves of `Lᵢ` for the next.
+            live = match self.check_statement(&at, &statement.command, &statements, live)? {
+                Flow::On => live,
+                Flow::Decided(alternatives) => {
+                    let decided = self.solver.bdd.implies(guard, alternatives);
+                    self.solver.bdd.and(live, decided)
                 }
-                Command::Bind { var, value } => {
-                    check_expr_obligations(
-                        self.program,
-                        &mut self.solver,
-                        value,
-                        r_i,
-                        &env,
-                        &self.owner_name,
-                        line,
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    self.check_consume_expr(value, r_i, line, &visible_vars, in_loop)?;
-                    // [O1]: Θ ⊨ ¬(Rᵢ ∧ D(x))
-                    let d_var = self.defined[*var];
-                    let double_bind = self.solver.bdd.and(r_i, d_var);
-                    require_entailment(
-                        &mut self.solver,
-                        double_bind,
-                        &self.owner_name,
-                        line,
-                        "O1",
-                        format!(
-                            "`{}` may already be bound on this history",
-                            self.body.vars[*var].name
-                        ),
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    self.bind_value(*var, r_i, value, &env);
-                    self.defined[*var] = self.solver.bdd.or(self.defined[*var], r_i);
-                    let not_ri = self.solver.bdd.not(r_i);
-                    self.moved[*var] = self.solver.bdd.and(self.moved[*var], not_ri);
-                    if let Expr::Borrow(_, place, _) = value {
-                        self.bind_local_borrow(*var, r_i, place, &env);
-                    } else if let Expr::Var(VarRef::Local(src), ty) = value
-                        && matches!(ty, Type::Ref(_, _))
-                        && let Some(entries) = self.local_borrows.get(src).cloned()
-                    {
-                        let dest = self.local_borrows.entry(*var).or_default();
-                        for (bg, fp) in entries {
-                            let g = self.solver.bdd.and(r_i, bg);
-                            if g != bdd::FALSE {
-                                dest.push((g, fp));
-                            }
-                        }
-                    }
-                    self.record_expr_loan_roots(*var, value, r_i);
-                    self.carry_capture(value, *var, r_i);
-                }
-                Command::Unpack {
-                    struct_id,
-                    vars,
-                    value,
-                } => {
-                    check_expr_obligations(
-                        self.program,
-                        &mut self.solver,
-                        value,
-                        r_i,
-                        &env,
-                        &self.owner_name,
-                        line,
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    self.check_consume_expr(value, r_i, line, &visible_vars, in_loop)?;
-                    let val_term = translate_term(self.program, &mut self.solver, value, &env);
-                    let mut field_terms = Vec::with_capacity(vars.len());
-                    for (fidx, &var_id) in vars.iter().enumerate() {
-                        let d_var = self.defined[var_id];
-                        let double_bind = self.solver.bdd.and(r_i, d_var);
-                        require_entailment(
-                            &mut self.solver,
-                            double_bind,
-                            &self.owner_name,
-                            line,
-                            "O1",
-                            format!(
-                                "`{}` may already be bound on this history",
-                                self.body.vars[var_id].name
-                            ),
-                            &visible_vars,
-                            in_loop,
-                            self.certificates,
-                        )?;
-                        let fty = self.program.structs[*struct_id].fields[fidx].ty.clone();
-                        let ft = translate_field_term(
-                            &mut self.solver,
-                            val_term.clone(),
-                            *struct_id,
-                            fidx,
-                            &fty,
-                        );
-                        let tid = self.bind_value_term(var_id, r_i, ft);
-                        self.defined[var_id] = self.solver.bdd.or(self.defined[var_id], r_i);
-                        let not_ri = self.solver.bdd.not(r_i);
-                        self.moved[var_id] = self.solver.bdd.and(self.moved[var_id], not_ri);
-                        self.record_expr_loan_roots(var_id, value, r_i);
-                        field_terms.push(LinearTerm::var(tid));
-                    }
-                    let cid = self
-                        .solver
-                        .intern_term(AtomTerm::StructCtor(*struct_id, field_terms));
-                    self.solver.instantiate_all();
-                    let eq = self.solver.eq(&val_term, &LinearTerm::var(cid));
-                    self.solver.add_fact(r_i, eq);
-                }
-                Command::Assign { var, value } => {
-                    check_expr_obligations(
-                        self.program,
-                        &mut self.solver,
-                        value,
-                        r_i,
-                        &env,
-                        &self.owner_name,
-                        line,
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    self.check_consume_expr(value, r_i, line, &visible_vars, in_loop)?;
-                    // [O4]: Θ ⊨ Rᵢ → D(x)
-                    let d_var = self.defined[*var];
-                    require_formula(
-                        &mut self.solver,
-                        r_i,
-                        d_var,
-                        &self.owner_name,
-                        line,
-                        "O4",
-                        format!(
-                            "`{}` has no slot on this history",
-                            self.body.vars[*var].name
-                        ),
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    if self.program.kind(self.body.vars[*var].ty.deref_type()) == Kind::Must {
-                        let m_var = self.moved[*var];
-                        require_formula(
-                            &mut self.solver,
-                            r_i,
-                            m_var,
-                            &self.owner_name,
-                            line,
-                            "O4",
-                            format!(
-                                "`{}` holds an unconsumed `must` value and cannot be overwritten",
-                                self.body.vars[*var].name
-                            ),
-                            &visible_vars,
-                            in_loop,
-                            self.certificates,
-                        )?;
-                    }
-                    if matches!(self.body.vars[*var].ty, Type::Ref(BorrowMode::Exclusive, _)) {
-                        let new_val = translate_term(self.program, &mut self.solver, value, &env);
-                        let place = Place {
-                            root: *var,
-                            root_ty: self.body.vars[*var].ty.clone(),
-                            steps: Vec::new(),
-                            ty: self.body.vars[*var].ty.deref_type().clone(),
-                        };
-                        self.apply_place_write(&place, r_i, new_val, &env);
-                    } else {
-                        self.bind_value(*var, r_i, value, &env);
-                        self.refresh_dependent_local_borrows(*var, r_i);
-                    }
-                    let not_ri = self.solver.bdd.not(r_i);
-                    self.moved[*var] = self.solver.bdd.and(self.moved[*var], not_ri);
-                    self.forget_capture(*var, r_i);
-                    self.carry_capture(value, *var, r_i);
-                }
-                Command::AssignPlace { target, value } => {
-                    check_expr_obligations(
-                        self.program,
-                        &mut self.solver,
-                        value,
-                        r_i,
-                        &env,
-                        &self.owner_name,
-                        line,
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    self.check_consume_expr(value, r_i, line, &visible_vars, in_loop)?;
-                    self.check_available(target.root, r_i, line, &visible_vars, in_loop)?;
-                    for step in &target.steps {
-                        if let PlaceStep::Index(idx_expr, _) = step {
-                            self.check_read_expr(idx_expr, r_i, line, &visible_vars, in_loop)?;
-                        }
-                    }
-                    check_place_obligations(
-                        self.program,
-                        &mut self.solver,
-                        target,
-                        r_i,
-                        &env,
-                        &self.owner_name,
-                        line,
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    if self.program.kind(&target.ty) == Kind::Must
-                        && self.is_feasible(r_i, &visible_vars, in_loop)
-                    {
-                        return Err(Error {
-                            control: self.owner_name.clone(),
-                            line,
-                            clause: "O4",
-                            message: "cannot assign to a place of kind `must`".to_string(),
-                            counterexample: None,
-                        });
-                    }
-                    let new_val = translate_term(self.program, &mut self.solver, value, &env);
-                    self.apply_place_write(target, r_i, new_val, &env);
-                }
-                Command::Oblige(formula) => {
-                    self.check_reads(formula, r_i, line, &visible_vars, in_loop)?;
-                    let phi = translate_formula(self.program, &mut self.solver, formula, &env);
-                    // [P1]: Θ; Rᵢ ⊨ φ
-                    require_formula(
-                        &mut self.solver,
-                        r_i,
-                        phi,
-                        &self.owner_name,
-                        line,
-                        "P1",
-                        "proof obligation may not hold",
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    self.solver.add_fact(r_i, phi);
-                }
-                Command::Test { site, condition } => {
-                    check_expr_obligations(
-                        self.program,
-                        &mut self.solver,
-                        condition,
-                        r_i,
-                        &env,
-                        &self.owner_name,
-                        line,
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    self.check_read_expr(condition, r_i, line, &visible_vars, in_loop)?;
-                    let d_true = self.atom(*site, 0);
-                    let d_false = self.atom(*site, 1);
-                    // [K4]: d.true → Rᵢ, d.false → Rᵢ, ¬(d.true ∧ d.false)
-                    let t_imp_r = self.solver.bdd.implies(d_true, r_i);
-                    let f_imp_r = self.solver.bdd.implies(d_false, r_i);
-                    let both = self.solver.bdd.and(d_true, d_false);
-                    let not_both = self.solver.bdd.not(both);
-                    // [K5]: Rᵢ → d.true ∨ d.false
-                    let either = self.solver.bdd.or(d_true, d_false);
-                    let r_imp_either = self.solver.bdd.implies(r_i, either);
-                    self.solver.add_structure(t_imp_r);
-                    self.solver.add_structure(f_imp_r);
-                    self.solver.add_structure(not_both);
-                    self.solver.add_structure(r_imp_either);
-
-                    // [N4]: d.true ⇒ e, d.false ⇒ ¬e
-                    let phi = translate_formula(self.program, &mut self.solver, condition, &env);
-                    let not_phi = self.solver.bdd.not(phi);
-                    self.solver.add_fact(d_true, phi);
-                    self.solver.add_fact(d_false, not_phi);
-                }
-                Command::Capture {
-                    var,
-                    outcome_id: _,
-                    operation,
-                    arguments,
-                } => {
-                    let mut old_args: Vec<LinearTerm> = arguments
-                        .iter()
-                        .map(|a| translate_term(self.program, &mut self.solver, a, &env))
-                        .collect();
-                    let cap_param_tys: Option<Vec<Type>> = match operation {
-                        Operation::Control(cid) => Some(
-                            self.program.controls[*cid]
-                                .parameters
-                                .iter()
-                                .map(|p| p.ty.clone())
-                                .collect(),
-                        ),
-                        _ => None,
-                    };
-                    self.check_operands_o0(
-                        arguments,
-                        cap_param_tys.as_deref(),
-                        r_i,
-                        &env,
-                        line,
-                        &visible_vars,
-                        in_loop,
-                    )?;
-
-                    let mut post_args = old_args.clone();
-                    match operation {
-                        Operation::Control(cid) => {
-                            let callee = &self.program.controls[*cid];
-                            if self.in_contingency
-                                && !callee.contingent
-                                && self.is_feasible(r_i, &visible_vars, in_loop)
-                            {
-                                return Err(Error {
-                                    control: self.owner_name.clone(),
-                                    line,
-                                    clause: "F5",
-                                    message: format!(
-                                        "contingency may not call non-contingent `{}`",
-                                        callee.name
-                                    ),
-                                    counterexample: None,
-                                });
-                            }
-                            if callee.faults {
-                                self.check_call_enclosed(
-                                    &callee.name,
-                                    r_i,
-                                    line,
-                                    &visible_vars,
-                                    in_loop,
-                                )?;
-                                self.check_may_fault(r_i, line, &visible_vars, in_loop)?;
-                            }
-                            let uses = callee.uses.clone();
-                            let callee_name = callee.name.clone();
-                            self.check_effects(
-                                &uses,
-                                &callee_name,
-                                r_i,
-                                line,
-                                &visible_vars,
-                                in_loop,
-                            )?;
-
-                            if let Some(pre) = &self.program.controls[*cid].precondition.clone() {
-                                let call_env = Env {
-                                    locals: BTreeMap::new(),
-                                    parameters: old_args.clone(),
-                                    old_parameters: old_args.clone(),
-                                    fields: Vec::new(),
-                                    constants: BTreeMap::new(),
-                                };
-                                let pre_formula = translate_formula(
-                                    self.program,
-                                    &mut self.solver,
-                                    pre,
-                                    &call_env,
-                                );
-                                require_formula(
-                                    &mut self.solver,
-                                    r_i,
-                                    pre_formula,
-                                    &self.owner_name,
-                                    line,
-                                    "P3",
-                                    format!(
-                                        "precondition of `{}` may not hold",
-                                        self.program.controls[*cid].name
-                                    ),
-                                    &visible_vars,
-                                    in_loop,
-                                    self.certificates,
-                                )?;
-                                self.solver.add_fact(r_i, pre_formula);
-                            }
-
-                            self.apply_call_exclusive_updates(
-                                *cid,
-                                arguments,
-                                r_i,
-                                &mut post_args,
-                                &env,
-                            );
-                        }
-                        Operation::Builtin {
-                            op: BuiltinOp::Emit,
-                            ..
-                        } => {
-                            let uses = vec!["console.write".to_string()];
-                            self.check_effects(&uses, "emit", r_i, line, &visible_vars, in_loop)?;
-                        }
-                        Operation::Builtin {
-                            target: Some(place),
-                            ..
-                        } => {
-                            // [B5], [I12]: the operation runs at the capture,
-                            // so the collection is written here, whatever
-                            // the alternative. What the alternative says of
-                            // the old and the new collection is known when
-                            // the outcome is decided.
-                            let old = translate_place(self.program, &mut self.solver, place, &env);
-                            let new = LinearTerm::var(self.alloc_shape_term(&place.ty));
-                            self.apply_place_write(place, r_i, new.clone(), &env);
-                            old_args[0] = old;
-                            post_args[0] = new;
-                        }
-                        _ => {}
-                    }
-
-                    // [O1] on `var`.
-                    let d_var = self.defined[*var];
-                    let double_bind = self.solver.bdd.and(r_i, d_var);
-                    require_entailment(
-                        &mut self.solver,
-                        double_bind,
-                        &self.owner_name,
-                        line,
-                        "O1",
-                        format!(
-                            "`{}` may already be bound on this history",
-                            self.body.vars[*var].name
-                        ),
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    let tid = self.alloc_var_term(*var);
-                    self.set_version(*var, r_i, tid);
-                    self.defined[*var] = self.solver.bdd.or(self.defined[*var], r_i);
-                    let not_ri = self.solver.bdd.not(r_i);
-                    self.moved[*var] = self.solver.bdd.and(self.moved[*var], not_ri);
-                    self.captured.entry(*var).or_default().push((
-                        r_i,
-                        CapturedInfo {
-                            operation: operation.clone(),
-                            old_args,
-                            post_args,
-                        },
-                    ));
-                }
-                Command::Decide {
-                    site,
-                    operation: _,
-                    op_kind,
-                    arguments,
-                    arms,
-                } => {
-                    let contract = op_kind.contract(self.program);
-                    let op_name = op_kind.name(self.program).to_string();
-                    // [C2]: Every alternative of the operation's contract is listed.
-                    if arms.len() != contract.len() {
-                        return Err(Error {
-                            control: self.owner_name.clone(),
-                            line,
-                            clause: "C2",
-                            message: format!(
-                                "decision on `{op_name}` lists {} of {} alternatives",
-                                arms.len(),
-                                contract.len()
-                            ),
-                            counterexample: None,
-                        });
-                    }
-
-                    let old_arg_terms: Vec<LinearTerm> = arguments
-                        .iter()
-                        .map(|a| translate_term(self.program, &mut self.solver, a, &env))
-                        .collect();
-                    let mut post_arg_terms = old_arg_terms.clone();
-
-                    // Check [O0], [F5], [F1]/[F2]/[F6], [F3], [P3] depending on operation kind.
-                    match op_kind {
-                        Operation::AwaitControl(_)
-                        | Operation::AwaitNext(_, _)
-                        | Operation::RunControl(_) => {
-                            return Err(Error {
-                                control: self.owner_name.clone(),
-                                line,
-                                clause: "TK1",
-                                message:
-                                    "static checking for Slice 4 tasks is scheduled for Phase 3"
-                                        .to_string(),
-                                counterexample: None,
-                            });
-                        }
-                        Operation::Control(cid) => {
-                            let callee = &self.program.controls[*cid];
-                            if self.in_contingency
-                                && !callee.contingent
-                                && self.is_feasible(r_i, &visible_vars, in_loop)
-                            {
-                                return Err(Error {
-                                    control: self.owner_name.clone(),
-                                    line,
-                                    clause: "F5",
-                                    message: format!(
-                                        "contingency may not call non-contingent `{}`",
-                                        callee.name
-                                    ),
-                                    counterexample: None,
-                                });
-                            }
-                            let decide_param_tys: Vec<Type> =
-                                callee.parameters.iter().map(|p| p.ty.clone()).collect();
-                            self.check_operands_o0(
-                                arguments,
-                                Some(&decide_param_tys),
-                                r_i,
-                                &env,
-                                line,
-                                &visible_vars,
-                                in_loop,
-                            )?;
-                            if self.program.controls[*cid].faults {
-                                self.check_call_enclosed(
-                                    &op_name,
-                                    r_i,
-                                    line,
-                                    &visible_vars,
-                                    in_loop,
-                                )?;
-                                self.check_may_fault(r_i, line, &visible_vars, in_loop)?;
-                            }
-                            let uses = self.program.controls[*cid].uses.clone();
-                            self.check_effects(&uses, &op_name, r_i, line, &visible_vars, in_loop)?;
-
-                            if let Some(pre) = &self.program.controls[*cid].precondition.clone() {
-                                let call_env = Env {
-                                    locals: BTreeMap::new(),
-                                    parameters: old_arg_terms.clone(),
-                                    old_parameters: old_arg_terms.clone(),
-                                    fields: Vec::new(),
-                                    constants: BTreeMap::new(),
-                                };
-                                let pre_formula = translate_formula(
-                                    self.program,
-                                    &mut self.solver,
-                                    pre,
-                                    &call_env,
-                                );
-                                require_formula(
-                                    &mut self.solver,
-                                    r_i,
-                                    pre_formula,
-                                    &self.owner_name,
-                                    line,
-                                    "P3",
-                                    format!("precondition of `{op_name}` may not hold"),
-                                    &visible_vars,
-                                    in_loop,
-                                    self.certificates,
-                                )?;
-                                self.solver.add_fact(r_i, pre_formula);
-                            }
-
-                            self.apply_call_exclusive_updates(
-                                *cid,
-                                arguments,
-                                r_i,
-                                &mut post_arg_terms,
-                                &env,
-                            );
-                        }
-                        Operation::Builtin { op, .. } => {
-                            self.check_operands_o0(
-                                arguments,
-                                None,
-                                r_i,
-                                &env,
-                                line,
-                                &visible_vars,
-                                in_loop,
-                            )?;
-                            if *op == BuiltinOp::Emit {
-                                let uses = vec!["console.write".to_string()];
-                                self.check_effects(
-                                    &uses,
-                                    "emit",
-                                    r_i,
-                                    line,
-                                    &visible_vars,
-                                    in_loop,
-                                )?;
-                            }
-                        }
-                        Operation::Outcome(_) => {
-                            self.check_operands_o0(
-                                arguments,
-                                None,
-                                r_i,
-                                &env,
-                                line,
-                                &visible_vars,
-                                in_loop,
-                            )?;
-                        }
-                        Operation::Variant { .. } => {
-                            if let Some(arg) = arguments.first() {
-                                check_expr_obligations(
-                                    self.program,
-                                    &mut self.solver,
-                                    arg,
-                                    r_i,
-                                    &env,
-                                    &self.owner_name,
-                                    line,
-                                    &visible_vars,
-                                    in_loop,
-                                    self.certificates,
-                                )?;
-                                self.check_consume_expr(arg, r_i, line, &visible_vars, in_loop)?;
-                            }
-                        }
-                    }
-
-                    let mut any_arm = bdd::FALSE;
-                    let mut arm_atoms = Vec::new();
-                    for pos in 0..arms.len() {
-                        let atom = self.atom(*site, pos);
-                        arm_atoms.push(atom);
-                        any_arm = self.solver.bdd.or(any_arm, atom);
-                        // [K4]: d.a → Rᵢ
-                        let imp = self.solver.bdd.implies(atom, r_i);
-                        self.solver.add_structure(imp);
-                    }
-                    // [K4]: ¬(d.a ∧ d.b)
-                    for i in 0..arm_atoms.len() {
-                        for j in (i + 1)..arm_atoms.len() {
-                            let both = self.solver.bdd.and(arm_atoms[i], arm_atoms[j]);
-                            let not_both = self.solver.bdd.not(both);
-                            self.solver.add_structure(not_both);
-                        }
-                    }
-
-                    let (is_pure, pure_cid) = match op_kind {
-                        Operation::Control(cid) if self.program.control_is_pure(*cid) => {
-                            (true, Some(*cid))
-                        }
-                        _ => (false, None),
-                    };
-                    let pure_alt_term = pure_cid.map(|cid| {
-                        let id = self
-                            .solver
-                            .intern_term(AtomTerm::PureAlt(cid, old_arg_terms.clone()));
-                        self.solver.instantiate_all();
-                        LinearTerm::var(id)
-                    });
-
-                    // Snapshot captured entries if deciding an outcome variable.
-                    let outcome_captures = match op_kind {
-                        Operation::Outcome(_) => match arguments.first() {
-                            Some(Expr::Var(VarRef::Local(v), _)) => self.captured.get(v).cloned(),
-                            Some(Expr::Move(inner, _)) => match &**inner {
-                                Expr::Var(VarRef::Local(v), _) => self.captured.get(v).cloned(),
-                                _ => None,
-                            },
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-
-                    for (pos, arm) in arms.iter().enumerate() {
-                        let atom = arm_atoms[pos];
-                        let contract_alt = &contract[arm.alternative];
-                        let mut field_terms = Vec::new();
-
-                        for (field_idx, &var_id) in arm.vars.iter().enumerate() {
-                            // [O1]: Θ ⊨ ¬(d.a ∧ D(x))
-                            let d_var = self.defined[var_id];
-                            let double_bind = self.solver.bdd.and(atom, d_var);
-                            require_entailment(
-                                &mut self.solver,
-                                double_bind,
-                                &self.owner_name,
-                                line,
-                                "O1",
-                                format!(
-                                    "`{}` may already be bound on this history",
-                                    self.body.vars[var_id].name
-                                ),
-                                &visible_vars,
-                                in_loop,
-                                self.certificates,
-                            )?;
-                            let tid = self.alloc_var_term(var_id);
-                            let v_term = LinearTerm::var(tid);
-                            self.set_version(var_id, atom, tid);
-                            self.defined[var_id] = self.solver.bdd.or(self.defined[var_id], atom);
-                            let not_atom = self.solver.bdd.not(atom);
-                            self.moved[var_id] = self.solver.bdd.and(self.moved[var_id], not_atom);
-                            if let Some(field) = contract_alt.fields.get(field_idx)
-                                && self.program.contains_borrow_or_view(&field.ty)
-                            {
-                                for &oidx in &field.origins {
-                                    if let Some(arg) = arguments.get(oidx) {
-                                        self.record_expr_loan_roots(var_id, arg, atom);
-                                    }
-                                }
-                            }
-
-                            if let Some(cid) = pure_cid {
-                                let pay_id = self.solver.intern_term(AtomTerm::PurePay(
-                                    cid,
-                                    arm.alternative,
-                                    field_idx,
-                                    old_arg_terms.clone(),
-                                ));
-                                self.solver.instantiate_all();
-                                let eq = self.solver.eq(&v_term, &LinearTerm::var(pay_id));
-                                self.solver.add_fact(atom, eq);
-                            }
-                            field_terms.push(v_term);
-                        }
-
-                        if let Some(alt_term) = &pure_alt_term {
-                            let eq = self
-                                .solver
-                                .eq(alt_term, &LinearTerm::from_i128(arm.alternative as i128));
-                            self.solver.add_fact(atom, eq);
-                        }
-
-                        match op_kind {
-                            Operation::AwaitControl(_)
-                            | Operation::AwaitNext(_, _)
-                            | Operation::RunControl(_) => {}
-                            Operation::Control(_) => {
-                                if let Some(cond) = &contract_alt.condition {
-                                    let cond_env = Env {
-                                        locals: BTreeMap::new(),
-                                        parameters: post_arg_terms.clone(),
-                                        old_parameters: old_arg_terms.clone(),
-                                        fields: field_terms,
-                                        constants: BTreeMap::new(),
-                                    };
-                                    let cond_formula = translate_formula(
-                                        self.program,
-                                        &mut self.solver,
-                                        cond,
-                                        &cond_env,
-                                    );
-                                    self.solver.add_fact(atom, cond_formula);
-                                }
-                            }
-                            Operation::Builtin { op, target, .. } => {
-                                self.apply_builtin_facts(
-                                    *op,
-                                    target.as_ref(),
-                                    &old_arg_terms,
-                                    arm.alternative,
-                                    atom,
-                                    &field_terms,
-                                    &env,
-                                );
-                            }
-                            Operation::Variant { id: vid, .. } => {
-                                // [I11]: `d.c ⇒ x = V.c {ȳ}`
-                                if let Some(scrutinee) = old_arg_terms.first() {
-                                    let num_ctors = self.program.variants[*vid].constructors.len();
-                                    let ctor_id = self.solver.intern_term(AtomTerm::VariantCtor {
-                                        variant_id: *vid,
-                                        ctor_idx: arm.alternative,
-                                        fields: field_terms,
-                                        num_ctors,
-                                    });
-                                    self.solver.instantiate_all();
-                                    let eq = self.solver.eq(scrutinee, &LinearTerm::var(ctor_id));
-                                    self.solver.add_fact(atom, eq);
-                                }
-                            }
-                            Operation::Outcome(oid) => {
-                                // [I12]: the conditions of the captured
-                                // operation over the arguments of the
-                                // capture, on the histories that saw it.
-                                let mut seen = bdd::FALSE;
-                                if let Some(entries) = &outcome_captures {
-                                    for (cap_guard, info) in entries {
-                                        seen = self.solver.bdd.or(seen, *cap_guard);
-                                        let g = self.solver.bdd.and(*cap_guard, atom);
-                                        if g == bdd::FALSE {
-                                            continue;
-                                        }
-                                        match &info.operation {
-                                            Operation::Control(cid) => {
-                                                if let Some(cond) = &self.program.controls[*cid]
-                                                    .contract[arm.alternative]
-                                                    .condition
-                                                {
-                                                    let cond_env = Env {
-                                                        locals: BTreeMap::new(),
-                                                        parameters: info.post_args.clone(),
-                                                        old_parameters: info.old_args.clone(),
-                                                        fields: field_terms.clone(),
-                                                        constants: BTreeMap::new(),
-                                                    };
-                                                    let cf = translate_formula(
-                                                        self.program,
-                                                        &mut self.solver,
-                                                        cond,
-                                                        &cond_env,
-                                                    );
-                                                    self.solver.add_fact(g, cf);
-                                                }
-                                            }
-                                            Operation::Builtin { op, target, .. } => {
-                                                self.apply_builtin_facts(
-                                                    *op,
-                                                    None,
-                                                    &info.old_args,
-                                                    arm.alternative,
-                                                    g,
-                                                    &field_terms,
-                                                    &env,
-                                                );
-                                                if target.is_some() {
-                                                    self.shape_facts(
-                                                        *op,
-                                                        &info.old_args[0],
-                                                        &info.post_args[0],
-                                                        arm.alternative,
-                                                        g,
-                                                    );
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                // Where the capture is not visible (the
-                                // value arrived as a parameter or as a
-                                // payload), the arguments are fresh names.
-                                let source = outcome_control(self.program, *oid);
-                                let condition = contract_alt.condition.clone().or_else(|| {
-                                    let control = &self.program.controls[source?];
-                                    control.contract[arm.alternative].condition.clone()
-                                });
-                                let unseen = self.solver.bdd.minus(r_i, seen);
-                                if unseen != bdd::FALSE
-                                    && let Some(cond) = condition
-                                {
-                                    let mut parameters = Vec::new();
-                                    let mut old_parameters = Vec::new();
-                                    for p in 0..max_param_index(&cond) {
-                                        let ty = source
-                                            .and_then(|cid| {
-                                                self.program.controls[cid].parameters.get(p)
-                                            })
-                                            .map(|parameter| parameter.ty.clone());
-                                        let fresh = |checker: &mut Self, tag: &str| match &ty {
-                                            Some(ty) => {
-                                                checker.alloc_type_term(&format!("{tag}{p}"), ty)
-                                            }
-                                            None => checker.solver.fresh_var(
-                                                format!("{tag}{p}"),
-                                                None,
-                                                false,
-                                            ),
-                                        };
-                                        let now = LinearTerm::var(fresh(self, "_out_arg"));
-                                        // `old(p)` is another value than `p`
-                                        // for an `&~` parameter alone ([P4]).
-                                        let exclusive = matches!(
-                                            ty,
-                                            None | Some(Type::Ref(BorrowMode::Exclusive, _))
-                                        );
-                                        old_parameters.push(if exclusive {
-                                            LinearTerm::var(fresh(self, "_out_old"))
-                                        } else {
-                                            now.clone()
-                                        });
-                                        parameters.push(now);
-                                    }
-                                    let cond_env = Env {
-                                        locals: BTreeMap::new(),
-                                        parameters,
-                                        old_parameters,
-                                        fields: field_terms,
-                                        constants: BTreeMap::new(),
-                                    };
-                                    let cf = translate_formula(
-                                        self.program,
-                                        &mut self.solver,
-                                        &cond,
-                                        &cond_env,
-                                    );
-                                    let not_seen = self.solver.bdd.not(seen);
-                                    let guard = self.solver.bdd.and(atom, not_seen);
-                                    self.solver.add_fact(guard, cf);
-                                }
-                            }
-                        }
-                    }
-
-                    let always_check_u16 = matches!(op_kind, Operation::Outcome(_))
-                        || matches!(
-                            op_kind,
-                            Operation::Builtin {
-                                op: BuiltinOp::Pop
-                                    | BuiltinOp::Take
-                                    | BuiltinOp::Insert
-                                    | BuiltinOp::Remove
-                                    | BuiltinOp::Get
-                                    | BuiltinOp::EntryAt,
-                                ..
-                            }
-                        );
-                    self.warn_unreachable_arms(
-                        &op_name,
-                        line,
-                        &statements,
-                        &contract,
-                        arms,
-                        &arm_atoms,
-                        is_pure,
-                        always_check_u16,
-                        r_i,
-                        &visible_vars,
-                        in_loop,
-                    );
-
-                    // [K3]: Lᵢ₊₁ = Lᵢ ∧ (gᵢ → d.a₁ ∨ … ∨ d.aₙ)
-                    let g_imp_any = self.solver.bdd.implies(g_i, any_arm);
-                    live = self.solver.bdd.and(live, g_imp_any);
-                }
-                Command::Loop {
-                    site,
-                    body: loop_body,
-                    initial,
-                    arms,
-                } => {
-                    self.check_operands_o0(initial, None, r_i, &env, line, &visible_vars, in_loop)?;
-
-                    let head = self.body.bodies[*loop_body]
-                        .head
-                        .as_ref()
-                        .expect("a loop head")
-                        .clone();
-
-                    // [P2]: Loop invariant holds for the initial arguments at entry.
-                    if let Some(inv) = &head.invariant {
-                        let mut init_env = env.clone();
-                        for (&param_var, init_expr) in head.parameters.iter().zip(initial) {
-                            let init_term =
-                                translate_term(self.program, &mut self.solver, init_expr, &env);
-                            init_env.locals.insert(param_var, init_term);
-                        }
-                        let inv_entry =
-                            translate_formula(self.program, &mut self.solver, inv, &init_env);
-                        require_formula(
-                            &mut self.solver,
-                            r_i,
-                            inv_entry,
-                            &self.owner_name,
-                            line,
-                            "P2",
-                            format!("invariant of loop `{}` may not hold at entry", head.name),
-                            &visible_vars,
-                            in_loop,
-                            self.certificates,
-                        )?;
-                    }
-
-                    // Save outer state before checking the generic iteration ([K6], [N5], [O6]).
-                    let saved_defined = self.defined.clone();
-                    let saved_moved = self.moved.clone();
-                    let saved_versions = self.versions.clone();
-                    let mut entry_avail = Vec::with_capacity(self.body.vars.len());
-                    for v in 0..self.body.vars.len() {
-                        entry_avail.push(self.avail(v));
-                    }
-                    self.loop_entry_avail.insert(*loop_body, entry_avail);
-
-                    for (&param_var, init_expr) in head.parameters.iter().zip(initial) {
-                        self.record_expr_loan_roots(param_var, init_expr, r_i);
-                    }
-                    self.collect_loop_again_root_vars(*loop_body, r_i);
-
-                    // [N5], [I9]: Give fresh logical names to loop parameters
-                    // and to outer names that the loop body can change.
-                    let mut modified_outer = BTreeSet::new();
-                    collect_modified_vars(self.program, self.body, *loop_body, &mut modified_outer);
-                    self.close_modified_with_borrows(&mut modified_outer);
-                    for &var in &modified_outer {
-                        if self.body.vars[var].body != *loop_body && self.defined[var] != bdd::FALSE
-                        {
-                            let fresh_tid = self.alloc_var_term(var);
-                            let active_on_loop = self.solver.bdd.and(self.defined[var], r_i);
-                            self.set_version(var, active_on_loop, fresh_tid);
-                            self.forget_capture(var, r_i);
-                        }
-                    }
-
-                    for &param_var in &head.parameters {
-                        let tid = self.alloc_var_term(param_var);
-                        self.defined[param_var] = r_i;
-                        let not_ri = self.solver.bdd.not(r_i);
-                        self.moved[param_var] = self.solver.bdd.and(self.moved[param_var], not_ri);
-                        self.versions[param_var] = vec![(r_i, tid)];
-                    }
-
-                    // [N4]: Inside the loop body, the invariant is assumed on R_d.
-                    if let Some(inv) = &head.invariant {
-                        let (iter_env, _) = self.current_env();
-                        let inv_iter =
-                            translate_formula(self.program, &mut self.solver, inv, &iter_env);
-                        self.solver.add_fact(r_i, inv_iter);
-                    }
-
-                    loop_leaves.insert(*loop_body, Vec::new());
-                    self.active_scopes.push(*loop_body);
-                    // [K6]: Check the loop body for one generic iteration with L₁ = R_d.
-                    self.check_body_inner(*loop_body, r_i, true, loop_leaves, false)?;
-                    self.active_scopes.pop();
-                    self.loop_entry_avail.remove(loop_body);
-                    let leaves = loop_leaves.remove(loop_body).unwrap_or_default();
-
-                    // Restore outer definedness and link post-loop facts ([K8], [O6]).
-                    self.defined = saved_defined;
-                    self.moved = saved_moved;
-                    self.versions = saved_versions;
-
-                    let mut any_arm = bdd::FALSE;
-                    let mut arm_atoms = Vec::new();
-                    for alt_idx in 0..arms.len() {
-                        let atom = self.atom(*site, alt_idx);
-                        arm_atoms.push(atom);
-                        any_arm = self.solver.bdd.or(any_arm, atom);
-                        // [K4]: d.a → Rᵢ
-                        let imp = self.solver.bdd.implies(atom, r_i);
-                        self.solver.add_structure(imp);
-
-                        // [K8]: d.a ↔ R_{j₁} ∨ … ∨ R_{jₖ}
-                        let mut leave_disj = bdd::FALSE;
-                        for (leave_alt, r_j, _, _, _, _, _) in &leaves {
-                            if *leave_alt == alt_idx {
-                                leave_disj = self.solver.bdd.or(leave_disj, *r_j);
-                            }
-                        }
-                        let iff = self.solver.bdd.iff(atom, leave_disj);
-                        self.solver.add_structure(iff);
-                    }
-                    for i in 0..arm_atoms.len() {
-                        for j in (i + 1)..arm_atoms.len() {
-                            let both = self.solver.bdd.and(arm_atoms[i], arm_atoms[j]);
-                            let not_both = self.solver.bdd.not(both);
-                            self.solver.add_structure(not_both);
-                        }
-                    }
-
-                    // Update modified outer variables on the histories where the loop left ([K8]).
-                    for (_, r_j, _, leave_versions, _, _, _) in &leaves {
-                        for &var in &modified_outer {
-                            if self.body.vars[var].body != *loop_body {
-                                let mux = self.alloc_var_term(var);
-                                for &(h, tid) in &leave_versions[var] {
-                                    let on_leave = self.solver.bdd.and(*r_j, h);
-                                    if on_leave != bdd::FALSE {
-                                        self.solver.add_def_linear(
-                                            on_leave,
-                                            mux,
-                                            LinearTerm::var(tid),
-                                        );
-                                    }
-                                }
-                                self.set_version(var, *r_j, mux);
-                            }
-                        }
-                    }
-
-                    // [O6](b): `□ a` leaves must agree on every outer variable's availability.
-                    for (alt_idx, &atom) in arm_atoms.iter().enumerate() {
-                        for var in 0..self.body.vars.len() {
-                            if !self.active_scopes.contains(&self.body.vars[var].body) {
-                                continue;
-                            }
-                            let mut same_as_entry_bad = bdd::FALSE;
-                            let mut moved_bad = bdd::FALSE;
-                            let mut avail_bad = bdd::FALSE;
-                            let entry_a = self.avail(var);
-                            let mut has_leaf = false;
-                            for (leave_alt, r_j, _, _, l_def, l_mov, _) in &leaves {
-                                if *leave_alt != alt_idx {
-                                    continue;
-                                }
-                                has_leaf = true;
-                                let not_lmov = self.solver.bdd.not(l_mov[var]);
-                                let l_avail = self.solver.bdd.and(l_def[var], not_lmov);
-                                let eq_entry = self.solver.bdd.iff(l_avail, entry_a);
-                                let not_eq_entry = self.solver.bdd.not(eq_entry);
-                                let b_entry = self.solver.bdd.and(*r_j, not_eq_entry);
-                                same_as_entry_bad = self.solver.bdd.or(same_as_entry_bad, b_entry);
-
-                                let b_mov = self.solver.bdd.and(*r_j, l_avail);
-                                moved_bad = self.solver.bdd.or(moved_bad, b_mov);
-
-                                let not_lav = self.solver.bdd.not(l_avail);
-                                let b_av = self.solver.bdd.and(*r_j, not_lav);
-                                avail_bad = self.solver.bdd.or(avail_bad, b_av);
-                            }
-                            if !has_leaf || same_as_entry_bad == bdd::FALSE {
-                                continue;
-                            }
-                            let about = "the ownership of a name after a loop";
-                            if self.has_no_model(
-                                same_as_entry_bad,
-                                &visible_vars,
-                                in_loop,
-                                "O6",
-                                about,
-                            ) {
-                                continue;
-                            }
-                            if self.has_no_model(moved_bad, &visible_vars, in_loop, "O6", about) {
-                                self.moved[var] = self.solver.bdd.or(self.moved[var], atom);
-                                continue;
-                            }
-                            if self.has_no_model(avail_bad, &visible_vars, in_loop, "O6", about) {
-                                self.defined[var] = self.solver.bdd.or(self.defined[var], atom);
-                                let not_atom = self.solver.bdd.not(atom);
-                                self.moved[var] = self.solver.bdd.and(self.moved[var], not_atom);
-                                continue;
-                            }
-                            require_entailment(
-                                &mut self.solver,
-                                same_as_entry_bad,
-                                &self.owner_name,
-                                line,
-                                "O6",
-                                format!(
-                                    "loop leaves disagree on ownership of outer `{}`",
-                                    self.body.vars[var].name
-                                ),
-                                &visible_vars,
-                                in_loop,
-                                self.certificates,
-                            )?;
-                        }
-                    }
-
-                    // Bind loop arm payload variables ([O1], [K8]).
-                    for (alt_idx, arm_vars) in arms.iter().enumerate() {
-                        let atom = arm_atoms[alt_idx];
-                        for (field_pos, &var_id) in arm_vars.iter().enumerate() {
-                            let d_var = self.defined[var_id];
-                            let double_bind = self.solver.bdd.and(atom, d_var);
-                            require_entailment(
-                                &mut self.solver,
-                                double_bind,
-                                &self.owner_name,
-                                line,
-                                "O1",
-                                format!(
-                                    "`{}` may already be bound on this history",
-                                    self.body.vars[var_id].name
-                                ),
-                                &visible_vars,
-                                in_loop,
-                                self.certificates,
-                            )?;
-                            let out_tid = self.alloc_var_term(var_id);
-                            let out_is_borrow_or_view = self
-                                .program
-                                .contains_borrow_or_view(&self.body.vars[var_id].ty);
-                            for (leave_alt, r_j, payload_terms, _, _, _, payload_roots) in &leaves {
-                                if *leave_alt == alt_idx {
-                                    if let Some(val_term) = payload_terms.get(field_pos) {
-                                        if *self.body.vars[var_id].ty.deref_type() == Type::Bool {
-                                            let b =
-                                                self.solver.le(&LinearTerm::from_i128(1), val_term);
-                                            self.solver.add_def_bool(*r_j, out_tid, b);
-                                        } else {
-                                            self.solver.add_def_linear(
-                                                *r_j,
-                                                out_tid,
-                                                val_term.clone(),
-                                            );
-                                        }
-                                    }
-                                    if out_is_borrow_or_view
-                                        && let Some(proots) = payload_roots.get(field_pos)
-                                    {
-                                        for &(lg, rv) in proots {
-                                            if !self.var_in_body_tree(rv, *loop_body) {
-                                                let rj_lg = self.solver.bdd.and(*r_j, lg);
-                                                let g = self.solver.bdd.and(atom, rj_lg);
-                                                self.push_var_loan_root(var_id, g, rv);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            self.set_version(var_id, atom, out_tid);
-                            self.defined[var_id] = self.solver.bdd.or(self.defined[var_id], atom);
-                            let not_atom = self.solver.bdd.not(atom);
-                            self.moved[var_id] = self.solver.bdd.and(self.moved[var_id], not_atom);
-                        }
-                    }
-
-                    // [K3]: Lᵢ₊₁ = Lᵢ ∧ (gᵢ → d.a₁ ∨ … ∨ d.aₙ)
-                    let g_imp_any = self.solver.bdd.implies(g_i, any_arm);
-                    live = self.solver.bdd.and(live, g_imp_any);
-                }
-                Command::Boundary {
-                    site,
-                    body: b1_body,
-                    captures,
-                    contingency_vars,
-                    message_var,
-                    contingency: b2_body,
-                } => {
-                    // [F5]: Captured names must own their values, be available, and move.
-                    let mut cap_terms = Vec::with_capacity(captures.len());
-                    for &cap_var in captures {
-                        self.check_available(cap_var, r_i, line, &visible_vars, in_loop)?;
-                        let cap_term = env
-                            .locals
-                            .get(&cap_var)
-                            .cloned()
-                            .unwrap_or_else(|| LinearTerm::from_i128(0));
-                        cap_terms.push(cap_term);
-                        if self.program.kind(&self.body.vars[cap_var].ty) != Kind::Copy {
-                            self.moved[cap_var] = self.solver.bdd.or(self.moved[cap_var], r_i);
-                        }
-                    }
-
-                    let outer_defined = self.defined.clone();
-                    let outer_moved = self.moved.clone();
-                    let outer_versions = self.versions.clone();
-                    let outer_permits_faults = self.permits_faults;
-                    let outer_in_contingency = self.in_contingency;
-
-                    // Check `B₁` with fault permission enabled ([F5]). The
-                    // boundary has `x̄` in its care while `B₁` runs, and the
-                    // states in which `B₁` may fault are where `B₂` begins.
-                    self.care.push((*b1_body, captures.clone()));
-                    self.fault_frames.push(Vec::new());
-                    self.active_scopes.push(*b1_body);
-                    self.permits_faults = true;
-                    self.in_contingency = false;
-                    let b1_exit_live =
-                        self.check_body_inner(*b1_body, r_i, in_loop, loop_leaves, true)?;
-                    self.boundary_fallthrough_live
-                        .insert(*b1_body, b1_exit_live);
-                    let (_, b1_visible) = self.current_env();
-                    self.check_scope_obligations(
-                        &[*b1_body],
-                        b1_exit_live,
-                        line,
-                        &b1_visible,
-                        in_loop,
-                    )?;
-                    self.active_scopes.pop();
-                    self.care.pop();
-                    let fault_states = self.fault_frames.pop().unwrap_or_default();
-                    let b1_end_defined = self.defined.clone();
-                    let b1_end_moved = self.moved.clone();
-                    let b1_end_versions = self.versions.clone();
-
-                    // Check `B₂` (`contingency`) with outer state reset and captures + message bound.
-                    self.defined = outer_defined.clone();
-                    self.moved = outer_moved.clone();
-                    self.versions = outer_versions.clone();
-                    let mut b1_modified = BTreeSet::new();
-                    collect_modified_vars(self.program, self.body, *b1_body, &mut b1_modified);
-                    self.close_modified_with_borrows(&mut b1_modified);
-                    for &var in &b1_modified {
-                        if self.active_scopes.contains(&self.body.vars[var].body)
-                            && self.defined[var] != bdd::FALSE
-                        {
-                            let fresh_tid = self.alloc_var_term(var);
-                            let on_b2 = self.solver.bdd.and(self.defined[var], r_i);
-                            self.set_version(var, on_b2, fresh_tid);
-                        }
-                    }
-                    for (cvar, cap_term) in contingency_vars.iter().zip(&cap_terms) {
-                        let _ = self.bind_value_term(*cvar, r_i, cap_term.clone());
-                        self.defined[*cvar] = self.solver.bdd.or(self.defined[*cvar], r_i);
-                        let not_ri = self.solver.bdd.not(r_i);
-                        self.moved[*cvar] = self.solver.bdd.and(self.moved[*cvar], not_ri);
-                    }
-                    if let Some(mvar) = message_var {
-                        let mtid = self.alloc_var_term(*mvar);
-                        self.set_version(*mvar, r_i, mtid);
-                        self.defined[*mvar] = self.solver.bdd.or(self.defined[*mvar], r_i);
-                        let not_ri = self.solver.bdd.not(r_i);
-                        self.moved[*mvar] = self.solver.bdd.and(self.moved[*mvar], not_ri);
-                    }
-                    // [F5]: `B₂` runs after a fault at a statement of `B₁`,
-                    // so its histories are those of the statements of `B₁`
-                    // that may fault, and none when there is no such
-                    // statement.
-                    let mut faulted = bdd::FALSE;
-                    for state in &fault_states {
-                        faulted = self.solver.bdd.or(faulted, state.reach);
-                    }
-                    let b2_live = self.solver.bdd.and(r_i, faulted);
-                    let outer_after_fault = self
-                        .after_fault
-                        .replace((fault_states, self.active_scopes.len()));
-                    self.active_scopes.push(*b2_body);
-                    self.permits_faults = outer_permits_faults;
-                    self.in_contingency = true;
-                    self.check_body_inner(*b2_body, b2_live, in_loop, loop_leaves, false)?;
-                    self.active_scopes.pop();
-                    self.after_fault = outer_after_fault;
-
-                    // Restore flags and merge `B₁` fallthrough state with bypassed `!g_i` histories.
-                    self.permits_faults = outer_permits_faults;
-                    self.in_contingency = outer_in_contingency;
-                    let bypassed = self.solver.bdd.minus(live, g_i);
-                    for v in 0..self.body.vars.len() {
-                        let left_d = self.solver.bdd.and(outer_defined[v], bypassed);
-                        let right_d = self.solver.bdd.and(b1_end_defined[v], b1_exit_live);
-                        self.defined[v] = self.solver.bdd.or(left_d, right_d);
-
-                        let left_m = self.solver.bdd.and(outer_moved[v], bypassed);
-                        let right_m = self.solver.bdd.and(b1_end_moved[v], b1_exit_live);
-                        self.moved[v] = self.solver.bdd.or(left_m, right_m);
-
-                        let mut merged = Vec::new();
-                        for (g, tid) in &outer_versions[v] {
-                            let mg = self.solver.bdd.and(*g, bypassed);
-                            if mg != bdd::FALSE {
-                                merged.push((mg, *tid));
-                            }
-                        }
-                        for (g, tid) in &b1_end_versions[v] {
-                            let mg = self.solver.bdd.and(*g, b1_exit_live);
-                            if mg != bdd::FALSE {
-                                merged.push((mg, *tid));
-                            }
-                        }
-                        self.versions[v] = merged;
-                    }
-                    let d_done = self.atom(*site, 0);
-                    let iff = self.solver.bdd.iff(d_done, b1_exit_live);
-                    self.solver.add_structure(iff);
-                    let g_imp_done = self.solver.bdd.implies(g_i, d_done);
-                    live = self.solver.bdd.and(live, g_imp_done);
-                }
-                Command::Supervise {
-                    boundary: bid,
-                    arguments,
-                } => {
-                    let bdef = &self.program.boundaries[*bid];
-                    let bname = bdef.name.clone();
-                    if self.in_contingency && self.is_feasible(r_i, &visible_vars, in_loop) {
-                        return Err(Error {
-                            control: self.owner_name.clone(),
-                            line,
-                            clause: "F5",
-                            message: format!("contingency may not supervise boundary `{bname}`"),
-                            counterexample: None,
-                        });
-                    }
-                    let b_param_tys: Vec<Type> =
-                        bdef.parameters.iter().map(|p| p.ty.clone()).collect();
-                    self.check_operands_o0(
-                        arguments,
-                        Some(&b_param_tys),
-                        r_i,
-                        &env,
-                        line,
-                        &visible_vars,
-                        in_loop,
-                    )?;
-                    let uses = bdef.uses.clone();
-                    self.check_effects(&uses, &bname, r_i, line, &visible_vars, in_loop)?;
-                    if self.boundary_may_fault[*bid] {
-                        self.check_may_fault(r_i, line, &visible_vars, in_loop)?;
-                    }
-                }
-                Command::Again {
-                    body: target_body,
-                    arguments,
-                } => {
-                    self.check_operands_o0(
-                        arguments,
-                        None,
-                        r_i,
-                        &env,
-                        line,
-                        &visible_vars,
-                        in_loop,
-                    )?;
-                    let head = self.body.bodies[*target_body]
-                        .head
-                        .as_ref()
-                        .expect("a loop head")
-                        .clone();
-                    // [P2]: Loop invariant holds for the new arguments at `↑`.
-                    if let Some(inv) = &head.invariant {
-                        let mut next_env = env.clone();
-                        for (&param_var, arg_expr) in head.parameters.iter().zip(arguments) {
-                            let arg_term =
-                                translate_term(self.program, &mut self.solver, arg_expr, &env);
-                            next_env.locals.insert(param_var, arg_term);
-                        }
-                        let inv_again =
-                            translate_formula(self.program, &mut self.solver, inv, &next_env);
-                        require_formula(
-                            &mut self.solver,
-                            r_i,
-                            inv_again,
-                            &self.owner_name,
-                            line,
-                            "P2",
-                            format!("invariant of loop `{}` may not hold at `↑`", head.name),
-                            &visible_vars,
-                            in_loop,
-                            self.certificates,
-                        )?;
-                    }
-                    self.check_loop_repeat_scope(
-                        *target_body,
-                        r_i,
-                        line,
-                        "↑",
-                        &visible_vars,
-                        in_loop,
-                    )?;
-                    // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
-                    live = self.solver.bdd.minus(live, g_i);
-                }
-                Command::Leave {
-                    alternative,
-                    payload,
-                } => {
-                    self.check_operands_o0(payload, None, r_i, &env, line, &visible_vars, in_loop)?;
-                    let payload_terms: Vec<LinearTerm> = payload
-                        .iter()
-                        .map(|e| translate_term(self.program, &mut self.solver, e, &env))
-                        .collect();
-                    let payload_roots: Vec<Vec<(Formula, VarId)>> = payload
-                        .iter()
-                        .map(|e| self.expr_loan_roots(e, bdd::TRUE))
-                        .collect();
-                    let target_loop_pos = self
-                        .active_scopes
-                        .iter()
-                        .rposition(|&b| self.body.bodies[b].head.is_some());
-                    if let Some(pos) = target_loop_pos {
-                        let target_loop = self.active_scopes[pos];
-                        let ended: Vec<BodyId> = self.active_scopes[pos..].to_vec();
-                        self.check_scope_obligations(&ended, r_i, line, &visible_vars, in_loop)?;
-                        if let Some(list) = loop_leaves.get_mut(&target_loop) {
-                            list.push((
-                                *alternative,
-                                r_i,
-                                payload_terms,
-                                self.versions.clone(),
-                                self.defined.clone(),
-                                self.moved.clone(),
-                                payload_roots,
-                            ));
-                        }
-                    }
-                    // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
-                    live = self.solver.bdd.minus(live, g_i);
-                }
-                Command::Exit {
-                    alternative,
-                    payload,
-                } => {
-                    self.check_operands_o0(payload, None, r_i, &env, line, &visible_vars, in_loop)?;
-                    let entry = &self.contract[*alternative];
-                    // [P4]: Contract condition `⇐ φₐ` at `■`.
-                    if let Some(cond) = &entry.condition {
-                        let payload_terms: Vec<LinearTerm> = payload
-                            .iter()
-                            .map(|e| translate_term(self.program, &mut self.solver, e, &env))
-                            .collect();
-                        let exit_parameters: Vec<LinearTerm> = self
-                            .param_types
-                            .iter()
-                            .enumerate()
-                            .map(|(pidx, pty)| {
-                                if self.program.has_exclusive_borrow(pty) {
-                                    env.locals
-                                        .get(&pidx)
-                                        .cloned()
-                                        .unwrap_or_else(|| self.entry_parameters[pidx].clone())
-                                } else {
-                                    self.entry_parameters[pidx].clone()
-                                }
-                            })
-                            .collect();
-                        let exit_env = Env {
-                            locals: BTreeMap::new(),
-                            parameters: exit_parameters,
-                            old_parameters: self.entry_parameters.clone(),
-                            fields: payload_terms,
-                            constants: BTreeMap::new(),
-                        };
-                        let cond_formula =
-                            translate_formula(self.program, &mut self.solver, cond, &exit_env);
-                        require_formula(
-                            &mut self.solver,
-                            r_i,
-                            cond_formula,
-                            &self.owner_name,
-                            line,
-                            "P4",
-                            format!(
-                                "condition of exit alternative `{}` may not hold",
-                                entry.name
-                            ),
-                            &visible_vars,
-                            in_loop,
-                            self.certificates,
-                        )?;
-                    }
-                    let all_scopes = self.active_scopes.clone();
-                    self.check_scope_obligations(&all_scopes, r_i, line, &visible_vars, in_loop)?;
-                    // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
-                    live = self.solver.bdd.minus(live, g_i);
-                }
-                Command::Fault {
-                    message,
-                    assumed: _,
-                } => {
-                    check_expr_obligations(
-                        self.program,
-                        &mut self.solver,
-                        message,
-                        r_i,
-                        &env,
-                        &self.owner_name,
-                        line,
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    self.check_consume_expr(message, r_i, line, &visible_vars, in_loop)?;
-                    self.check_may_fault(r_i, line, &visible_vars, in_loop)?;
-                    if self.in_contingency && self.is_feasible(r_i, &visible_vars, in_loop) {
-                        self.boundary_can_fault = true;
-                    }
-                    // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
-                    live = self.solver.bdd.minus(live, g_i);
-                }
-                Command::Escalate => {
-                    self.check_may_fault(r_i, line, &visible_vars, in_loop)?;
-                    if self.in_contingency && self.is_feasible(r_i, &visible_vars, in_loop) {
-                        self.boundary_can_fault = true;
-                    }
-                    // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
-                    live = self.solver.bdd.minus(live, g_i);
-                }
-                Command::Terminate(_) => {
-                    let all_scopes = self.active_scopes.clone();
-                    self.for_each_fault_state(r_i, |checker, reach| {
-                        checker.check_scope_obligations(
-                            &all_scopes,
-                            reach,
-                            line,
-                            &visible_vars,
-                            in_loop,
-                        )
-                    })?;
-                    // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
-                    live = self.solver.bdd.minus(live, g_i);
-                }
-                Command::Recover { body: target_body } => {
-                    let head = self.body.bodies[*target_body]
-                        .head
-                        .as_ref()
-                        .expect("a loop head")
-                        .clone();
-                    if let Some(inv) = head.invariant.clone() {
-                        let inv_rec = translate_formula(self.program, &mut self.solver, &inv, &env);
-                        require_formula(
-                            &mut self.solver,
-                            r_i,
-                            inv_rec,
-                            &self.owner_name,
-                            line,
-                            "P2",
-                            "loop invariant may not hold at `recover ↑`",
-                            &visible_vars,
-                            in_loop,
-                            self.certificates,
-                        )?;
-                    }
-                    // [E-Contingency]: the parameters of the loop are read
-                    // as operands ([O2], [O3]), and then the scopes end as
-                    // at `↑` ([O5], [O6]).
-                    let target = *target_body;
-                    self.for_each_fault_state(r_i, |checker, reach| {
-                        for &parameter in &head.parameters {
-                            checker.check_available(
-                                parameter,
-                                reach,
-                                line,
-                                &visible_vars,
-                                in_loop,
-                            )?;
-                            if checker.program.kind(&checker.body.vars[parameter].ty) != Kind::Copy
-                            {
-                                checker.moved[parameter] =
-                                    checker.solver.bdd.or(checker.moved[parameter], reach);
-                            }
-                        }
-                        checker.check_loop_repeat_scope(
-                            target,
-                            reach,
-                            line,
-                            "recover ↑",
-                            &visible_vars,
-                            in_loop,
-                        )
-                    })?;
-                    // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
-                    live = self.solver.bdd.minus(live, g_i);
-                }
-                Command::Impossible => {
-                    // [P6]: Θ ⊨ ¬Rᵢ
-                    require_entailment(
-                        &mut self.solver,
-                        r_i,
-                        &self.owner_name,
-                        line,
-                        "P6",
-                        "`⊥` may be reachable on this history",
-                        &visible_vars,
-                        in_loop,
-                        self.certificates,
-                    )?;
-                    // [K3]: Lᵢ₊₁ = Lᵢ ∧ ¬gᵢ
-                    live = self.solver.bdd.minus(live, g_i);
-                }
-            }
+                Flow::Ended => self.solver.bdd.minus(live, guard),
+            };
         }
 
         if !allow_fallthrough {
@@ -5396,6 +3820,1669 @@ impl<'a> BodyChecker<'a> {
             )?;
         }
         Ok(live)
+    }
+
+    /// Checks one statement by the rules of its command, and says what it
+    /// leaves of the histories that reach it. `live` is `Lᵢ`.
+    fn check_statement(
+        &mut self,
+        at: &Point,
+        command: &Command,
+        statements: &[Statement],
+        live: Formula,
+    ) -> Result<Flow, Error> {
+        match command {
+            Command::Spawn { .. } | Command::Cancel { .. } => Err(self.tasks_unchecked(at.line)),
+            Command::Bind { var, value } => self.check_bind(at, *var, value),
+            Command::Unpack {
+                struct_id,
+                vars,
+                value,
+            } => self.check_unpack(at, *struct_id, vars, value),
+            Command::Assign { var, value } => self.check_assign(at, *var, value),
+            Command::AssignPlace { target, value } => self.check_assign_place(at, target, value),
+            Command::Oblige(formula) => self.check_oblige(at, formula),
+            Command::Test { site, condition } => self.check_test(at, *site, condition),
+            Command::Capture {
+                var,
+                outcome_id: _,
+                operation,
+                arguments,
+            } => self.check_capture(at, *var, operation, arguments),
+            Command::Decide {
+                site,
+                operation: _,
+                op_kind,
+                arguments,
+                arms,
+            } => self.check_decide(at, *site, op_kind, arguments, arms, statements),
+            Command::Loop {
+                site,
+                body,
+                initial,
+                arms,
+            } => self.check_loop(at, *site, *body, initial, arms),
+            Command::Boundary {
+                site,
+                body,
+                captures,
+                contingency_vars,
+                message_var,
+                contingency,
+            } => self.check_boundary(
+                at,
+                live,
+                *site,
+                *body,
+                captures,
+                contingency_vars,
+                *message_var,
+                *contingency,
+            ),
+            Command::Supervise {
+                boundary,
+                arguments,
+            } => self.check_supervise(at, *boundary, arguments),
+            Command::Again { body, arguments } => self.check_again(at, *body, arguments),
+            Command::Leave {
+                alternative,
+                payload,
+            } => self.check_leave(at, *alternative, payload),
+            Command::Exit {
+                alternative,
+                payload,
+            } => self.check_exit(at, *alternative, payload),
+            Command::Fault {
+                message,
+                assumed: _,
+            } => self.check_fault(at, message),
+            Command::Escalate => self.check_escalate(at),
+            Command::Terminate(_) => self.check_terminate(at),
+            Command::Recover { body } => self.check_recover(at, *body),
+            Command::Impossible => self.check_impossible(at),
+        }
+    }
+
+    /// The tasks of slice 4 are not checked yet.
+    fn tasks_unchecked(&self, line: u32) -> Error {
+        Error {
+            control: self.owner_name.clone(),
+            line,
+            clause: "TK1",
+            message: "static checking for Slice 4 tasks is scheduled for Phase 3".to_string(),
+            counterexample: None,
+        }
+    }
+
+    /// `Θ; Rᵢ ⊨ goal` at a statement ([N2]).
+    fn require(
+        &mut self,
+        at: &Point,
+        goal: Formula,
+        clause: &'static str,
+        message: impl Into<String>,
+    ) -> Result<(), Error> {
+        require_formula(
+            &mut self.solver,
+            at.reach,
+            goal,
+            &self.owner_name,
+            at.line,
+            clause,
+            message,
+            &at.visible,
+            at.in_loop,
+            self.certificates,
+        )
+    }
+
+    /// `Θ ⊨ ¬histories` at a statement.
+    fn exclude(
+        &mut self,
+        at: &Point,
+        histories: Formula,
+        clause: &'static str,
+        message: impl Into<String>,
+    ) -> Result<(), Error> {
+        require_entailment(
+            &mut self.solver,
+            histories,
+            &self.owner_name,
+            at.line,
+            clause,
+            message,
+            &at.visible,
+            at.in_loop,
+            self.certificates,
+        )
+    }
+
+    /// What an expression asks of the histories that evaluate it at a
+    /// statement.
+    fn obligations(&mut self, at: &Point, expr: &Expr) -> Result<(), Error> {
+        check_expr_obligations(
+            self.program,
+            &mut self.solver,
+            expr,
+            at.reach,
+            &at.env,
+            &self.owner_name,
+            at.line,
+            &at.visible,
+            at.in_loop,
+            self.certificates,
+        )
+    }
+
+    /// [O1]: `Θ ⊨ ¬(H ∧ D(x))` for the histories `H` on which a statement
+    /// binds `x`.
+    fn unbound(&mut self, at: &Point, var: VarId, histories: Formula) -> Result<(), Error> {
+        let d_var = self.defined[var];
+        let double_bind = self.solver.bdd.and(histories, d_var);
+        self.exclude(
+            at,
+            double_bind,
+            "O1",
+            format!(
+                "`{}` may already be bound on this history",
+                self.body.vars[var].name
+            ),
+        )
+    }
+
+    /// From here on `x` has a slot that holds a value on `histories`.
+    fn bound_on(&mut self, var: VarId, histories: Formula) {
+        self.defined[var] = self.solver.bdd.or(self.defined[var], histories);
+        self.holds_on(var, histories);
+    }
+
+    /// From here on the slot of `x` holds a value on `histories`.
+    fn holds_on(&mut self, var: VarId, histories: Formula) {
+        let elsewhere = self.solver.bdd.not(histories);
+        self.moved[var] = self.solver.bdd.and(self.moved[var], elsewhere);
+    }
+
+    /// `D(x)`, `M(x)` and the terms of every name, as they are here.
+    fn names(&self) -> Names {
+        Names {
+            defined: self.defined.clone(),
+            moved: self.moved.clone(),
+            versions: self.versions.clone(),
+        }
+    }
+
+    fn restore(&mut self, names: Names) {
+        self.defined = names.defined;
+        self.moved = names.moved;
+        self.versions = names.versions;
+    }
+
+    /// The names where two sets of histories meet: as `left` has them on
+    /// `on_left`, and as `right` has them on `on_right`.
+    fn join_names(&mut self, left: &Names, on_left: Formula, right: &Names, on_right: Formula) {
+        for v in 0..self.body.vars.len() {
+            let left_d = self.solver.bdd.and(left.defined[v], on_left);
+            let right_d = self.solver.bdd.and(right.defined[v], on_right);
+            self.defined[v] = self.solver.bdd.or(left_d, right_d);
+
+            let left_m = self.solver.bdd.and(left.moved[v], on_left);
+            let right_m = self.solver.bdd.and(right.moved[v], on_right);
+            self.moved[v] = self.solver.bdd.or(left_m, right_m);
+
+            let mut merged = Vec::new();
+            for (g, tid) in &left.versions[v] {
+                let mg = self.solver.bdd.and(*g, on_left);
+                if mg != bdd::FALSE {
+                    merged.push((mg, *tid));
+                }
+            }
+            for (g, tid) in &right.versions[v] {
+                let mg = self.solver.bdd.and(*g, on_right);
+                if mg != bdd::FALSE {
+                    merged.push((mg, *tid));
+                }
+            }
+            self.versions[v] = merged;
+        }
+    }
+
+    /// A bind `x := e` ([O1]).
+    fn check_bind(&mut self, at: &Point, var: VarId, value: &Expr) -> Result<Flow, Error> {
+        self.obligations(at, value)?;
+        self.check_consume_expr(value, at.reach, at.line, &at.visible, at.in_loop)?;
+        // [O1]: Θ ⊨ ¬(Rᵢ ∧ D(x))
+        self.unbound(at, var, at.reach)?;
+        self.bind_value(var, at.reach, value, &at.env);
+        self.bound_on(var, at.reach);
+        if let Expr::Borrow(_, place, _) = value {
+            self.bind_local_borrow(var, at.reach, place, &at.env);
+        } else if let Expr::Var(VarRef::Local(src), ty) = value
+            && matches!(ty, Type::Ref(_, _))
+            && let Some(entries) = self.local_borrows.get(src).cloned()
+        {
+            let dest = self.local_borrows.entry(var).or_default();
+            for (bg, fp) in entries {
+                let g = self.solver.bdd.and(at.reach, bg);
+                if g != bdd::FALSE {
+                    dest.push((g, fp));
+                }
+            }
+        }
+        self.record_expr_loan_roots(var, value, at.reach);
+        self.carry_capture(value, var, at.reach);
+        Ok(Flow::On)
+    }
+
+    /// A bind that takes a struct value apart into a name for each field
+    /// ([O1]).
+    fn check_unpack(
+        &mut self,
+        at: &Point,
+        struct_id: StructId,
+        vars: &[VarId],
+        value: &Expr,
+    ) -> Result<Flow, Error> {
+        self.obligations(at, value)?;
+        self.check_consume_expr(value, at.reach, at.line, &at.visible, at.in_loop)?;
+        let val_term = translate_term(self.program, &mut self.solver, value, &at.env);
+        let mut field_terms = Vec::with_capacity(vars.len());
+        for (fidx, &var_id) in vars.iter().enumerate() {
+            self.unbound(at, var_id, at.reach)?;
+            let fty = self.program.structs[struct_id].fields[fidx].ty.clone();
+            let ft =
+                translate_field_term(&mut self.solver, val_term.clone(), struct_id, fidx, &fty);
+            let tid = self.bind_value_term(var_id, at.reach, ft);
+            self.bound_on(var_id, at.reach);
+            self.record_expr_loan_roots(var_id, value, at.reach);
+            field_terms.push(LinearTerm::var(tid));
+        }
+        let cid = self
+            .solver
+            .intern_term(AtomTerm::StructCtor(struct_id, field_terms));
+        self.solver.instantiate_all();
+        let eq = self.solver.eq(&val_term, &LinearTerm::var(cid));
+        self.solver.add_fact(at.reach, eq);
+        Ok(Flow::On)
+    }
+
+    /// An assignment `x ← e` to a name ([O4]).
+    fn check_assign(&mut self, at: &Point, var: VarId, value: &Expr) -> Result<Flow, Error> {
+        self.obligations(at, value)?;
+        self.check_consume_expr(value, at.reach, at.line, &at.visible, at.in_loop)?;
+        // [O4]: Θ ⊨ Rᵢ → D(x)
+        let d_var = self.defined[var];
+        self.require(
+            at,
+            d_var,
+            "O4",
+            format!("`{}` has no slot on this history", self.body.vars[var].name),
+        )?;
+        if self.program.kind(self.body.vars[var].ty.deref_type()) == Kind::Must {
+            let m_var = self.moved[var];
+            self.require(
+                at,
+                m_var,
+                "O4",
+                format!(
+                    "`{}` holds an unconsumed `must` value and cannot be overwritten",
+                    self.body.vars[var].name
+                ),
+            )?;
+        }
+        if matches!(self.body.vars[var].ty, Type::Ref(BorrowMode::Exclusive, _)) {
+            let new_val = translate_term(self.program, &mut self.solver, value, &at.env);
+            let place = Place {
+                root: var,
+                root_ty: self.body.vars[var].ty.clone(),
+                steps: Vec::new(),
+                ty: self.body.vars[var].ty.deref_type().clone(),
+            };
+            self.apply_place_write(&place, at.reach, new_val, &at.env);
+        } else {
+            self.bind_value(var, at.reach, value, &at.env);
+            self.refresh_dependent_local_borrows(var, at.reach);
+        }
+        self.holds_on(var, at.reach);
+        self.forget_capture(var, at.reach);
+        self.carry_capture(value, var, at.reach);
+        Ok(Flow::On)
+    }
+
+    /// An assignment to a component of a name ([O4]).
+    fn check_assign_place(
+        &mut self,
+        at: &Point,
+        target: &Place,
+        value: &Expr,
+    ) -> Result<Flow, Error> {
+        self.obligations(at, value)?;
+        self.check_consume_expr(value, at.reach, at.line, &at.visible, at.in_loop)?;
+        self.check_available(target.root, at.reach, at.line, &at.visible, at.in_loop)?;
+        for step in &target.steps {
+            if let PlaceStep::Index(idx_expr, _) = step {
+                self.check_read_expr(idx_expr, at.reach, at.line, &at.visible, at.in_loop)?;
+            }
+        }
+        check_place_obligations(
+            self.program,
+            &mut self.solver,
+            target,
+            at.reach,
+            &at.env,
+            &self.owner_name,
+            at.line,
+            &at.visible,
+            at.in_loop,
+            self.certificates,
+        )?;
+        if self.program.kind(&target.ty) == Kind::Must
+            && self.is_feasible(at.reach, &at.visible, at.in_loop)
+        {
+            return Err(Error {
+                control: self.owner_name.clone(),
+                line: at.line,
+                clause: "O4",
+                message: "cannot assign to a place of kind `must`".to_string(),
+                counterexample: None,
+            });
+        }
+        let new_val = translate_term(self.program, &mut self.solver, value, &at.env);
+        self.apply_place_write(target, at.reach, new_val, &at.env);
+        Ok(Flow::On)
+    }
+
+    /// A proof obligation `⊢ φ` ([P1]), which is known afterwards.
+    fn check_oblige(&mut self, at: &Point, formula: &Expr) -> Result<Flow, Error> {
+        self.check_reads(formula, at.reach, at.line, &at.visible, at.in_loop)?;
+        let phi = translate_formula(self.program, &mut self.solver, formula, &at.env);
+        // [P1]: Θ; Rᵢ ⊨ φ
+        self.require(at, phi, "P1", "proof obligation may not hold")?;
+        self.solver.add_fact(at.reach, phi);
+        Ok(Flow::On)
+    }
+
+    /// A decision on a condition ([K4], [K5], [N4]).
+    fn check_test(&mut self, at: &Point, site: SiteId, condition: &Expr) -> Result<Flow, Error> {
+        self.obligations(at, condition)?;
+        self.check_read_expr(condition, at.reach, at.line, &at.visible, at.in_loop)?;
+        let d_true = self.atom(site, 0);
+        let d_false = self.atom(site, 1);
+        // [K4]: d.true → Rᵢ, d.false → Rᵢ, ¬(d.true ∧ d.false)
+        let t_imp_r = self.solver.bdd.implies(d_true, at.reach);
+        let f_imp_r = self.solver.bdd.implies(d_false, at.reach);
+        let both = self.solver.bdd.and(d_true, d_false);
+        let not_both = self.solver.bdd.not(both);
+        // [K5]: Rᵢ → d.true ∨ d.false
+        let either = self.solver.bdd.or(d_true, d_false);
+        let r_imp_either = self.solver.bdd.implies(at.reach, either);
+        self.solver.add_structure(t_imp_r);
+        self.solver.add_structure(f_imp_r);
+        self.solver.add_structure(not_both);
+        self.solver.add_structure(r_imp_either);
+
+        // [N4]: d.true ⇒ e, d.false ⇒ ¬e
+        let phi = translate_formula(self.program, &mut self.solver, condition, &at.env);
+        let not_phi = self.solver.bdd.not(phi);
+        self.solver.add_fact(d_true, phi);
+        self.solver.add_fact(d_false, not_phi);
+        Ok(Flow::On)
+    }
+
+    /// [F5]: a contingency calls contingent controls only.
+    fn check_call_in_contingency(&mut self, at: &Point, cid: ControlId) -> Result<(), Error> {
+        let callee = &self.program.controls[cid];
+        if self.in_contingency
+            && !callee.contingent
+            && self.is_feasible(at.reach, &at.visible, at.in_loop)
+        {
+            return Err(Error {
+                control: self.owner_name.clone(),
+                line: at.line,
+                clause: "F5",
+                message: format!("contingency may not call non-contingent `{}`", callee.name),
+                counterexample: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// A call of a control, once its operands are checked: where it may
+    /// fault ([F1], [F2], [F6]), its effects ([F3]), its precondition
+    /// ([P3], known afterwards) and what it writes through its `&~`
+    /// parameters. `old` has the terms of the operands, and `post` gets
+    /// those of what the call wrote.
+    fn check_call(
+        &mut self,
+        at: &Point,
+        cid: ControlId,
+        arguments: &[Expr],
+        old: &[LinearTerm],
+        post: &mut [LinearTerm],
+    ) -> Result<(), Error> {
+        let callee = &self.program.controls[cid];
+        if callee.faults {
+            self.check_call_enclosed(&callee.name, at.reach, at.line, &at.visible, at.in_loop)?;
+            self.check_may_fault(at.reach, at.line, &at.visible, at.in_loop)?;
+        }
+        self.check_effects(
+            &callee.uses,
+            &callee.name,
+            at.reach,
+            at.line,
+            &at.visible,
+            at.in_loop,
+        )?;
+        if let Some(pre) = &callee.precondition {
+            let call_env = Env {
+                locals: BTreeMap::new(),
+                parameters: old.to_vec(),
+                old_parameters: old.to_vec(),
+                fields: Vec::new(),
+                constants: BTreeMap::new(),
+            };
+            let pre_formula = translate_formula(self.program, &mut self.solver, pre, &call_env);
+            self.require(
+                at,
+                pre_formula,
+                "P3",
+                format!("precondition of `{}` may not hold", callee.name),
+            )?;
+            self.solver.add_fact(at.reach, pre_formula);
+        }
+        self.apply_call_exclusive_updates(cid, arguments, at.reach, post, &at.env);
+        Ok(())
+    }
+
+    /// A captured operation: it runs here, and what its alternative says is
+    /// known where the outcome is decided ([I12]).
+    fn check_capture(
+        &mut self,
+        at: &Point,
+        var: VarId,
+        operation: &Operation,
+        arguments: &[Expr],
+    ) -> Result<Flow, Error> {
+        let mut old_args: Vec<LinearTerm> = arguments
+            .iter()
+            .map(|a| translate_term(self.program, &mut self.solver, a, &at.env))
+            .collect();
+        let cap_param_tys: Option<Vec<Type>> = match operation {
+            Operation::Control(cid) => Some(
+                self.program.controls[*cid]
+                    .parameters
+                    .iter()
+                    .map(|p| p.ty.clone())
+                    .collect(),
+            ),
+            _ => None,
+        };
+        self.check_operands_o0(
+            arguments,
+            cap_param_tys.as_deref(),
+            at.reach,
+            &at.env,
+            at.line,
+            &at.visible,
+            at.in_loop,
+        )?;
+
+        let mut post_args = old_args.clone();
+        match operation {
+            Operation::Control(cid) => {
+                self.check_call_in_contingency(at, *cid)?;
+                self.check_call(at, *cid, arguments, &old_args, &mut post_args)?;
+            }
+            Operation::Builtin {
+                op: BuiltinOp::Emit,
+                ..
+            } => {
+                let uses = vec!["console.write".to_string()];
+                self.check_effects(&uses, "emit", at.reach, at.line, &at.visible, at.in_loop)?;
+            }
+            Operation::Builtin {
+                target: Some(place),
+                ..
+            } => {
+                // [B5], [I12]: the operation runs at the capture,
+                // so the collection is written here, whatever
+                // the alternative. What the alternative says of
+                // the old and the new collection is known when
+                // the outcome is decided.
+                let old = translate_place(self.program, &mut self.solver, place, &at.env);
+                let new = LinearTerm::var(self.alloc_shape_term(&place.ty));
+                self.apply_place_write(place, at.reach, new.clone(), &at.env);
+                old_args[0] = old;
+                post_args[0] = new;
+            }
+            _ => {}
+        }
+
+        // [O1] on `var`.
+        self.unbound(at, var, at.reach)?;
+        let tid = self.alloc_var_term(var);
+        self.set_version(var, at.reach, tid);
+        self.bound_on(var, at.reach);
+        self.captured.entry(var).or_default().push((
+            at.reach,
+            CapturedInfo {
+                operation: operation.clone(),
+                old_args,
+                post_args,
+            },
+        ));
+        Ok(Flow::On)
+    }
+
+    /// A decision on an operation, on a variant value or on a captured
+    /// outcome, with a payload for each alternative.
+    fn check_decide(
+        &mut self,
+        at: &Point,
+        site: SiteId,
+        op_kind: &Operation,
+        arguments: &[Expr],
+        arms: &[Arm],
+        statements: &[Statement],
+    ) -> Result<Flow, Error> {
+        let contract = op_kind.contract(self.program);
+        let op_name = op_kind.name(self.program).to_string();
+        // [C2]: Every alternative of the operation's contract is listed.
+        if arms.len() != contract.len() {
+            return Err(Error {
+                control: self.owner_name.clone(),
+                line: at.line,
+                clause: "C2",
+                message: format!(
+                    "decision on `{op_name}` lists {} of {} alternatives",
+                    arms.len(),
+                    contract.len()
+                ),
+                counterexample: None,
+            });
+        }
+
+        let old_arg_terms: Vec<LinearTerm> = arguments
+            .iter()
+            .map(|a| translate_term(self.program, &mut self.solver, a, &at.env))
+            .collect();
+        let mut post_arg_terms = old_arg_terms.clone();
+        self.check_decided_operands(at, op_kind, arguments, &old_arg_terms, &mut post_arg_terms)?;
+
+        let (arm_atoms, any_arm) = self.decision_atoms(at, site, arms.len());
+
+        let (is_pure, pure_cid) = match op_kind {
+            Operation::Control(cid) if self.program.control_is_pure(*cid) => (true, Some(*cid)),
+            _ => (false, None),
+        };
+        let pure_alt_term = pure_cid.map(|cid| {
+            let id = self
+                .solver
+                .intern_term(AtomTerm::PureAlt(cid, old_arg_terms.clone()));
+            self.solver.instantiate_all();
+            LinearTerm::var(id)
+        });
+
+        // Snapshot captured entries if deciding an outcome variable.
+        let outcome_captures = match op_kind {
+            Operation::Outcome(_) => match arguments.first() {
+                Some(Expr::Var(VarRef::Local(v), _)) => self.captured.get(v).cloned(),
+                Some(Expr::Move(inner, _)) => match &**inner {
+                    Expr::Var(VarRef::Local(v), _) => self.captured.get(v).cloned(),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        let decision = Deciding {
+            operation: op_kind,
+            arguments,
+            contract,
+            old: old_arg_terms,
+            post: post_arg_terms,
+            pure: pure_cid,
+            captures: outcome_captures,
+        };
+
+        for (pos, arm) in arms.iter().enumerate() {
+            let atom = arm_atoms[pos];
+            let payload = self.bind_arm_payload(at, &decision, atom, arm)?;
+            if let Some(alt_term) = &pure_alt_term {
+                let eq = self
+                    .solver
+                    .eq(alt_term, &LinearTerm::from_i128(arm.alternative as i128));
+                self.solver.add_fact(atom, eq);
+            }
+            self.arm_facts(at, &decision, atom, arm, payload);
+        }
+
+        let always_check_u16 = matches!(op_kind, Operation::Outcome(_))
+            || matches!(
+                op_kind,
+                Operation::Builtin {
+                    op: BuiltinOp::Pop
+                        | BuiltinOp::Take
+                        | BuiltinOp::Insert
+                        | BuiltinOp::Remove
+                        | BuiltinOp::Get
+                        | BuiltinOp::EntryAt,
+                    ..
+                }
+            );
+        self.warn_unreachable_arms(
+            &op_name,
+            at.line,
+            statements,
+            &decision.contract,
+            arms,
+            &arm_atoms,
+            is_pure,
+            always_check_u16,
+            at.reach,
+            &at.visible,
+            at.in_loop,
+        );
+        Ok(Flow::Decided(any_arm))
+    }
+
+    /// The atoms of the alternatives of a decision and their disjunction:
+    /// an alternative is taken on histories of the statement only, and no
+    /// two are taken together ([K4]).
+    fn decision_atoms(
+        &mut self,
+        at: &Point,
+        site: SiteId,
+        count: usize,
+    ) -> (Vec<Formula>, Formula) {
+        let mut any_arm = bdd::FALSE;
+        let mut arm_atoms = Vec::new();
+        for pos in 0..count {
+            let atom = self.atom(site, pos);
+            arm_atoms.push(atom);
+            any_arm = self.solver.bdd.or(any_arm, atom);
+            // [K4]: d.a → Rᵢ
+            let imp = self.solver.bdd.implies(atom, at.reach);
+            self.solver.add_structure(imp);
+        }
+        self.exclude_each_other(&arm_atoms);
+        (arm_atoms, any_arm)
+    }
+
+    /// [K4]: `¬(d.a ∧ d.b)` for every two alternatives of a decision.
+    fn exclude_each_other(&mut self, arm_atoms: &[Formula]) {
+        for i in 0..arm_atoms.len() {
+            for j in (i + 1)..arm_atoms.len() {
+                let both = self.solver.bdd.and(arm_atoms[i], arm_atoms[j]);
+                let not_both = self.solver.bdd.not(both);
+                self.solver.add_structure(not_both);
+            }
+        }
+    }
+
+    /// The operands of a decision, and what its operation asks where it
+    /// runs ([O0], [F5], [F1] to [F3], [P3]).
+    fn check_decided_operands(
+        &mut self,
+        at: &Point,
+        op_kind: &Operation,
+        arguments: &[Expr],
+        old: &[LinearTerm],
+        post: &mut [LinearTerm],
+    ) -> Result<(), Error> {
+        match op_kind {
+            Operation::AwaitControl(_) | Operation::AwaitNext(_, _) | Operation::RunControl(_) => {
+                return Err(self.tasks_unchecked(at.line));
+            }
+            Operation::Control(cid) => {
+                self.check_call_in_contingency(at, *cid)?;
+                let parameter_types: Vec<Type> = self.program.controls[*cid]
+                    .parameters
+                    .iter()
+                    .map(|p| p.ty.clone())
+                    .collect();
+                self.check_operands_o0(
+                    arguments,
+                    Some(&parameter_types),
+                    at.reach,
+                    &at.env,
+                    at.line,
+                    &at.visible,
+                    at.in_loop,
+                )?;
+                self.check_call(at, *cid, arguments, old, post)?;
+            }
+            Operation::Builtin { op, .. } => {
+                self.check_operands_o0(
+                    arguments,
+                    None,
+                    at.reach,
+                    &at.env,
+                    at.line,
+                    &at.visible,
+                    at.in_loop,
+                )?;
+                if *op == BuiltinOp::Emit {
+                    let uses = vec!["console.write".to_string()];
+                    self.check_effects(&uses, "emit", at.reach, at.line, &at.visible, at.in_loop)?;
+                }
+            }
+            Operation::Outcome(_) => {
+                self.check_operands_o0(
+                    arguments,
+                    None,
+                    at.reach,
+                    &at.env,
+                    at.line,
+                    &at.visible,
+                    at.in_loop,
+                )?;
+            }
+            Operation::Variant { .. } => {
+                if let Some(arg) = arguments.first() {
+                    self.obligations(at, arg)?;
+                    self.check_consume_expr(arg, at.reach, at.line, &at.visible, at.in_loop)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Binds the payload names of one alternative of a decision on the
+    /// histories that take it ([O1]), and gives their terms.
+    fn bind_arm_payload(
+        &mut self,
+        at: &Point,
+        decision: &Deciding,
+        atom: Formula,
+        arm: &Arm,
+    ) -> Result<Vec<LinearTerm>, Error> {
+        let contract_alt = &decision.contract[arm.alternative];
+        let mut field_terms = Vec::new();
+        for (field_idx, &var_id) in arm.vars.iter().enumerate() {
+            // [O1]: Θ ⊨ ¬(d.a ∧ D(x))
+            self.unbound(at, var_id, atom)?;
+            let tid = self.alloc_var_term(var_id);
+            let v_term = LinearTerm::var(tid);
+            self.set_version(var_id, atom, tid);
+            self.bound_on(var_id, atom);
+            if let Some(field) = contract_alt.fields.get(field_idx)
+                && self.program.contains_borrow_or_view(&field.ty)
+            {
+                for &oidx in &field.origins {
+                    if let Some(arg) = decision.arguments.get(oidx) {
+                        self.record_expr_loan_roots(var_id, arg, atom);
+                    }
+                }
+            }
+
+            if let Some(cid) = decision.pure {
+                let pay_id = self.solver.intern_term(AtomTerm::PurePay(
+                    cid,
+                    arm.alternative,
+                    field_idx,
+                    decision.old.clone(),
+                ));
+                self.solver.instantiate_all();
+                let eq = self.solver.eq(&v_term, &LinearTerm::var(pay_id));
+                self.solver.add_fact(atom, eq);
+            }
+            field_terms.push(v_term);
+        }
+        Ok(field_terms)
+    }
+
+    /// What one alternative of a decision says, on the histories that take
+    /// it, of its payload `field_terms` and of the operands: the condition
+    /// of a control's alternative, what a built-in does, the constructor of
+    /// a variant value ([I11]) and the conditions of a captured operation
+    /// ([I12]).
+    fn arm_facts(
+        &mut self,
+        at: &Point,
+        decision: &Deciding,
+        atom: Formula,
+        arm: &Arm,
+        field_terms: Vec<LinearTerm>,
+    ) {
+        let contract_alt = &decision.contract[arm.alternative];
+        match decision.operation {
+            Operation::AwaitControl(_) | Operation::AwaitNext(_, _) | Operation::RunControl(_) => {}
+            Operation::Control(_) => {
+                if let Some(cond) = &contract_alt.condition {
+                    let cond_env = Env {
+                        locals: BTreeMap::new(),
+                        parameters: decision.post.clone(),
+                        old_parameters: decision.old.clone(),
+                        fields: field_terms,
+                        constants: BTreeMap::new(),
+                    };
+                    let cond_formula =
+                        translate_formula(self.program, &mut self.solver, cond, &cond_env);
+                    self.solver.add_fact(atom, cond_formula);
+                }
+            }
+            Operation::Builtin { op, target, .. } => {
+                self.apply_builtin_facts(
+                    *op,
+                    target.as_ref(),
+                    &decision.old,
+                    arm.alternative,
+                    atom,
+                    &field_terms,
+                    &at.env,
+                );
+            }
+            Operation::Variant { id: vid, .. } => {
+                // [I11]: `d.c ⇒ x = V.c {ȳ}`
+                if let Some(scrutinee) = decision.old.first() {
+                    let num_ctors = self.program.variants[*vid].constructors.len();
+                    let ctor_id = self.solver.intern_term(AtomTerm::VariantCtor {
+                        variant_id: *vid,
+                        ctor_idx: arm.alternative,
+                        fields: field_terms,
+                        num_ctors,
+                    });
+                    self.solver.instantiate_all();
+                    let eq = self.solver.eq(scrutinee, &LinearTerm::var(ctor_id));
+                    self.solver.add_fact(atom, eq);
+                }
+            }
+            Operation::Outcome(oid) => {
+                self.outcome_facts(at, decision, atom, arm, *oid, field_terms);
+            }
+        }
+    }
+
+    /// [I12]: what the alternative of a decided outcome value says: the
+    /// condition of the operation that gave it, over the operands of the
+    /// capture where the capture is seen, and over fresh names elsewhere.
+    fn outcome_facts(
+        &mut self,
+        at: &Point,
+        decision: &Deciding,
+        atom: Formula,
+        arm: &Arm,
+        oid: OutcomeId,
+        field_terms: Vec<LinearTerm>,
+    ) {
+        let contract_alt = &decision.contract[arm.alternative];
+        // [I12]: the conditions of the captured
+        // operation over the arguments of the
+        // capture, on the histories that saw it.
+        let mut seen = bdd::FALSE;
+        if let Some(entries) = &decision.captures {
+            for (cap_guard, info) in entries {
+                seen = self.solver.bdd.or(seen, *cap_guard);
+                let g = self.solver.bdd.and(*cap_guard, atom);
+                if g == bdd::FALSE {
+                    continue;
+                }
+                match &info.operation {
+                    Operation::Control(cid) => {
+                        if let Some(cond) =
+                            &self.program.controls[*cid].contract[arm.alternative].condition
+                        {
+                            let cond_env = Env {
+                                locals: BTreeMap::new(),
+                                parameters: info.post_args.clone(),
+                                old_parameters: info.old_args.clone(),
+                                fields: field_terms.clone(),
+                                constants: BTreeMap::new(),
+                            };
+                            let cf =
+                                translate_formula(self.program, &mut self.solver, cond, &cond_env);
+                            self.solver.add_fact(g, cf);
+                        }
+                    }
+                    Operation::Builtin { op, target, .. } => {
+                        self.apply_builtin_facts(
+                            *op,
+                            None,
+                            &info.old_args,
+                            arm.alternative,
+                            g,
+                            &field_terms,
+                            &at.env,
+                        );
+                        if target.is_some() {
+                            self.shape_facts(
+                                *op,
+                                &info.old_args[0],
+                                &info.post_args[0],
+                                arm.alternative,
+                                g,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Where the capture is not visible (the
+        // value arrived as a parameter or as a
+        // payload), the arguments are fresh names.
+        let source = outcome_control(self.program, oid);
+        let condition = contract_alt.condition.clone().or_else(|| {
+            let control = &self.program.controls[source?];
+            control.contract[arm.alternative].condition.clone()
+        });
+        let unseen = self.solver.bdd.minus(at.reach, seen);
+        if unseen != bdd::FALSE
+            && let Some(cond) = condition
+        {
+            let mut parameters = Vec::new();
+            let mut old_parameters = Vec::new();
+            for p in 0..max_param_index(&cond) {
+                let ty = source
+                    .and_then(|cid| self.program.controls[cid].parameters.get(p))
+                    .map(|parameter| parameter.ty.clone());
+                let fresh = |checker: &mut Self, tag: &str| match &ty {
+                    Some(ty) => checker.alloc_type_term(&format!("{tag}{p}"), ty),
+                    None => checker.solver.fresh_var(format!("{tag}{p}"), None, false),
+                };
+                let now = LinearTerm::var(fresh(self, "_out_arg"));
+                // `old(p)` is another value than `p`
+                // for an `&~` parameter alone ([P4]).
+                let exclusive = matches!(ty, None | Some(Type::Ref(BorrowMode::Exclusive, _)));
+                old_parameters.push(if exclusive {
+                    LinearTerm::var(fresh(self, "_out_old"))
+                } else {
+                    now.clone()
+                });
+                parameters.push(now);
+            }
+            let cond_env = Env {
+                locals: BTreeMap::new(),
+                parameters,
+                old_parameters,
+                fields: field_terms,
+                constants: BTreeMap::new(),
+            };
+            let cf = translate_formula(self.program, &mut self.solver, &cond, &cond_env);
+            let not_seen = self.solver.bdd.not(seen);
+            let guard = self.solver.bdd.and(atom, not_seen);
+            self.solver.add_fact(guard, cf);
+        }
+    }
+
+    /// A loop: its body is checked once, for an iteration that stands for
+    /// every one ([K6]), and the loop is a decision among the alternatives
+    /// of its leaves ([K8]).
+    fn check_loop(
+        &mut self,
+        at: &Point,
+        site: SiteId,
+        loop_body: BodyId,
+        initial: &[Expr],
+        arms: &[Vec<VarId>],
+    ) -> Result<Flow, Error> {
+        self.check_operands_o0(
+            initial,
+            None,
+            at.reach,
+            &at.env,
+            at.line,
+            &at.visible,
+            at.in_loop,
+        )?;
+
+        let head = self.body.bodies[loop_body]
+            .head
+            .as_ref()
+            .expect("a loop head")
+            .clone();
+
+        // [P2]: Loop invariant holds for the initial arguments at entry.
+        if let Some(inv) = &head.invariant {
+            let mut init_env = at.env.clone();
+            for (&param_var, init_expr) in head.parameters.iter().zip(initial) {
+                let init_term = translate_term(self.program, &mut self.solver, init_expr, &at.env);
+                init_env.locals.insert(param_var, init_term);
+            }
+            let inv_entry = translate_formula(self.program, &mut self.solver, inv, &init_env);
+            self.require(
+                at,
+                inv_entry,
+                "P2",
+                format!("invariant of loop `{}` may not hold at entry", head.name),
+            )?;
+        }
+
+        // The names around the loop are restored when its body is checked
+        // ([K6], [N5], [O6]).
+        let around = self.names();
+        let modified_outer = self.enter_loop(at, loop_body, &head, initial);
+
+        self.leaves.insert(loop_body, Vec::new());
+        self.active_scopes.push(loop_body);
+        // [K6]: Check the loop body for one generic iteration with L₁ = R_d.
+        self.check_body_inner(loop_body, at.reach, true, false)?;
+        self.active_scopes.pop();
+        self.loop_entry_avail.remove(&loop_body);
+        let leaves = self.leaves.remove(&loop_body).unwrap_or_default();
+        self.restore(around);
+
+        let (arm_atoms, any_arm) = self.loop_alternatives(at, site, arms.len(), &leaves);
+        self.join_leaves(loop_body, &modified_outer, &leaves);
+        self.check_leaves_agree(at, &arm_atoms, &leaves)?;
+        self.bind_loop_payloads(at, loop_body, arms, &arm_atoms, &leaves)?;
+        Ok(Flow::Decided(any_arm))
+    }
+
+    /// Makes the names as an iteration of a loop finds them: the parameters
+    /// and every name around that the body can change are fresh ([N5],
+    /// [I9]), and the invariant holds ([N4]). Gives the names around the
+    /// loop that its body can change.
+    fn enter_loop(
+        &mut self,
+        at: &Point,
+        loop_body: BodyId,
+        head: &LoopHead,
+        initial: &[Expr],
+    ) -> BTreeSet<VarId> {
+        let mut entry_avail = Vec::with_capacity(self.body.vars.len());
+        for v in 0..self.body.vars.len() {
+            entry_avail.push(self.avail(v));
+        }
+        self.loop_entry_avail.insert(loop_body, entry_avail);
+
+        for (&param_var, init_expr) in head.parameters.iter().zip(initial) {
+            self.record_expr_loan_roots(param_var, init_expr, at.reach);
+        }
+        self.collect_loop_again_root_vars(loop_body, at.reach);
+
+        // [N5], [I9]: Give fresh logical names to loop parameters
+        // and to outer names that the loop body can change.
+        let mut modified_outer = BTreeSet::new();
+        collect_modified_vars(self.program, self.body, loop_body, &mut modified_outer);
+        self.close_modified_with_borrows(&mut modified_outer);
+        for &var in &modified_outer {
+            if self.body.vars[var].body != loop_body && self.defined[var] != bdd::FALSE {
+                let fresh_tid = self.alloc_var_term(var);
+                let active_on_loop = self.solver.bdd.and(self.defined[var], at.reach);
+                self.set_version(var, active_on_loop, fresh_tid);
+                self.forget_capture(var, at.reach);
+            }
+        }
+
+        for &param_var in &head.parameters {
+            let tid = self.alloc_var_term(param_var);
+            self.defined[param_var] = at.reach;
+            self.holds_on(param_var, at.reach);
+            self.versions[param_var] = vec![(at.reach, tid)];
+        }
+
+        // [N4]: Inside the loop body, the invariant is assumed on R_d.
+        if let Some(inv) = &head.invariant {
+            let (iter_env, _) = self.current_env();
+            let inv_iter = translate_formula(self.program, &mut self.solver, inv, &iter_env);
+            self.solver.add_fact(at.reach, inv_iter);
+        }
+        modified_outer
+    }
+
+    /// The alternatives of a loop: each is taken on the histories of the
+    /// leaves that name it ([K4], [K8]). Gives the atom of each and their
+    /// disjunction.
+    fn loop_alternatives(
+        &mut self,
+        at: &Point,
+        site: SiteId,
+        count: usize,
+        leaves: &[Leave],
+    ) -> (Vec<Formula>, Formula) {
+        let mut any_arm = bdd::FALSE;
+        let mut arm_atoms = Vec::new();
+        for alt_idx in 0..count {
+            let atom = self.atom(site, alt_idx);
+            arm_atoms.push(atom);
+            any_arm = self.solver.bdd.or(any_arm, atom);
+            // [K4]: d.a → Rᵢ
+            let imp = self.solver.bdd.implies(atom, at.reach);
+            self.solver.add_structure(imp);
+
+            // [K8]: d.a ↔ R_{j₁} ∨ … ∨ R_{jₖ}
+            let mut leave_disj = bdd::FALSE;
+            for leave in leaves {
+                if leave.alternative == alt_idx {
+                    leave_disj = self.solver.bdd.or(leave_disj, leave.reach);
+                }
+            }
+            let iff = self.solver.bdd.iff(atom, leave_disj);
+            self.solver.add_structure(iff);
+        }
+        self.exclude_each_other(&arm_atoms);
+        (arm_atoms, any_arm)
+    }
+
+    /// After a loop, a name around it that the body can change is what the
+    /// leave that was taken found ([K8]).
+    fn join_leaves(
+        &mut self,
+        loop_body: BodyId,
+        modified_outer: &BTreeSet<VarId>,
+        leaves: &[Leave],
+    ) {
+        for leave in leaves {
+            for &var in modified_outer {
+                if self.body.vars[var].body != loop_body {
+                    let mux = self.alloc_var_term(var);
+                    for &(h, tid) in &leave.names.versions[var] {
+                        let on_leave = self.solver.bdd.and(leave.reach, h);
+                        if on_leave != bdd::FALSE {
+                            self.solver
+                                .add_def_linear(on_leave, mux, LinearTerm::var(tid));
+                        }
+                    }
+                    self.set_version(var, leave.reach, mux);
+                }
+            }
+        }
+    }
+
+    /// [O6](b): on the leaves of one alternative a name around the loop is
+    /// as the loop found it, or holds a value on every one of them, or on
+    /// none; and after the loop it is as they left it.
+    fn check_leaves_agree(
+        &mut self,
+        at: &Point,
+        arm_atoms: &[Formula],
+        leaves: &[Leave],
+    ) -> Result<(), Error> {
+        for (alt_idx, &atom) in arm_atoms.iter().enumerate() {
+            for var in 0..self.body.vars.len() {
+                if !self.active_scopes.contains(&self.body.vars[var].body) {
+                    continue;
+                }
+                let mut same_as_entry_bad = bdd::FALSE;
+                let mut moved_bad = bdd::FALSE;
+                let mut avail_bad = bdd::FALSE;
+                let entry_a = self.avail(var);
+                let mut has_leaf = false;
+                for leave in leaves {
+                    if leave.alternative != alt_idx {
+                        continue;
+                    }
+                    has_leaf = true;
+                    let not_lmov = self.solver.bdd.not(leave.names.moved[var]);
+                    let l_avail = self.solver.bdd.and(leave.names.defined[var], not_lmov);
+                    let eq_entry = self.solver.bdd.iff(l_avail, entry_a);
+                    let not_eq_entry = self.solver.bdd.not(eq_entry);
+                    let b_entry = self.solver.bdd.and(leave.reach, not_eq_entry);
+                    same_as_entry_bad = self.solver.bdd.or(same_as_entry_bad, b_entry);
+
+                    let b_mov = self.solver.bdd.and(leave.reach, l_avail);
+                    moved_bad = self.solver.bdd.or(moved_bad, b_mov);
+
+                    let not_lav = self.solver.bdd.not(l_avail);
+                    let b_av = self.solver.bdd.and(leave.reach, not_lav);
+                    avail_bad = self.solver.bdd.or(avail_bad, b_av);
+                }
+                if !has_leaf || same_as_entry_bad == bdd::FALSE {
+                    continue;
+                }
+                let about = "the ownership of a name after a loop";
+                if self.has_no_model(same_as_entry_bad, &at.visible, at.in_loop, "O6", about) {
+                    continue;
+                }
+                if self.has_no_model(moved_bad, &at.visible, at.in_loop, "O6", about) {
+                    self.moved[var] = self.solver.bdd.or(self.moved[var], atom);
+                    continue;
+                }
+                if self.has_no_model(avail_bad, &at.visible, at.in_loop, "O6", about) {
+                    self.bound_on(var, atom);
+                    continue;
+                }
+                self.exclude(
+                    at,
+                    same_as_entry_bad,
+                    "O6",
+                    format!(
+                        "loop leaves disagree on ownership of outer `{}`",
+                        self.body.vars[var].name
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Binds the payload names of each alternative of a loop to what its
+    /// leaves carry ([O1], [K8]).
+    fn bind_loop_payloads(
+        &mut self,
+        at: &Point,
+        loop_body: BodyId,
+        arms: &[Vec<VarId>],
+        arm_atoms: &[Formula],
+        leaves: &[Leave],
+    ) -> Result<(), Error> {
+        for (alt_idx, arm_vars) in arms.iter().enumerate() {
+            let atom = arm_atoms[alt_idx];
+            for (field_pos, &var_id) in arm_vars.iter().enumerate() {
+                self.unbound(at, var_id, atom)?;
+                let out_tid = self.alloc_var_term(var_id);
+                let out_is_borrow_or_view = self
+                    .program
+                    .contains_borrow_or_view(&self.body.vars[var_id].ty);
+                for leave in leaves {
+                    if leave.alternative == alt_idx {
+                        if let Some(val_term) = leave.payload.get(field_pos) {
+                            if *self.body.vars[var_id].ty.deref_type() == Type::Bool {
+                                let b = self.solver.le(&LinearTerm::from_i128(1), val_term);
+                                self.solver.add_def_bool(leave.reach, out_tid, b);
+                            } else {
+                                self.solver
+                                    .add_def_linear(leave.reach, out_tid, val_term.clone());
+                            }
+                        }
+                        if out_is_borrow_or_view && let Some(proots) = leave.roots.get(field_pos) {
+                            for &(lg, rv) in proots {
+                                if !self.var_in_body_tree(rv, loop_body) {
+                                    let rj_lg = self.solver.bdd.and(leave.reach, lg);
+                                    let g = self.solver.bdd.and(atom, rj_lg);
+                                    self.push_var_loan_root(var_id, g, rv);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.set_version(var_id, atom, out_tid);
+                self.bound_on(var_id, atom);
+            }
+        }
+        Ok(())
+    }
+
+    /// A lexical boundary ([F5]): `B₂` begins in the states in which a
+    /// statement of `B₁` may fault, and the statement after the boundary is
+    /// reached from the end of `B₁` alone. `live` is `Lᵢ`.
+    #[allow(clippy::too_many_arguments)]
+    fn check_boundary(
+        &mut self,
+        at: &Point,
+        live: Formula,
+        site: SiteId,
+        b1_body: BodyId,
+        captures: &[VarId],
+        contingency_vars: &[VarId],
+        message_var: Option<VarId>,
+        b2_body: BodyId,
+    ) -> Result<Flow, Error> {
+        let cap_terms = self.take_into_care(at, captures)?;
+        let outer = self.names();
+        let outer_permits_faults = self.permits_faults;
+        let outer_in_contingency = self.in_contingency;
+
+        // Check `B₁` with fault permission enabled ([F5]). The
+        // boundary has `x̄` in its care while `B₁` runs, and the
+        // states in which `B₁` may fault are where `B₂` begins.
+        self.care.push((b1_body, captures.to_vec()));
+        self.fault_frames.push(Vec::new());
+        self.active_scopes.push(b1_body);
+        self.permits_faults = true;
+        self.in_contingency = false;
+        let b1_exit_live = self.check_body_inner(b1_body, at.reach, at.in_loop, true)?;
+        self.boundary_fallthrough_live.insert(b1_body, b1_exit_live);
+        let (_, b1_visible) = self.current_env();
+        self.check_scope_obligations(&[b1_body], b1_exit_live, at.line, &b1_visible, at.in_loop)?;
+        self.active_scopes.pop();
+        self.care.pop();
+        let fault_states = self.fault_frames.pop().unwrap_or_default();
+        let after_work = self.names();
+
+        // Check `B₂` with the names around the boundary as they were before
+        // `B₁`, and with the names of the contingency bound.
+        self.restore(outer.clone());
+        self.enter_contingency(at, b1_body, contingency_vars, &cap_terms, message_var);
+        // [F5]: `B₂` runs after a fault at a statement of `B₁`,
+        // so its histories are those of the statements of `B₁`
+        // that may fault, and none when there is no such
+        // statement.
+        let mut faulted = bdd::FALSE;
+        for state in &fault_states {
+            faulted = self.solver.bdd.or(faulted, state.reach);
+        }
+        let b2_live = self.solver.bdd.and(at.reach, faulted);
+        let outer_after_fault = self
+            .after_fault
+            .replace((fault_states, self.active_scopes.len()));
+        self.active_scopes.push(b2_body);
+        self.permits_faults = outer_permits_faults;
+        self.in_contingency = true;
+        self.check_body_inner(b2_body, b2_live, at.in_loop, false)?;
+        self.active_scopes.pop();
+        self.after_fault = outer_after_fault;
+
+        // After the boundary the names are as the end of `B₁` left them, and
+        // as they were where the statement was not selected.
+        self.permits_faults = outer_permits_faults;
+        self.in_contingency = outer_in_contingency;
+        let bypassed = self.solver.bdd.minus(live, at.guard);
+        self.join_names(&outer, bypassed, &after_work, b1_exit_live);
+        let d_done = self.atom(site, 0);
+        let iff = self.solver.bdd.iff(d_done, b1_exit_live);
+        self.solver.add_structure(iff);
+        Ok(Flow::Decided(d_done))
+    }
+
+    /// [F5]: the names that a boundary takes into its care hold their
+    /// values, and the boundary has them from here on. Gives their terms.
+    fn take_into_care(&mut self, at: &Point, captures: &[VarId]) -> Result<Vec<LinearTerm>, Error> {
+        let mut cap_terms = Vec::with_capacity(captures.len());
+        for &cap_var in captures {
+            self.check_available(cap_var, at.reach, at.line, &at.visible, at.in_loop)?;
+            let cap_term = at
+                .env
+                .locals
+                .get(&cap_var)
+                .cloned()
+                .unwrap_or_else(|| LinearTerm::from_i128(0));
+            cap_terms.push(cap_term);
+            if self.program.kind(&self.body.vars[cap_var].ty) != Kind::Copy {
+                self.moved[cap_var] = self.solver.bdd.or(self.moved[cap_var], at.reach);
+            }
+        }
+        Ok(cap_terms)
+    }
+
+    /// Makes the names as the contingency of a lexical boundary finds them:
+    /// what `B₁` can change of the names around it is fresh, and the names
+    /// of the contingency are bound to what the boundary took and to the
+    /// message.
+    fn enter_contingency(
+        &mut self,
+        at: &Point,
+        b1_body: BodyId,
+        contingency_vars: &[VarId],
+        cap_terms: &[LinearTerm],
+        message_var: Option<VarId>,
+    ) {
+        let mut b1_modified = BTreeSet::new();
+        collect_modified_vars(self.program, self.body, b1_body, &mut b1_modified);
+        self.close_modified_with_borrows(&mut b1_modified);
+        for &var in &b1_modified {
+            if self.active_scopes.contains(&self.body.vars[var].body)
+                && self.defined[var] != bdd::FALSE
+            {
+                let fresh_tid = self.alloc_var_term(var);
+                let on_b2 = self.solver.bdd.and(self.defined[var], at.reach);
+                self.set_version(var, on_b2, fresh_tid);
+            }
+        }
+        for (cvar, cap_term) in contingency_vars.iter().zip(cap_terms) {
+            let _ = self.bind_value_term(*cvar, at.reach, cap_term.clone());
+            self.bound_on(*cvar, at.reach);
+        }
+        if let Some(mvar) = message_var {
+            let mtid = self.alloc_var_term(mvar);
+            self.set_version(mvar, at.reach, mtid);
+            self.bound_on(mvar, at.reach);
+        }
+    }
+
+    /// A named boundary is supervised ([F5], [O0], [F3], [F1]).
+    fn check_supervise(
+        &mut self,
+        at: &Point,
+        bid: BoundaryId,
+        arguments: &[Expr],
+    ) -> Result<Flow, Error> {
+        let bdef = &self.program.boundaries[bid];
+        let bname = bdef.name.clone();
+        if self.in_contingency && self.is_feasible(at.reach, &at.visible, at.in_loop) {
+            return Err(Error {
+                control: self.owner_name.clone(),
+                line: at.line,
+                clause: "F5",
+                message: format!("contingency may not supervise boundary `{bname}`"),
+                counterexample: None,
+            });
+        }
+        let b_param_tys: Vec<Type> = bdef.parameters.iter().map(|p| p.ty.clone()).collect();
+        self.check_operands_o0(
+            arguments,
+            Some(&b_param_tys),
+            at.reach,
+            &at.env,
+            at.line,
+            &at.visible,
+            at.in_loop,
+        )?;
+        let uses = bdef.uses.clone();
+        self.check_effects(&uses, &bname, at.reach, at.line, &at.visible, at.in_loop)?;
+        if self.boundary_may_fault[bid] {
+            self.check_may_fault(at.reach, at.line, &at.visible, at.in_loop)?;
+        }
+        Ok(Flow::On)
+    }
+
+    /// `↑`: the loop goes round with new arguments ([P2], [O5], [O6]).
+    fn check_again(
+        &mut self,
+        at: &Point,
+        target_body: BodyId,
+        arguments: &[Expr],
+    ) -> Result<Flow, Error> {
+        self.check_operands_o0(
+            arguments,
+            None,
+            at.reach,
+            &at.env,
+            at.line,
+            &at.visible,
+            at.in_loop,
+        )?;
+        let head = self.body.bodies[target_body]
+            .head
+            .as_ref()
+            .expect("a loop head")
+            .clone();
+        // [P2]: Loop invariant holds for the new arguments at `↑`.
+        if let Some(inv) = &head.invariant {
+            let mut next_env = at.env.clone();
+            for (&param_var, arg_expr) in head.parameters.iter().zip(arguments) {
+                let arg_term = translate_term(self.program, &mut self.solver, arg_expr, &at.env);
+                next_env.locals.insert(param_var, arg_term);
+            }
+            let inv_again = translate_formula(self.program, &mut self.solver, inv, &next_env);
+            self.require(
+                at,
+                inv_again,
+                "P2",
+                format!("invariant of loop `{}` may not hold at `↑`", head.name),
+            )?;
+        }
+        self.check_loop_repeat_scope(target_body, at.reach, at.line, "↑", &at.visible, at.in_loop)?;
+        Ok(Flow::Ended)
+    }
+
+    /// `□`: the innermost loop is left by an alternative, and the leave is
+    /// kept for the end of the loop ([K8]).
+    fn check_leave(
+        &mut self,
+        at: &Point,
+        alternative: usize,
+        payload: &[Expr],
+    ) -> Result<Flow, Error> {
+        self.check_operands_o0(
+            payload,
+            None,
+            at.reach,
+            &at.env,
+            at.line,
+            &at.visible,
+            at.in_loop,
+        )?;
+        let payload_terms: Vec<LinearTerm> = payload
+            .iter()
+            .map(|e| translate_term(self.program, &mut self.solver, e, &at.env))
+            .collect();
+        let payload_roots: Vec<Vec<(Formula, VarId)>> = payload
+            .iter()
+            .map(|e| self.expr_loan_roots(e, bdd::TRUE))
+            .collect();
+        let target_loop_pos = self
+            .active_scopes
+            .iter()
+            .rposition(|&b| self.body.bodies[b].head.is_some());
+        if let Some(pos) = target_loop_pos {
+            let target_loop = self.active_scopes[pos];
+            let ended: Vec<BodyId> = self.active_scopes[pos..].to_vec();
+            self.check_scope_obligations(&ended, at.reach, at.line, &at.visible, at.in_loop)?;
+            let leave = Leave {
+                alternative,
+                reach: at.reach,
+                payload: payload_terms,
+                names: self.names(),
+                roots: payload_roots,
+            };
+            if let Some(list) = self.leaves.get_mut(&target_loop) {
+                list.push(leave);
+            }
+        }
+        Ok(Flow::Ended)
+    }
+
+    /// `■`: the control ends by an alternative of its contract ([P4],
+    /// [O5]).
+    fn check_exit(
+        &mut self,
+        at: &Point,
+        alternative: usize,
+        payload: &[Expr],
+    ) -> Result<Flow, Error> {
+        self.check_operands_o0(
+            payload,
+            None,
+            at.reach,
+            &at.env,
+            at.line,
+            &at.visible,
+            at.in_loop,
+        )?;
+        let entry = &self.contract[alternative];
+        // [P4]: Contract condition `⇐ φₐ` at `■`.
+        if let Some(cond) = &entry.condition {
+            let payload_terms: Vec<LinearTerm> = payload
+                .iter()
+                .map(|e| translate_term(self.program, &mut self.solver, e, &at.env))
+                .collect();
+            let exit_parameters: Vec<LinearTerm> = self
+                .param_types
+                .iter()
+                .enumerate()
+                .map(|(pidx, pty)| {
+                    if self.program.has_exclusive_borrow(pty) {
+                        at.env
+                            .locals
+                            .get(&pidx)
+                            .cloned()
+                            .unwrap_or_else(|| self.entry_parameters[pidx].clone())
+                    } else {
+                        self.entry_parameters[pidx].clone()
+                    }
+                })
+                .collect();
+            let exit_env = Env {
+                locals: BTreeMap::new(),
+                parameters: exit_parameters,
+                old_parameters: self.entry_parameters.clone(),
+                fields: payload_terms,
+                constants: BTreeMap::new(),
+            };
+            let cond_formula = translate_formula(self.program, &mut self.solver, cond, &exit_env);
+            self.require(
+                at,
+                cond_formula,
+                "P4",
+                format!(
+                    "condition of exit alternative `{}` may not hold",
+                    entry.name
+                ),
+            )?;
+        }
+        let all_scopes = self.active_scopes.clone();
+        self.check_scope_obligations(&all_scopes, at.reach, at.line, &at.visible, at.in_loop)?;
+        Ok(Flow::Ended)
+    }
+
+    /// A fault with a message ([F1], [F6]).
+    fn check_fault(&mut self, at: &Point, message: &Expr) -> Result<Flow, Error> {
+        self.obligations(at, message)?;
+        self.check_consume_expr(message, at.reach, at.line, &at.visible, at.in_loop)?;
+        self.check_may_fault(at.reach, at.line, &at.visible, at.in_loop)?;
+        if self.in_contingency && self.is_feasible(at.reach, &at.visible, at.in_loop) {
+            self.boundary_can_fault = true;
+        }
+        Ok(Flow::Ended)
+    }
+
+    /// A contingency passes its fault on ([F1], [F6]).
+    fn check_escalate(&mut self, at: &Point) -> Result<Flow, Error> {
+        self.check_may_fault(at.reach, at.line, &at.visible, at.in_loop)?;
+        if self.in_contingency && self.is_feasible(at.reach, &at.visible, at.in_loop) {
+            self.boundary_can_fault = true;
+        }
+        Ok(Flow::Ended)
+    }
+
+    /// A contingency ends the run: every scope ends, in each state in which
+    /// the work may have faulted ([O5]).
+    fn check_terminate(&mut self, at: &Point) -> Result<Flow, Error> {
+        let all_scopes = self.active_scopes.clone();
+        self.for_each_fault_state(at.reach, |checker, reach| {
+            checker.check_scope_obligations(&all_scopes, reach, at.line, &at.visible, at.in_loop)
+        })?;
+        Ok(Flow::Ended)
+    }
+
+    /// A contingency restarts a loop around its boundary ([P2], and the
+    /// scopes end as at `↑`).
+    fn check_recover(&mut self, at: &Point, target_body: BodyId) -> Result<Flow, Error> {
+        let head = self.body.bodies[target_body]
+            .head
+            .as_ref()
+            .expect("a loop head")
+            .clone();
+        if let Some(inv) = head.invariant.clone() {
+            let inv_rec = translate_formula(self.program, &mut self.solver, &inv, &at.env);
+            self.require(
+                at,
+                inv_rec,
+                "P2",
+                "loop invariant may not hold at `recover ↑`",
+            )?;
+        }
+        // [E-Contingency]: the parameters of the loop are read
+        // as operands ([O2], [O3]), and then the scopes end as
+        // at `↑` ([O5], [O6]).
+        let target = target_body;
+        self.for_each_fault_state(at.reach, |checker, reach| {
+            for &parameter in &head.parameters {
+                checker.check_available(parameter, reach, at.line, &at.visible, at.in_loop)?;
+                if checker.program.kind(&checker.body.vars[parameter].ty) != Kind::Copy {
+                    checker.moved[parameter] =
+                        checker.solver.bdd.or(checker.moved[parameter], reach);
+                }
+            }
+            checker.check_loop_repeat_scope(
+                target,
+                reach,
+                at.line,
+                "recover ↑",
+                &at.visible,
+                at.in_loop,
+            )
+        })?;
+        Ok(Flow::Ended)
+    }
+
+    /// `⊥`: no history reaches the statement ([P6]).
+    fn check_impossible(&mut self, at: &Point) -> Result<Flow, Error> {
+        // [P6]: Θ ⊨ ¬Rᵢ
+        self.exclude(at, at.reach, "P6", "`⊥` may be reachable on this history")?;
+        Ok(Flow::Ended)
     }
 }
 
@@ -5569,6 +5656,7 @@ fn check_boundary(
         boundary_fallthrough_live: BTreeMap::new(),
         loop_entry_avail: BTreeMap::new(),
         active_scopes: vec![0],
+        leaves: BTreeMap::new(),
         permits_faults: true,
         in_contingency: false,
         retained_vars: boundary.retains.clone(),
@@ -5590,9 +5678,8 @@ fn check_boundary(
         checker1.versions[param_idx] = vec![(bdd::TRUE, tid)];
         checker1.entry_parameters.push(LinearTerm::var(tid));
     }
-    let mut loop_leaves1 = BTreeMap::new();
     let result = checker1
-        .check_body(0, bdd::TRUE, false, &mut loop_leaves1)
+        .check_body(0, bdd::TRUE, false)
         .and_then(|()| checker1.check_loans());
     checker1.settle(result)?;
     let work_can_fault = checker1.work_can_fault;
@@ -5632,6 +5719,7 @@ fn check_boundary(
         boundary_fallthrough_live: BTreeMap::new(),
         loop_entry_avail: BTreeMap::new(),
         active_scopes: vec![0],
+        leaves: BTreeMap::new(),
         permits_faults: true,
         in_contingency: true,
         retained_vars: Vec::new(),
@@ -5653,7 +5741,6 @@ fn check_boundary(
         checker2.versions[param_idx] = vec![(bdd::TRUE, tid)];
         checker2.entry_parameters.push(LinearTerm::var(tid));
     }
-    let mut loop_leaves2 = BTreeMap::new();
     // [F6]: `B₂` runs after a fault of `B₁`, and on no history when `B₁`
     // cannot fault.
     let entry2 = if work_can_fault {
@@ -5662,7 +5749,7 @@ fn check_boundary(
         bdd::FALSE
     };
     let result = checker2
-        .check_body(0, entry2, false, &mut loop_leaves2)
+        .check_body(0, entry2, false)
         .and_then(|()| checker2.check_loans());
     checker2.settle(result)?;
     let can_fault = checker2.boundary_can_fault;
@@ -5706,6 +5793,7 @@ fn check_control(
         boundary_fallthrough_live: BTreeMap::new(),
         loop_entry_avail: BTreeMap::new(),
         active_scopes: vec![0],
+        leaves: BTreeMap::new(),
         permits_faults: control.faults,
         in_contingency: false,
         retained_vars: Vec::new(),
@@ -5735,9 +5823,8 @@ fn check_control(
         checker.solver.add_fact(bdd::TRUE, pre_formula);
     }
 
-    let mut loop_leaves = BTreeMap::new();
     let result = checker
-        .check_body(0, bdd::TRUE, false, &mut loop_leaves)
+        .check_body(0, bdd::TRUE, false)
         .and_then(|()| checker.check_loans());
     checker.settle(result)?;
     let solver = checker.solver;

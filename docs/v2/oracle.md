@@ -36,7 +36,7 @@ can be read on its own. Nothing in it is built for speed.
 | `certificate` | The text of certificates ([V5]): the writer, and a reader that makes the tables, the goals and the premises from a text alone and gives them to the kernel (section 10) |
 | `counts` | The work of the search as counts for each thread, which `vn2 check --counts` prints; nothing reads them to decide anything (section 10) |
 | `terms`, `lia`, `rational` | The terms, rows, proofs, names of instances and certificates that the search and the kernel both read; the theory check for the rows of a candidate, which answers with a model, a proof or the counted limit of [J6], and whose last part, the Omega test (`lia/omega.rs`), decides rows without bounds (section 7 of the [fact logic](facts.md) has a note on the method); and the rationals of its simplex method |
-| `check` | The phase 3 checker: coverage ([K1] to [K8]), conditional facts and SSA renaming ([N1] to [N5]), acknowledgement ([C2]), availability ([O1], [O2], [O4], [O6]), obligations ([P1] to [P8]), effects ([F3]) and impossible-arm warnings ([U16]) (section 10) |
+| `check` | The phase 3 checker: coverage ([K1] to [K8]), conditional facts and SSA renaming ([N1] to [N5]), acknowledgement ([C2]), availability ([O1], [O2], [O4], [O6]), obligations ([P1] to [P8]), effects ([F3]) and impossible-arm warnings ([U16]) (section 10). `check_body_inner` goes through the statements of a body and keeps the histories that reach each ([K2], [K3]); a statement is checked by the method of its command (`check_bind`, `check_decide`, `check_loop`, `check_boundary` and the others) |
 | `expand` | Theorem 4 call expansion: in-place expansion of decisions on defined controls, lifting loop exits and preserving checking and observations (section 11) |
 | `codegen` | The phase 4 typed LLVM IR and C ABI backend under the erased semantics ([R1] to [R3]), with native `-O0`/`-O2`/`-O3` compilation and differential execution (section 11) |
 | `oracle` | Section 6 of the core, one function for each rule |
@@ -1558,7 +1558,7 @@ fact propagation/invalidation, and Pass 2 static ROBDD loan checking to
 - **Borrow and view fact logic (`[I7]`, `[I9]`).** Tracks multi-hop
   `local_borrows` with functional updates when owners change (`[I7]`), tracks
   `var_loan_roots` across `Bind`, `Unpack`, `Decide` (controls, builtins, and
-  borrowed variants), `Loop`, and `Leave` (`LeaveRecord::payload_roots`),
+  borrowed variants), `Loop`, and `Leave` (`Leave::roots`),
   invalidates dependent roots on non-local borrow/view writes and exclusive view
   arguments (`apply_call_exclusive_updates`, `invalidate_exclusive_view_arg`)
   (`I9`), and transitively closes `modified_outer` across loops and lexical
