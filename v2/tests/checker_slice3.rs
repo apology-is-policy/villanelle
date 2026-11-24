@@ -1185,3 +1185,271 @@ fn a_loop_renames_what_its_body_lends_exclusively_i9() {
         done_and_accepted("I9", source);
     }
 }
+
+/// The rule files of the borrows (`v2/tests/slice3/`), each with the runs
+/// that apply its rule and the runs that are stuck by it.
+const RULE_FILES: [&str; 8] = [
+    "b1_access",
+    "b2_invalidation",
+    "b3_creation",
+    "b4_moves_and_scopes",
+    "b5_shapes",
+    "e_borrow_operands",
+    "e_extern_writes",
+    "e_views",
+];
+
+/// The controls of the rule files that the checker refuses although no run
+/// of them is stuck, with the clause and the reason: the loans go by places
+/// and not by values ([RM7], [L2]), and the logic knows a place through a
+/// local borrow name only ([I7]).
+const ASKS_MORE: [(&str, &str, &str, &str); 4] = [
+    (
+        "b5_shapes",
+        "element_beside_element",
+        "L3",
+        "[RM7]: all elements of one collection overlap, so `r[1]` is lent when `r[0]` is written",
+    ),
+    (
+        "e_borrow_operands",
+        "lends_two_places",
+        "L3",
+        "[RM7]: `xs[0]` and `xs[1]` overlap for the checker, which does not compare indices",
+    ),
+    (
+        "e_views",
+        "copy_field_beside_dead",
+        "L3",
+        "[L2]: a use of a view uses every borrow it holds, although `w.start` is a `copy` field",
+    ),
+    (
+        "e_views",
+        "moves_a_view",
+        "P5",
+        "[I7], [I9]: a write through a field of a view gives `xs` a fresh name with no fact, so its length is not known after it",
+    ),
+];
+
+/// The runs that are stuck in a control that the checker accepts, because a
+/// control further out broke the clause and the checker refuses that one:
+/// the file, the control in which the run is stuck, the control that broke
+/// the clause, the clause by which the checker refuses it, and how.
+const STUCK_BY_ANOTHER: [(&str, &str, &str, &str, &str); 3] = [
+    (
+        "b1_access",
+        "shows",
+        "passes_dead",
+        "L3",
+        "`passes_dead` passes a borrow that its assignment ended, and `shows` reads through it",
+    ),
+    (
+        "b4_moves_and_scopes",
+        "reads_a_dead_payload",
+        "lends_a_local",
+        "L4",
+        "`lends_a_local` returns a borrow of its own local, and the caller reads through it",
+    ),
+    (
+        "e_borrow_operands",
+        "copy_from",
+        "lends_twice",
+        "L3",
+        "`lends_twice` reads `x` in the operand after `&~x`, and `copy_from` writes through the borrow that the read ended",
+    ),
+];
+
+/// Whether a clause of the checker is the one that excludes a stuck state
+/// of the oracle: a dead borrow by the loans ([L1] to [L5]), a name used
+/// after it moved by [O2], an index out of range by [P5].
+fn excludes(clause: &str, state: &str) -> bool {
+    match state {
+        "X4 B1" => clause.starts_with('L'),
+        "X2 E-Var" => clause == "O2",
+        "X7 E-Index" => clause == "P5",
+        _ => false,
+    }
+}
+
+/// Holds the checker against the oracle on files of the suite of slice 3,
+/// control by control: a control in which a run is stuck must be rejected,
+/// and any other must be accepted, apart from those of `asks_more`, which
+/// the checker refuses by the clause named, and the pairs of
+/// `stuck_by_another`. Gives the numbers of the controls rejected and
+/// accepted.
+fn held_against_the_oracle(
+    files: &[&str],
+    asks_more: &[(&str, &str, &str, &str)],
+    stuck_by_another: &[(&str, &str, &str, &str, &str)],
+) -> (usize, usize) {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/slice3");
+    let mut failures = Vec::new();
+    let mut rejected = 0;
+    let mut accepted = 0;
+    let mut asked_more = 0;
+    let mut paired = 0;
+    for name in files {
+        let source = std::fs::read_to_string(dir.join(format!("{name}.core"))).unwrap();
+        let report = villanelle_v2::script::check(&source);
+        assert!(
+            report.failures.is_empty(),
+            "{name}: {}",
+            report.failures.join("\n")
+        );
+        let program = load(&source).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let verdicts = check::check_each(&program).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (control, verdict) in verdicts {
+            let stuck = report.stuck_in.get(&control);
+            if let Some((_, _, _, clause, _)) = stuck_by_another
+                .iter()
+                .find(|(file, _, culprit, _, _)| file == name && *culprit == control)
+            {
+                // The control that broke the clause: no run is stuck in it,
+                // and the checker refuses it.
+                match (stuck, verdict) {
+                    (None, Some(error)) if error.clause == *clause => paired += 1,
+                    (_, verdict) => failures.push(format!(
+                        "{name}: `{control}` is to be refused by [{clause}] with no run stuck in it: {verdict:?}, {stuck:?}"
+                    )),
+                }
+                continue;
+            }
+            if stuck_by_another
+                .iter()
+                .any(|(file, in_control, _, _, _)| file == name && *in_control == control)
+            {
+                // The control in which the run is stuck keeps its contract.
+                match (stuck, verdict) {
+                    (Some(_), None) => paired += 1,
+                    (_, verdict) => failures.push(format!(
+                        "{name}: `{control}` is to be stuck and accepted: {verdict:?}, {stuck:?}"
+                    )),
+                }
+                continue;
+            }
+            if let Some((_, _, clause, _)) = asks_more
+                .iter()
+                .find(|(file, asked, _, _)| file == name && *asked == control)
+            {
+                assert!(stuck.is_none(), "{name}: {control}");
+                match verdict {
+                    Some(error) if error.clause == *clause => asked_more += 1,
+                    Some(error) => {
+                        failures.push(format!("{name}: [{clause}] is expected, and {error}"))
+                    }
+                    None => failures.push(format!("{name}: `{control}` is accepted")),
+                }
+                continue;
+            }
+            match (stuck, verdict) {
+                (Some(states), None) => failures.push(format!(
+                    "{name}: `{control}` is accepted, and a run of it is stuck ({})",
+                    states.iter().cloned().collect::<Vec<_>>().join(", ")
+                )),
+                (None, Some(error)) => {
+                    failures.push(format!("{name}: `{control}`: no run is stuck, and {error}"))
+                }
+                (Some(states), Some(error)) => {
+                    // The checker refuses the control by a clause that
+                    // excludes the stuck state, and not by another.
+                    if states.iter().any(|state| excludes(error.clause, state)) {
+                        rejected += 1;
+                    } else {
+                        failures.push(format!(
+                            "{name}: `{control}` is stuck ({}), and refused by another clause: {error}",
+                            states.iter().cloned().collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                }
+                (None, None) => accepted += 1,
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!(asked_more, asks_more.len());
+    assert_eq!(paired, 2 * stuck_by_another.len());
+    (rejected, accepted)
+}
+
+/// Every control of the rule files of the borrows in which a run of the
+/// oracle is stuck is rejected by the checker, and every other control is
+/// accepted, apart from the four that ask more and the three pairs in which
+/// a run is stuck in one control by what another did ([L1] to [L5], [O2],
+/// [P1] to [P5], [I7], [I9]).
+#[test]
+fn the_rule_files_of_the_borrows_are_rejected_exactly_where_a_run_is_stuck() {
+    let counts = held_against_the_oracle(&RULE_FILES, &ASKS_MORE, &STUCK_BY_ANOTHER);
+    assert_eq!(counts, (39, 35));
+}
+
+/// Review finding RC27: an assignment through a name of exclusive borrow
+/// type that a bind or an operation had moved was accepted, and is stuck in
+/// the oracle (`X2 E-Var`). [E-Assign] reads the name as [E-Var] does, so
+/// the checker asks [O2] of it. The bind with a move mark says the same.
+const RC27_STUCK: [&str; 3] = [
+    r#"
+control c()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ q : &~u32 := r
+    ⊤ ▷ r ← 4
+    ⊤ ▷ ■ ok {x}
+
+//! run c() => stuck X2 E-Var
+"#,
+    r#"
+control c()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ q : &~u32 := ▾r
+    ⊤ ▷ r ← 4
+    ⊤ ▷ ■ ok {x}
+
+//! run c() => stuck X2 E-Var
+"#,
+    r#"
+control set(p : &~u32)
+    ■ { done {} }
+    ⊤ ▷ p ← 7
+    ⊤ ▷ ■ done {}
+control c()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ d : Δ set(r) ▸ done {}
+    ⊤ ▷ r ← 4
+    ⊤ ▷ ■ ok {x}
+
+//! run c() => stuck X2 E-Var
+"#,
+];
+
+/// The new name writes, and an operand with the move mark passes the borrow
+/// on as the bare name does: what the callee's condition says of it holds.
+const RC27_DONE: &str = r#"
+control set(p : &~u32)
+    ■ { done {} ⇐ p = 7 }
+    ⊤ ▷ p ← 7
+    ⊤ ▷ ■ done {}
+control c()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ q : &~u32 := ▾r
+    ⊤ ▷ q ← 4
+    ⊤ ▷ s : &~u32 := &~x
+    ⊤ ▷ d : Δ set(▾s) ▸ done {}
+    ⊤ ▷ ⊢ x = 7
+    ⊤ ▷ ■ ok {x}
+
+//! run c() => done ok {7}
+"#;
+
+#[test]
+fn a_borrow_name_that_moved_is_not_written_through_o2() {
+    for source in RC27_STUCK {
+        stuck_and_rejected("O2", source);
+    }
+    done_and_accepted("O2", RC27_DONE);
+}

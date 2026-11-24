@@ -1,0 +1,16 @@
+// [C1] A place given for an `&~` parameter of an operation lends only when
+// the operand says so: `&~x`, or a name of that borrow type. A bare place
+// is refused (RO14), as for a shared parameter.
+
+control set(p : &~u32)
+    ■ { done {} }
+    ⊤ ▷ p ← 7
+    ⊤ ▷ ■ done {}
+
+control lends_unmarked()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ d : Δ set(x) ▸ done {}
+    ⊤ ▷ ■ ok {x}
+
+//! reject C1

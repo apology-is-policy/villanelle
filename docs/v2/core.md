@@ -986,7 +986,10 @@ causes an error, and every reported error comes with a feasible history.
   of an operation, a payload field, a loop parameter, a field of a view, a
   bind with a written borrow type), the operand is `&p` or `&~p` in the
   mode of that type, or a name or a field of a view that has that very
-  type and stands for the borrow itself. An expression of the type that the
+  type and stands for the borrow itself. A name of exclusive borrow type
+  that stands there is moved, and may carry the move mark `▾`; a name of
+  shared borrow type is read, and a mark on it is refused ([O3]). An
+  expression of the type that the
   borrow refers to is no operand there, and neither is a name of exclusive
   borrow type where a shared borrow is expected: `&r` lends what is behind
   it again. The surface binds an expression that is not a place to a hidden
@@ -1596,3 +1599,4 @@ and what asked for it:
 | 24 November 2026 | [E-Formula] says that the value of a parameter at entry or at completion is read only where a formula of the signature mentions it. | The same tests (review finding RO17): the oracle read every argument through its borrow at a call and every borrowed parameter at an exit, so a call that passed a dead borrow to a control that never reads it was stuck, although passing a borrow is no access. |
 | 24 November 2026 | [E-Assign] says that a name of borrow type through which an assignment writes is read as [E-Var] says. | The same tests: `r ← e` where `r` was moved is a read of a moved name, and the oracle reported an assignment to one (`X2 E-Assign`). It reports `X2 E-Var`. |
 | 24 November 2026 | [C1] says what stands where a borrow type is expected: `&p` or `&~p`, or a name or a field of a view of that type. | The reader of the core text (review finding RO14): it took any expression of the type that the borrow refers to, a constructor or a literal among them, and a name of exclusive borrow type for a shared one. The grammar has `&p` and `&~p` as the only borrows, [W5a] gives a function a place, and [U11] of the surface binds other expressions to hidden names; the reader asks for these forms now. |
+| 24 November 2026 | [C1] says that a name of exclusive borrow type where a borrow is expected may carry the move mark, and a name of shared borrow type may not. | The checker against the rule files of the borrows (review findings RO18 and RC27): the reader took a bare place given for an `&~` parameter of an operation as `&~p`, and refused `▾r` there, although the name moves and [O3] allows the mark on a name that is consumed. A name of shared borrow type is read there, as RC7 has it for `len(▾v)`. |

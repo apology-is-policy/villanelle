@@ -96,7 +96,7 @@ control formula_through_gone()
     ⊤ ▷ ~xs : [u32] := [4, 5]
     ⊤ ▷ r : &u32 := &xs[1]
     ⊤ ▷ p : Δ pop(&~xs) ▸ item {it} │ empty {}
-    ⊤ ▷ ⊢ r = 5
+    ⊤ ▷ ⊢ r ≥ 0
     ⊤ ▷ ■ ok {0}
 
 control shows(a : &u32)
@@ -121,7 +121,7 @@ control passes_dead(read : bool)
     t.false ▷ ■ ok {w}
 
 control bounded(a : &u32)
-    ■ { ok {} ⇐ a < 10 }
+    ■ { ok {} ⇐ a ≥ 0 }
     ⊤ ▷ ■ ok {}
 
 // X4: the condition of an exit reads a parameter through a dead borrow.

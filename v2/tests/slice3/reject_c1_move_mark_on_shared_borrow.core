@@ -1,0 +1,12 @@
+// [C1], [O3] A name of shared borrow type where a borrow is expected is
+// read, and a move mark on it is refused; on a name of exclusive borrow
+// type, which moves, the mark is allowed.
+
+control marks_a_read()
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := 1
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ q : &u32 := ▾r
+    ⊤ ▷ ■ ok {q}
+
+//! reject C1

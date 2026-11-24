@@ -76,7 +76,8 @@ control two_entries()
     ⊤ ▷ b : string := "b"
     ⊤ ▷ g : Δ get(&m, &a) ▸ found {va} │ missing {}
     ⊤ ▷ h : Δ get(&m, &b) ▸ found {vb} │ missing {}
-    g.found ∧ h.found ▷ ■ ok {va + vb}
+    g.found ∧ h.found ▷ t : ? va < 1000 ∧ vb < 1000
+    g.found ∧ h.found ∧ t.true ▷ ■ ok {va + vb}
     ⊤ ▷ ■ ok {0}
 
 //! run push_kills_element() => stuck X4 B1

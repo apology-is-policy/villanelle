@@ -131,7 +131,7 @@ const DEATHS: [(&str, &str, &str); 40] = [
     ("b5_shapes.core", "pop_kills_element", SHAPE),
     ("b5_shapes.core", "insert_kills_entry", SHAPE),
     ("b5_shapes.core", "remove_kills_entry", SHAPE),
-    ("e_borrow_operands.core", "add_from", SHARED),
+    ("e_borrow_operands.core", "copy_from", SHARED),
     (
         "e_borrow_operands.core",
         "function_read_ends_exclusive",

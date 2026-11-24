@@ -1655,6 +1655,44 @@ fact propagation/invalidation, and Pass 2 static ROBDD loan checking to
   programs under `vn2 check --certificates`, and all 9 stuck controls plus
   `[RM7]` `disjoint_elements` from `tests/slice3/*.core`.
 
+### 16.1 The checker against the rule files of the borrows, 24 November 2026
+
+`the_rule_files_of_the_borrows_are_rejected_exactly_where_a_run_is_stuck`
+(`v2/tests/checker_slice3.rs`) gives each control of the eight rule files
+of slice 3 to `check::check_each` and asks that the checker refuse exactly
+the controls in which a run of the oracle is stuck, and by the clause that
+excludes the stuck state (`excludes`: `X4 B1` by a loan clause, `X2
+E-Var` by [O2], `X7 E-Index` by [P5]); a refusal for another reason where a
+run is stuck is a failure, since it hides whether the clause holds. Of 84
+controls, 39 are refused and 35 accepted; `ASKS_MORE` lists four that the
+checker refuses where no run is stuck (two by [RM7], which does not compare
+indices, one by [L2], for which a use of a view uses each of its borrows,
+and one because a write through a field of a view leaves the root with no
+fact, [I7] and [I9]); `STUCK_BY_ANOTHER` lists three pairs in which a run
+is stuck in a control that keeps its contract (it reads a borrow it was
+given, or one a callee returned) and the checker refuses the caller or the
+callee that broke the clause ([L3], [L4]).
+
+The loan check runs after the check of the facts, so a control that is
+stuck by a dead borrow and also adds numbers the logic cannot bound was
+refused by [P5] first. The rule files were written for the oracle: ten of
+their controls with only runs that end added or compared numbers that the
+logic does not know (an element of a vector literal, [A3]; a value found
+in a map; a payload of a host; a condition the control does not
+establish), and bound them now by a precondition, a condition of the
+host, a guard or an element written before it is read, or keep the
+arithmetic out; four that are stuck by a dead borrow keep it out, so that
+the loan clause is the one that refuses them. `add_from` of
+`e_borrow_operands.core` is `copy_from`, and copies.
+
+Found and closed: RC27, an assignment through a name of exclusive borrow
+type that had moved was accepted (`check_assign` asks [O2] of the name);
+RO18, the operands of a decision for an `&~` parameter took a bare place as
+`&~p` (`Resolver::arguments`), and the move mark on such a name is read now
+([C1]). RC1 is closed in the same part (section 9 of the review): a loop
+renames at its entry every place its body lends exclusively
+(`collect_modified_vars`).
+
 ## 17. Slice 3 Phase 4: Theorem 4 Expansion and Typed LLVM IR / C ABI Backend for Borrows and Views
 
 Slice 3 Phase 4 completes Theorem 4 call expansion (`expand.rs`), erased borrow

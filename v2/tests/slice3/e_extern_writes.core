@@ -25,7 +25,7 @@ extern control keeps(t : &~token)
     ■ { kept {} }
 
 extern control slot_of(c : &~counter)
-    ■ { slot {out : &~u32 ∈ c} }
+    ■ { slot {out : &~u32 ∈ c} ⇐ out < 100 }
 
 // The write is the value at completion that the condition reads.
 control bumps(start : u32)

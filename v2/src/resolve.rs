@@ -679,6 +679,15 @@ impl Typer<'_> {
                 }
                 Ok(Expr::Borrow(*mode, place, expected.clone()))
             }
+            // A name of exclusive borrow type that stands here is moved
+            // ([W8]), and may carry the move mark, which says so; a name of
+            // shared borrow type is read, and a mark on it is refused.
+            syntax::Expr::Move(inner)
+                if exp_mode == BorrowMode::Exclusive
+                    && matches!(**inner, syntax::Expr::Name(_)) =>
+            {
+                self.borrow_operand(inner, expected, exp_mode, exp_inner)
+            }
             syntax::Expr::Name(name) => match self.scope.find(name) {
                 Some((var, var_ty)) if var_ty == *expected => Ok(Expr::Var(var, var_ty)),
                 Some((_, var_ty)) => self.error(format!(
@@ -1576,8 +1585,13 @@ impl<'g, 'a> Builder<'g, 'a> {
         let mut built = Vec::with_capacity(arguments.len());
         for (argument, ty) in arguments.iter().zip(types) {
             if let Type::Ref(BorrowMode::Exclusive, inner) = ty {
-                // [W8]: A name or view field of type `&~τ` passes the borrow itself.
-                if let syntax::Expr::Name(name) = argument
+                // [W8]: A name or view field of type `&~τ` passes the borrow
+                // itself and is moved; the name may carry the move mark.
+                let named = match argument {
+                    syntax::Expr::Move(name) => &**name,
+                    other => other,
+                };
+                if let syntax::Expr::Name(name) = named
                     && let Some((var, var_ty)) = self.find(name)
                     && var_ty == *ty
                 {
@@ -1591,9 +1605,13 @@ impl<'g, 'a> Builder<'g, 'a> {
                     built.push(expr);
                     continue;
                 }
-                let place_expr = match argument {
-                    syntax::Expr::Borrow(BorrowMode::Exclusive, p) => &**p,
-                    other => other,
+                // [C1]: otherwise the operand lends, and says so (RO14).
+                let syntax::Expr::Borrow(BorrowMode::Exclusive, place_expr) = argument else {
+                    return fail(
+                        line,
+                        "C1",
+                        format!("a slot of type {ty} takes `&~p` or a name of that type"),
+                    );
                 };
                 let (place, through_exc) = typer.resolve_place(place_expr)?;
                 if !self.is_mutable_place(&place, through_exc) {

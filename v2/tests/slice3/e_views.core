@@ -14,7 +14,8 @@ function at_start(w : window) ⊢ w.start < len(w.items) : u32 := w.items[w.star
 // A view of shared borrows is copied; both copies read.
 control copies_a_view()
     ■ { ok {v : u32} }
-    ⊤ ▷ xs : [u32] := [4, 5]
+    ⊤ ▷ ~xs : [u32] := [4, 5]
+    ⊤ ▷ xs[1] ← 5
     ⊤ ▷ w : window := window {&xs, 1}
     ⊤ ▷ w2 : window := w
     ⊤ ▷ ■ ok {at_start(w) + at_start(w2)}
@@ -66,7 +67,9 @@ view struct pair_of_windows {left : window, right : window}
 
 control nested_views()
     ■ { ok {v : u32} }
-    ⊤ ▷ xs : [u32] := [4, 5]
+    ⊤ ▷ ~xs : [u32] := [4, 5]
+    ⊤ ▷ xs[0] ← 4
+    ⊤ ▷ xs[1] ← 5
     ⊤ ▷ w : window := window {&xs, 0}
     ⊤ ▷ p : pair_of_windows := pair_of_windows {w, window {&xs, 1}}
     ⊤ ▷ ■ ok {at_start(p.left) + at_start(p.right)}

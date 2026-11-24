@@ -4159,6 +4159,10 @@ impl<'a> BodyChecker<'a> {
             )?;
         }
         if matches!(self.body.vars[var].ty, Type::Ref(BorrowMode::Exclusive, _)) {
+            // [E-Assign]: the borrow name through which the assignment
+            // writes is read as [E-Var] says, so it is available ([O2]):
+            // a bind, an operand or a call that took the borrow moved it.
+            self.check_available(var, at.reach, at.line, &at.visible, at.in_loop)?;
             let new_val = translate_term(self.program, &mut self.solver, value, &at.env);
             let place = Place {
                 root: var,

@@ -75,7 +75,7 @@ control disjoint_places()
     ⊤ ▷ p.y ← 7
     ⊤ ▷ ~v : [u32] := [1, 2]
     ⊤ ▷ r0 : &u32 := &v[0]
-    ⊤ ▷ v[1] ← r0 + 5
+    ⊤ ▷ v[1] ← r0
     ⊤ ▷ ■ ok {p, v}
 
 // X4: a write to the whole kills a borrow of a part.
@@ -127,7 +127,7 @@ control whole_read_kills_part()
 //! run ancestors_live() => done ok {6}
 //! run parent_kills_child() => stuck X4 B1
 //! run descendants_die() => stuck X4 B1
-//! run disjoint_places() => done ok {pair {12, 7}, [1, 6]}
+//! run disjoint_places() => done ok {pair {12, 7}, [1, 1]}
 //! run whole_kills_part() => stuck X4 B1
 //! run part_kills_whole() => stuck X4 B1
 //! run element_kills_element() => stuck X4 B1

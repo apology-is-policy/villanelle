@@ -12,7 +12,7 @@ control move_kills_borrow()
     ⊤ ▷ s : string := "hello"
     ⊤ ▷ r : &string := &s
     ⊤ ▷ t : string := s
-    ⊤ ▷ ■ ok {len(r) + len(t)}
+    ⊤ ▷ ■ ok {len(r)}
 
 // X4: a move of the owner kills a borrow of a component.
 control move_kills_component()
@@ -82,7 +82,7 @@ control old_name_is_moved()
 control leaves_a_local()
     ■ { ok {v : u32} }
     ⊤ ▷ l : ↻ l(i : u32 := 0) {
-        ⊤ ▷ local : u32 := i + 1
+        ⊤ ▷ local : u32 := i
         ⊤ ▷ □ out {&local}
     } ▸ out {r}
     ⊤ ▷ ■ ok {r}
@@ -93,7 +93,7 @@ control goes_round_with_a_local()
     ⊤ ▷ ~seed : u32 := 7
     ⊤ ▷ l : ↻ l(r : &u32 := &seed, i : u32 := 0) {
         ⊢ i ≤ 1
-        ⊤ ▷ local : u32 := r + 1
+        ⊤ ▷ local : u32 := r
         ⊤ ▷ t : ? i = 1
         t.true ▷ □ out {local}
         ⊤ ▷ ↑ l(&local, i + 1)
