@@ -1,0 +1,174 @@
+// [E-Spawn]: the operands are evaluated and the precondition of the producer
+// is checked; the new member is ready and does not run yet, since `spawn`
+// does not pass the turn. [E-Next]: `await next(x)` gives up the turn; it
+// completes with the payload of the member that was done first, which leaves
+// the set, or with `empty` when the set has no members, and then the slot of
+// `x` is `◌`. [E-Done]: a member keeps its payload until it is delivered.
+// `count(x)` is the number of members, done ones among them.
+
+async control say(name : string) ■ { said {who : string} } uses console.write
+    1 ⊤ ▷ e : Δ emit(&name) ▸ done {}
+    2 ⊤ ▷ ■ said {name}
+
+// The parent emits before the member runs, whatever the turns.
+async control spawns_first() ■ { ok {before : usize, after : usize} } uses console.write
+    1 ⊤ ▷ ~pool : tasks⟨say⟩ := tasks⟨say⟩()
+    2 ⊤ ▷ b : usize := count(pool)
+    3 ⊤ ▷ spawn say("member") into pool
+    4 ⊤ ▷ s : string := "parent"
+    5 ⊤ ▷ e : Δ emit(&s) ▸ done {}
+    6 ⊤ ▷ a : usize := count(pool)
+    7 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ said {m} │ empty {}
+          2 n.said ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    8 ⊤ ▷ ■ ok {b, a}
+
+control runs_spawns_first() ■ { ok {before : usize, after : usize} } uses console.write
+    1 ⊤ ▷ d : Δ run spawns_first() ▸ ok {b, a}
+    2 d.ok ▷ ■ ok {b, a}
+
+//! run runs_spawns_first() => done ok {0, 1} trace [emit("parent") -> done; emit("member") -> done]
+//! run runs_spawns_first() turns [1, 1, 1] => done ok {0, 1} trace [emit("parent") -> done; emit("member") -> done]
+
+// The members are delivered in the order in which they were done; a done
+// member is counted until it is delivered.
+async control order() ■ { ok {first : string, second : string, left : usize} } uses console.write
+    1 ⊤ ▷ ~pool : tasks⟨say⟩ := tasks⟨say⟩()
+    2 ⊤ ▷ spawn say("one") into pool
+    3 ⊤ ▷ spawn say("two") into pool
+    4 ⊤ ▷ n : Δ await next(pool) ▸ said {m1} │ empty {}
+    5 n.said ▷ k : usize := count(pool)
+    6 n.said ▷ o : Δ await next(pool) ▸ said {m2} │ empty {}
+    7 o.said ▷ e : Δ await next(pool) ▸ said {m3} │ empty {}
+    8 e.empty ▷ ■ ok {m1, m2, k}
+    9 e.said ▷ ⊥
+    10 o.empty ▷ ⊥
+    11 n.empty ▷ ⊥
+
+control runs_order() ■ { ok {first : string, second : string, left : usize} } uses console.write
+    1 ⊤ ▷ d : Δ run order() ▸ ok {a, b, k}
+    2 d.ok ▷ ■ ok {a, b, k}
+
+// Both members are done before the root takes its turn: one is delivered,
+// and the other is still counted.
+//! run runs_order() => done ok {"one", "two", 1} trace [emit("one") -> done; emit("two") -> done]
+//! run runs_order() turns [1] => done ok {"two", "one", 1} trace [emit("two") -> done; emit("one") -> done]
+// The root takes the first done member before the second runs.
+//! run runs_order() turns [0, 0] => done ok {"one", "two", 1} trace [emit("one") -> done; emit("two") -> done]
+
+// `empty` moves the set: a second `await next` on it is stuck.
+async control after_empty() ■ { ok {} }
+    1 ⊤ ▷ ~pool : tasks⟨say⟩ := tasks⟨say⟩()
+    2 ⊤ ▷ n : Δ await next(pool) ▸ said {m} │ empty {}
+    3 n.empty ▷ o : Δ await next(pool) ▸ said {m2} │ empty {}
+    4 ⊤ ▷ ■ ok {}
+
+control runs_after_empty() ■ { ok {} }
+    1 ⊤ ▷ d : Δ run after_empty() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_after_empty() => stuck X2 E-Var
+
+// So are a spawn into it, a cancel and a count.
+async control spawn_after_empty() ■ { ok {} } uses console.write
+    1 ⊤ ▷ ~pool : tasks⟨say⟩ := tasks⟨say⟩()
+    2 ⊤ ▷ n : Δ await next(pool) ▸ said {m} │ empty {}
+    3 n.empty ▷ spawn say("late") into pool
+    4 ⊤ ▷ ■ ok {}
+
+control runs_spawn_after_empty() ■ { ok {} } uses console.write
+    1 ⊤ ▷ d : Δ run spawn_after_empty() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_spawn_after_empty() => stuck X2 E-Var
+
+async control cancel_after_empty() ■ { ok {} }
+    1 ⊤ ▷ ~pool : tasks⟨say⟩ := tasks⟨say⟩()
+    2 ⊤ ▷ n : Δ await next(pool) ▸ said {m} │ empty {}
+    3 n.empty ▷ cancel pool
+    4 ⊤ ▷ ■ ok {}
+
+control runs_cancel_after_empty() ■ { ok {} }
+    1 ⊤ ▷ d : Δ run cancel_after_empty() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_cancel_after_empty() => stuck X2 E-Var
+
+async control count_after_empty() ■ { ok {c : usize} }
+    1 ⊤ ▷ ~pool : tasks⟨say⟩ := tasks⟨say⟩()
+    2 ⊤ ▷ n : Δ await next(pool) ▸ said {m} │ empty {}
+    3 n.empty ▷ c : usize := count(pool)
+    4 n.empty ▷ ■ ok {c}
+    5 n.said ▷ ⊥
+
+control runs_count_after_empty() ■ { ok {c : usize} }
+    1 ⊤ ▷ d : Δ run count_after_empty() ▸ ok {c}
+    2 d.ok ▷ ■ ok {c}
+
+//! run runs_count_after_empty() => stuck X2 E-Var
+
+// The precondition of the producer is checked at the spawn.
+async control positive(n : u32) ⊢ n > 0 ■ { ok {v : u32} }
+    1 ⊤ ▷ ■ ok {n}
+
+async control spawns_positive(n : u32) ■ { ok {v : u32} }
+    1 ⊤ ▷ ~pool : tasks⟨positive⟩ := tasks⟨positive⟩()
+    2 ⊤ ▷ spawn positive(n) into pool
+    3 ⊤ ▷ x : Δ await next(pool) ▸ ok {v} │ empty {}
+    4 x.ok ▷ y : Δ await next(pool) ▸ ok {w} │ empty {}
+    5 y.empty ▷ ■ ok {v}
+    6 y.ok ▷ ⊥
+    7 x.empty ▷ ⊥
+
+control runs_spawns_positive(n : u32) ■ { ok {v : u32} }
+    1 ⊤ ▷ d : Δ run spawns_positive(n) ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+//! run runs_spawns_positive(5) => done ok {5}
+//! run runs_spawns_positive(0) => stuck X7 E-Spawn
+
+// A scope that ends with a member in its set is stuck.
+async control leaves_member() ■ { ok {} } uses console.write
+    1 ⊤ ▷ ~pool : tasks⟨say⟩ := tasks⟨say⟩()
+    2 ⊤ ▷ spawn say("left") into pool
+    3 ⊤ ▷ ■ ok {}
+
+control runs_leaves_member() ■ { ok {} } uses console.write
+    1 ⊤ ▷ d : Δ run leaves_member() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_leaves_member() => stuck X5 E-Scope
+
+// So is one whose member is done and not delivered.
+async control leaves_done() ■ { ok {} } uses console.write
+    1 ⊤ ▷ ~pool : tasks⟨say⟩ := tasks⟨say⟩()
+    2 ⊤ ▷ spawn say("done") into pool
+    3 ⊤ ▷ n : Δ await next(pool) ▸ said {m} │ empty {}
+    4 n.said ▷ spawn say("again") into pool
+    5 n.said ▷ ~others : tasks⟨say⟩ := tasks⟨say⟩()
+    6 n.said ▷ o : Δ await next(others) ▸ said {m2} │ empty {}
+    7 o.empty ▷ ■ ok {}
+    8 n.empty ▷ ⊥
+    9 o.said ▷ ⊥
+
+control runs_leaves_done() ■ { ok {} } uses console.write
+    1 ⊤ ▷ d : Δ run leaves_done() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_leaves_done() => stuck X5 E-Scope
+
+// A decision on `await next` that does not list `empty` meets it.
+async control lacks_empty() ■ { ok {} } uses console.write
+    1 ⊤ ▷ ~pool : tasks⟨say⟩ := tasks⟨say⟩()
+    2 ⊤ ▷ spawn say("only") into pool
+    3 ⊤ ▷ n : Δ await next(pool) ▸ said {m}
+    4 n.said ▷ o : Δ await next(pool) ▸ said {m2}
+    5 o.said ▷ ⊥
+
+control runs_lacks_empty() ■ { ok {} } uses console.write
+    1 ⊤ ▷ d : Δ run lacks_empty() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_lacks_empty() => stuck X10 E-Decide

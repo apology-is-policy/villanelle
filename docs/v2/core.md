@@ -621,8 +621,9 @@ Storage is the host's, and running out of it is not an outcome.
 - **[E-Exhaust]** A step that makes a value or a task may instead end the
   execution, at the host's choice, with the final result `exhausted`. It
   does so where it would make a length or a count greater than `usize.max`
-  ([fact logic](facts.md), [A3]): `push` or `insert` on a collection that has
-  `usize.max` elements, `spawn` into a set that has `usize.max` members. No
+  ([fact logic](facts.md), [A3]): `push` onto a vector, or `insert` of a key
+  that is not there into a map, that has `usize.max` elements, and `spawn`
+  into a set that has `usize.max` members. No
   scope ends, nothing is released, no contingency runs and no permission is
   asked: the execution stops as a process does when its system stops it, and
   leaves what it holds to the host. The instrumented profile lets a script give the
@@ -1399,17 +1400,19 @@ of the final payload.
 
 **Theorem 3 (erasure).** See section 9.
 
-**Theorem 4 (expansion).** Expanding a decision on a defined control that is
-not `async` in place (the control's body with fresh names and sites, its
+**Theorem 4 (expansion).** Expanding in place a decision on a defined control
+`g` that is not `async` (the body of `g` with fresh names and sites, its
 parameters bound to the arguments, and each exit replaced by the caller's
 continuation for that alternative) yields a checked program with the same
-observations.
+observations, unless the decision is in an `async` control and the body of
+`g` contains `run`.
 
 The theorem says nothing of `await f` and `run f`. `await f` on a defined
 control passes the turn before the first statement of `f` ([E-Await]), so a
 member of a set of the caller may run there, and `run f` starts a run with a
 pool and a root of its own ([E-Run]). The body put in place keeps neither,
-and the core has no statement that would.
+and the core has no statement that would. Nor does it put a `run` into the
+body of an `async` control, which [W10] forbids.
 
 The proofs rest on five invariants of reachable configurations, each relating a
 scope at statement `i` to the checker's state there:
@@ -1669,4 +1672,4 @@ and what asked for it:
 | 24 November 2026 | [E-Run] says how a run of an `extern async control` asks the host: its root has no activation and waits for the operation as [E-AwaitHost] says, and is `done(cancelled)` when it is cancelled and the operation is cancellable. [TK4] asks fault-releasable types of the operands that such a run passes by value. | The second review of the task rules (finding RT1) and the author's choice of 24 November (section 11). [W10] allowed the run, and nothing said how it starts; the draft oracle released the arguments of a cancelled one, and a lock that is not `on fault release` made it stuck (`X8 E-Unwind`) where the checker had nothing to refuse. |
 | 24 November 2026 | [E-MemberFault] withdraws the operation that the owner itself awaits when the fault of a member reaches it, and releases its arguments given by value. | The same review (RT2). The rule stopped the activations above the owner, whose operations [E-Stop] withdraws, and said nothing of an operation the owner awaits: the lease it holds would have been neither released nor completed, against Theorem 2. The oracle withdrew it already. |
 | 24 November 2026 | [E-Exhaust] (section 6.6): a step that makes a value or a task may end the execution with the final result `exhausted`, and does where a length or a count would pass `usize.max`. [E-Spawn], [TK6], sections 6.10 and 6.11, Theorem 2 and [R7] refer to it. | The same review (RT3) and the author's choice of 24 November (section 11). A loop that spawns without an await could give a set `usize.max + 1` members, and [TK6] and [A3] then had no valuation on a reachable history; `push` and `insert` had the same gap for `len`, and the prelude said only that memory exhaustion is not an outcome. |
-| 24 November 2026 | Theorem 4 is about decisions on controls that are not `async`, and says why `await f` and `run f` are not expanded. | The same review (RT4). Putting the body of an awaited control in place drops the turn that [E-Await] gives up before its first statement, so a member that would have run first runs later, which is a different trace. |
+| 24 November 2026 | Theorem 4 is about decisions on controls that are not `async`, says why `await f` and `run f` are not expanded, and leaves out a decision in an `async` control on a control whose body contains `run`. | The same review (RT4). Putting the body of an awaited control in place drops the turn that [E-Await] gives up before its first statement, so a member that would have run first runs later, which is a different trace. The last exception was found by the test of the expansion of slice 4: the crate put the body of a synchronous control that runs an async one into the async control that called it, and [W10] refused the result. |

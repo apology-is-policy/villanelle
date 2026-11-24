@@ -1,0 +1,134 @@
+// [E-MemberFault]: when a member faults, it leaves its set and no task takes
+// a turn before the fault is delivered. The owner task waits at an await, in
+// the owner `A` or in an activation that `A` awaits: those above `A` are
+// stopped, an operation that `A` itself awaits is withdrawn (finding RT2),
+// and the owner goes on in mode `fault`, as when a callee faults.
+
+extern resource lease on fault release
+extern control open_lease(id : u32) ■ { ok {l : lease} } uses io.res
+extern control close_lease(l : lease) ■ { ok {} } uses io.res
+extern async control tick(id : u32) ■ { done {} │ cancelled {} } uses io.net
+extern async control hold(l : lease) ■ { done {v : u32} │ cancelled {} } uses io.net
+
+async control member(flag : u32) ■ { ok {} } faults uses console.write
+    1 ⊤ ▷ t : ? flag = 0
+    2 t.true ▷ fault "member boom"
+    3 t.false ▷ s : string := "survivor"
+    4 t.false ▷ e : Δ emit(&s) ▸ done {}
+    5 t.false ▷ ■ ok {}
+
+// A boundary around the set takes the fault. The other member does not run
+// before it is delivered; given the first turn, it runs to its end.
+async control catches() ■ { ok {} } faults uses console.write
+    1 ⊤ ▷ b : boundary {
+          1 ⊤ ▷ ~pool : tasks⟨member⟩ := tasks⟨member⟩()
+          2 ⊤ ▷ spawn member(0) into pool
+          3 ⊤ ▷ spawn member(1) into pool
+          4 ⊤ ▷ lp : ↻ drain() {
+                1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+                2 n.ok ▷ ↑ drain()
+                3 n.empty ▷ □ drained {}
+              } ▸ drained {}
+      } contingency (m : string) {
+          1 ⊤ ▷ e : Δ emit(&m) ▸ done {}
+          2 ⊤ ▷ fault "caught"
+      }
+    2 b.done ▷ ■ ok {}
+
+control runs_catches() ■ { ok {} } faults uses console.write
+    1 ⊤ ▷ d : Δ run catches() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_catches() => faulted "caught" trace [emit("member boom") -> done]
+//! run runs_catches() turns [1] => faulted "caught" trace [emit("survivor") -> done; emit("member boom") -> done]
+
+// The owner does not permit the fault and no boundary is around the set.
+async control unpermitted() ■ { ok {} } uses console.write
+    1 ⊤ ▷ ~pool : tasks⟨member⟩ := tasks⟨member⟩()
+    2 ⊤ ▷ spawn member(0) into pool
+    3 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+    4 n.ok ▷ m : Δ await next(pool) ▸ ok {} │ empty {}
+    5 m.empty ▷ ■ ok {}
+    6 m.ok ▷ ⊥
+    7 n.empty ▷ ⊥
+
+control runs_unpermitted() ■ { ok {} } faults uses console.write
+    1 ⊤ ▷ d : Δ run unpermitted() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_unpermitted() => stuck X8 E-Unwind
+
+async control early() ■ { ok {} } faults
+    1 ⊤ ▷ fault "early"
+
+// RT2: the owner itself awaits an operation when the fault arrives. The
+// operation is withdrawn, with no event, and the lease it was given by value
+// is released once. The script has no answer for `hold`.
+async control owner_waits(id : u32) ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨early⟩ := tasks⟨early⟩()
+    2 ⊤ ▷ spawn early() into pool
+    3 ⊤ ▷ o : Δ open_lease(id) ▸ ok {l}
+    4 o.ok ▷ w : Δ await hold(l) ▸ done {v} │ cancelled {}
+    5 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    6 ⊤ ▷ ■ ok {}
+
+control runs_owner_waits() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ d : Δ run owner_waits(1) ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_owner_waits() with [open_lease -> ok {lease#1}] => faulted "early" trace [open_lease(1) -> ok {lease#1}; lease.release(lease#1) -> released]
+
+// The owner awaits a defined control that waits for the host: that
+// activation is stopped, its operation withdrawn and its lease given by
+// value released, and the lease it holds in its scope too.
+async control waiter(id : u32) ■ { ok {} } uses io.res, io.net
+    1 ⊤ ▷ o : Δ open_lease(id) ▸ ok {l}
+    2 o.ok ▷ p : Δ open_lease(id + 1) ▸ ok {kept}
+    3 p.ok ▷ w : Δ await hold(l) ▸ done {v} │ cancelled {}
+    4 p.ok ▷ c : Δ close_lease(kept) ▸ ok {}
+    5 p.ok ▷ ■ ok {}
+
+async control owner_awaits_waiter() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨early⟩ := tasks⟨early⟩()
+    2 ⊤ ▷ spawn early() into pool
+    3 ⊤ ▷ a : Δ await waiter(1) ▸ ok {}
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_owner_awaits_waiter() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ d : Δ run owner_awaits_waiter() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_owner_awaits_waiter() with [open_lease -> ok {lease#1}; open_lease -> ok {lease#2}] turns [0, 1] => faulted "early" trace [open_lease(1) -> ok {lease#1}; open_lease(2) -> ok {lease#2}; lease.release(lease#1) -> released; lease.release(lease#2) -> released]
+
+// The fault arrives at an owner that is ready: its await has completed
+// (`cancelled` at once, the root being cancelled), and the statement after
+// it, which would give the lease away, has not begun. The lease is released.
+async control owner_ready(id : u32) ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ t : Δ await tick(9) ▸ done {} │ cancelled {}
+    2 ⊤ ▷ ~pool : tasks⟨early⟩ := tasks⟨early⟩()
+    3 ⊤ ▷ spawn early() into pool
+    4 ⊤ ▷ o : Δ open_lease(id) ▸ ok {l}
+    5 o.ok ▷ w : Δ await tick(0) ▸ done {} │ cancelled {}
+    6 o.ok ▷ c : Δ close_lease(l) ▸ ok {}
+    7 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    8 ⊤ ▷ ■ ok {}
+
+control runs_owner_ready() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ d : Δ run owner_ready(2) ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_owner_ready() with [open_lease -> ok {lease#2}] cancel_at 1 turns [0, 1] => faulted "early" trace [open_lease(2) -> ok {lease#2}; lease.release(lease#2) -> released]
+//! run runs_owner_ready() with [open_lease -> ok {lease#2}; close_lease -> ok] cancel_at 1 => faulted "early" trace [open_lease(2) -> ok {lease#2}; close_lease(lease#2) -> ok]

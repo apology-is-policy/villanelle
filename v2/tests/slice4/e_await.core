@@ -1,0 +1,71 @@
+// [E-Await]: `await f(ō)` on a defined `async control` calls `f` in the same
+// task, with its parameters bound, and the task gives up its turn before the
+// first statement of `f`. A member of a set of the caller may run there,
+// which a body put in place would not let it do (finding RT4).
+
+async control say(name : string) ■ { ok {} } uses console.write
+    1 ⊤ ▷ e : Δ emit(&name) ▸ done {}
+    2 ⊤ ▷ ■ ok {}
+
+async control parent() ■ { ok {} } uses console.write
+    1 ⊤ ▷ ~pool : tasks⟨say⟩ := tasks⟨say⟩()
+    2 ⊤ ▷ spawn say("child") into pool
+    3 ⊤ ▷ a : Δ await say("parent") ▸ ok {}
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_parent() ■ { ok {} } uses console.write
+    1 ⊤ ▷ d : Δ run parent() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_parent() => done ok trace [emit("parent") -> done; emit("child") -> done]
+//! run runs_parent() turns [1] => done ok trace [emit("child") -> done; emit("parent") -> done]
+
+// The arguments are bound when the call is made: the awaited control sees the
+// value the parent had, though the parent changes its own name before the
+// awaited control runs.
+async control echo(n : u32) ■ { ok {v : u32} }
+    1 ⊤ ▷ ■ ok {n}
+
+async control binds() ■ { ok {v : u32} }
+    1 ⊤ ▷ ~x : u32 := 3
+    2 ⊤ ▷ a : Δ await echo(x) ▸ ok {v}
+    3 a.ok ▷ x ← x + v
+    4 a.ok ▷ ■ ok {x}
+
+control runs_binds() ■ { ok {v : u32} }
+    1 ⊤ ▷ d : Δ run binds() ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+//! run runs_binds() => done ok {6}
+
+// The precondition of the awaited control is checked at the call.
+async control positive(n : u32) ⊢ n > 0 ■ { ok {v : u32} }
+    1 ⊤ ▷ ■ ok {n}
+
+async control awaits_positive(n : u32) ■ { ok {v : u32} }
+    1 ⊤ ▷ a : Δ await positive(n) ▸ ok {v}
+    2 a.ok ▷ ■ ok {v}
+
+control runs_awaits_positive(n : u32) ■ { ok {v : u32} }
+    1 ⊤ ▷ d : Δ run awaits_positive(n) ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+//! run runs_awaits_positive(2) => done ok {2}
+//! run runs_awaits_positive(0) => stuck X7 E-Call
+
+// `capture await` keeps the outcome as a value.
+async control captures(n : u32) ■ { ok {v : u32} }
+    1 ⊤ ▷ c := capture await echo(n)
+    2 ⊤ ▷ d : Δ outcome(c) ▸ ok {v}
+    3 d.ok ▷ ■ ok {v}
+
+control runs_captures(n : u32) ■ { ok {v : u32} }
+    1 ⊤ ▷ d : Δ run captures(n) ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+//! run runs_captures(8) => done ok {8}

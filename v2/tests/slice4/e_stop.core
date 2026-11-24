@@ -1,0 +1,167 @@
+// [E-Stop]: stopping a task ends the scopes of its activations, innermost
+// first, as [E-Unwind] ends them: a resource declared `on fault release` is
+// released, and any other open resource makes the configuration stuck. An
+// operation the host has started is withdrawn and the arguments it was given
+// by value are released; the values in the care of a boundary are released;
+// the payload of a member that is done is released. No contingency runs. A
+// member is stopped where the scope that holds its set ends by a fault.
+
+extern resource lease on fault release
+extern resource lock
+extern control open_lease(id : u32) ■ { ok {l : lease} } uses io.res
+extern control close_lease(l : lease) ■ { ok {} } uses io.res
+extern control open_lock(id : u32) ■ { ok {k : lock} } uses io.res
+extern control close_lock(k : lock) ■ { ok {} } uses io.res
+extern async control tick(id : u32) ■ { done {} │ cancelled {} } uses io.net
+extern async control hold(l : lease) ■ { done {v : u32} │ cancelled {} } uses io.net
+contingent extern control drop_lease(l : lease) ■ { ok {} } uses io.res
+contingent control say(m : &string) ■ { ok {} } uses console.write
+    1 ⊤ ▷ e : Δ emit(m) ▸ done {}
+    2 ⊤ ▷ ■ ok {}
+
+// A sibling that waits for an operation it gave its lease to: the operation
+// is withdrawn and the lease released.
+async control gives(id : u32) ■ { held {l : lease} } faults uses io.res, io.net
+    1 ⊤ ▷ t : ? id = 0
+    2 t.true ▷ fault "early"
+    3 t.false ▷ o : Δ open_lease(id) ▸ ok {l}
+    4 o.ok ▷ w : Δ await hold(l) ▸ done {v} │ cancelled {}
+    5 o.ok ▷ p : Δ open_lease(id) ▸ ok {l2}
+    6 p.ok ▷ ■ held {l2}
+
+async control stops_giver() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨gives⟩ := tasks⟨gives⟩()
+    2 ⊤ ▷ spawn gives(1) into pool
+    3 ⊤ ▷ spawn gives(0) into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ held {k} │ empty {}
+          2 n.held ▷ c : Δ close_lease(k) ▸ ok {}
+          3 n.held ▷ ↑ drain()
+          4 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_stops_giver() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ d : Δ run stops_giver() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_stops_giver() with [open_lease -> ok {lease#1}] => faulted "early" trace [open_lease(1) -> ok {lease#1}; lease.release(lease#1) -> released]
+
+// A sibling that is done when the fault comes, and not delivered: its
+// payload is released.
+async control quick(id : u32) ■ { held {l : lease} } faults uses io.res
+    1 ⊤ ▷ t : ? id = 0
+    2 t.true ▷ fault "early"
+    3 t.false ▷ o : Δ open_lease(id) ▸ ok {l}
+    4 o.ok ▷ ■ held {l}
+
+async control stops_done() ■ { ok {} } faults uses io.res
+    1 ⊤ ▷ ~pool : tasks⟨quick⟩ := tasks⟨quick⟩()
+    2 ⊤ ▷ spawn quick(1) into pool
+    3 ⊤ ▷ spawn quick(0) into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ held {k} │ empty {}
+          2 n.held ▷ c : Δ close_lease(k) ▸ ok {}
+          3 n.held ▷ ↑ drain()
+          4 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_stops_done() ■ { ok {} } faults uses io.res
+    1 ⊤ ▷ d : Δ run stops_done() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_stops_done() with [open_lease -> ok {lease#1}] turns [0, 1] => faulted "early" trace [open_lease(1) -> ok {lease#1}; lease.release(lease#1) -> released]
+// Delivered before the fault, the lease is closed by the owner.
+//! run runs_stops_done() with [open_lease -> ok {lease#1}; close_lease -> ok] turns [0, 0] => faulted "early" trace [open_lease(1) -> ok {lease#1}; close_lease(lease#1) -> ok]
+
+// A sibling that is ready, its await completed, before a statement that
+// would give its lease away (the schedule of the review's probe RO5).
+async control keeps(id : u32) ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ t : ? id = 0
+    2 t.true ▷ fault "early"
+    3 t.false ▷ o : Δ open_lease(id) ▸ ok {l}
+    4 o.ok ▷ w : Δ await tick(id) ▸ done {} │ cancelled {}
+    5 o.ok ▷ c : Δ close_lease(l) ▸ ok {}
+    6 o.ok ▷ ■ ok {}
+
+async control stops_keeper() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨keeps⟩ := tasks⟨keeps⟩()
+    2 ⊤ ▷ spawn keeps(2) into pool
+    3 ⊤ ▷ spawn keeps(0) into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_stops_keeper() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ d : Δ run stops_keeper() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+// The sibling waits for its tick: its lease, in its scope, is released.
+//! run runs_stops_keeper() with [open_lease -> ok {lease#2}] => faulted "early" trace [open_lease(2) -> ok {lease#2}; lease.release(lease#2) -> released]
+// The root is cancelled at the first turn, so the tick of the sibling is
+// `cancelled` at once and the sibling is ready before `close_lease`.
+//! run runs_stops_keeper() with [open_lease -> ok {lease#2}] turns [0, 1, 0, 0, 0] cancel_at 1 => faulted "early" trace [open_lease(2) -> ok {lease#2}; lease.release(lease#2) -> released]
+
+// A sibling that holds a lock, which is not fault-releasable.
+async control locks(id : u32) ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ t : ? id = 0
+    2 t.true ▷ fault "early"
+    3 t.false ▷ o : Δ open_lock(id) ▸ ok {k}
+    4 o.ok ▷ w : Δ await tick(id) ▸ done {} │ cancelled {}
+    5 o.ok ▷ c : Δ close_lock(k) ▸ ok {}
+    6 o.ok ▷ ■ ok {}
+
+async control stops_locker() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨locks⟩ := tasks⟨locks⟩()
+    2 ⊤ ▷ spawn locks(3) into pool
+    3 ⊤ ▷ spawn locks(0) into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_stops_locker() ■ { ok {} } faults uses io.res, io.net
+    1 ⊤ ▷ d : Δ run stops_locker() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_stops_locker() with [open_lock -> ok {lock#3}] => stuck X8 E-Stop
+//! run runs_stops_locker() with [open_lock -> ok {lock#3}; tick -> done; close_lock -> ok] turns [0, 0] waiting [0] => stuck X8 E-Stop
+
+// A sibling within a boundary of its own: the boundary's care is released and
+// its contingency does not run.
+async control guarded(id : u32) ■ { ok {} } faults uses io.res, io.net, console.write
+    1 ⊤ ▷ t : ? id = 0
+    2 t.true ▷ fault "early"
+    3 t.false ▷ o : Δ open_lease(id) ▸ ok {l}
+    4 o.ok ▷ b : boundary {
+          1 ⊤ ▷ w : Δ await tick(id) ▸ done {} │ cancelled {}
+          2 ⊤ ▷ fault "inner"
+      } contingency [l] (m : string) {
+          1 ⊤ ▷ e : Δ say(&m) ▸ ok {}
+          2 ⊤ ▷ c : Δ drop_lease(▾l) ▸ ok {}
+          3 ⊤ ▷ escalate
+      }
+    5 ⊤ ▷ ■ ok {}
+
+async control stops_guarded() ■ { ok {} } faults uses io.res, io.net, console.write
+    1 ⊤ ▷ ~pool : tasks⟨guarded⟩ := tasks⟨guarded⟩()
+    2 ⊤ ▷ spawn guarded(4) into pool
+    3 ⊤ ▷ spawn guarded(0) into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_stops_guarded() ■ { ok {} } faults uses io.res, io.net, console.write
+    1 ⊤ ▷ d : Δ run stops_guarded() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_stops_guarded() with [open_lease -> ok {lease#4}] => faulted "early" trace [open_lease(4) -> ok {lease#4}; lease.release(lease#4) -> released]

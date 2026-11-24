@@ -1,0 +1,62 @@
+// [E-Exhaust]: a step that would make a length or a count greater than the
+// capacity ends the execution `exhausted` (finding RT3 of the second review
+// of the task rules). The capacity is `usize.max` unless a run gives one. No
+// scope ends and nothing is released: the lease below is never released and
+// no contingency runs. An insert of a key that is there does not grow a map.
+
+extern resource lease on fault release
+extern control open_lease(id : u32) ■ { ok {l : lease} } uses io.res
+
+async control idle() ■ { ok {} }
+    1 ⊤ ▷ ■ ok {}
+
+// A loop that spawns without an await (the program of RT3).
+async control spawns(n : u32) ■ { done {count : usize} }
+    1 ⊤ ▷ ~pool : tasks⟨idle⟩ := tasks⟨idle⟩()
+    2 ⊤ ▷ s : ↻ more(i : u32 := 0) {
+          1 ⊤ ▷ t : ? i < n
+          2 t.true ▷ spawn idle() into pool
+          3 t.true ▷ ↑ more(i + 1)
+          4 t.false ▷ □ filled {}
+        } ▸ filled {}
+    3 ⊤ ▷ c : usize := count(pool)
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ x : Δ await next(pool) ▸ ok {} │ empty {}
+          2 x.ok ▷ ↑ drain()
+          3 x.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ done {c}
+
+control runs_spawns(n : u32) ■ { done {count : usize} }
+    1 ⊤ ▷ d : Δ run spawns(n) ▸ done {c}
+    2 d.done ▷ ■ done {c}
+
+//! run runs_spawns(3) capacity 3 => done done {3}
+//! run runs_spawns(4) capacity 3 => exhausted
+//! run runs_spawns(4) => done done {4}
+
+// `push` at the capacity, with a resource held: it is not released.
+control pushes(n : u32) ■ { done {length : usize} } faults uses io.res
+    1 ⊤ ▷ o : Δ open_lease(1) ▸ ok {l}
+    2 ⊤ ▷ ~v : [u32] := []
+    3 ⊤ ▷ s : ↻ more(i : u32 := 0) {
+          1 ⊤ ▷ t : ? i < n
+          2 t.true ▷ p : Δ push(&~v, i) ▸ done {}
+          3 t.true ▷ ↑ more(i + 1)
+          4 t.false ▷ □ filled {}
+        } ▸ filled {}
+    4 ⊤ ▷ fault "after the pushes"
+
+//! run pushes(2) with [open_lease -> ok {lease#1}] capacity 2 => faulted "after the pushes" trace [open_lease(1) -> ok {lease#1}; lease.release(lease#1) -> released]
+//! run pushes(3) with [open_lease -> ok {lease#1}] capacity 2 => exhausted trace [open_lease(1) -> ok {lease#1}]
+
+// `insert` of a new key at the capacity; of a key that is there, not.
+control inserts(k : u32) ■ { done {length : usize} }
+    1 ⊤ ▷ ~m : u32 ⇀ u32 := ∅
+    2 ⊤ ▷ a : Δ insert(&~m, 1, 10) ▸ inserted {} │ replaced {old}
+    3 ⊤ ▷ b : Δ insert(&~m, k, 20) ▸ inserted {} │ replaced {old2}
+    4 ⊤ ▷ ■ done {len(m)}
+
+//! run inserts(1) capacity 1 => done done {1}
+//! run inserts(2) capacity 1 => exhausted
+//! run inserts(2) => done done {2}

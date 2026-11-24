@@ -259,13 +259,19 @@ must yield.
 ```
 
 `run` names an entry control and its arguments. The options follow: `with
-arithmetic`, `with [...]` for a scripted host, `usize 32`, `fuel N`. After
-In a scripted answer, `~x <- v` after the alternative and its payload is the
+arithmetic`, `with [...]` for a scripted host, `usize 32`, `fuel N`, and for
+tasks `turns [i, …]` (each time the host gives a turn, the index of the task
+among those that are ready, in the order of the run's tasks), `waiting [i,
+…]` (each time no task is ready, the index of the operation the host
+completes among those that wait), `cancel_at N` (the host sets the flag of
+the root of the innermost run at its `N`th turn), and `capacity N` (the
+largest length of a collection and count of a set that a step may make,
+[E-Exhaust]). In a scripted answer, `~x <- v` after the alternative and its payload is the
 value that the host leaves behind its parameter `x`. After
 `=>` comes the expected end: `done` with the alternative and its payload,
 `faulted` with the message, `terminated` with the status of `terminate n`,
-`stuck` with the state and the clause, `violation`, `host-failed`, `fuel`, or
-`not-an-execution` (the arguments are not values of the parameter types, or
+`stuck` with the state and the clause, `exhausted`, `violation`,
+`host-failed`, `fuel`, or `not-an-execution` (the arguments are not values of the parameter types, or
 the precondition of the entry is false; section 8 of the core does not count
 such a run as an execution). `trace [...]` states the events. `reject` names
 the clause by which `resolve` must refuse the program.
@@ -275,7 +281,7 @@ to: `&x` or `&~x`, with `x` a parameter of the control that is answered,
 followed by any number of `.field` and `[value]` steps, where `[n]` is an
 element of a vector and `[key]` the value at a key of a map.
 
-Every `run` that ends in `done`, `faulted`, `terminated` or `fuel` is also carried out under the erased
+Every `run` that ends in `done`, `faulted`, `terminated`, `exhausted` or `fuel` is also carried out under the erased
 semantics with the host's answers replayed, and the two observations must agree
 (Theorem 3). `erased` in the place of `run` states a run of the erased
 semantics alone; it may also end in `undefined` (`⊥`, the end of a body, an
@@ -2009,6 +2015,81 @@ Rails surface:
   cancel and member-fault stop, all `[W10]`–`[W12]`/`[TK1]`/`[U19]` refusals,
   `[I10]` supervised-`run` impurity, `[G3]` `■ auto`, `[G10]` canonical
   formatting, and oracle-vs-erased differential parity.
+
+That was the account of the draft (22 November). What the suite held then
+was two files, and its test asserted no stuck state; the review counted the
+oracle of slice 4 as not met.
+
+### 18.1 The clause tests of the task rules, 24 November 2026
+
+`v2/tests/slice4/` has a file for each rule of the tasks, each with the runs
+that apply it and a run for each way of being stuck by it: `e_run.core`,
+`e_turn.core`, `e_await.core`, `e_await_host.core`, `e_spawn_next.core`
+([E-Spawn], [E-Next], [E-Done], `count`), `e_cancel.core`,
+`e_member_fault.core`, `e_stop.core` and `e_exhaust.core`, beside the two
+files of the draft. 11 files, 93 runs, 70 of them compared with the erased
+semantics. `slice_four_core_conforms_and_matches_erased`
+(`v2/tests/slice4.rs`) asks that each of the 11 rules be applied and that
+each stuck run be stuck in the control and the state that `STUCK` lists (22
+rows: X2 `E-Var` for a set used after `empty`, X4 `B1`, X5 `E-Scope`, X7
+`E-Call`, `E-Extern` and `E-Spawn`, X8 `E-Stop` and `E-Unwind`, X9
+`E-Effect`, X10 `E-Decide` for `await next` without `empty`), and every
+stuck control of the suite is in the table. The test of the refusals has 23
+programs ([W10], [W11], [W12], [TK1]).
+
+What the rules of 24 November changed (core section 12), and what the files
+found:
+
+- **[E-Run] of an extern control (RT1).** The draft asked the host at once,
+  as a plain call. A run of an `extern async control` is now a run whose
+  root task has no activation and waits for the operation (`TaskState::
+  WaitingHost` with an empty stack): the host completes it when no task is
+  ready, or withdraws it when it cancels the root, and
+  `Machine::finish_extern_root` ends the run and completes the caller's
+  decision, in the oracle and in the erased semantics. A root cancellation
+  that ends such a run gives the caller the turn (`step_scheduler`).
+- **[E-MemberFault] (RT2).** The oracle withdrew the operation that the
+  owner itself awaits already; `runs_owner_waits` holds it (the script has
+  no answer for the operation, and the lease it was given is released once).
+- **[E-Exhaust] (RT3).** `End::Exhausted` in both semantics, written
+  `exhausted`; `Config::capacity` (directive `capacity N`) is the largest
+  length and count, `usize_max` otherwise; `push`, an `insert` of a new key
+  and `spawn` check it. No scope ends and nothing is released.
+- **RO5 with tasks** (the review's probe
+  `r6_repo_suite_other_schedule.core`). The erased semantics ended the
+  scopes of a stopped task by the formulas of the statement at which it
+  stood, which count the arguments of that statement as moved; a task that
+  is ready stands before a statement it has not begun, so a lease that the
+  next statement would give away was not released. `erased::Layout` has
+  `before_at` now, the formulas before the arguments of each statement
+  move, and `stop_activation` uses them for the top activation of a task
+  that is ready. The same held where the fault of a member arrives at an
+  owner that is ready (`trigger_unwind`, `before`). Both are runs of the
+  suite that differed (`runs_stops_keeper` with the probe's schedule,
+  `runs_owner_ready`).
+- **Theorem 4 (RT4).** `expand.rs` expanded only plain decisions already;
+  the test of the expansion of the suite
+  (`slice_four_expansion_keeps_turns_and_runs_rt4`: every file, expanded, is
+  well formed, and each run that ends gives its end and trace) found that it
+  put the body of a synchronous control that runs an async one into the
+  async control that called it, which [W10] refuses. It does not now, and
+  the theorem leaves that case out.
+- The directive `waiting [i, …]` chooses the operation the host completes
+  when no task is ready.
+
+Each change was broken and its test failed: a stop of a ready task by the
+formulas of its next statement, and the arrival at a ready owner likewise
+(one run each), the release of the owner's own withdrawn operation (two
+runs), the capacity of `push` (one run, oracle against erased), and the
+guard that keeps `run` out of an async control in the expansion (four
+files). Before the change of [E-Run], `runs_finish` with `cancel_at 1`
+ended in `host-failed`.
+
+Limits of the instrumented profile: the host sets the flag of the root of
+the innermost run only, where [E-Cancel] lets it set that of any root; and
+no compiled code runs tasks (RB9), so no run of this suite runs natively,
+and a run with `capacity` is left out of the native comparison of the other
+slices.
 
 ## 19. What is open
 

@@ -90,6 +90,7 @@ fn differ(oracle: &oracle::Run, erased: &erased::Run, unused: usize) -> Option<S
         (oracle::End::Faulted(m1), erased::End::Faulted(m2)) => m1 == m2,
         (oracle::End::Terminated(n1), erased::End::Terminated(n2)) => n1 == n2,
         (oracle::End::OutOfFuel, erased::End::OutOfFuel) => true,
+        (oracle::End::Exhausted, erased::End::Exhausted) => true,
         _ => false,
     };
     if !same_end {
@@ -152,6 +153,7 @@ pub fn compare(
         oracle::End::Done { .. }
             | oracle::End::Faulted(_)
             | oracle::End::Terminated(_)
+            | oracle::End::Exhausted
             | oracle::End::OutOfFuel
     ) {
         return Outcome {

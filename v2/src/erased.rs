@@ -45,6 +45,9 @@ pub enum End {
     /// The host of this run had no answer.
     HostFailed(String),
     OutOfFuel,
+    /// A step would have made a length or a count greater than the capacity
+    /// ([E-Exhaust], [R7]).
+    Exhausted,
     NotAnExecution(String),
 }
 
@@ -64,6 +67,7 @@ impl fmt::Display for End {
             End::Undefined(detail) => write!(formatter, "undefined: {detail}"),
             End::HostFailed(detail) => write!(formatter, "host-failed: {detail}"),
             End::OutOfFuel => formatter.write_str("fuel"),
+            End::Exhausted => formatter.write_str("exhausted"),
             End::NotAnExecution(detail) => write!(formatter, "not-an-execution: {detail}"),
         }
     }
@@ -349,6 +353,9 @@ struct Plan {
     /// have moved, used to decide resource release on fault unwind with zero
     /// runtime moved flags.
     avail_at: Vec<Vec<Vec<Option<Selector>>>>,
+    /// The same formulas before each statement's arguments have moved: where
+    /// a task that is ready stands when it is stopped ([E-Stop]).
+    before_at: Vec<Vec<Vec<Option<Selector>>>>,
     /// For a `□` whose loop leaves a name of the bodies around it in another
     /// state than it found it, by body and position: the bit that says the
     /// loop ended there ([O6](b)).
@@ -393,6 +400,8 @@ struct Nest {
     /// The formulas of each body that has been laid out, by statement and
     /// by name.
     avail_at: Vec<Vec<Vec<Option<Selector>>>>,
+    /// The formulas before each statement's arguments have moved.
+    before_at: Vec<Vec<Vec<Option<Selector>>>>,
 }
 
 /// The layout of a unit, which the erased semantics and compiled code share
@@ -403,6 +412,10 @@ pub(crate) struct Layout {
     /// last statement. It covers the names of the bodies around the
     /// statement too, as the bodies inside left them.
     pub(crate) avail_at: Vec<Vec<Vec<Option<Selector>>>>,
+    /// The availability of each name before each statement of each body,
+    /// before its arguments have moved: where a task stands between two
+    /// statements, as it does when it is ready ([E-Stop]).
+    pub(crate) before_at: Vec<Vec<Vec<Option<Selector>>>>,
     /// The `□` statements that a formula names ([O6](b)).
     pub(crate) leaves: Vec<Mark>,
     /// The statements of the work of a boundary that a formula names
@@ -594,8 +607,10 @@ fn compute_body_availability(
 
     let stmts = &body.bodies[body_id].statements;
     let mut body_avail = Vec::with_capacity(stmts.len());
+    let mut body_before = Vec::with_capacity(stmts.len() + 1);
 
     for (pc, stmt) in stmts.iter().enumerate() {
+        body_before.push(availability(&defined, &moved));
         let g = &stmt.selector;
         // 1. Move variables consumed by `stmt.command`'s arguments.
         let mut consumed = Vec::new();
@@ -714,20 +729,7 @@ fn compute_body_availability(
         }
 
         // 2. Record availability `D(x) ∧ ¬M(x)` at this statement (after args moved).
-        let mut snap = vec![None; body.vars.len()];
-        for v in 0..body.vars.len() {
-            if let Some(d) = &defined[v] {
-                snap[v] = match &moved[v] {
-                    None => Some(d.clone()),
-                    Some(Selector::Top) => None,
-                    Some(m) => Some(Selector::And(
-                        Box::new(d.clone()),
-                        Box::new(Selector::Not(Box::new(m.clone()))),
-                    )),
-                };
-            }
-        }
-        body_avail.push(snap);
+        body_avail.push(availability(&defined, &moved));
 
         // 3. Apply post-command bindings / assignments / nested bodies.
         match &stmt.command {
@@ -910,23 +912,33 @@ fn compute_body_availability(
 
     // Also record post-end availability at index `stmts.len()` after the last
     // statement's binders/assignments take effect (`[R4]`).
-    let mut end_snap = vec![None; body.vars.len()];
-    for v in 0..body.vars.len() {
-        if let Some(d) = &defined[v] {
-            end_snap[v] = match &moved[v] {
+    let end_snap = availability(&defined, &moved);
+    body_before.push(end_snap.clone());
+    body_avail.push(end_snap);
+
+    nest.avail_at[body_id] = body_avail;
+    nest.before_at[body_id] = body_before;
+    (defined, moved)
+}
+
+/// The formula `D(x) ∧ ¬M(x)` of each name, from where it is defined and
+/// where it is moved.
+fn availability(defined: &[Option<Selector>], moved: &[Option<Selector>]) -> Vec<Option<Selector>> {
+    defined
+        .iter()
+        .zip(moved)
+        .map(|(d, m)| {
+            let d = d.as_ref()?;
+            match m {
                 None => Some(d.clone()),
                 Some(Selector::Top) => None,
                 Some(m) => Some(Selector::And(
                     Box::new(d.clone()),
                     Box::new(Selector::Not(Box::new(m.clone()))),
                 )),
-            };
-        }
-    }
-    body_avail.push(end_snap);
-
-    nest.avail_at[body_id] = body_avail;
-    (defined, moved)
+            }
+        })
+        .collect()
 }
 
 /// Lays a unit out: its first `param_count` names are its parameters.
@@ -944,10 +956,12 @@ pub(crate) fn layout(program: &Program, body: &ControlBody, param_count: usize) 
         fault_marks: Vec::new(),
         may_fault: BTreeSet::new(),
         avail_at: vec![Vec::new(); body.bodies.len()],
+        before_at: vec![Vec::new(); body.bodies.len()],
     };
     let _ = compute_body_availability(program, body, 0, param_count, defined, moved, &mut nest);
     Layout {
         avail_at: nest.avail_at,
+        before_at: nest.before_at,
         leaves: nest.leave_marks,
         faults: nest.fault_marks,
         may_fault: nest.may_fault,
@@ -964,12 +978,14 @@ fn plan(program: &Program, body: &ControlBody, param_count: usize) -> Plan {
         bits: 0,
         own: vec![Vec::new(); body.bodies.len()],
         avail_at: vec![Vec::new(); body.bodies.len()],
+        before_at: vec![Vec::new(); body.bodies.len()],
         leave_bit: BTreeMap::new(),
         fault_bit: BTreeMap::new(),
         may_fault: BTreeSet::new(),
     };
     let laid = layout(program, body, param_count);
     plan.avail_at = laid.avail_at;
+    plan.before_at = laid.before_at;
     plan.may_fault = laid.may_fault;
 
     for inner in &body.bodies {
@@ -1151,6 +1167,8 @@ struct Machine<'a> {
     current_task: usize,
     has_turn: bool,
     turns_taken: u64,
+    /// Set by the step that ended the execution `exhausted` ([R7]).
+    exhausted: bool,
     trace: Vec<Event>,
 }
 
@@ -1865,12 +1883,16 @@ impl<'a> Machine<'a> {
         }
     }
 
-    fn stop_activation(&mut self, mut act: Activation) {
+    /// [E-Stop]: ends the scopes of `act`, innermost first. `started` says
+    /// whether the statement at which it stands has begun, as an await whose
+    /// arguments have gone to the callee or to the host has; a task that is
+    /// ready stands before a statement it has not begun.
+    fn stop_activation(&mut self, mut act: Activation, started: bool) {
         self.stack.push(act);
         let point = self.fault_point();
         while let Some(frame) = self.stack.last_mut().expect("act").frames.pop() {
             if let Some(point) = point {
-                self.unwind_frame(frame.body, point, &[]);
+                self.unwind_frame_at(frame.body, point, &[], !started);
             }
             match frame.kind {
                 FrameKind::LexicalBoundary { captures, .. } => {
@@ -1892,6 +1914,7 @@ impl<'a> Machine<'a> {
             return;
         }
         let prev = std::mem::replace(&mut self.tasks[tid].state, TaskState::Stopped);
+        let started = !matches!(prev, TaskState::Ready);
         match prev {
             TaskState::WaitingHost {
                 callee,
@@ -1920,8 +1943,12 @@ impl<'a> Machine<'a> {
             | TaskState::Stopped => {}
         }
         let mut stack = std::mem::take(&mut self.tasks[tid].stack);
+        // The activations below the top wait at an await of the one above,
+        // whose arguments have gone to it.
+        let mut top = true;
         while let Some(act) = stack.pop() {
-            self.stop_activation(act);
+            self.stop_activation(act, started || !top);
+            top = false;
         }
     }
 
@@ -1931,6 +1958,29 @@ impl<'a> Machine<'a> {
         for mid in members {
             self.stop_task(mid);
         }
+    }
+
+    /// [R7]: the step ends the execution `exhausted`; the run loop turns the
+    /// error into the end.
+    fn exhaust<T>(&mut self) -> Result<T, String> {
+        self.exhausted = true;
+        Err("exhausted".to_string())
+    }
+
+    /// The root of a run of an `extern async control` is done: the run ends
+    /// and the caller's decision completes ([E-Run]).
+    fn finish_extern_root(
+        &mut self,
+        tid: usize,
+        alternative: usize,
+        payload: &[Value],
+    ) -> Result<(), String> {
+        let finished_run = self.runs.pop().expect("the run of an extern root");
+        debug_assert_eq!(finished_run.root_task, tid);
+        self.tasks[tid].state = TaskState::Stopped;
+        let caller = finished_run.caller_task.expect("a run has a caller");
+        self.activate_task(caller);
+        self.complete(alternative, payload)
     }
 
     fn withdraw_cancelled_host_waits(&mut self) -> Result<(), String> {
@@ -1966,6 +2016,10 @@ impl<'a> Machine<'a> {
                     .iter()
                     .position(|a| a.name == "cancelled")
                     .expect("cancellable control has `cancelled`");
+                if self.tasks[tid].stack.is_empty() {
+                    // The root of a run of an extern control ([E-Run]).
+                    return self.finish_extern_root(tid, cancel_idx, &[]);
+                }
                 let saved_stack = std::mem::take(&mut self.stack);
                 let saved_task = self.current_task;
                 let saved_turn = self.has_turn;
@@ -1996,11 +2050,28 @@ impl<'a> Machine<'a> {
     /// they say of every name in scope there, of this body and of those
     /// around it, whether it is available on the current history.
     fn unwind_frame(&mut self, frame_body: BodyId, point: (BodyId, usize), exclude: &[VarId]) {
+        self.unwind_frame_at(frame_body, point, exclude, false);
+    }
+
+    /// [`Self::unwind_frame`] by the formulas before the arguments of the
+    /// statement at `point` have moved where `before` is set ([E-Stop]).
+    fn unwind_frame_at(
+        &mut self,
+        frame_body: BodyId,
+        point: (BodyId, usize),
+        exclude: &[VarId],
+        before: bool,
+    ) {
         let (body, plan) = self.laid_out();
         let act = self.stack.last().expect("an activation");
-        let pc = point.1.min(plan.avail_at[point.0].len().saturating_sub(1));
+        let table = if before {
+            &plan.before_at
+        } else {
+            &plan.avail_at
+        };
+        let pc = point.1.min(table[point.0].len().saturating_sub(1));
         let mut to_release = Vec::new();
-        if let Some(snap) = plan.avail_at[point.0].get(pc) {
+        if let Some(snap) = table[point.0].get(pc) {
             for (var_id, var) in body.vars.iter().enumerate().rev() {
                 if var.body != frame_body || exclude.contains(&var_id) {
                     continue;
@@ -2070,6 +2141,10 @@ impl<'a> Machine<'a> {
         // Where the fault occurred in the activation on top, for the
         // availability of its names. `None` asks for it anew.
         let mut point = None;
+        // Set where the fault of a member arrives at an owner that is ready:
+        // its await has completed, and it stands before the next statement,
+        // which has not begun ([E-MemberFault]).
+        let mut before = false;
         loop {
             if point.is_none() {
                 point = self.fault_point();
@@ -2097,7 +2172,14 @@ impl<'a> Machine<'a> {
                     .pop()
                     .unwrap();
                 let at = point.expect("the position of the frame");
-                self.unwind_frame(frame.body, at, &[]);
+                self.unwind_frame_at(frame.body, at, &[], before);
+                // The statement at which the fault arrived: the await that
+                // completed, where the owner is ready.
+                let at = if before {
+                    (at.0, at.1.saturating_sub(1))
+                } else {
+                    at
+                };
                 match frame.kind {
                     FrameKind::LexicalBoundary {
                         parent_body,
@@ -2162,6 +2244,7 @@ impl<'a> Machine<'a> {
 
             let _popped = self.stack.pop().expect("an activation");
             point = None;
+            before = false;
             if self.stack.is_empty() {
                 let cur = self.current_task;
                 if let Some(set_id) = self.tasks[cur].member_of {
@@ -2176,11 +2259,16 @@ impl<'a> Machine<'a> {
                     let owner_task = self.task_sets[set_id as usize].owner_task;
                     let owner_act_id = self.task_sets[set_id as usize].owner_act_id;
 
+                    let owner_state =
+                        std::mem::replace(&mut self.tasks[owner_task].state, TaskState::Ready);
+                    // Where the owner task is ready, its top activation
+                    // stands before a statement it has not begun.
+                    let mut started = !matches!(owner_state, TaskState::Ready);
                     if let TaskState::WaitingHost {
                         callee,
                         concrete_args,
                         ..
-                    } = std::mem::replace(&mut self.tasks[owner_task].state, TaskState::Ready)
+                    } = owner_state
                     {
                         let param_is_ref: Vec<bool> = self.program.controls[callee]
                             .parameters
@@ -2202,8 +2290,10 @@ impl<'a> Machine<'a> {
                         .expect("owner activation still on owner task stack");
                     while self.stack.len() > owner_act_idx + 1 {
                         let above = self.stack.pop().expect("activation above owner");
-                        self.stop_activation(above);
+                        self.stop_activation(above, started);
+                        started = true;
                     }
+                    before = !started;
                     continue;
                 }
                 if self.runs.len() > 1 {
@@ -2234,6 +2324,9 @@ impl<'a> Machine<'a> {
                 let Value::Vector(mut items) = self.read_place(&place)? else {
                     return Err("`push` on non-vector".to_string());
                 };
+                if self.config.exhausts(items.len()) {
+                    return self.exhaust();
+                }
                 items.push(elem);
                 self.write_place(&place, Value::Vector(items))?;
                 Ok((0, Vec::new()))
@@ -2294,6 +2387,9 @@ impl<'a> Machine<'a> {
                 let Value::Map(mut entries) = self.read_place(&place)? else {
                     return Err("`insert` on non-map".to_string());
                 };
+                if !entries.contains_key(&key) && self.config.exhausts(entries.len()) {
+                    return self.exhaust();
+                }
                 let prev = entries.insert(key, value);
                 self.write_place(&place, Value::Map(entries))?;
                 match prev {
@@ -2501,47 +2597,28 @@ impl<'a> Machine<'a> {
                             .expect("cancellable control has `cancelled`");
                         return Ok(Some(Ok((cancel_idx, Vec::new()))));
                     }
-                    let answer = match self.host.call(callee, &concrete_args, self.config) {
-                        Ok(answer) => answer,
-                        Err(detail) => return Ok(Some(Err(End::HostFailed(detail)))),
-                    };
-                    let Some(index) = callee
-                        .contract
-                        .iter()
-                        .position(|entry| entry.name == answer.alternative)
-                    else {
-                        return Err(format!(
-                            "`{}` answered `{}`, which its contract does not list",
-                            callee.name, answer.alternative
-                        ));
-                    };
-                    self.host_writes(*callee_id, &values, &answer.writes)?;
-                    let fields = &callee.contract[index].fields;
-                    if answer.payload.len() != fields.len() {
-                        return Err(format!(
-                            "`{}` answered a payload of the wrong shape",
-                            callee.name
-                        ));
-                    }
-                    let payload: Vec<Value> = answer
-                        .payload
-                        .iter()
-                        .zip(fields)
-                        .map(|(value, field)| lend(&values, arith.normalize(value, &field.ty)))
-                        .collect::<Result<_, _>>()?;
-                    if !callee.is_pure(program) {
-                        let mut concrete_payload = Vec::with_capacity(payload.len());
-                        for v in &payload {
-                            concrete_payload.push(self.deref_value(v)?);
-                        }
-                        self.trace.push(Event {
-                            control: callee.name.clone(),
-                            arguments: concrete_args,
-                            alternative: answer.alternative,
-                            payload: concrete_payload,
-                        });
-                    }
-                    return Ok(Some(Ok((index, payload))));
+                    // The root of the run has no activation: it waits for the
+                    // operation as an awaiting task does ([E-Run]).
+                    let caller = self.current_task;
+                    self.park_current(TaskState::WaitingRun);
+                    let root_id = self.tasks.len();
+                    self.tasks.push(Task {
+                        stack: Vec::new(),
+                        state: TaskState::WaitingHost {
+                            callee: *callee_id,
+                            arguments: values,
+                            concrete_args,
+                        },
+                        member_of: None,
+                        cancelled: false,
+                    });
+                    self.runs.push(TaskRun {
+                        root_task: root_id,
+                        caller_task: Some(caller),
+                        tasks: vec![root_id],
+                    });
+                    self.current_task = root_id;
+                    return Ok(None);
                 }
                 let caller = self.current_task;
                 self.park_current(TaskState::WaitingRun);
@@ -2815,6 +2892,12 @@ impl<'a> Machine<'a> {
                 else {
                     return Err("`spawn` into non-task-set".to_string());
                 };
+                if self
+                    .config
+                    .exhausts(self.task_sets[set_id as usize].members.len())
+                {
+                    return self.exhaust();
+                }
                 let member_act = self.make_control_activation(*control, &values);
                 let tid = self.tasks.len();
                 self.tasks.push(Task {
@@ -3047,6 +3130,11 @@ impl<'a> Machine<'a> {
                 payload: concrete_payload,
             });
         }
+        if self.tasks[tid].stack.is_empty() {
+            // The root of a run of an extern control ([E-Run]).
+            self.finish_extern_root(tid, index, &payload)?;
+            return Ok(None);
+        }
         self.stack = std::mem::take(&mut self.tasks[tid].stack);
         self.current_task = tid;
         self.complete(index, &payload)?;
@@ -3064,6 +3152,10 @@ impl<'a> Machine<'a> {
         if !self.is_task_cancelled(top_run_root) && self.host.should_cancel_root(self.turns_taken) {
             self.tasks[top_run_root].cancelled = true;
             self.withdraw_cancelled_host_waits()?;
+            if self.has_turn {
+                // The withdrawal ended the run of an extern root ([E-Run]).
+                return Ok(None);
+            }
         }
 
         let run_tasks = self.runs.last().expect("a run").tasks.clone();
@@ -3294,6 +3386,7 @@ pub fn run(
         current_task: 0,
         has_turn: true,
         turns_taken: 0,
+        exhausted: false,
         trace: Vec::new(),
     };
     let wrapped_args: Vec<Value> = normalized_args
@@ -3311,6 +3404,7 @@ pub fn run(
         match machine.step_scheduler() {
             Ok(None) => {}
             Ok(Some(end)) => break end,
+            Err(_) if machine.exhausted => break End::Exhausted,
             Err(detail) => break End::Undefined(detail),
         }
     };

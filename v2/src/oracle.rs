@@ -239,6 +239,9 @@ pub struct Config {
     pub usize_max: Int,
     /// The number of steps after which a run is reported as not ending.
     pub fuel: u64,
+    /// The largest length of a collection and count of a set that a step may
+    /// make, where a script gives one; `usize_max` otherwise ([E-Exhaust]).
+    pub capacity: Option<Int>,
 }
 
 impl Default for Config {
@@ -246,11 +249,19 @@ impl Default for Config {
         Config {
             usize_max: Int::power_of_two(64).minus(&Int::from_u64(1)),
             fuel: 1_000_000,
+            capacity: None,
         }
     }
 }
 
 impl Config {
+    /// Whether a step that adds one to a length or a count of `len` ends the
+    /// execution `exhausted` ([E-Exhaust]).
+    pub fn exhausts(&self, len: usize) -> bool {
+        let capacity = self.capacity.as_ref().unwrap_or(&self.usize_max);
+        Int::from_u64(len as u64) >= *capacity
+    }
+
     pub fn with_usize_bits(bits: u32) -> Config {
         Config {
             usize_max: Int::power_of_two(bits).minus(&Int::from_u64(1)),
@@ -410,6 +421,9 @@ pub enum End {
     HostFailed(String),
     /// The fuel ran out. The instrumented profile's stand-in for divergence.
     OutOfFuel,
+    /// A step would have made a length or a count greater than the capacity
+    /// ([E-Exhaust]). Not a stuck state.
+    Exhausted,
     /// The entry or its arguments do not start an execution (section 8).
     NotAnExecution(String),
 }
@@ -435,6 +449,7 @@ impl fmt::Display for End {
             End::HostViolation(detail) => write!(formatter, "violation: {detail}"),
             End::HostFailed(detail) => write!(formatter, "host-failed: {detail}"),
             End::OutOfFuel => formatter.write_str("fuel"),
+            End::Exhausted => formatter.write_str("exhausted"),
             End::NotAnExecution(detail) => write!(formatter, "not-an-execution: {detail}"),
         }
     }
@@ -1561,6 +1576,8 @@ struct Machine<'a> {
     current_task: usize,
     has_turn: bool,
     turns_taken: u64,
+    /// Set by the step that ended the execution `exhausted` ([E-Exhaust]).
+    exhausted: bool,
     trace: Vec<Event>,
     steps: u64,
     rules: BTreeMap<&'static str, u64>,
@@ -2779,6 +2796,70 @@ impl<'a> Machine<'a> {
         self.has_turn = true;
     }
 
+    /// [E-Exhaust]: the step ends the execution `exhausted`. No scope ends
+    /// and nothing is released; the run loop turns the failure into the end.
+    fn exhaust<T>(&mut self, what: &str) -> Result<T, Fail> {
+        self.exhausted = true;
+        self.count("E-Exhaust");
+        fail(0, "E-Exhaust", what)
+    }
+
+    /// The open resources among the arguments of a host operation that it is
+    /// given by value ([E-Resource]); stuck where one of them is not open.
+    fn consumed_resources(
+        &self,
+        callee_id: ControlId,
+        concrete_args: &[Value],
+    ) -> Result<Vec<(ResourceId, u64)>, Fail> {
+        let callee = &self.program.controls[callee_id];
+        let mut consumed = Vec::new();
+        for (arg, param) in concrete_args.iter().zip(&callee.parameters) {
+            let mut arg_res = Vec::new();
+            collect_resources(arg, &mut arg_res);
+            for &(rid, handle_id) in &arg_res {
+                if !self
+                    .resources
+                    .get(&(rid, handle_id))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    return fail(
+                        5,
+                        "E-Resource",
+                        format!(
+                            "resource `{}#{handle_id}` passed to `{}` is not open",
+                            self.program.resources[rid].name, callee.name
+                        ),
+                    );
+                }
+            }
+            if !matches!(param.ty, Type::Ref(_, _)) {
+                consumed.extend(arg_res);
+            }
+        }
+        Ok(consumed)
+    }
+
+    /// The root of a run of an `extern async control`, which has no
+    /// activation, is done: the run ends, and the decision of the caller
+    /// completes with `alternative` and `payload` ([E-Run]).
+    fn finish_extern_root(
+        &mut self,
+        tid: usize,
+        alternative: usize,
+        payload: Vec<Value>,
+    ) -> Result<(), Fail> {
+        let finished_run = self.runs.pop().expect("the run of an extern root");
+        debug_assert_eq!(finished_run.root_task, tid);
+        self.tasks[tid].state = TaskState::Stopped;
+        let caller = finished_run.caller_task.expect("a run has a caller");
+        self.activate_task(caller);
+        self.locate();
+        self.complete(alternative, payload)?;
+        self.count("E-Done");
+        Ok(())
+    }
+
     /// Withdraws any `WaitingHost` cancellable operation in the innermost run
     /// whose task is now effectively cancelled ([E-Cancel], [E-AwaitHost]).
     fn withdraw_cancelled_host_waits(&mut self) -> Result<(), Fail> {
@@ -2815,6 +2896,11 @@ impl<'a> Machine<'a> {
                 .iter()
                 .position(|a| a.name == "cancelled")
                 .expect("cancellable control has `cancelled`");
+            if self.tasks[tid].stack.is_empty() {
+                // The root of a run of an extern control is `done(cancelled)` ([E-Run]).
+                self.count("E-AwaitHost");
+                return self.finish_extern_root(tid, cancel_idx, Vec::new());
+            }
             // Temporarily swap `tid`'s stack in to complete its waiting decision/capture.
             let saved_stack = std::mem::take(&mut self.stack);
             let saved_tid = self.current_task;
@@ -3501,6 +3587,9 @@ impl<'a> Machine<'a> {
                 let Value::Vector(mut items) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`push` on non-vector");
                 };
+                if self.config.exhausts(items.len()) {
+                    return self.exhaust("`push` onto a vector at its capacity");
+                }
                 items.push(elem);
                 self.write_runtime_place(&place, tag, Value::Vector(items), false, Access::Shape)?;
                 self.count("B5");
@@ -3578,6 +3667,9 @@ impl<'a> Machine<'a> {
                 let Value::Map(mut entries) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`insert` on non-map");
                 };
+                if !entries.contains_key(&key) && self.config.exhausts(entries.len()) {
+                    return self.exhaust("`insert` of a new key into a map at its capacity");
+                }
                 let prev = entries.insert(key, value);
                 self.write_runtime_place(&place, tag, Value::Map(entries), false, Access::Shape)?;
                 self.count("B5");
@@ -3726,31 +3818,8 @@ impl<'a> Machine<'a> {
                         }
                     }
                     self.check_effects(&callee.uses, &callee.name)?;
-                    let mut consumed_resources = Vec::new();
-                    for (arg, param) in concrete_args.iter().zip(&callee.parameters) {
-                        let mut arg_res = Vec::new();
-                        collect_resources(arg, &mut arg_res);
-                        for &(rid, handle_id) in &arg_res {
-                            if !self
-                                .resources
-                                .get(&(rid, handle_id))
-                                .copied()
-                                .unwrap_or(false)
-                            {
-                                return fail(
-                                    5,
-                                    "E-Resource",
-                                    format!(
-                                        "resource `{}#{handle_id}` passed to `{}` is not open",
-                                        self.program.resources[rid].name, callee.name
-                                    ),
-                                );
-                            }
-                        }
-                        if !matches!(param.ty, Type::Ref(_, _)) {
-                            consumed_resources.extend(arg_res);
-                        }
-                    }
+                    let consumed_resources = self.consumed_resources(*callee_id, &concrete_args)?;
+                    let callee = &self.program.controls[*callee_id];
                     let is_cancellable = callee.is_cancellable();
                     if self.is_task_cancelled(self.current_task) && is_cancellable {
                         let param_is_ref: Vec<bool> = callee
@@ -3859,6 +3928,8 @@ impl<'a> Machine<'a> {
                         }
                     }
                     self.check_effects(&callee.uses, &callee.name)?;
+                    let consumed_resources = self.consumed_resources(*callee_id, &concrete_args)?;
+                    let callee = &self.program.controls[*callee_id];
                     let is_cancellable = callee.is_cancellable();
                     if self.is_task_cancelled(self.current_task) && is_cancellable {
                         let param_is_ref: Vec<bool> = callee
@@ -3879,8 +3950,32 @@ impl<'a> Machine<'a> {
                         self.count("E-Run");
                         return Ok(Some(Answered::Completed(cancel_idx, Vec::new())));
                     }
+                    // The root of the run has no activation: it waits for the
+                    // operation as an awaiting task does ([E-Run], [E-AwaitHost]).
+                    let caller = self.current_task;
+                    let allowances = self.collect_allowances();
+                    self.park_current(TaskState::WaitingRun);
+                    let root_id = self.tasks.len();
+                    self.tasks.push(Task {
+                        stack: Vec::new(),
+                        state: TaskState::WaitingHost {
+                            callee: *callee_id,
+                            arguments: arg_values,
+                            concrete_args,
+                            consumed_resources,
+                        },
+                        member_of: None,
+                        cancelled: false,
+                        parent_allowances: allowances,
+                    });
+                    self.runs.push(TaskRun {
+                        root_task: root_id,
+                        caller_task: Some(caller),
+                        tasks: vec![root_id],
+                    });
+                    self.current_task = root_id;
                     self.count("E-Run");
-                    return Ok(Some(self.external(*callee_id, arg_values)?));
+                    return Ok(None);
                 }
                 // Defined `async control` started as a nested run ([E-Run]).
                 let entry_snapshots = self.entry_values(*callee_id, &arg_values)?;
@@ -4254,6 +4349,12 @@ impl<'a> Machine<'a> {
                             ),
                         );
                     }
+                }
+                if self
+                    .config
+                    .exhausts(self.task_sets[set_id as usize].members.len())
+                {
+                    return self.exhaust("`spawn` into a set at its capacity");
                 }
                 let allowances = self.collect_allowances();
                 let member_act =
@@ -4653,9 +4754,13 @@ impl<'a> Machine<'a> {
             unreachable!();
         };
         // Swap `tid`'s stack in so `deref_formula`, `complete`, and `locate` see `tid`.
+        // The root of a run of an extern control has none ([E-Run]).
+        let extern_root = self.tasks[tid].stack.is_empty();
         self.stack = std::mem::take(&mut self.tasks[tid].stack);
         self.current_task = tid;
-        self.locate();
+        if !extern_root {
+            self.locate();
+        }
 
         let callee_ctrl = &self.program.controls[callee];
         let mut answer = match self.host.call(callee_ctrl, &concrete_args, self.config) {
@@ -4835,6 +4940,10 @@ impl<'a> Machine<'a> {
             });
         }
         self.count("E-Extern");
+        if extern_root {
+            self.finish_extern_root(tid, index, answer.payload)?;
+            return Ok(None);
+        }
         self.complete(index, answer.payload)?;
         self.tasks[tid].stack = std::mem::take(&mut self.stack);
         self.tasks[tid].state = TaskState::Ready;
@@ -4851,6 +4960,11 @@ impl<'a> Machine<'a> {
         if !self.is_task_cancelled(top_run_root) && self.host.should_cancel_root(self.turns_taken) {
             self.tasks[top_run_root].cancelled = true;
             self.withdraw_cancelled_host_waits()?;
+            if self.has_turn {
+                // The withdrawal ended the run of an extern root, and its
+                // caller goes on ([E-Run]).
+                return Ok(None);
+            }
         }
 
         let run_tasks = self.runs.last().expect("a run").tasks.clone();
@@ -5103,6 +5217,7 @@ pub fn run(
         current_task: 0,
         has_turn: true,
         turns_taken: 0,
+        exhausted: false,
         trace: Vec::new(),
         steps: 0,
         rules: BTreeMap::new(),
@@ -5183,6 +5298,7 @@ pub fn run(
         match machine.step_scheduler() {
             Ok(None) => {}
             Ok(Some(end)) => break end,
+            Err(_) if machine.exhausted => break End::Exhausted,
             Err(stuck) => {
                 break End::Stuck(Stuck {
                     state: stuck.state,

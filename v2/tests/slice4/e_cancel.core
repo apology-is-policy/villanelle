@@ -1,0 +1,121 @@
+// [E-Cancel]: `cancel x` sets the flag of every member of the set. A task is
+// cancelled when its flag is set or the owner task of its set is cancelled.
+// Nothing else happens at the `cancel`: a cancelled task learns of it only as
+// the alternative `cancelled` of a cancellable operation it awaits, and ends
+// by its own exits. A member spawned after the `cancel` is not cancelled.
+
+extern resource lease on fault release
+extern control open_lease(id : u32) ■ { ok {l : lease} } uses io.res
+extern control close_lease(l : lease) ■ { ok {} } uses io.res
+extern async control tick(id : u32) ■ { done {} │ cancelled {} } uses io.net
+extern async control steady(id : u32) ■ { done {v : u32} } uses io.net
+extern async control hold(l : lease) ■ { done {v : u32} │ cancelled {} } uses io.net
+
+// A member that waits is withdrawn and takes `cancelled`; its lease, given
+// by value, is released.
+async control holder(id : u32) ■ { finished {code : u32} } uses io.res, io.net
+    1 ⊤ ▷ o : Δ open_lease(id) ▸ ok {l}
+    2 o.ok ▷ w : Δ await hold(l) ▸ done {v} │ cancelled {}
+    3 w.done ▷ ■ finished {v}
+    4 w.cancelled ▷ ■ finished {99}
+
+async control cancels_waiting() ■ { ok {code : u32} } uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨holder⟩ := tasks⟨holder⟩()
+    2 ⊤ ▷ spawn holder(1) into pool
+    3 ⊤ ▷ t : Δ await tick(0) ▸ done {} │ cancelled {}
+    4 ⊤ ▷ cancel pool
+    5 ⊤ ▷ n : Δ await next(pool) ▸ finished {c} │ empty {}
+    6 n.finished ▷ m : Δ await next(pool) ▸ finished {c2} │ empty {}
+    7 m.empty ▷ ■ ok {c}
+    8 m.finished ▷ ⊥
+    9 n.empty ▷ ⊥
+
+control runs_cancels_waiting() ■ { ok {code : u32} } uses io.res, io.net
+    1 ⊤ ▷ d : Δ run cancels_waiting() ▸ ok {c}
+    2 d.ok ▷ ■ ok {c}
+
+//! run runs_cancels_waiting() with [open_lease -> ok {lease#1}; tick -> done] => done ok {99} trace [open_lease(1) -> ok {lease#1}; tick(0) -> done; lease.release(lease#1) -> released]
+
+// A member cancelled before it awaits learns of it at its first cancellable
+// await; an operation that is not cancellable completes as usual, and the
+// member goes on by its own exits.
+async control careful(id : u32) ■ { finished {code : u32} } uses io.res, io.net
+    1 ⊤ ▷ s : Δ await steady(id) ▸ done {v}
+    2 s.done ▷ o : Δ open_lease(v) ▸ ok {l}
+    3 o.ok ▷ c : Δ close_lease(l) ▸ ok {}
+    4 c.ok ▷ w : Δ await tick(v) ▸ done {} │ cancelled {}
+    5 w.done ▷ ■ finished {v}
+    6 w.cancelled ▷ ■ finished {0}
+
+async control cancels_ready() ■ { ok {code : u32} } uses io.res, io.net
+    1 ⊤ ▷ ~pool : tasks⟨careful⟩ := tasks⟨careful⟩()
+    2 ⊤ ▷ spawn careful(4) into pool
+    3 ⊤ ▷ cancel pool
+    4 ⊤ ▷ n : Δ await next(pool) ▸ finished {c} │ empty {}
+    5 n.finished ▷ m : Δ await next(pool) ▸ finished {c2} │ empty {}
+    6 m.empty ▷ ■ ok {c}
+    7 m.finished ▷ ⊥
+    8 n.empty ▷ ⊥
+
+control runs_cancels_ready() ■ { ok {code : u32} } uses io.res, io.net
+    1 ⊤ ▷ d : Δ run cancels_ready() ▸ ok {c}
+    2 d.ok ▷ ■ ok {c}
+
+//! run runs_cancels_ready() with [steady -> done {4}; open_lease -> ok {lease#4}; close_lease -> ok] => done ok {0} trace [steady(4) -> done {4}; open_lease(4) -> ok {lease#4}; close_lease(lease#4) -> ok]
+
+// A member spawned after the `cancel` is not cancelled: its tick completes.
+async control ticker(id : u32) ■ { finished {code : u32} } uses io.net
+    1 ⊤ ▷ w : Δ await tick(id) ▸ done {} │ cancelled {}
+    2 w.done ▷ ■ finished {id}
+    3 w.cancelled ▷ ■ finished {0}
+
+async control spawns_after_cancel() ■ { ok {first : u32, second : u32} } uses io.net
+    1 ⊤ ▷ ~pool : tasks⟨ticker⟩ := tasks⟨ticker⟩()
+    2 ⊤ ▷ spawn ticker(1) into pool
+    3 ⊤ ▷ cancel pool
+    4 ⊤ ▷ spawn ticker(2) into pool
+    5 ⊤ ▷ n : Δ await next(pool) ▸ finished {a} │ empty {}
+    6 n.finished ▷ m : Δ await next(pool) ▸ finished {b} │ empty {}
+    7 m.finished ▷ e : Δ await next(pool) ▸ finished {c} │ empty {}
+    8 e.empty ▷ ■ ok {a, b}
+    9 e.finished ▷ ⊥
+    10 m.empty ▷ ⊥
+    11 n.empty ▷ ⊥
+
+control runs_spawns_after_cancel() ■ { ok {first : u32, second : u32} } uses io.net
+    1 ⊤ ▷ d : Δ run spawns_after_cancel() ▸ ok {a, b}
+    2 d.ok ▷ ■ ok {a, b}
+
+//! run runs_spawns_after_cancel() with [tick -> done] => done ok {0, 2} trace [tick(2) -> done]
+
+// A cancelled owner cancels the members of its sets, and theirs: the root is
+// cancelled, and the member of a member takes `cancelled`.
+async control grandchild(id : u32) ■ { finished {code : u32} } uses io.net
+    1 ⊤ ▷ w : Δ await tick(id) ▸ done {} │ cancelled {}
+    2 w.done ▷ ■ finished {id}
+    3 w.cancelled ▷ ■ finished {77}
+
+async control child(id : u32) ■ { finished {code : u32} } uses io.net
+    1 ⊤ ▷ ~inner : tasks⟨grandchild⟩ := tasks⟨grandchild⟩()
+    2 ⊤ ▷ spawn grandchild(id) into inner
+    3 ⊤ ▷ n : Δ await next(inner) ▸ finished {c} │ empty {}
+    4 n.finished ▷ m : Δ await next(inner) ▸ finished {c2} │ empty {}
+    5 m.empty ▷ ■ finished {c}
+    6 m.finished ▷ ⊥
+    7 n.empty ▷ ⊥
+
+async control family() ■ { ok {code : u32} } uses io.net
+    1 ⊤ ▷ ~pool : tasks⟨child⟩ := tasks⟨child⟩()
+    2 ⊤ ▷ spawn child(3) into pool
+    3 ⊤ ▷ n : Δ await next(pool) ▸ finished {c} │ empty {}
+    4 n.finished ▷ m : Δ await next(pool) ▸ finished {c2} │ empty {}
+    5 m.empty ▷ ■ ok {c}
+    6 m.finished ▷ ⊥
+    7 n.empty ▷ ⊥
+
+control runs_family() ■ { ok {code : u32} } uses io.net
+    1 ⊤ ▷ d : Δ run family() ▸ ok {c}
+    2 d.ok ▷ ■ ok {c}
+
+//! run runs_family() with [tick -> done] => done ok {3} trace [tick(3) -> done]
+//! run runs_family() cancel_at 3 => done ok {77} trace []

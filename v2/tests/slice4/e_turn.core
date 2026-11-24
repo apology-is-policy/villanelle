@@ -1,0 +1,127 @@
+// [E-Turn]: one task runs at a time and the turn passes only at an `await`;
+// the host gives it to a ready task of the innermost run, and when no task is
+// ready it completes an operation that one of them waits for. The tasks of
+// the runs around the innermost one stand still until it ends.
+
+extern async control tick(id : u32) ■ { done {} } uses io.net
+
+// Each member emits twice, with an await between: the turns interleave them,
+// and nothing interrupts a member between two awaits.
+async control twice(name : string) ■ { ok {} } uses io.net, console.write
+    1 ⊤ ▷ a : Δ emit(&name) ▸ done {}
+    2 ⊤ ▷ b : Δ emit(&name) ▸ done {}
+    3 ⊤ ▷ t : Δ await tick(0) ▸ done {}
+    4 ⊤ ▷ c : Δ emit(&name) ▸ done {}
+    5 ⊤ ▷ ■ ok {}
+
+async control pair() ■ { ok {} } uses io.net, console.write
+    1 ⊤ ▷ ~pool : tasks⟨twice⟩ := tasks⟨twice⟩()
+    2 ⊤ ▷ spawn twice("a") into pool
+    3 ⊤ ▷ spawn twice("b") into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_pair() ■ { ok {} } uses io.net, console.write
+    1 ⊤ ▷ d : Δ run pair() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+// The root gives up its turn at `await next`; the first member runs to its
+// await, then the second. No task is ready then, and the host completes the
+// first tick; the first member is ready and runs before the host completes
+// the second.
+//! run runs_pair() with [tick -> done; tick -> done] => done ok trace [emit("a") -> done; emit("a") -> done; emit("b") -> done; emit("b") -> done; tick(0) -> done; emit("a") -> done; tick(0) -> done; emit("b") -> done]
+// Another order of turns: the second member first. A turn index counts the
+// ready tasks only, and the root that waits at `await next` is not one.
+//! run runs_pair() with [tick -> done; tick -> done] turns [1] => done ok trace [emit("b") -> done; emit("b") -> done; emit("a") -> done; emit("a") -> done; tick(0) -> done; emit("a") -> done; tick(0) -> done; emit("b") -> done]
+
+// A member that awaits nothing runs to its end in one turn.
+async control straight(name : string) ■ { ok {} } uses console.write
+    1 ⊤ ▷ a : Δ emit(&name) ▸ done {}
+    2 ⊤ ▷ b : Δ emit(&name) ▸ done {}
+    3 ⊤ ▷ ■ ok {}
+
+async control straights() ■ { ok {} } uses console.write
+    1 ⊤ ▷ ~pool : tasks⟨straight⟩ := tasks⟨straight⟩()
+    2 ⊤ ▷ spawn straight("x") into pool
+    3 ⊤ ▷ spawn straight("y") into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_straights() ■ { ok {} } uses console.write
+    1 ⊤ ▷ d : Δ run straights() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_straights() => done ok trace [emit("x") -> done; emit("x") -> done; emit("y") -> done; emit("y") -> done]
+//! run runs_straights() turns [1] => done ok trace [emit("y") -> done; emit("y") -> done; emit("x") -> done; emit("x") -> done]
+
+// The tasks of the run around stand still while a nested run goes on: the
+// member `b` is ready, and does not run before the nested run of `inner`
+// ends. The second turn, of the nested run, asks for the second ready task,
+// and there is one only.
+async control inner(name : string) ■ { ok {} } uses io.net, console.write
+    1 ⊤ ▷ t : Δ await tick(1) ▸ done {}
+    2 ⊤ ▷ a : Δ emit(&name) ▸ done {}
+    3 ⊤ ▷ ■ ok {}
+
+control nested(name : string) ■ { ok {} } uses io.net, console.write
+    1 ⊤ ▷ d : Δ run inner(name) ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+async control outer_member(name : string) ■ { ok {} } uses io.net, console.write
+    1 ⊤ ▷ t : ? name = "a"
+    2 t.true ▷ d : Δ nested("inner") ▸ ok {}
+    3 ⊤ ▷ e : Δ emit(&name) ▸ done {}
+    4 ⊤ ▷ ■ ok {}
+
+async control outer() ■ { ok {} } uses io.net, console.write
+    1 ⊤ ▷ ~pool : tasks⟨outer_member⟩ := tasks⟨outer_member⟩()
+    2 ⊤ ▷ spawn outer_member("a") into pool
+    3 ⊤ ▷ spawn outer_member("b") into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_outer() ■ { ok {} } uses io.net, console.write
+    1 ⊤ ▷ d : Δ run outer() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_outer() with [tick -> done] turns [0, 1, 1] => done ok trace [tick(1) -> done; emit("inner") -> done; emit("a") -> done; emit("b") -> done]
+
+// No task is ready and two wait for the host: the host completes the one it
+// chooses, here the second, by the order of its script.
+extern async control fetch(id : u32) ■ { got {v : u32} } uses io.net
+
+async control fetcher(id : u32) ■ { got {v : u32} } uses io.net
+    1 ⊤ ▷ f : Δ await fetch(id) ▸ got {v}
+    2 f.got ▷ ■ got {v}
+
+async control first_got() ■ { got {v : u32} } uses io.net
+    1 ⊤ ▷ ~pool : tasks⟨fetcher⟩ := tasks⟨fetcher⟩()
+    2 ⊤ ▷ spawn fetcher(1) into pool
+    3 ⊤ ▷ spawn fetcher(2) into pool
+    4 ⊤ ▷ n : Δ await next(pool) ▸ got {v} │ empty {}
+    5 n.got ▷ lp : ↻ drain() {
+          1 ⊤ ▷ m : Δ await next(pool) ▸ got {w} │ empty {}
+          2 m.got ▷ ↑ drain()
+          3 m.empty ▷ □ drained {}
+        } ▸ drained {}
+    6 n.got ▷ ■ got {v}
+    7 n.empty ▷ ⊥
+
+control runs_first_got() ■ { got {v : u32} } uses io.net
+    1 ⊤ ▷ d : Δ run first_got() ▸ got {v}
+    2 d.got ▷ ■ got {v}
+
+//! run runs_first_got() with [fetch -> got {10}; fetch -> got {20}] => done got {10} trace [fetch(1) -> got {10}; fetch(2) -> got {20}]
+//! run runs_first_got() with [fetch -> got {20}; fetch -> got {10}] waiting [1, 0] => done got {20} trace [fetch(2) -> got {20}; fetch(1) -> got {10}]

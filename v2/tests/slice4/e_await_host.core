@@ -1,0 +1,115 @@
+// [E-AwaitHost]: `await f(ō)` on an `extern async control`. The precondition
+// and the effect allowance are checked first. A cancelled task gets
+// `cancelled` from a cancellable operation at once, the host is not asked,
+// its arguments given by value are released, and it gives up its turn.
+// Otherwise the task waits; the host completes the operation, or withdraws
+// it when the task becomes cancelled, with no event, releasing the arguments
+// given by value. An operation that is not cancellable is not withdrawn.
+
+extern resource lease on fault release
+extern control open_lease(id : u32) ■ { ok {l : lease} } uses io.res
+extern async control tick(id : u32) ■ { done {} │ cancelled {} } uses io.net
+extern async control hold(l : lease) ■ { done {v : u32} │ cancelled {} } uses io.net
+extern async control steady(id : u32) ■ { done {v : u32} } uses io.net
+extern async control positive_io(x : u32) ⊢ x > 0 ■ { done {} │ cancelled {} } uses io.net
+extern async control secret_io(x : u32) ■ { done {} │ cancelled {} } uses io.secret
+
+// The host completes the operation, and the payload is bound.
+async control holds(id : u32) ■ { got {v : u32} │ cancelled {} } uses io.res, io.net
+    1 ⊤ ▷ o : Δ open_lease(id) ▸ ok {l}
+    2 o.ok ▷ w : Δ await hold(l) ▸ done {v} │ cancelled {}
+    3 w.done ▷ ■ got {v}
+    4 w.cancelled ▷ ■ cancelled {}
+
+control runs_holds(id : u32) ■ { got {v : u32} │ cancelled {} } uses io.res, io.net
+    1 ⊤ ▷ d : Δ run holds(id) ▸ got {v} │ cancelled {}
+    2 d.got ▷ ■ got {v}
+    3 d.cancelled ▷ ■ cancelled {}
+
+//! run runs_holds(1) with [open_lease -> ok {lease#1}; hold -> done {4}] => done got {4} trace [open_lease(1) -> ok {lease#1}; hold(lease#1) -> done {4}]
+// The root is cancelled while it waits: the operation is withdrawn, with no
+// event, and the lease is released.
+//! run runs_holds(1) with [open_lease -> ok {lease#1}] cancel_at 1 => done cancelled trace [open_lease(1) -> ok {lease#1}; lease.release(lease#1) -> released]
+
+// A task that is cancelled before it awaits gets `cancelled` at once; the
+// lease it gives by value is released and the host is not asked.
+async control late(id : u32) ■ { got {v : u32} │ cancelled {} } uses io.res, io.net
+    1 ⊤ ▷ t : Δ await tick(0) ▸ done {} │ cancelled {}
+    2 ⊤ ▷ o : Δ open_lease(id) ▸ ok {l}
+    3 o.ok ▷ w : Δ await hold(l) ▸ done {v} │ cancelled {}
+    4 w.done ▷ ■ got {v}
+    5 w.cancelled ▷ ■ cancelled {}
+
+control runs_late(id : u32) ■ { got {v : u32} │ cancelled {} } uses io.res, io.net
+    1 ⊤ ▷ d : Δ run late(id) ▸ got {v} │ cancelled {}
+    2 d.got ▷ ■ got {v}
+    3 d.cancelled ▷ ■ cancelled {}
+
+//! run runs_late(2) with [open_lease -> ok {lease#2}] cancel_at 1 => done cancelled trace [open_lease(2) -> ok {lease#2}; lease.release(lease#2) -> released]
+
+// The immediate `cancelled` passes the turn: the member runs before the
+// root goes on.
+async control note(name : string) ■ { ok {} } uses console.write
+    1 ⊤ ▷ e : Δ emit(&name) ▸ done {}
+    2 ⊤ ▷ ■ ok {}
+
+async control passes(id : u32) ■ { ok {} } uses io.net, console.write
+    1 ⊤ ▷ t : Δ await tick(0) ▸ done {} │ cancelled {}
+    2 ⊤ ▷ ~pool : tasks⟨note⟩ := tasks⟨note⟩()
+    3 ⊤ ▷ spawn note("member") into pool
+    4 ⊤ ▷ u : Δ await tick(1) ▸ done {} │ cancelled {}
+    5 ⊤ ▷ s : string := "root"
+    6 ⊤ ▷ e : Δ emit(&s) ▸ done {}
+    7 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    8 ⊤ ▷ ■ ok {}
+
+control runs_passes() ■ { ok {} } uses io.net, console.write
+    1 ⊤ ▷ d : Δ run passes(0) ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_passes() cancel_at 1 turns [0, 1] => done ok trace [emit("member") -> done; emit("root") -> done]
+//! run runs_passes() cancel_at 1 => done ok trace [emit("root") -> done; emit("member") -> done]
+
+// An operation that is not cancellable is completed, cancelled or not.
+async control waits_steady() ■ { got {v : u32} } uses io.net
+    1 ⊤ ▷ t : Δ await tick(0) ▸ done {} │ cancelled {}
+    2 ⊤ ▷ w : Δ await steady(3) ▸ done {v}
+    3 w.done ▷ ■ got {v}
+
+control runs_waits_steady() ■ { got {v : u32} } uses io.net
+    1 ⊤ ▷ d : Δ run waits_steady() ▸ got {v}
+    2 d.got ▷ ■ got {v}
+
+//! run runs_waits_steady() with [steady -> done {5}] cancel_at 1 => done got {5} trace [steady(3) -> done {5}]
+
+// The precondition and the allowance are checked before the shortcut.
+async control awaits_positive(x : u32) ■ { done {} │ cancelled {} } uses io.net
+    1 ⊤ ▷ t : Δ await tick(0) ▸ done {} │ cancelled {}
+    2 ⊤ ▷ w : Δ await positive_io(x) ▸ done {} │ cancelled {}
+    3 w.done ▷ ■ done {}
+    4 w.cancelled ▷ ■ cancelled {}
+
+control runs_awaits_positive(x : u32) ■ { done {} │ cancelled {} } uses io.net
+    1 ⊤ ▷ d : Δ run awaits_positive(x) ▸ done {} │ cancelled {}
+    2 d.done ▷ ■ done {}
+    3 d.cancelled ▷ ■ cancelled {}
+
+//! run runs_awaits_positive(1) cancel_at 1 => done cancelled trace []
+//! run runs_awaits_positive(0) cancel_at 1 => stuck X7 E-Extern
+
+async control awaits_secret() ■ { done {} │ cancelled {} } uses io.net
+    1 ⊤ ▷ t : Δ await tick(0) ▸ done {} │ cancelled {}
+    2 ⊤ ▷ w : Δ await secret_io(1) ▸ done {} │ cancelled {}
+    3 w.done ▷ ■ done {}
+    4 w.cancelled ▷ ■ cancelled {}
+
+control runs_awaits_secret() ■ { done {} │ cancelled {} } uses io.net
+    1 ⊤ ▷ d : Δ run awaits_secret() ▸ done {} │ cancelled {}
+    2 d.done ▷ ■ done {}
+    3 d.cancelled ▷ ■ cancelled {}
+
+//! run runs_awaits_secret() cancel_at 1 => stuck X9 E-Effect

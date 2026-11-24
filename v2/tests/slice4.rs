@@ -41,41 +41,99 @@ fn surface_files() -> Vec<(String, String)> {
     files
 }
 
+/// The rules of the tasks ([E-Run] to [E-Stop] of the core, section 6.12)
+/// and [E-Exhaust] (section 6.6): each is applied by a run of the suite.
+const SLICE4_RULES: [&str; 11] = [
+    "E-Run",
+    "E-Turn",
+    "E-Await",
+    "E-AwaitHost",
+    "E-Spawn",
+    "E-Next",
+    "E-Cancel",
+    "E-Done",
+    "E-MemberFault",
+    "E-Stop",
+    "E-Exhaust",
+];
+
+/// Each run of the suite that is stuck: the file, the control in which it is
+/// stuck, and the state. Every stuck control of the suite is in the table.
+const STUCK: [(&str, &str, &str); 22] = [
+    ("e_await.core", "awaits_positive", "X7 E-Call"),
+    ("e_await_host.core", "awaits_positive", "X7 E-Extern"),
+    ("e_await_host.core", "awaits_secret", "X9 E-Effect"),
+    ("e_member_fault.core", "unpermitted", "X8 E-Unwind"),
+    ("e_run.core", "bridge_lock", "X8 E-Unwind"),
+    ("e_run.core", "runs_finish_lock", "X8 E-Unwind"),
+    ("e_run.core", "runs_positive", "X7 E-Call"),
+    ("e_run.core", "runs_settle", "X7 E-Extern"),
+    ("e_spawn_next.core", "after_empty", "X2 E-Var"),
+    ("e_spawn_next.core", "cancel_after_empty", "X2 E-Var"),
+    ("e_spawn_next.core", "count_after_empty", "X2 E-Var"),
+    ("e_spawn_next.core", "lacks_empty", "X10 E-Decide"),
+    ("e_spawn_next.core", "leaves_done", "X5 E-Scope"),
+    ("e_spawn_next.core", "leaves_member", "X5 E-Scope"),
+    ("e_spawn_next.core", "spawn_after_empty", "X2 E-Var"),
+    ("e_spawn_next.core", "spawns_positive", "X7 E-Spawn"),
+    ("e_stop.core", "stops_locker", "X8 E-Stop"),
+    ("tasks_and_turns.core", "bad_effect_member", "X9 E-Effect"),
+    ("tasks_and_turns.core", "leak_pool", "X5 E-Scope"),
+    ("tasks_and_turns.core", "read_at", "X4 B1"),
+    ("tasks_faults_and_cancel.core", "lock_pool", "X8 E-Stop"),
+    (
+        "tasks_faults_and_cancel.core",
+        "unpermitted_fault_pool",
+        "X8 E-Unwind",
+    ),
+];
+
 #[test]
 fn slice_four_core_conforms_and_matches_erased() {
     let files = core_files();
     assert!(!files.is_empty(), "expected slice 4 core test files");
+    let mut failures = Vec::new();
     let mut runs = 0usize;
     let mut compared = 0usize;
     let mut rules = BTreeSet::new();
+    let mut stuck_in = BTreeSet::new();
     for (name, source) in &files {
         let report = script::check(source);
-        if !report.failures.is_empty() {
-            panic!("{} failed:\n{}", name, report.failures.join("\n"));
+        for failure in &report.failures {
+            failures.push(format!("{name}: {failure}"));
         }
-        assert!(report.runs > 0, "{name} has no run directives");
+        if report.runs == 0 {
+            failures.push(format!("{name} has no run directives"));
+        }
         runs += report.runs;
         compared += report.compared;
         rules.extend(report.rules.keys().cloned());
+        for (control, labels) in report.stuck_in {
+            for label in labels {
+                stuck_in.insert((name.clone(), control.clone(), label));
+            }
+        }
     }
-    assert!(runs >= 12 && compared >= 8 && compared < runs);
-    for required in [
-        "E-Run",
-        "E-Turn",
-        "E-Await",
-        "E-AwaitHost",
-        "E-Spawn",
-        "E-Next",
-        "E-Cancel",
-        "E-Done",
-        "E-MemberFault",
-        "E-Stop",
-    ] {
-        assert!(
-            rules.contains(required),
-            "Slice 4 core suite did not exercise rule {required}; saw {rules:?}"
-        );
+    for rule in SLICE4_RULES {
+        if !rules.contains(rule) {
+            failures.push(format!("no slice 4 run applied [{rule}]"));
+        }
     }
+    let listed: BTreeSet<(String, String, String)> = STUCK
+        .iter()
+        .map(|(f, c, l)| (f.to_string(), c.to_string(), l.to_string()))
+        .collect();
+    for missing in listed.difference(&stuck_in) {
+        failures.push(format!("not stuck as listed: {missing:?}"));
+    }
+    for extra in stuck_in.difference(&listed) {
+        failures.push(format!("stuck and not listed: {extra:?}"));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(runs >= 92, "{runs} runs");
+    // Every run that ends and has a host that answers is compared with the
+    // erased semantics ([R6], [R7]).
+    assert!(compared >= 69 && compared < runs, "{compared} compared");
 }
 
 #[test]
@@ -285,6 +343,97 @@ async control bad() ■ { ok {} }
     2 ⊤ ▷ ■ ok {}
 "#,
         ),
+        // [W10]: the bodies of a named boundary are not `async`
+        (
+            "W10",
+            r#"
+async control leaf() ■ { ok {} }
+    1 ⊤ ▷ ■ ok {}
+boundary b() {
+    1 ⊤ ▷ d : Δ await leaf() ▸ ok {}
+    2 d.ok ▷ terminate
+} contingency (m : string) {
+    1 ⊤ ▷ terminate
+}
+control sup() ■ { ok {} }
+    1 ⊤ ▷ supervise b()
+    2 ⊤ ▷ ■ ok {}
+"#,
+        ),
+        // [W11]: `tasks⟨f⟩` as the type of a loop parameter
+        (
+            "W11",
+            r#"
+async control leaf() ■ { ok {} }
+    1 ⊤ ▷ ■ ok {}
+async control bad() ■ { ok {} }
+    1 ⊤ ▷ ~p : tasks⟨leaf⟩ := tasks⟨leaf⟩()
+    2 ⊤ ▷ s : ↻ more(q : tasks⟨leaf⟩ := p) {
+          1 ⊤ ▷ □ out {}
+        } ▸ out {}
+    3 ⊤ ▷ ■ ok {}
+"#,
+        ),
+        // [W11]: `tasks⟨f⟩` as the type of a payload field
+        (
+            "W11",
+            r#"
+async control leaf() ■ { ok {} }
+    1 ⊤ ▷ ■ ok {}
+async control bad() ■ { ok {s : tasks⟨leaf⟩} }
+    1 ⊤ ▷ ~p : tasks⟨leaf⟩ := tasks⟨leaf⟩()
+    2 ⊤ ▷ ■ ok {p}
+"#,
+        ),
+        // [W11]: `tasks⟨f⟩` as the type of an element
+        (
+            "W11",
+            r#"
+async control leaf() ■ { ok {} }
+    1 ⊤ ▷ ■ ok {}
+async control bad() ■ { ok {} }
+    1 ⊤ ▷ ~v : [tasks⟨leaf⟩] := []
+    2 ⊤ ▷ ■ ok {}
+"#,
+        ),
+        // [W11]: a task set is never moved
+        (
+            "W11",
+            r#"
+async control leaf() ■ { ok {} }
+    1 ⊤ ▷ ■ ok {}
+async control bad() ■ { ok {} }
+    1 ⊤ ▷ ~p : tasks⟨leaf⟩ := tasks⟨leaf⟩()
+    2 ⊤ ▷ ~q : tasks⟨leaf⟩ := ▾p
+    3 ⊤ ▷ ■ ok {}
+"#,
+        ),
+        // [W11]: a task set is never lent
+        (
+            "W11",
+            r#"
+async control leaf() ■ { ok {} }
+    1 ⊤ ▷ ■ ok {}
+async control takes(s : &tasks⟨leaf⟩) ■ { ok {} }
+    1 ⊤ ▷ ■ ok {}
+async control bad() ■ { ok {} }
+    1 ⊤ ▷ ~p : tasks⟨leaf⟩ := tasks⟨leaf⟩()
+    2 ⊤ ▷ d : Δ await takes(&p) ▸ ok {}
+    3 ⊤ ▷ ■ ok {}
+"#,
+        ),
+        // [W11]: a task set is never assigned
+        (
+            "W11",
+            r#"
+async control leaf() ■ { ok {} }
+    1 ⊤ ▷ ■ ok {}
+async control bad() ■ { ok {} }
+    1 ⊤ ▷ ~p : tasks⟨leaf⟩ := tasks⟨leaf⟩()
+    2 ⊤ ▷ p ← tasks⟨leaf⟩()
+    3 ⊤ ▷ ■ ok {}
+"#,
+        ),
         // [TK1]: `spawn` producer mismatch
         (
             "TK1",
@@ -429,4 +578,49 @@ control entry(x : u32) ■ { done {} │ cancelled {} } uses io.net
         }
         other => panic!("expected X7 E-Extern before cancel shortcut, got {other}"),
     }
+}
+
+/// Theorem 4 covers plain decisions only (finding RT4): `await f` keeps the
+/// turn it gives up before the first statement of `f`, `run f` keeps its pool,
+/// and a control whose body holds `run` is not put into an `async` control,
+/// where [W10] forbids `run`. Every core file of the suite, expanded, is well
+/// formed, and each of its runs that ends gives the end and the trace it gave
+/// before.
+#[test]
+fn slice_four_expansion_keeps_turns_and_runs_rt4() {
+    let mut failures = Vec::new();
+    let mut runs = 0usize;
+    for (name, source) in core_files() {
+        let parsed = text::parse(&source).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let expanded = match villanelle_v2::expand::expand(&parsed) {
+            Ok(expanded) => expanded,
+            Err(err) => {
+                failures.push(format!("{name}: not expanded: {err:?}"));
+                continue;
+            }
+        };
+        let mut text = expanded.print();
+        for line in source.lines() {
+            if line.starts_with("//! run") && !line.contains("=> stuck") {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        let report = script::check(&text);
+        if let Some(clause) = &report.rejected {
+            failures.push(format!("{name}: the expansion is refused [{clause}]"));
+        }
+        for failure in &report.failures {
+            failures.push(format!("{name} expanded: {failure}"));
+        }
+        runs += report.runs;
+        if name == "e_await.core" {
+            assert!(
+                text.contains("Δ await say(\"parent\")"),
+                "the await of a defined control was expanded:\n{text}"
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(runs >= 70, "{runs} runs");
 }

@@ -85,6 +85,7 @@ fn verify_native_specs(
     let config = Config {
         usize_max: Int::power_of_two(usize_bits).minus(&Int::from_u64(1)),
         fuel: 200_000,
+        capacity: None,
     };
 
     let mut expected = Vec::with_capacity(specs.len());

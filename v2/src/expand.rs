@@ -6,8 +6,11 @@
 //! > that alternative) yields a checked program with the same observations.
 //!
 //! [`expand`] takes a [`syntax::Program`], resolves it to check well-formedness,
-//! and expands every decision on a defined control in place across all control
-//! bodies and named boundaries. Any `■` (`Exit`) inside a loop of a callee is
+//! and expands every decision on a defined control that is not `async` in place
+//! across all control bodies and named boundaries. `await f` and `run f` are not
+//! expanded, nor is a decision in an `async` control on a control whose body
+//! contains `run` ([W10] keeps `run` out of async bodies): Theorem 4 does not
+//! cover them (finding RT4). Any `■` (`Exit`) inside a loop of a callee is
 //! first lifted out of the loop through a fresh `□` (`Leave`) alternative so
 //! that all exits of a callee stand at the top level of its body before
 //! inlining. Slice 2 support also handles `&τ`/`&~τ` borrow substitution,
@@ -17,8 +20,8 @@
 use crate::int::Int;
 use crate::resolve;
 use crate::syntax::{
-    Alternative, Arm, Command, Control, Declaration, Expr, LoopParameter, Place, PlaceStep,
-    Program, Selector, Statement,
+    Alternative, Arm, CallMode, Command, Control, Declaration, Expr, LoopParameter, Place,
+    PlaceStep, Program, Selector, Statement,
 };
 use crate::typed::{BorrowMode, IntType, Type};
 use std::collections::{HashMap, HashSet};
@@ -46,12 +49,13 @@ pub fn expand(program: &Program) -> Result<Program, resolve::Error> {
             if control.external {
                 continue;
             }
-            if has_defined_call(&control.body, &snapshot) {
+            if has_defined_call(&control.body, &snapshot, control.is_async) {
                 control.body = expand_body(
                     &control.body,
                     &snapshot,
                     &program.declarations,
                     &mut next_id,
+                    control.is_async,
                 );
                 any_expanded = true;
             }
@@ -72,20 +76,23 @@ pub fn expand(program: &Program) -> Result<Program, resolve::Error> {
             }
             Declaration::Boundary(b) => {
                 let mut nb = b.clone();
-                if has_defined_call(&nb.body, &final_controls) {
+                // The bodies of a named boundary are not `async` ([W10]).
+                if has_defined_call(&nb.body, &final_controls, false) {
                     nb.body = expand_body(
                         &nb.body,
                         &final_controls,
                         &program.declarations,
                         &mut next_id,
+                        false,
                     );
                 }
-                if has_defined_call(&nb.contingency, &final_controls) {
+                if has_defined_call(&nb.contingency, &final_controls, false) {
                     nb.contingency = expand_body(
                         &nb.contingency,
                         &final_controls,
                         &program.declarations,
                         &mut next_id,
+                        false,
                     );
                 }
                 declarations.push(Declaration::Boundary(nb));
@@ -117,24 +124,62 @@ fn has_exit_in_boundary(statements: &[Statement]) -> bool {
     })
 }
 
-fn is_expandable_callee(controls: &HashMap<String, Control>, operation: &str) -> bool {
-    controls
-        .get(operation)
-        .is_some_and(|c| !c.external && !has_exit_in_boundary(&c.body))
+/// Whether a plain decision on `operation`, in a control that is `async`
+/// where `into_async` is set, is expanded.
+fn is_expandable_callee(
+    controls: &HashMap<String, Control>,
+    operation: &str,
+    into_async: bool,
+) -> bool {
+    controls.get(operation).is_some_and(|c| {
+        !c.external
+            && !c.is_async
+            && !has_exit_in_boundary(&c.body)
+            && !(into_async && contains_run(&c.body))
+    })
 }
 
-fn has_defined_call(statements: &[Statement], controls: &HashMap<String, Control>) -> bool {
+/// Whether `statements` contain `run`, as a decision or a capture.
+fn contains_run(statements: &[Statement]) -> bool {
+    statements.iter().any(|stmt| match &stmt.command {
+        Command::Decide {
+            mode: CallMode::Run,
+            ..
+        }
+        | Command::Capture {
+            mode: CallMode::Run,
+            ..
+        } => true,
+        Command::Loop { body, .. } => contains_run(body),
+        Command::Boundary {
+            body, contingency, ..
+        } => contains_run(body) || contains_run(contingency),
+        _ => false,
+    })
+}
+
+fn has_defined_call(
+    statements: &[Statement],
+    controls: &HashMap<String, Control>,
+    into_async: bool,
+) -> bool {
     for stmt in statements {
         match &stmt.command {
-            Command::Decide { operation, .. } if is_expandable_callee(controls, operation) => {
+            Command::Decide {
+                mode: CallMode::Sync,
+                operation,
+                ..
+            } if is_expandable_callee(controls, operation, into_async) => {
                 return true;
             }
-            Command::Loop { body, .. } if has_defined_call(body, controls) => {
+            Command::Loop { body, .. } if has_defined_call(body, controls, into_async) => {
                 return true;
             }
             Command::Boundary {
                 body, contingency, ..
-            } if has_defined_call(body, controls) || has_defined_call(contingency, controls) => {
+            } if has_defined_call(body, controls, into_async)
+                || has_defined_call(contingency, controls, into_async) =>
+            {
                 return true;
             }
             _ => {}
@@ -148,6 +193,7 @@ fn expand_body(
     controls: &HashMap<String, Control>,
     decls: &[Declaration],
     next_id: &mut usize,
+    into_async: bool,
 ) -> Vec<Statement> {
     let mut current: Vec<Statement> = statements
         .iter()
@@ -166,7 +212,7 @@ fn expand_body(
                     name: name.clone(),
                     parameters: parameters.clone(),
                     invariant: invariant.clone(),
-                    body: expand_body(body, controls, decls, next_id),
+                    body: expand_body(body, controls, decls, next_id, into_async),
                     arms: arms.clone(),
                 },
                 line: stmt.line,
@@ -181,10 +227,10 @@ fn expand_body(
                 selector: stmt.selector.clone(),
                 command: Command::Boundary {
                     site: site.clone(),
-                    body: expand_body(body, controls, decls, next_id),
+                    body: expand_body(body, controls, decls, next_id, into_async),
                     captures: captures.clone(),
                     message: message.clone(),
-                    contingency: expand_body(contingency, controls, decls, next_id),
+                    contingency: expand_body(contingency, controls, decls, next_id, into_async),
                 },
                 line: stmt.line,
             },
@@ -196,10 +242,10 @@ fn expand_body(
     while idx < current.len() {
         let is_defined_decide = match &current[idx].command {
             Command::Decide {
-                mode: crate::syntax::CallMode::Sync,
+                mode: CallMode::Sync,
                 operation,
                 ..
-            } => is_expandable_callee(controls, operation),
+            } => is_expandable_callee(controls, operation, into_async),
             _ => false,
         };
         if !is_defined_decide {
@@ -212,7 +258,7 @@ fn expand_body(
         let call_line = call_stmt.line;
         let Command::Decide {
             site: call_site,
-            mode: crate::syntax::CallMode::Sync,
+            mode: CallMode::Sync,
             operation,
             arguments,
             arms: caller_arms,

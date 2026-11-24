@@ -1,0 +1,121 @@
+// [E-Run]: `d : Δ run f(ō)` starts a run whose root task has one activation
+// of `f`; the decision completes with the root's alternative and payload, and
+// a fault of the root goes on in the caller. For an `extern async control`
+// the root has no activation: it waits for the operation, which the host
+// completes, or withdraws when the root is cancelled (finding RT1 of the
+// second review of the task rules).
+
+extern resource lease on fault release
+extern resource lock
+extern control open_lease(id : u32) ■ { ok {l : lease} } uses io.res
+extern control open_lock(id : u32) ■ { ok {k : lock} } uses io.res
+extern async control tick(id : u32) ■ { done {} │ cancelled {} } uses io.net
+extern async control finish(l : lease) ■ { ok {code : u32} │ cancelled {} } uses io.net
+extern async control finish_lock(k : lock) ■ { ok {} │ cancelled {} } uses io.net
+extern async control settle(n : u32) ⊢ n > 0 ■ { ok {v : u32} } uses io.net
+
+async control add(a : u32, b : u32) ■ { sum {v : u32} }
+    1 ⊤ ▷ ■ sum {a + b}
+
+async control boom(n : u32) ■ { ok {} } faults
+    1 ⊤ ▷ fault "root boom"
+
+async control positive(n : u32) ⊢ n > 0 ■ { ok {v : u32} }
+    1 ⊤ ▷ ■ ok {n}
+
+// A defined control: the decision takes the root's alternative and payload.
+control runs_add(a : u32, b : u32) ■ { sum {v : u32} }
+    1 ⊤ ▷ d : Δ run add(a, b) ▸ sum {v}
+    2 d.sum ▷ ■ sum {v}
+
+//! run runs_add(2, 3) => done sum {5}
+
+// The root faults: the decision completes with no alternative, and the fault
+// goes on in the caller, which permits it.
+control runs_boom() ■ { ok {} } faults
+    1 ⊤ ▷ d : Δ run boom(1) ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_boom() => faulted "root boom"
+
+// The precondition of a defined control is checked when the run starts.
+control runs_positive(n : u32) ■ { ok {v : u32} }
+    1 ⊤ ▷ d : Δ run positive(n) ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+//! run runs_positive(4) => done ok {4}
+//! run runs_positive(0) => stuck X7 E-Call
+
+// An extern control: the root waits, and the host completes the operation.
+control runs_finish(id : u32) ■ { ok {code : u32} │ cancelled {} } uses io.res, io.net
+    1 ⊤ ▷ o : Δ open_lease(id) ▸ ok {l}
+    2 o.ok ▷ d : Δ run finish(l) ▸ ok {c} │ cancelled {}
+    3 d.ok ▷ ■ ok {c}
+    4 d.cancelled ▷ ■ cancelled {}
+
+//! run runs_finish(1) with [open_lease -> ok {lease#1}; finish -> ok {7}] => done ok {7} trace [open_lease(1) -> ok {lease#1}; finish(lease#1) -> ok {7}]
+
+// The host cancels the root while it waits: the operation is withdrawn, has
+// no event, and the lease it was given by value is released.
+//! run runs_finish(1) with [open_lease -> ok {lease#1}] cancel_at 1 => done cancelled trace [open_lease(1) -> ok {lease#1}; lease.release(lease#1) -> released]
+
+// The precondition of an extern control is checked when the run starts.
+control runs_settle(n : u32) ■ { ok {v : u32} } uses io.net
+    1 ⊤ ▷ d : Δ run settle(n) ▸ ok {v}
+    2 d.ok ▷ ■ ok {v}
+
+//! run runs_settle(3) with [settle -> ok {9}] => done ok {9} trace [settle(3) -> ok {9}]
+//! run runs_settle(0) => stuck X7 E-Extern
+
+// A run that a cancelled task starts has a cancelled root: the host is not
+// asked, and the lease is released at once.
+control bridge(l : lease) ■ { ok {code : u32} │ cancelled {} } uses io.net
+    1 ⊤ ▷ d : Δ run finish(l) ▸ ok {c} │ cancelled {}
+    2 d.ok ▷ ■ ok {c}
+    3 d.cancelled ▷ ■ cancelled {}
+
+async control cancelled_caller() ■ { ok {code : u32} │ cancelled {} } uses io.res, io.net
+    1 ⊤ ▷ t : Δ await tick(0) ▸ done {} │ cancelled {}
+    2 ⊤ ▷ o : Δ open_lease(5) ▸ ok {l}
+    3 o.ok ▷ b : Δ bridge(l) ▸ ok {c} │ cancelled {}
+    4 b.ok ▷ ■ ok {c}
+    5 b.cancelled ▷ ■ cancelled {}
+
+control runs_cancelled_caller() ■ { ok {code : u32} │ cancelled {} } uses io.res, io.net
+    1 ⊤ ▷ d : Δ run cancelled_caller() ▸ ok {c} │ cancelled {}
+    2 d.ok ▷ ■ ok {c}
+    3 d.cancelled ▷ ■ cancelled {}
+
+//! run runs_cancelled_caller() with [open_lease -> ok {lease#5}] cancel_at 1 => done cancelled trace [open_lease(5) -> ok {lease#5}; lease.release(lease#5) -> released]
+//! run runs_cancelled_caller() with [tick -> done; open_lease -> ok {lease#5}; finish -> ok {3}] => done ok {3} trace [tick(0) -> done; open_lease(5) -> ok {lease#5}; finish(lease#5) -> ok {3}]
+
+// RT1: a lock is not fault-releasable, and a cancelled run of a cancellable
+// extern control cannot release it ([TK4] refuses the program).
+control bridge_lock(k : lock) ■ { ok {} │ cancelled {} } uses io.net
+    1 ⊤ ▷ d : Δ run finish_lock(k) ▸ ok {} │ cancelled {}
+    2 d.ok ▷ ■ ok {}
+    3 d.cancelled ▷ ■ cancelled {}
+
+async control cancelled_lock_caller() ■ { ok {} │ cancelled {} } uses io.res, io.net
+    1 ⊤ ▷ t : Δ await tick(0) ▸ done {} │ cancelled {}
+    2 ⊤ ▷ o : Δ open_lock(6) ▸ ok {k}
+    3 o.ok ▷ b : Δ bridge_lock(k) ▸ ok {} │ cancelled {}
+    4 b.ok ▷ ■ ok {}
+    5 b.cancelled ▷ ■ cancelled {}
+
+control runs_cancelled_lock_caller() ■ { ok {} │ cancelled {} } uses io.res, io.net
+    1 ⊤ ▷ d : Δ run cancelled_lock_caller() ▸ ok {} │ cancelled {}
+    2 d.ok ▷ ■ ok {}
+    3 d.cancelled ▷ ■ cancelled {}
+
+//! run runs_cancelled_lock_caller() with [open_lock -> ok {lock#6}] cancel_at 1 => stuck X8 E-Unwind
+//! run runs_cancelled_lock_caller() with [tick -> done; open_lock -> ok {lock#6}; finish_lock -> ok] => done ok trace [tick(0) -> done; open_lock(6) -> ok {lock#6}; finish_lock(lock#6) -> ok]
+
+// The same lock given to a run that the host cancels while it waits.
+control runs_finish_lock(id : u32) ■ { ok {} │ cancelled {} } uses io.res, io.net
+    1 ⊤ ▷ o : Δ open_lock(id) ▸ ok {k}
+    2 o.ok ▷ d : Δ run finish_lock(k) ▸ ok {} │ cancelled {}
+    3 d.ok ▷ ■ ok {}
+    4 d.cancelled ▷ ■ cancelled {}
+
+//! run runs_finish_lock(2) with [open_lock -> ok {lock#2}] cancel_at 1 => stuck X8 E-Unwind

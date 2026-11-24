@@ -819,6 +819,9 @@ struct RawRunSpec {
     /// host leaves behind parameters lent exclusively (`~x <- v`).
     answers: Vec<RawAnswer>,
     turns: Vec<usize>,
+    /// Which waiting operation the host completes, each time no task is
+    /// ready, as an index among those that wait ([E-Turn]).
+    waiting: Vec<usize>,
     cancel_at_turn: Option<u64>,
     config: Config,
     expect: RawExpect,
@@ -872,6 +875,7 @@ fn directive(line: usize, text: &str) -> Result<Directive, String> {
         arithmetic: false,
         answers: Vec::new(),
         turns: Vec::new(),
+        waiting: Vec::new(),
         cancel_at_turn: None,
         config: Config::default(),
         expect: RawExpect::Other("fuel"),
@@ -914,12 +918,30 @@ fn directive(line: usize, text: &str) -> Result<Directive, String> {
                     spec.turns.push(t);
                 }
             }
+            "waiting" => {
+                reader.need("[")?;
+                while !reader.mark("]") {
+                    if !spec.waiting.is_empty() {
+                        reader.need(",")?;
+                    }
+                    let w_str = reader.word("an index among the waiting operations")?;
+                    let w: usize = w_str
+                        .parse()
+                        .map_err(|_| format!("`{w_str}` is not an index"))?;
+                    spec.waiting.push(w);
+                }
+            }
             "cancel_at" => {
                 let t_str = reader.word("a turn number")?;
                 let t: u64 = t_str
                     .parse()
                     .map_err(|_| format!("`{t_str}` is not a turn number"))?;
                 spec.cancel_at_turn = Some(t);
+            }
+            "capacity" => {
+                let n = reader.word("the largest length and count")?;
+                let n: u64 = n.parse().map_err(|_| format!("`{n}` is not a capacity"))?;
+                spec.config.capacity = Some(Int::from_u64(n));
             }
             "usize" => {
                 let bits = reader.word("32 or 64")?;
@@ -951,6 +973,7 @@ fn directive(line: usize, text: &str) -> Result<Directive, String> {
         "violation" => RawExpect::Other("violation"),
         "host-failed" => RawExpect::Other("host-failed"),
         "fuel" => RawExpect::Other("fuel"),
+        "exhausted" => RawExpect::Other("exhausted"),
         "not-an-execution" => RawExpect::Other("not-an-execution"),
         other => return Err(format!("`{other}` is not an end of a run")),
     };
@@ -1073,8 +1096,10 @@ pub fn native_runs(source: &str) -> Result<(Program, Vec<NativeRunSpec>), String
         );
         if !ends
             || !raw_spec.turns.is_empty()
+            || !raw_spec.waiting.is_empty()
             || raw_spec.cancel_at_turn.is_some()
             || raw_spec.config.usize_max != Config::default().usize_max
+            || raw_spec.config.capacity.is_some()
         {
             continue;
         }
@@ -1116,6 +1141,7 @@ fn kind(end: &End) -> &'static str {
         End::HostViolation(_) => "violation",
         End::HostFailed(_) => "host-failed",
         End::OutOfFuel => "fuel",
+        End::Exhausted => "exhausted",
         End::NotAnExecution(_) => "not-an-execution",
     }
 }
@@ -1354,7 +1380,7 @@ fn check_with(source: &str, is_surface: bool) -> Report {
                 answers: answers.into_iter().collect(),
             }),
             turns: raw_spec.turns.iter().copied().collect(),
-            waiting: std::collections::VecDeque::new(),
+            waiting: raw_spec.waiting.iter().copied().collect(),
             cancel_at_turn: raw_spec.cancel_at_turn,
             cancel_decisions: std::collections::VecDeque::new(),
         };
@@ -1363,7 +1389,7 @@ fn check_with(source: &str, is_surface: bool) -> Report {
                 answers: scheduled.inner.0.answers.clone(),
             },
             turns: raw_spec.turns.iter().copied().collect(),
-            waiting: std::collections::VecDeque::new(),
+            waiting: raw_spec.waiting.iter().copied().collect(),
             cancel_at_turn: raw_spec.cancel_at_turn,
             cancel_decisions: std::collections::VecDeque::new(),
         };
@@ -1396,6 +1422,7 @@ fn check_with(source: &str, is_surface: bool) -> Report {
                             erased::End::Undefined(_) => "undefined",
                             erased::End::HostFailed(_) => "host-failed",
                             erased::End::OutOfFuel => "fuel",
+                            erased::End::Exhausted => "exhausted",
                             erased::End::NotAnExecution(_) => "not-an-execution",
                         }
                 }
