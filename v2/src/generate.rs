@@ -29,10 +29,12 @@ use crate::syntax::{
 use crate::typed::{self, IntType, Type};
 use std::collections::BTreeMap;
 
+mod borrow_coverage;
 mod interval;
 mod valid;
 
-pub use valid::{valid, valid_data};
+pub use borrow_coverage::BORROW_CONSTRUCTS;
+pub use valid::{valid, valid_borrows, valid_data};
 
 /// Every syntactic construct of slice 1.
 pub const CONSTRUCTS: [&str; 61] = [
@@ -657,6 +659,7 @@ impl Coverage {
                 _ => {}
             }
         }
+        self.observe_borrows(program);
     }
 
     /// The constructs of [`CONSTRUCTS`] that have not been seen yet.
@@ -671,6 +674,15 @@ impl Coverage {
     /// The constructs of [`DATA_CONSTRUCTS`] that have not been seen yet.
     pub fn missing_data(&self) -> Vec<&'static str> {
         DATA_CONSTRUCTS
+            .iter()
+            .copied()
+            .filter(|name| !self.counts.contains_key(name))
+            .collect()
+    }
+
+    /// The constructs of [`BORROW_CONSTRUCTS`] that have not been seen yet.
+    pub fn missing_borrows(&self) -> Vec<&'static str> {
+        BORROW_CONSTRUCTS
             .iter()
             .copied()
             .filter(|name| !self.counts.contains_key(name))

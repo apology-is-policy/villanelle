@@ -135,6 +135,110 @@ fn the_checker_accepts_generated_programs_with_data() {
     assert_eq!(accepted, 30 - NO_ANSWER.len() as u64);
 }
 
+/// The kinds of place that a host may lend from its arguments, by the last
+/// step to them, as `fuzz::Report::host_places` counts them.
+const HOST_PLACES: [&str; 6] = [
+    "whole arguments",
+    "fields",
+    "fields of variants",
+    "elements",
+    "values of maps",
+    "keys of maps",
+];
+
+/// The generator with the borrows of slice 3
+/// ([`villanelle_v2::generate::valid_borrows`]): as for slices 1 and 2, what
+/// it writes reads back, resolves, runs to an end and gives the same
+/// observation under the erased semantics, with seeded hosts that write
+/// behind arguments lent exclusively and lend places within the arguments.
+/// It reaches every construct of slices 1 and 2 and every construct of the
+/// borrows, and the hosts lend every kind of place. Seed 204 is in the range:
+/// its loop payload was written in an order that moved a name before an
+/// operand read it (`docs/v2/review.md`, RG8).
+#[test]
+fn generated_programs_with_borrows_run_to_an_end_and_reach_the_borrow_constructs() {
+    let options = fuzz::Options {
+        slice: 3,
+        ..fuzz::Options::default()
+    };
+    let report = fuzz::campaign_without_checker(1, 300, &options);
+    let failures: Vec<String> = report
+        .findings
+        .iter()
+        .map(|finding| format!("seed {} {}: {}", finding.seed, finding.kind, finding.detail))
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        report.coverage.missing().is_empty(),
+        "constructs not reached: {:?}",
+        report.coverage.missing()
+    );
+    assert!(
+        report.coverage.missing_data().is_empty(),
+        "constructs of slice 2 not reached: {:?}",
+        report.coverage.missing_data()
+    );
+    assert!(
+        report.coverage.missing_borrows().is_empty(),
+        "constructs of slice 3 not reached: {:?}",
+        report.coverage.missing_borrows()
+    );
+    for kind in HOST_PLACES {
+        assert!(
+            report.host_places.get(kind).is_some_and(|count| *count > 0),
+            "no host lent {kind}: {:?}",
+            report.host_places
+        );
+    }
+    assert!(report.runs >= 10_000, "runs = {}", report.runs);
+    assert!(report.faulted >= 100, "faulted = {}", report.faulted);
+    assert!(
+        report.terminated >= 20,
+        "terminated = {}",
+        report.terminated
+    );
+    assert_eq!(
+        fuzz::program_in(7, 3).print(),
+        fuzz::program_in(7, 3).print()
+    );
+    assert_ne!(
+        fuzz::program_in(7, 3).print(),
+        fuzz::program_in(7, 2).print()
+    );
+}
+
+/// The checker accepts the programs with borrows that the generator calls
+/// valid: those of the first 30 seeds, and that of seed 157, which divides by
+/// a name that borrows a constant. The checker takes a name bound once to a
+/// constant expression as that constant ([I3]) and a borrow name as no
+/// constant, and a generator that took the borrow name as the constant wrote
+/// a product there that the checker cannot bound. `vn2 fuzz --slice 3` tries
+/// more seeds.
+#[test]
+fn the_checker_accepts_generated_programs_with_borrows() {
+    let options = fuzz::Options {
+        slice: 3,
+        entries: 1,
+        hosts: 1,
+        seconds: 120,
+        ..fuzz::Options::default()
+    };
+    let seeds: Vec<u64> = (1..=30).chain([157]).collect();
+    let mut accepted = 0;
+    let mut findings: Vec<String> = Vec::new();
+    for &seed in &seeds {
+        let report = fuzz::campaign(seed, 1, &options);
+        accepted += report.accepted;
+        findings.extend(
+            report.findings.iter().map(|finding| {
+                format!("seed {} {}: {}", finding.seed, finding.kind, finding.detail)
+            }),
+        );
+    }
+    assert!(findings.is_empty(), "{}", findings.join("\n"));
+    assert_eq!(accepted, seeds.len() as u64);
+}
+
 /// The calls of functions in one expression nest to a depth and no deeper
 /// (`docs/v2/review.md`, RG4): the arguments of a call began with a budget
 /// of their own, and writing the program of this seed did not end.

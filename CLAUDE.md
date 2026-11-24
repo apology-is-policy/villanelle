@@ -82,7 +82,7 @@ plan's phase sections are authoritative for scope and exit conditions.
 | --- | --- | --- |
 | 0 | Close out v1 | Done; tagged `v1-final` |
 | 1 | Design on paper: core specification, fact logic, reference model, surface, the corpus rewritten by hand, a reading and repair test. No compiler code. | Done; accepted 20 November 2026 |
-| 2 | Oracle interpreter, program generator, differential harness, mutation tests | Active: slice 1 is requalified and slice 2 is being requalified (`docs/v2/review.md`). The oracle of slice 1 is qualified, and that of slice 2 has a test for each clause of its rules; the rest of slices 2 to 4 is draft |
+| 2 | Oracle interpreter, program generator, differential harness, mutation tests | Active: slice 1 is requalified, and slices 2 and 3 are being requalified (`docs/v2/review.md`). The oracles of slices 1 to 3 have a test for each clause of their rules, and the generators of slices 1 to 3 reach every construct of their slices; the rest of slices 2 to 4 is draft |
 | 3 | Checker on a typed core, with the formatter that owns the rails | Draft code for slices 1 to 3, unqualified |
 | 4 | Typed backend; exit is 1.2× optimized Rust on every kernel under `experiments/` | Draft code for slices 1 to 3, unqualified; no kernel under `experiments/` measured |
 | 5 | Language breadth: numbers, functions, loops as decisions, recursion, closures, recursive data, views | |
@@ -148,11 +148,12 @@ validates it in the kernel. `check --counts` prints the work of the search
 as counts (theory checks, nodes of diagrams, exchanges, entries written);
 measure the checker with them, since a time depends on the load of the
 machine. `vn2 fuzz --seed N
---count N [--slice 2] [--mutants] [--native] [--out DIR]` tries generated programs in the
+--count N [--slice 2|3] [--mutants] [--native] [--out DIR]` tries generated programs in the
 reader, the two semantics and the checker, their mutants, and with `--native`
 their compiled code, and prints the counts of the search over the campaign;
 a program is a function of its seed, `--slice 2` takes the programs with the
-data of slice 2, and
+data of slice 2, `--slice 3` those with the borrows of slice 3 and hosts that
+lend and write, and
 a release build (`cargo run --release`) is some ten times faster. With
 `VN2_KEEP_IR=DIR` in the environment the IR of every compiled batch is kept
 in `DIR`. Inputs are `.core` (the core text form) or `.rails`.

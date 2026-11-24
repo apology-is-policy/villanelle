@@ -861,15 +861,30 @@ pub struct Seeded<'a> {
     seed: u64,
     rng: Rng,
     next_res: u64,
+    /// Whether it leaves values of its own behind the arguments lent
+    /// exclusively, now and then.
+    writes: bool,
 }
 
 impl<'a> Seeded<'a> {
+    /// A host that leaves every argument as it found it.
     pub fn new(program: &'a Program, seed: u64) -> Seeded<'a> {
         Seeded {
             program,
             seed,
             rng: Rng::new(seed),
             next_res: 0,
+            writes: false,
+        }
+    }
+
+    /// A host that now and then leaves a value of its own behind an
+    /// argument lent exclusively, where the condition of the alternative
+    /// does not speak of it and the value holds no obligation ([E-Host]).
+    pub fn writing(program: &'a Program, seed: u64) -> Seeded<'a> {
+        Seeded {
+            writes: true,
+            ..Seeded::new(program, seed)
         }
     }
 }
@@ -925,8 +940,15 @@ impl Wanted<'_> {
                     steps.pop();
                 }
             }
-            (Type::Map(_, element), Value::Map(entries)) => {
+            (Type::Map(key_ty, element), Value::Map(entries)) => {
                 for (key, item) in entries {
+                    // A key is lent shared only: a map keeps its keys in
+                    // order.
+                    if self.mode == BorrowMode::Shared && **key_ty == *self.ty {
+                        steps.push(RuntimeStep::MapKey(key.clone()));
+                        out.push((self.argument, steps.clone(), key.clone()));
+                        steps.pop();
+                    }
                     steps.push(RuntimeStep::MapValue(key.clone()));
                     self.within(element, item, steps, out);
                     steps.pop();
@@ -1096,12 +1118,46 @@ impl Host for Seeded<'_> {
             ) else {
                 continue;
             };
+            // What the host leaves behind an argument lent exclusively is
+            // written there before the borrows of the payload are made
+            // ([E-Extern]), so they name places in what it leaves.
+            let mut writes = Vec::new();
+            let mut written = arguments.to_vec();
+            if self.writes {
+                for (position, parameter) in control.parameters.iter().enumerate() {
+                    let Type::Ref(BorrowMode::Exclusive, referent) = &parameter.ty else {
+                        continue;
+                    };
+                    let spoken = alternative.condition.as_ref().is_some_and(|condition| {
+                        typed::mentions(condition, VarRef::Parameter(position))
+                    });
+                    if spoken
+                        || self.program.kind(referent) == typed::Kind::Must
+                        || self.program.contains_borrow_or_view(referent)
+                        || !rng.chance(1, 3)
+                    {
+                        continue;
+                    }
+                    let Some(value) = draw_value_in_program(
+                        self.program,
+                        &mut rng,
+                        referent,
+                        arguments,
+                        config,
+                        &mut res_counter,
+                    ) else {
+                        continue;
+                    };
+                    written[position] = value.clone();
+                    writes.push((position, value));
+                }
+            }
             // A borrow of the payload names a place within an origin; the
             // condition reads the value there.
             let mut referred = payload.clone();
             let mut lending = Lending {
                 control,
-                arguments,
+                arguments: &written,
                 config,
                 taken: Vec::new(),
             };
@@ -1141,7 +1197,7 @@ impl Host for Seeded<'_> {
                 return Ok(Answer {
                     alternative: alternative.name.clone(),
                     payload,
-                    writes: Vec::new(),
+                    writes,
                 });
             }
         }

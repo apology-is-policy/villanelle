@@ -33,7 +33,8 @@ Options of `run`:
 Options of `fuzz`:
   --seed N       the first seed (default: 1); a program is a function of its seed
   --count N      the number of seeds (default: 100)
-  --slice N      1 for scalars and decisions (default), 2 for programs with data
+  --slice N      1 for scalars and decisions (default), 2 for programs with data,
+                 3 for programs with borrows and hosts that lend and write
   --mutants      try the mutants of each program too
   --native       compile each accepted program and run it too (needs clang)
   --show         print the programs and try nothing

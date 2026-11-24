@@ -165,7 +165,7 @@ pub(super) fn know_at<'e>(env: &'e mut Env, root: &str, steps: &[usize]) -> Opti
 
 /// What is known of a value once a name or a field holds it: an integer is
 /// then a value term of its type ([A1]), and no constant expression ([I3]).
-fn held(ty: &Type, know: Know) -> Know {
+pub(super) fn held(ty: &Type, know: Know) -> Know {
     match (ty, know) {
         (Type::Int(int_ty), Know::Int(val)) => Know::Int(Val::value(*int_ty, val.flow)),
         (_, know) => know,
@@ -178,13 +178,13 @@ pub(super) struct Ctx {
     pub(super) env: Env,
     /// The names that an operand lends, and those that one lends
     /// exclusively.
-    lent: BTreeSet<String>,
-    exclusive: BTreeSet<String>,
+    pub(super) lent: BTreeSet<String>,
+    pub(super) exclusive: BTreeSet<String>,
     /// The names that the statement consumes.
     pub(super) moved: Vec<String>,
     /// The names that an operation may have changed, of which only the type
     /// is known afterwards ([I9]).
-    changed: Vec<String>,
+    pub(super) changed: Vec<String>,
     /// The values that an operand lends and that no name held: each is
     /// bound to a name of its own before the statement ([C1], [U11]).
     hidden: Vec<Command>,
@@ -377,7 +377,7 @@ impl Generator<'_> {
         }
     }
 
-    fn here(&self) -> usize {
+    pub(super) fn here(&self) -> usize {
         self.scopes.len() - 1
     }
 
@@ -397,7 +397,9 @@ impl Generator<'_> {
     pub(super) fn consumable(&self, name: &str, slot: &Slot) -> bool {
         !slot.gone
             && (self.types.kind(&slot.ty) == Kind::Copy
-                || slot.home >= self.floor() && !self.retained.contains(name))
+                || slot.lent.is_none()
+                    && slot.home >= self.floor()
+                    && !self.retained.contains(name))
     }
 
     /// Whether the type is fault-releasable ([T3]).
@@ -433,7 +435,7 @@ impl Generator<'_> {
         }
     }
 
-    fn bind_name(&mut self, running: &[usize], bound: &str, slot: &Slot) {
+    pub(super) fn bind_name(&mut self, running: &[usize], bound: &str, slot: &Slot) {
         let last = self.here();
         for &index in running {
             self.scopes[last].live[index]
@@ -442,7 +444,7 @@ impl Generator<'_> {
         }
     }
 
-    fn slot(&self, ty: &Type, mutable: bool, know: Know) -> Slot {
+    pub(super) fn slot(&self, ty: &Type, mutable: bool, know: Know) -> Slot {
         Slot {
             ty: ty.clone(),
             mutable,
@@ -451,6 +453,8 @@ impl Generator<'_> {
             gone: false,
             turned: false,
             home: self.here(),
+            loans: Vec::new(),
+            lent: None,
         }
     }
 
@@ -489,9 +493,10 @@ impl Generator<'_> {
     pub(super) fn payload_type(&mut self) -> Type {
         if self.data && !self.types.resources.is_empty() && self.rng.chance(1, 8) {
             self.resource_type().expect("a resource")
-        } else if self.data && !self.callables.is_empty() && self.rng.chance(1, 10) {
-            let index = self.rng.index(self.callables.len());
-            Type::OutcomeNamed(self.callables[index].name.clone())
+        } else if self.data && !self.capturable().is_empty() && self.rng.chance(1, 10) {
+            let capturable = self.capturable();
+            let index = self.rng.index(capturable.len());
+            Type::OutcomeNamed(capturable[index].clone())
         } else {
             self.value_type()
         }
@@ -548,7 +553,7 @@ impl Generator<'_> {
 
     /// The type of an element or of a field: a scalar most often, and
     /// none that holds an obligation.
-    fn element_type(&mut self) -> Type {
+    pub(super) fn element_type(&mut self) -> Type {
         match self.rng.below(6) {
             0 => Type::String,
             1 => self
@@ -730,14 +735,24 @@ impl Generator<'_> {
             if slot.gone || self.ending && self.types.kind(&slot.ty) == Kind::Must {
                 continue;
             }
+            // What is behind a borrow name is a place too, written through
+            // it where it is exclusive and nothing lends it ([B1]). A name
+            // that a live loan lends is not written ([L3]).
+            let (ty, mutable) = match &slot.ty {
+                Type::Ref(mode, inner) if self.borrows => (
+                    (**inner).clone(),
+                    *mode == BorrowMode::Exclusive && slot.lent.is_none(),
+                ),
+                ty => (ty.clone(), slot.mutable && slot.lent.is_none()),
+            };
             walk.walk(
                 Spot {
                     expr: name(root),
                     root: root.clone(),
                     steps: Vec::new(),
                     fields: Vec::new(),
-                    ty: slot.ty.clone(),
-                    mutable: slot.mutable,
+                    ty,
+                    mutable,
                 },
                 2,
             );
@@ -931,6 +946,13 @@ impl Generator<'_> {
     /// An operand for a parameter of the type `ty`: a value, `&p` or `&~p`
     /// ([W8]). `pre` is what the precondition says of it.
     pub(super) fn operand_for(&mut self, ctx: &mut Ctx, ty: &Type, pre: Range) -> Option<Expr> {
+        if self.borrows
+            && let Type::Ref(mode, inner) = ty
+            && self.rng.chance(1, 2)
+            && let Some(operand) = self.borrow_operand(ctx, *mode, inner, pre)
+        {
+            return Some(operand);
+        }
         let long = |slot: &Slot| match &slot.know {
             Know::Sized(length) => length.lo >= pre.lo,
             _ => pre.lo <= 0,
@@ -946,6 +968,7 @@ impl Generator<'_> {
                     .filter(|(name, slot)| {
                         slot.mutable
                             && !slot.gone
+                            && slot.lent.is_none()
                             && slot.ty == **inner
                             && !ctx.lent.contains(*name)
                             && long(slot)
@@ -953,7 +976,13 @@ impl Generator<'_> {
                     .map(|(name, _)| name.clone())
                     .collect();
                 if names.is_empty() {
-                    return None;
+                    // With the borrows of slice 3, a value that no name
+                    // holds is bound to a name with `~` first, so that a
+                    // host may write behind it and lend from it.
+                    if !self.borrows || self.types.kind(inner) == Kind::Must {
+                        return None;
+                    }
+                    return self.hidden_operand(ctx, BorrowMode::Exclusive, inner, pre);
                 }
                 let chosen = self.rng.pick(&names).clone();
                 ctx.lent.insert(chosen.clone());
@@ -989,26 +1018,39 @@ impl Generator<'_> {
                 }
                 // A value that no name holds is bound to one first: a
                 // slot of borrow type takes `&p` ([C1]).
-                let before = ctx.moved.len();
-                let value = self.sized_value(ctx, inner, pre)?;
-                if ctx.moved[before..]
-                    .iter()
-                    .any(|name| ctx.read.contains(name))
-                {
-                    return None;
-                }
-                self.hidden += 1;
-                let hidden = format!("h{}", self.hidden);
-                ctx.hidden.push(Command::Bind {
-                    mutable: false,
-                    name: hidden.clone(),
-                    ty: Some((**inner).clone()),
-                    value,
-                });
-                Some(Expr::Borrow(BorrowMode::Shared, Box::new(name(&hidden))))
+                self.hidden_operand(ctx, BorrowMode::Shared, inner, pre)
             }
             other => self.sized_value(ctx, other, pre),
         }
+    }
+
+    /// `&hN` or `&~hN` for a value of the type `inner` that the statement
+    /// binds to the fresh name `hN` before it, with `~` where it is lent
+    /// exclusively.
+    fn hidden_operand(
+        &mut self,
+        ctx: &mut Ctx,
+        mode: BorrowMode,
+        inner: &Type,
+        pre: Range,
+    ) -> Option<Expr> {
+        let before = ctx.moved.len();
+        let value = self.sized_value(ctx, inner, pre)?;
+        if ctx.moved[before..]
+            .iter()
+            .any(|name| ctx.read.contains(name))
+        {
+            return None;
+        }
+        self.hidden += 1;
+        let hidden = format!("h{}", self.hidden);
+        ctx.hidden.push(Command::Bind {
+            mutable: mode == BorrowMode::Exclusive,
+            name: hidden.clone(),
+            ty: Some(inner.clone()),
+            value,
+        });
+        Some(Expr::Borrow(mode, Box::new(name(&hidden))))
     }
 
     // Statements.
@@ -1153,7 +1195,7 @@ impl Generator<'_> {
                     && if self.types.kind(&slot.ty) == Kind::Must {
                         slot.home >= floor && self.gone_on_all(running, name)
                     } else {
-                        !slot.gone || slot.home >= floor
+                        slot.lent.is_none() && (!slot.gone || slot.home >= floor)
                     }
             })
             .map(|(name, _)| name.clone())
@@ -1223,6 +1265,7 @@ impl Generator<'_> {
         let target = spot.place(element.as_ref().map(|(_, index)| int(*index)));
         self.push(selector, Command::AssignPlace { target, value });
         self.apply(running, &ctx);
+        self.written_through(running, &spot.root);
         if element.is_none() {
             let know = held(&written, know);
             let last = self.here();
@@ -1395,6 +1438,7 @@ impl Generator<'_> {
         let lent = Expr::Borrow(BorrowMode::Exclusive, Box::new(spot.expr.clone()));
         let site = self.operation(selector, "push", vec![lent, value], vec![arm("done", &[])]);
         self.apply(running, &ctx);
+        self.written_through(running, &spot.root);
         let outcomes = running
             .iter()
             .map(|&index| {
@@ -1427,6 +1471,7 @@ impl Generator<'_> {
             let lent = Expr::Borrow(BorrowMode::Exclusive, Box::new(spot.expr.clone()));
             let arms = vec![arm("item", &[&last]), arm("empty", &[])];
             let site = self.operation(selector, "pop", vec![lent], arms);
+            self.written_through(running, &spot.root);
             let outcomes = running
                 .iter()
                 .map(|&index| {
@@ -1546,7 +1591,7 @@ impl Generator<'_> {
 
     /// `get`, `entry_at`, `insert` or `remove` on a map. The conditions of
     /// the prelude say what becomes of its length.
-    fn map_op(&mut self, selector: &Selector, running: &[usize]) -> bool {
+    pub(super) fn map_op(&mut self, selector: &Selector, running: &[usize]) -> bool {
         let mut ctx = self.ctx(running);
         let spots = self.places(&ctx.env, &|ty| matches!(ty, Type::Map(_, _)));
         if spots.is_empty() {
@@ -1571,7 +1616,14 @@ impl Generator<'_> {
                 .map(|&index| generator.scope().live[index].env.clone())
                 .collect()
         };
-        match self.rng.below(if spot.mutable { 7 } else { 3 }) {
+        // With the borrows of slice 3, half of the operations on a map that
+        // may be written insert, so that a host finds keys and values to lend.
+        let choice = if self.borrows && spot.mutable && self.rng.chance(1, 2) {
+            3
+        } else {
+            self.rng.below(if spot.mutable { 7 } else { 3 })
+        };
+        match choice {
             0 | 1 => {
                 let Some(key) = self.read_operand(&mut ctx, key_ty) else {
                     return false;
@@ -1621,6 +1673,7 @@ impl Generator<'_> {
                 let arguments = vec![lend(BorrowMode::Exclusive), key, value];
                 let site = self.operation(selector, "insert", arguments, arms);
                 self.apply(running, &ctx);
+                self.written_through(running, &spot.root);
                 let outcomes = envs(self)
                     .into_iter()
                     .map(|env| {
@@ -1656,6 +1709,7 @@ impl Generator<'_> {
                 self.bind_hidden(selector, &mut ctx);
                 let site = self.operation(selector, "remove", arguments, arms);
                 self.apply(running, &ctx);
+                self.written_through(running, &spot.root);
                 // The contract of `remove` says nothing of the length.
                 let outcomes = envs(self)
                     .into_iter()
@@ -1759,6 +1813,7 @@ impl Generator<'_> {
                 sig.params
                     .iter()
                     .all(|(_, ty)| !matches!(ty, Type::Ref(BorrowMode::Exclusive, _)))
+                    && !super::borrows::lends(sig)
             })
             .collect();
         if callables.is_empty() {

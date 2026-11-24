@@ -141,6 +141,8 @@ fn owned(ty: &Type, know: Know) -> Slot {
         gone: false,
         turned: false,
         home: 0,
+        loans: Vec::new(),
+        lent: None,
     }
 }
 
@@ -737,7 +739,7 @@ impl Generator<'_> {
         }
 
         // The work sees the names around it.
-        let start = self.running_env(&running);
+        let start = self.merged_env(&running);
         let mut inner = start.clone();
         for parameter in &parameters {
             inner.remove(parameter);
@@ -787,7 +789,9 @@ impl Generator<'_> {
                     let (Some(before), Some(after)) = (start.get(name), fell.get(name)) else {
                         continue;
                     };
-                    if slot.mutable {
+                    // What is behind a borrow name may have been written
+                    // through it.
+                    if slot.mutable || matches!(slot.ty, Type::Ref(_, _)) {
                         slot.know = after.know.clone();
                         slot.definition = None;
                     }

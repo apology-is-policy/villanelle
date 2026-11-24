@@ -506,6 +506,57 @@ stuck state above: coverage [K7] is X1, [P1] to [P5] are X7, and [P6] is X6.
   what `recover` or `terminate n` of an outer one ends is given up before a
   statement of the inner work that may fault. `terminate n` belongs to a
   boundary that stands in the work of no other ([F5](e)).
+- **Borrows in generated programs (`generate::valid_borrows`,
+  `v2/src/generate/valid/borrows.rs`, `vn2 fuzz --slice 3`).** The
+  generator of slice 2 with the borrows of slice 3; programs of slices 1 and
+  2 are unchanged (600 seeds of each, text for text). For every name on
+  every history it keeps the loans the name holds ([L1]): a place, as a
+  root and the fields and indexes from it, and a mode. The name a borrow is
+  bound to holds it, and so do the copies of a shared one, the name an
+  exclusive one moves to, a borrow made through it, and a payload name of a
+  decision whose contract field borrows from the argument. While a
+  statement is written, a name that a live loan lends exclusively is not
+  available to it, and one lent shared is read and not written, moved or
+  lent exclusively ([L3]); the steps of slice 2 therefore keep the loans
+  without knowing of them. A borrow of a place is made where no live loan
+  overlaps it, unless both are shared; the test goes by places, so two
+  fields of one struct may be lent exclusively at once. A loan ends where
+  the generator stops mentioning each name that holds it ([L2]): a holder
+  bound in the body being written is retired now and then and never named
+  again. A loop body keeps what was lent around it lent throughout ([L2a]):
+  an exclusive borrow name of a body around is either written in the body,
+  and then nothing is known of it or of what it borrows, or kept read-only.
+  What is known of the value behind a borrow name is what was known of the
+  place ([I7]), with no integer taken as a constant ([I3] takes a name bound
+  to a constant as that constant, and a borrow name is no such name); a write
+  through it leaves what its exclusive loans are on known by its type alone
+  ([I9]). Statements: `r : &τ := &p` and `r : &~τ := &~p` of names, fields
+  and elements, also through borrow names; copies of shared and moves of
+  exclusive borrow names; `r ← e`, `r.f ← e`, `r[i] ← e`; borrow names read
+  in expressions; a borrow name or `&r`, `&~r` as an operand, of a built-in
+  operation too; controls with borrowed parameters. An extern control may
+  borrow its data, now and then one map or vector more (with a precondition
+  on the length of a vector), and its payload fields may borrow places
+  within the borrowed arguments, `&τ ∈ p` or `&~τ ∈ p`: a struct field, the
+  whole value, a field of a variant, an element, a value or a key of a map
+  (keys shared only). An alternative that the conditions may leave as the
+  only one an argument allows asks only for a place that every argument
+  has. A value that no name holds is bound to a name first where an operand
+  borrows it, with `~` where it is lent exclusively. The seeded host of
+  slice 3 (`host::Seeded::writing`) writes, now and then, a drawn value
+  behind an argument lent exclusively whose referent holds no obligation and
+  that the condition of the alternative does not mention, and then names
+  the places of the payload in what it left ([E-Extern], [E-Host]).
+  `generate::BORROW_CONSTRUCTS` lists the 20 constructs of the slice;
+  `v2/tests/harness.rs` runs 300 seeds in the two semantics, requires every
+  construct of the three slices and every kind of place lent, and asks the
+  checker about 31 seeds. Over 900 seeds `vn2 fuzz --slice 3` gives 36,396
+  runs with no stuck run and no difference, 3,590 of them ending in a fault
+  and 1,076 with `terminate n`, the checker accepts all 900, and the hosts
+  lent 8,691 whole arguments, 758 fields, 42 fields of variants, 731
+  elements, 23 values and 38 keys of maps. With `--native`, 300 programs
+  give 25,736 compiled runs that end as the oracle's do, with 29,692
+  allocations, each released. Review findings RG8 and RC30 came from it.
 - **Fuzzing (`fuzz`, `vn2 fuzz`).** `vn2 fuzz --seed N --count N` takes the
   program of each seed through the reader, the oracle and the erased
   semantics on entries that satisfy its precondition, and asks the checker.
@@ -1719,6 +1770,21 @@ of `len` counted as used by the command); both are in `eval_loan_expr`. The
 checker uses each field of a view in its own mode where [L5] said the view
 is one borrow; [L5] says what the checker does now (change entry of the
 core).
+
+### 16.3 Generated programs with borrows, 24 November 2026
+
+The generator of slice 3 (section 8, "Borrows in generated programs") found
+RC30: at `recover ↑ ℓ`, `compute_body_liveness` took a name bound in a body
+within the restarted loop, such as the work of a boundary around the one
+that recovers, as live after the restart, and a valid program whose payload
+borrow is held there was refused by [L3]. The name is bound anew by the
+next iteration ([L2a]), as the head of the loop already said; the condition
+is `var_in_body_tree` now.
+`a_name_bound_within_the_restarted_loop_is_not_live_after_recover_l2a`
+(`v2/tests/checker_slice3.rs`) holds it with a program that runs to its end
+and is accepted, and one that carries the borrow on through a parameter of
+the loop, which is stuck and refused. The checker accepts all of 900
+generated programs with borrows (36,396 runs, none stuck).
 
 ## 17. Slice 3 Phase 4: Theorem 4 Expansion and Typed LLVM IR / C ABI Backend for Borrows and Views
 

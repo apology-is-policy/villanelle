@@ -41,9 +41,11 @@ use crate::syntax::{
 use crate::typed::{BorrowMode, IntType, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod borrows;
 mod data;
 mod faults;
 
+use borrows::Loan;
 use data::{Ctx, Kind, Types};
 use faults::{BoundarySig, Unit, Work};
 
@@ -260,6 +262,13 @@ struct Slot {
     /// The body that binds the name, as an index into the bodies being
     /// written.
     home: usize,
+    /// The loans that the name holds, where it holds a borrow ([L1]).
+    loans: Vec<Loan>,
+    /// How the loans of the available names lend this one, as a statement
+    /// sees the names ([`Generator::lend_view`]). A loop body also keeps a
+    /// borrow name of the bodies around as lent shared where it does not
+    /// write through it.
+    lent: Option<BorrowMode>,
 }
 
 type Env = BTreeMap<String, Slot>;
@@ -288,6 +297,8 @@ struct FieldSig {
     ty: Type,
     lo: End,
     hi: End,
+    /// For a borrow, the parameters it is derived from ([W9]).
+    origins: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -406,7 +417,7 @@ impl Lib<'_> {
     /// expects another type ([C1]).
     fn anchor(&self, expr: &Expr, env: &Env) -> Option<IntType> {
         match expr {
-            Expr::Name(name) => match &env.get(name)?.ty {
+            Expr::Name(name) => match env.get(name)?.ty.deref_type() {
                 Type::Int(ty) => Some(*ty),
                 _ => None,
             },
@@ -438,7 +449,7 @@ impl Lib<'_> {
             }
             Expr::Field(base, field) => {
                 let (ty, know) = self.place(base, env, evaluated)?;
-                let Type::Named(name) = &ty else {
+                let Type::Named(name) = ty.deref_type() else {
                     return None;
                 };
                 let info = self.types.structure(name)?;
@@ -452,7 +463,8 @@ impl Lib<'_> {
             }
             Expr::Index(base, index) => {
                 let (ty, know) = self.place(base, env, evaluated)?;
-                let (Type::Vector(item), Know::Sized(length)) = (ty, know) else {
+                let (Type::Vector(item), Know::Sized(length)) = (ty.deref_type().clone(), know)
+                else {
                     return None;
                 };
                 let position = self.int(index, env, evaluated.then_some(IntType::Usize))?;
@@ -472,7 +484,7 @@ impl Lib<'_> {
             Expr::Name(name) => Some((name.clone(), Vec::new())),
             Expr::Field(base, field) => {
                 let (root, mut steps) = self.path(base, env)?;
-                let Type::Named(name) = self.place(base, env, false)?.0 else {
+                let Type::Named(name) = self.place(base, env, false)?.0.deref_type().clone() else {
                     return None;
                 };
                 let info = self.types.structure(&name)?;
@@ -505,8 +517,12 @@ impl Lib<'_> {
                     constant: operand.constant.and_then(i128::checked_neg),
                 })
             }
-            Expr::Name(name) => match &env.get(name)?.know {
-                Know::Int(val) => Some(*val),
+            Expr::Name(name) => match env.get(name)? {
+                Slot { gone: true, .. } => None,
+                Slot {
+                    know: Know::Int(val),
+                    ..
+                } => Some(*val),
                 _ => None,
             },
             Expr::Field(_, _) | Expr::Index(_, _) => match self.place(expr, env, fit.is_some())? {
@@ -662,6 +678,8 @@ impl Lib<'_> {
                     gone: false,
                     turned: false,
                     home: 0,
+                    loans: Vec::new(),
+                    lent: None,
                 },
             );
         }
@@ -672,8 +690,12 @@ impl Lib<'_> {
     fn boolean(&self, expr: &Expr, env: &Env, evaluated: bool) -> Option<Tri> {
         match expr {
             Expr::Boolean(value) => Some(Tri::of(*value)),
-            Expr::Name(name) => match &env.get(name)?.know {
-                Know::Bool(tri) => Some(*tri),
+            Expr::Name(name) => match env.get(name)? {
+                Slot { gone: true, .. } => None,
+                Slot {
+                    know: Know::Bool(tri),
+                    ..
+                } => Some(*tri),
                 _ => None,
             },
             Expr::Unary(Unary::Not, inner) => Some(self.boolean(inner, env, evaluated)?.not()),
@@ -938,6 +960,7 @@ enum Step {
     Data,
     Boundary,
     Supervise,
+    Borrow,
 }
 
 struct Generator<'r> {
@@ -959,6 +982,8 @@ struct Generator<'r> {
     /// declares.
     data: bool,
     types: Types,
+    /// Whether the program has the borrows of slice 3 too.
+    borrows: bool,
     /// How many calls of functions the expression being written is inside.
     calls: usize,
     /// Whether the expressions of a terminator are being written, or those
@@ -1029,6 +1054,12 @@ fn merge(paths: &[&Path]) -> Env {
                 slot.know = slot.know.hull(&theirs.know);
                 slot.gone |= theirs.gone;
                 slot.turned &= theirs.turned;
+                for loan in &theirs.loans {
+                    if !slot.loans.contains(loan) {
+                        slot.loans.push(loan.clone());
+                    }
+                }
+                slot.lent = slot.lent.max(theirs.lent);
                 let same = match (&slot.definition, &theirs.definition) {
                     (Some(ours), Some(theirs)) => ours.to_string() == theirs.to_string(),
                     _ => false,
@@ -1170,9 +1201,25 @@ impl Generator<'_> {
 
     fn names_of(env: &Env, ty: &Type) -> Vec<String> {
         env.iter()
-            .filter(|(_, slot)| &slot.ty == ty)
+            .filter(|(_, slot)| &slot.ty == ty && !slot.gone)
             .map(|(name, _)| name.clone())
             .collect()
+    }
+
+    /// The available names of the type `ty`, and with the borrows of
+    /// slice 3 the borrow names through which a value of it is read.
+    fn readable(&self, env: &Env, ty: &Type) -> Vec<String> {
+        let mut names = Self::names_of(env, ty);
+        if self.borrows {
+            names.extend(
+                env.iter()
+                    .filter(|(_, slot)| {
+                        !slot.gone && matches!(&slot.ty, Type::Ref(_, inner) if **inner == *ty)
+                    })
+                    .map(|(name, _)| name.clone()),
+            );
+        }
+        names
     }
 
     fn atom(&mut self, env: &Env, ty: IntType) -> Expr {
@@ -1182,7 +1229,7 @@ impl Generator<'_> {
         {
             return place;
         }
-        let names = Self::names_of(env, &Type::Int(ty));
+        let names = self.readable(env, &Type::Int(ty));
         if !names.is_empty() && self.rng.chance(3, 4) {
             name(self.rng.pick(&names))
         } else {
@@ -1394,7 +1441,7 @@ impl Generator<'_> {
     }
 
     fn propose_bool(&mut self, env: &Env, depth: u8) -> Expr {
-        let bools = Self::names_of(env, &Type::Bool);
+        let bools = self.readable(env, &Type::Bool);
         let choice = self.rng.below(if depth == 0 { 7 } else { 12 });
         match choice {
             0 if !bools.is_empty() => name(self.rng.pick(&bools)),
@@ -1488,8 +1535,13 @@ impl Generator<'_> {
     fn propose_fact(&mut self, env: &Env, depth: u8) -> Expr {
         let ints: Vec<(String, IntType, Range)> = env
             .iter()
+            .filter(|(_, slot)| !slot.gone)
             .filter_map(|(name, slot)| match (&slot.ty, &slot.know) {
                 (Type::Int(ty), Know::Int(val)) => Some((name.clone(), *ty, val.flow)),
+                (Type::Ref(_, inner), Know::Int(val)) if self.borrows => match **inner {
+                    Type::Int(ty) => Some((name.clone(), ty, val.flow)),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect();
@@ -1581,7 +1633,18 @@ impl Generator<'_> {
             .collect()
     }
 
+    /// The names as a statement on the histories `running` sees them: what
+    /// holds on every one of them, and what the live loans lend.
     fn running_env(&self, running: &[usize]) -> Env {
+        let mut env = self.merged_env(running);
+        if self.borrows {
+            self.lend_view(running, &mut env);
+        }
+        env
+    }
+
+    /// What holds on every one of the histories `running`.
+    fn merged_env(&self, running: &[usize]) -> Env {
         let scope = self.scope();
         let paths: Vec<&Path> = running.iter().map(|&index| &scope.live[index]).collect();
         merge(&paths)
@@ -1708,6 +1771,10 @@ impl Generator<'_> {
     }
 
     fn step(&mut self, selector: &Selector, running: &[usize]) {
+        // A borrow that is not mentioned again ends here ([L2]).
+        if self.borrows && self.rng.chance(1, 3) {
+            self.retire(running);
+        }
         let live = self.scope().live.len();
         let room = live < MAX_HISTORIES || running.len() <= 2;
         let mut choices = vec![(5u64, Step::Bind), (3, Step::Assign), (2, Step::Oblige)];
@@ -1744,6 +1811,9 @@ impl Generator<'_> {
             if !self.boundaries.is_empty() {
                 choices.push((2, Step::Supervise));
             }
+        }
+        if self.borrows {
+            choices.push((8, Step::Borrow));
         }
         let total: u64 = choices.iter().map(|(weight, _)| weight).sum();
         let mut drawn = self.rng.below(total);
@@ -1782,6 +1852,7 @@ impl Generator<'_> {
             Step::Data => self.data_step(selector, running, room),
             Step::Boundary => self.make_boundary(selector),
             Step::Supervise => self.supervise(selector, running),
+            Step::Borrow => self.borrow_step(selector, running, room),
         };
         if !done {
             self.bind(selector, running);
@@ -1833,6 +1904,8 @@ impl Generator<'_> {
             gone: false,
             turned: false,
             home: self.scopes.len() - 1,
+            loans: Vec::new(),
+            lent: None,
         };
         for &index in running {
             self.scope_mut().live[index]
@@ -1849,10 +1922,13 @@ impl Generator<'_> {
         }
     }
 
-    /// Whether every name in `expr` is one that is never assigned.
+    /// Whether every name in `expr` is one that is never assigned. What is
+    /// behind a borrow name changes with what it is borrowed from.
     fn unchanging(expr: &Expr, env: &Env) -> bool {
         match expr {
-            Expr::Name(name) => env.get(name).is_some_and(|slot| !slot.mutable),
+            Expr::Name(name) => env
+                .get(name)
+                .is_some_and(|slot| !slot.mutable && !matches!(slot.ty, Type::Ref(_, _))),
             Expr::Unary(_, inner) | Expr::Field(inner, _) | Expr::Len(inner) => {
                 Self::unchanging(inner, env)
             }
@@ -1881,7 +1957,12 @@ impl Generator<'_> {
         let counters = self.counters();
         let candidates: Vec<String> = env
             .iter()
-            .filter(|(name, slot)| slot.mutable && slot.ty.is_scalar() && !counters.contains(*name))
+            .filter(|(name, slot)| {
+                slot.mutable
+                    && slot.lent.is_none()
+                    && slot.ty.is_scalar()
+                    && !counters.contains(*name)
+            })
             .map(|(name, _)| name.clone())
             .collect();
         if candidates.is_empty() {
@@ -2022,6 +2103,9 @@ impl Generator<'_> {
                     let Some(know) = know else {
                         continue 'alternative;
                     };
+                    // A borrow of the payload holds what the arguments it
+                    // is derived from lend ([L1]).
+                    let loans = Self::derived_loans(&env, arguments, &field.origins);
                     env.insert(
                         bound.clone(),
                         Slot {
@@ -2032,6 +2116,8 @@ impl Generator<'_> {
                             gone: false,
                             turned: false,
                             home: self.scopes.len() - 1,
+                            loans,
+                            lent: None,
                         },
                     );
                 }
@@ -2255,7 +2341,7 @@ impl Generator<'_> {
         // inside by their type alone ([N5]); the others do not change.
         self.apply(running, &ctx);
         let mut inner = if self.data {
-            self.running_env(running)
+            self.merged_env(running)
         } else {
             env.clone()
         };
@@ -2273,6 +2359,37 @@ impl Generator<'_> {
                 } else {
                     slot.mutable = false;
                 }
+            }
+        }
+        if self.borrows {
+            // A borrow name of the bodies around that the body does not
+            // write through is lent shared in it. One that it does write
+            // through, and what its loans are on, are known by their types
+            // alone inside the body and after the loop ([N5], [K8]).
+            let mut behind = Vec::new();
+            for (outer, slot) in inner.iter_mut() {
+                if slot.gone || !matches!(slot.ty, Type::Ref(BorrowMode::Exclusive, _)) {
+                    continue;
+                }
+                if self.rng.chance(1, 2) {
+                    slot.know = self.types.top(&slot.ty);
+                    assignable.insert(outer.clone());
+                    behind.extend(
+                        slot.loans
+                            .iter()
+                            .filter(|loan| loan.mode == BorrowMode::Exclusive)
+                            .map(|loan| loan.root.clone()),
+                    );
+                } else {
+                    slot.lent = Some(BorrowMode::Shared);
+                }
+            }
+            for root in behind {
+                if let Some(slot) = inner.get_mut(&root) {
+                    slot.know = self.types.top(&slot.ty);
+                    slot.definition = None;
+                }
+                assignable.insert(root);
             }
         }
         let home = self.scopes.len();
@@ -2295,6 +2412,8 @@ impl Generator<'_> {
                     gone: false,
                     turned: false,
                     home,
+                    loans: Vec::new(),
+                    lent: None,
                 },
             );
         }
@@ -2429,6 +2548,8 @@ impl Generator<'_> {
                             gone: false,
                             turned: false,
                             home: self.scopes.len() - 1,
+                            loans: Vec::new(),
+                            lent: None,
                         },
                     );
                 }
@@ -2621,44 +2742,66 @@ impl Generator<'_> {
             .collect();
         let (which, ctx, values) = self.payload(running, &payloads);
         let (alternative, types) = info.planned[which].clone();
+        // An operand is bound to a name before the statement where the
+        // payload cannot say its type: the type of a payload of data is that
+        // of its operand too, and a literal of a collection does not say it;
+        // [W9]: a payload field of a loop has the type of its operand, and
+        // literals alone are `u32` ([C1]). A name says the type, and a
+        // borrow name alone would make the field a borrow.
+        let (exprs, knows): (Vec<Expr>, Vec<Know>) = values.into_iter().unzip();
+        let mut bound: Vec<bool> = types
+            .iter()
+            .zip(&exprs)
+            .map(|(ty, expr)| {
+                let literal = !ty.is_scalar() && !matches!(expr, Expr::Name(_) | Expr::Move(_));
+                let borrowed = matches!(
+                    expr,
+                    Expr::Name(held) if env.get(held).is_some_and(|slot| matches!(slot.ty, Type::Ref(_, _)))
+                );
+                literal
+                    || borrowed
+                    || matches!(ty, Type::Int(int_ty) if *int_ty != IntType::U32)
+                        && self.lib().anchor(expr, &env).is_none()
+            })
+            .collect();
+        // A bound operand is evaluated before the operands that stay in the
+        // payload: where it moves a name that one before it mentions, that
+        // one is bound before it, in their order ([O0]).
+        for late in (0..exprs.len()).rev() {
+            if !bound[late] {
+                continue;
+            }
+            let mut mentions = BTreeSet::new();
+            data::mentioned(&exprs[late], &mut mentions);
+            mentions.retain(|held| ctx.moved.contains(held));
+            if mentions.is_empty() {
+                continue;
+            }
+            for early in 0..late {
+                let mut theirs = BTreeSet::new();
+                data::mentioned(&exprs[early], &mut theirs);
+                if !bound[early] && !theirs.is_disjoint(&mentions) {
+                    bound[early] = true;
+                }
+            }
+        }
         let mut payload = Vec::new();
-        let mut knows = Vec::new();
-        for (ty, (mut expr, know)) in types.iter().zip(values) {
-            // The type of a payload of data is that of its operand too, and
-            // a literal of a collection does not say it.
-            if !ty.is_scalar() && !matches!(expr, Expr::Name(_) | Expr::Move(_)) {
-                let held = self.fresh("v");
-                self.push(
-                    selector,
-                    Command::Bind {
-                        mutable: false,
-                        name: held.clone(),
-                        ty: Some(ty.clone()),
-                        value: expr,
-                    },
-                );
-                expr = name(&held);
+        for ((ty, expr), bind) in types.iter().zip(exprs).zip(bound) {
+            if !bind {
+                payload.push(expr);
+                continue;
             }
-            // [W9]: a payload field of a loop has the type of its operand,
-            // and literals alone are `u32` ([C1]). A name says the type.
-            if let Type::Int(int_ty) = ty
-                && *int_ty != IntType::U32
-                && self.lib().anchor(&expr, &env).is_none()
-            {
-                let held = self.fresh("v");
-                self.push(
-                    selector,
-                    Command::Bind {
-                        mutable: false,
-                        name: held.clone(),
-                        ty: Some(ty.clone()),
-                        value: expr,
-                    },
-                );
-                expr = name(&held);
-            }
-            payload.push(expr);
-            knows.push(know);
+            let held = self.fresh("v");
+            self.push(
+                selector,
+                Command::Bind {
+                    mutable: false,
+                    name: held.clone(),
+                    ty: Some(ty.clone()),
+                    value: expr,
+                },
+            );
+            payload.push(name(&held));
         }
         let assigned = info
             .assignable
@@ -2828,6 +2971,8 @@ impl Generator<'_> {
                     gone: false,
                     turned: false,
                     home: 0,
+                    loans: Vec::new(),
+                    lent: None,
                 },
             );
         }
@@ -2921,7 +3066,14 @@ impl Generator<'_> {
                 fields: alternative
                     .fields
                     .iter()
-                    .map(|field| parameter(&field.name, &field.ty))
+                    .map(|field| Parameter {
+                        origins: field
+                            .origins
+                            .iter()
+                            .map(|&position| sig.params[position].0.clone())
+                            .collect(),
+                        ..parameter(&field.name, &field.ty)
+                    })
                     .collect(),
                 condition: self.condition(&sig.params, alternative),
             })
@@ -2948,9 +3100,12 @@ impl Generator<'_> {
 
     fn external(&mut self, index: usize) -> Control {
         let count = self.rng.index(4);
-        let (mut params, pre) = self.parameters_and_precondition("p", count, 1, true);
+        let (mut params, mut pre) = self.parameters_and_precondition("p", count, 1, true);
         if self.data {
             self.lend_parameters(&mut params);
+        }
+        if self.borrows {
+            self.lend_a_collection(&mut params, &mut pre);
         }
         let names = {
             let count = 1 + self.rng.index(3);
@@ -3002,6 +3157,7 @@ impl Generator<'_> {
                     ty,
                     lo,
                     hi,
+                    origins: Vec::new(),
                 });
             }
             alts.push(AltSig {
@@ -3032,6 +3188,12 @@ impl Generator<'_> {
                     hi: POS,
                 });
             }
+        }
+        if self.borrows {
+            // Where the first two alternatives divide the values of a
+            // parameter, either may be the only one an argument allows.
+            let divided = alts.len() >= 2 && alts[1].params.iter().any(Option::is_some);
+            self.lend_payloads(&params, &mut alts, if divided { 2 } else { 1 });
         }
         let uses = if self.rng.chance(1, 2) {
             vec![(*self.rng.pick(&EFFECTS)).to_string()]
@@ -3085,7 +3247,10 @@ impl Generator<'_> {
         self.faults = faults;
         self.entry = entry;
         let count = self.rng.index(5);
-        let (params, pre) = self.parameters_and_precondition("p", count, 2, true);
+        let (mut params, pre) = self.parameters_and_precondition("p", count, 2, true);
+        if self.borrows {
+            self.lend_parameters(&mut params);
+        }
         let order = self.order(&params, &pre);
         let names = {
             let count = 1 + self.rng.index(3);
@@ -3124,7 +3289,7 @@ impl Generator<'_> {
         self.parameters = params.iter().map(|(n, _)| n.clone()).collect();
         let mut env = Env::new();
         for ((parameter, ty), range) in params.iter().zip(&pre) {
-            let know = match ty {
+            let know = match ty.deref_type() {
                 Type::Int(int_ty) => Know::Int(Val::value(*int_ty, *range)),
                 Type::Vector(_) => Know::Sized(*range),
                 other => self.types.top(other),
@@ -3139,6 +3304,8 @@ impl Generator<'_> {
                     gone: false,
                     turned: false,
                     home: 0,
+                    loans: Vec::new(),
+                    lent: None,
                 },
             );
         }
@@ -3179,6 +3346,7 @@ impl Generator<'_> {
                     ty,
                     lo,
                     hi,
+                    origins: Vec::new(),
                 });
             }
             let mut param_bounds = vec![None; params.len()];
@@ -3277,6 +3445,7 @@ pub fn valid(rng: &mut Rng) -> Program {
         effects: BTreeSet::new(),
         data: false,
         types: Types::default(),
+        borrows: false,
         calls: 0,
         ending: false,
         unit: Unit::Control,
@@ -3306,6 +3475,19 @@ pub fn valid(rng: &mut Rng) -> Program {
 /// their lexical and named boundaries. A run of such a program ends with an
 /// outcome, with a fault that leaves the entry, or with `terminate n`.
 pub fn valid_data(rng: &mut Rng) -> Program {
+    with_data(rng, false)
+}
+
+/// As [`valid_data`], with the borrows of slice 3: borrows of places and
+/// through borrow names, bound to names, copied, moved, written through
+/// and passed to operations, controls with borrowed parameters, and extern
+/// controls whose payloads borrow from their arguments and whose hosts write
+/// behind the arguments lent exclusively.
+pub fn valid_borrows(rng: &mut Rng) -> Program {
+    with_data(rng, true)
+}
+
+fn with_data(rng: &mut Rng, borrows: bool) -> Program {
     let palette = (0..3).map(|_| *rng.pick(&IntType::ALL)).collect();
     let mut generator = Generator {
         rng,
@@ -3322,6 +3504,7 @@ pub fn valid_data(rng: &mut Rng) -> Program {
         effects: BTreeSet::new(),
         data: true,
         types: Types::default(),
+        borrows,
         calls: 0,
         ending: false,
         unit: Unit::Control,

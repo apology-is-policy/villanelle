@@ -6583,8 +6583,12 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                                 .get(&target)
                                 .cloned()
                                 .unwrap_or_default();
+                            // A name that the restarted loop body binds,
+                            // in any body within it, is bound anew by the
+                            // next iteration: what holds a borrow there
+                            // does not outlive this one ([L2a], RC30).
                             for v in feas {
-                                if self.bc.body.vars[v].body != target
+                                if !self.bc.var_in_body_tree(v, target)
                                     && !self.bc.var_in_body_tree(v, *b2)
                                 {
                                     or_guard_map(&mut b2_after, v, rec_g, &mut self.bc.solver.bdd);

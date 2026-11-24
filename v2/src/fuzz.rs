@@ -25,10 +25,10 @@ use crate::codegen::{NativeRunSpec, run_native_batch, run_native_counted};
 use crate::counts::{self, Counts};
 use crate::differential::{Verdict, compare};
 use crate::erased;
-use crate::generate::{Coverage, entry_runs, valid, valid_data};
+use crate::generate::{Coverage, entry_runs, valid, valid_borrows, valid_data};
 use crate::host::{Arithmetic, Seeded};
 use crate::mutate::{Kind, mutate};
-use crate::oracle::{self, Config, End};
+use crate::oracle::{self, Config, End, HOST_SCOPE, RuntimeStep, Value};
 use crate::rng::{Rng, mix};
 use crate::{resolve, text};
 use std::collections::{BTreeMap, BTreeSet};
@@ -124,6 +124,10 @@ pub struct Report {
     /// The slice whose constructs the campaign is to reach.
     pub slice: u8,
     pub rules: BTreeSet<&'static str>,
+    /// The places that hosts lent in the runs, by the last step to them:
+    /// a whole argument, a field, the field of a variant, an element, the
+    /// value or the key of a map.
+    pub host_places: BTreeMap<&'static str, u64>,
     /// The work of the search in every check that gave an answer in time.
     pub search: Counts,
     pub findings: Vec<Finding>,
@@ -249,7 +253,9 @@ pub fn program_of(seed: u64) -> crate::syntax::Program {
 
 /// The program of `seed` with the constructs of `slice`.
 pub fn program_in(seed: u64, slice: u8) -> crate::syntax::Program {
-    if slice >= 2 {
+    if slice >= 3 {
+        valid_borrows(&mut Rng::new(mix(&[seed, 0x626f72726f77])))
+    } else if slice >= 2 {
         valid_data(&mut Rng::new(mix(&[seed, 0x64617461])))
     } else {
         valid(&mut Rng::new(mix(&[seed, 0x76616c6964])))
@@ -306,12 +312,18 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
             .enumerate()
         {
             for host_seed in 0..options.hosts {
-                let mut host = Arithmetic(Seeded::new(
+                let mut host = Arithmetic(host_of(
                     &program,
                     mix(&[seed, index as u64, host_seed, u64::from(bits)]),
+                    options.slice,
                 ));
                 let outcome = compare(&program, &entry, arguments.clone(), &mut host, &config);
                 report.runs += 1;
+                for (_, answer) in &outcome.answers {
+                    for value in &answer.payload {
+                        note_places(value, &mut report.host_places);
+                    }
+                }
                 report.rules.extend(outcome.oracle.rules.keys().copied());
                 let run = format!(
                     "`{entry}({})`, usize of {bits} bits, host {host_seed}",
@@ -501,9 +513,10 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
                     .enumerate()
             {
                 for host_seed in 0..options.hosts {
-                    let mut host = Arithmetic(Seeded::new(
+                    let mut host = Arithmetic(host_of(
                         &typed,
                         mix(&[seed, index as u64, host_seed, u64::from(bits)]),
+                        options.slice,
                     ));
                     let run = oracle::run(&typed, &entry, arguments.clone(), &mut host, &config);
                     if let End::Stuck(state) = &run.end {
@@ -555,6 +568,40 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
                 &source,
             ),
         }
+    }
+}
+
+/// The host of the runs of a program of `slice`. From slice 3 on it writes
+/// behind the arguments lent exclusively too.
+fn host_of(program: &crate::typed::Program, seed: u64, slice: u8) -> Seeded<'_> {
+    if slice >= 3 {
+        Seeded::writing(program, seed)
+    } else {
+        Seeded::new(program, seed)
+    }
+}
+
+/// Counts the places that a host lent in `value`, a payload value, by the
+/// last step to each.
+fn note_places(value: &Value, out: &mut BTreeMap<&'static str, u64>) {
+    match value {
+        Value::Ref { place, .. } if place.scope == HOST_SCOPE => {
+            let step = match place.steps.last() {
+                None => "whole arguments",
+                Some(RuntimeStep::Field(_)) => "fields",
+                Some(RuntimeStep::VariantField(_, _)) => "fields of variants",
+                Some(RuntimeStep::Index(_)) => "elements",
+                Some(RuntimeStep::MapValue(_)) => "values of maps",
+                Some(RuntimeStep::MapKey(_)) => "keys of maps",
+            };
+            *out.entry(step).or_insert(0) += 1;
+        }
+        Value::Struct { fields, .. } => {
+            for field in fields {
+                note_places(field, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -623,9 +670,20 @@ impl Report {
                 ));
             }
         }
+        if !self.host_places.is_empty() {
+            let places: Vec<String> = self
+                .host_places
+                .iter()
+                .map(|(step, count)| format!("{count} {step}"))
+                .collect();
+            out.push_str(&format!("the hosts lent: {}\n", places.join(", ")));
+        }
         let mut missing = self.coverage.missing();
         if self.slice >= 2 {
             missing.extend(self.coverage.missing_data());
+        }
+        if self.slice >= 3 {
+            missing.extend(self.coverage.missing_borrows());
         }
         out.push_str(&format!(
             "constructs not reached: {}\n",

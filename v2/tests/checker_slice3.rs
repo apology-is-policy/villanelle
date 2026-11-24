@@ -1782,3 +1782,72 @@ control len_in_a_loop_payload()
 fn a_borrow_in_the_operand_of_len_is_not_used_after_it_l2() {
     done_and_accepted("L2", RC29_DONE);
 }
+
+/// Review finding RC30: at `recover ↑ ℓ` the checker took a name bound in a
+/// body within the restarted loop, a boundary around the one that recovers,
+/// as live after the restart, so a borrow that the payload of a decision
+/// there holds was in use when the scope of what it borrows ended, and the
+/// program was refused by [L3] although every run ends. The next iteration
+/// binds such a name anew ([L2a]), as the head of the loop already said. A
+/// borrow that goes on into the next iteration through a parameter of the
+/// loop does outlive the scope of what it borrows, and is refused.
+const RC30_DONE: &str = r#"
+extern control e0(p0 : &[u32])
+    ■ { high {r1 : &u32 ∈ p0} }
+
+control nested() ■ { stop {} }
+    ⊤ ▷ s3 : ↻ l4(~i5 : u16 := 0) {
+        ⊤ ▷ t7 : ? i5 < 3
+        t7.true ▷ i5 ← i5 + 1
+        t7.true ▷ b28 : boundary {
+            ⊤ ▷ h1 : [u32] := [1, 2]
+            ⊤ ▷ d9 : Δ e0(&h1) ▸ high {v15}
+            ⊤ ▷ b21 : boundary {
+                ⊤ ▷ v16 : u32 := v15
+                ⊤ ▷ fault "bad input"
+            } contingency (m22 : string) {
+                ⊤ ▷ recover ↑ l4
+            }
+            b21.done ▷ ⊥
+            ⊤ ▷ □ stop {}
+        } contingency (m29 : string) {
+            ⊤ ▷ ⊥
+        }
+        t7.true ∧ b28.done ▷ ⊥
+        t7.false ▷ □ stop {}
+} ▸ stop {}
+    ⊤ ▷ ■ stop {}
+
+//! run nested() with [e0 -> high {&p0[1]}; e0 -> high {&p0[1]}; e0 -> high {&p0[1]}] => done stop {}
+"#;
+
+const RC30_STUCK: &str = r#"
+extern control e0(p0 : &[u32])
+    ■ { high {r1 : &u32 ∈ p0} }
+
+control carried() ■ { stop {v : u32} }
+    ⊤ ▷ g : u32 := 7
+    ⊤ ▷ s3 : ↻ l4(i5 : u16 := 0, x : &u32 := &g) {
+        ⊢ i5 ≤ 3
+        ⊤ ▷ y : u32 := x
+        ⊤ ▷ t7 : ? i5 < 3
+        t7.false ▷ □ stop {y}
+        t7.true ▷ b28 : boundary {
+            ⊤ ▷ h1 : [u32] := [1, 2]
+            ⊤ ▷ d9 : Δ e0(&h1) ▸ high {v15}
+            ⊤ ▷ ↑ l4(i5 + 1, v15)
+        } contingency (m29 : string) {
+            ⊤ ▷ ⊥
+        }
+        t7.true ▷ ⊥
+} ▸ stop {w}
+    ⊤ ▷ ■ stop {w}
+
+//! run carried() with [e0 -> high {&p0[1]}] => stuck X4 B1
+"#;
+
+#[test]
+fn a_name_bound_within_the_restarted_loop_is_not_live_after_recover_l2a() {
+    done_and_accepted("L2a", RC30_DONE);
+    stuck_and_rejected("L3", RC30_STUCK);
+}
