@@ -31,7 +31,8 @@ control looks(settings : &string ⇀ u32, key : &string)
     1  ⊤ ▷ own : string := "b"
     2  ⊤ ▷ g1 : Δ get(settings, key) ▸ found {a} │ missing {}
     3  ⊤ ▷ g2 : Δ get(settings, &own) ▸ found {b} │ missing {}
-    4  ⊤ ▷ g3 : Δ get(&settings, "c") ▸ found {c} │ missing {}
+       ⊤ ▷ h1 : string := "c"
+    4  ⊤ ▷ g3 : Δ get(&settings, &h1) ▸ found {c} │ missing {}
     5  g1.found ∧ g2.found ∧ g3.missing ▷ ■ ok {a + b}
     6  ⊤ ▷ ■ ok {0}
 

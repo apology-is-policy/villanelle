@@ -29,7 +29,8 @@ extern control e1(p0 : &rs1, p1 : u16) ■ { miss {r0 : bool, r1 : rs0} │ none
 extern control e2(p0 : i8, p1 : &string) ■ { low {r0 : st0, r1 : vt1} │ more {r0 : string} │ high {r0 : bool, r1 : st0} } uses log
 
 pub control c0(p0 : usize) ⊢ 6 ≥ p0 ■ { low {} } faults uses log
-⊤ ▷ ~v1 : outcome⟨e2⟩ := capture e2(3, "key")
+⊤ ▷ h3 : string := "key"
+⊤ ▷ ~v1 : outcome⟨e2⟩ := capture e2(3, &h3)
 ⊤ ▷ t2 : ? p0 + 8 - 6 mod 4 < p0 mod 8 * (8 mod 4) * 4
 t2.true ▷ ⊥
 ⊤ ▷ v3 : string ⇀ u16 := ∅
@@ -50,9 +51,11 @@ control c1(p0 : usize, p1 : st0) ■ { some {r0 : i8, r1 : [bool]} │ done {r0 
 ⊤ ▷ s5 : ↻ l6(~i7 : usize := 0, ~x8 : st0 := v1) {
     ⊤ ▷ t9 : ? i7 ≥ 1
     t9.false ∨ ¬t9.true ▷ ~v10 : string ⇀ i32 := ∅
-    ¬t9.true ▷ d11 : Δ e2(9, "ok") ▸ low {v12, v13} │ more {v14} │ high {v15, v16}
+    ¬t9.true ▷ h4 : string := "ok"
+    ¬t9.true ▷ d11 : Δ e2(9, &h4) ▸ low {v12, v13} │ more {v14} │ high {v15, v16}
     t9.true ▷ v17 := x8
-    t9.true ▷ d18 : Δ emit("") ▸ done {}
+    t9.true ▷ h1 : string := ""
+    t9.true ▷ d18 : Δ emit(&h1) ▸ done {}
     d11.low ▷ s19 : ↻ l20(i21 : i16 := 3, ~x22 : st0 := ▾x8) {
         ⊤ ▷ t23 : ? 0 < i21
         d11.low ▷ t24 : ? v4 < v4 + v4 mod 1
@@ -112,7 +115,8 @@ control c2() ■ { hit {} } uses console.write
     }
     t6.false ∧ b13.done ▷ ⊥
     t6.true ▷ supervise w0([x5 mod 2 * (1 mod 4)], 1 ≠ 4294967295)
-    t6.true ▷ d15 : Δ emit("a") ▸ done {}
+    t6.true ▷ h2 : string := "a"
+    t6.true ▷ d15 : Δ emit(&h2) ▸ done {}
     ⊤ ▷ t16 : ? v1 - x5 mod 7 + v1 < v1 ÷ 9 mod 3 * ((0 + 4294967295) mod 9)
     t16.true ▷ ⊥
     ⊤ ▷ ↑ l3(i4 + 1, v1)

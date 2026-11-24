@@ -1,0 +1,95 @@
+// [B3] Making a shared borrow of a place through a tag is a read access
+// followed by a fresh tag of mode `shr`; making an exclusive borrow is a
+// write access followed by a fresh tag of mode `exc`. The new tag's parent
+// is the tag it was made through: the owner tag for `&x`, the tag of `r`
+// for a borrow made through `r` ([E-Borrow]).
+
+copy struct pair {x : u32, y : u32}
+
+// Shared borrows of one place are made side by side, through the owner and
+// through another shared borrow.
+control shared_side_by_side(n : u32)
+    ⊢ n < 1000
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := n
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ t : &u32 := &s
+    ⊤ ▷ u : &u32 := &x
+    ⊤ ▷ ■ ok {s + t + u}
+
+// X4: making a shared borrow is a read: it kills an exclusive borrow of
+// the place.
+control shared_kills_exclusive()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ r ← 2
+    ⊤ ▷ ■ ok {s}
+
+// X4: making an exclusive borrow is a write: it kills a shared borrow of
+// the place.
+control exclusive_kills_shared()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ ■ ok {s}
+
+// X4: and another exclusive borrow of it.
+control exclusive_kills_exclusive()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ q : &~u32 := &~x
+    ⊤ ▷ r ← 2
+    ⊤ ▷ ■ ok {q}
+
+// A shared borrow made through an exclusive one is its child: reading
+// through either leaves the other alive, and so does a read through the
+// exclusive one.
+control shared_through_exclusive()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ s : &u32 := &r
+    ⊤ ▷ y : u32 := r
+    ⊤ ▷ ■ ok {s + y}
+
+// X4: a write through the exclusive parent kills the shared child.
+control write_kills_shared_child()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ s : &u32 := &r
+    ⊤ ▷ r ← 5
+    ⊤ ▷ ■ ok {s}
+
+// A borrow of a component is made through the borrow of the whole.
+control component_through_borrow()
+    ■ { ok {p : pair} }
+    ⊤ ▷ ~p : pair := pair {1, 2}
+    ⊤ ▷ r : &~pair := &~p
+    ⊤ ▷ ry : &~u32 := &~r.y
+    ⊤ ▷ ry ← 20
+    ⊤ ▷ r.x ← 10
+    ⊤ ▷ ■ ok {p}
+
+// X4: a write through the borrow of the whole kills the borrow of its
+// component made through it.
+control whole_kills_component_child()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~p : pair := pair {1, 2}
+    ⊤ ▷ r : &~pair := &~p
+    ⊤ ▷ ry : &~u32 := &~r.y
+    ⊤ ▷ r ← pair {3, 4}
+    ⊤ ▷ ■ ok {ry}
+
+//! run shared_side_by_side(3) => done ok {9}
+//! run shared_kills_exclusive() => stuck X4 B1
+//! run exclusive_kills_shared() => stuck X4 B1
+//! run exclusive_kills_exclusive() => stuck X4 B1
+//! run shared_through_exclusive() => done ok {2}
+//! run write_kills_shared_child() => stuck X4 B1
+//! run component_through_borrow() => done ok {pair {10, 20}}
+//! run whole_kills_component_child() => stuck X4 B1

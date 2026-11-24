@@ -1,0 +1,80 @@
+// Views ([W6], [T1], [L5]): a view struct has fields of borrow types, view
+// types and types of kind `copy`. A view of shared borrows has kind `copy`
+// and is copied; a view that holds an exclusive borrow has kind `drop` and
+// moves. A field of borrow type stands for the borrow or for what it refers
+// to, as a name of borrow type does ([W8]). A view constructor evaluates
+// the fields that do not lend first ([E-Operands]).
+
+view struct window {items : &[u32], start : usize}
+
+view struct cursor {items : &~[u32], at : usize}
+
+function at_start(w : window) ⊢ w.start < len(w.items) : u32 := w.items[w.start]
+
+// A view of shared borrows is copied; both copies read.
+control copies_a_view()
+    ■ { ok {v : u32} }
+    ⊤ ▷ xs : [u32] := [4, 5]
+    ⊤ ▷ w : window := window {&xs, 1}
+    ⊤ ▷ w2 : window := w
+    ⊤ ▷ ■ ok {at_start(w) + at_start(w2)}
+
+// A view with an exclusive borrow moves, and the new name writes through it.
+control moves_a_view()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~xs : [u32] := [4, 5]
+    ⊤ ▷ c : cursor := cursor {&~xs, 1}
+    ⊤ ▷ c2 : cursor := c
+    ⊤ ▷ c2.items[c2.at] ← 9
+    ⊤ ▷ ■ ok {xs[1]}
+
+// X2: the old name of a moved view is moved.
+control old_view_is_moved()
+    ■ { ok {v : usize} }
+    ⊤ ▷ ~xs : [u32] := [4, 5]
+    ⊤ ▷ c : cursor := cursor {&~xs, 1}
+    ⊤ ▷ c2 : cursor := c
+    ⊤ ▷ ■ ok {c.at}
+
+// The constructor reads the length before it lends the vector.
+control reads_before_lending()
+    ■ { ok {v : [u32]} }
+    ⊤ ▷ ~xs : [u32] := [4, 5, 6]
+    ⊤ ▷ c : cursor := cursor {&~xs, len(xs) - 1}
+    ⊤ ▷ c.items[c.at] ← 0
+    ⊤ ▷ ■ ok {xs}
+
+// X4: a field read through a borrow that an assignment ended.
+control field_through_dead()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~xs : [u32] := [4, 5]
+    ⊤ ▷ w : window := window {&xs, 1}
+    ⊤ ▷ xs[0] ← 1
+    ⊤ ▷ ■ ok {w.items[1]}
+
+// A field of kind `copy` is a value of the view, read whatever became of
+// its borrows.
+control copy_field_beside_dead()
+    ■ { ok {v : usize} }
+    ⊤ ▷ ~xs : [u32] := [4, 5]
+    ⊤ ▷ w : window := window {&xs, 1}
+    ⊤ ▷ xs ← [1]
+    ⊤ ▷ ■ ok {w.start}
+
+// A view that holds a view is a holder of its borrows.
+view struct pair_of_windows {left : window, right : window}
+
+control nested_views()
+    ■ { ok {v : u32} }
+    ⊤ ▷ xs : [u32] := [4, 5]
+    ⊤ ▷ w : window := window {&xs, 0}
+    ⊤ ▷ p : pair_of_windows := pair_of_windows {w, window {&xs, 1}}
+    ⊤ ▷ ■ ok {at_start(p.left) + at_start(p.right)}
+
+//! run copies_a_view() => done ok {10}
+//! run moves_a_view() => done ok {9}
+//! run old_view_is_moved() => stuck X2 E-Var
+//! run reads_before_lending() => done ok {[4, 5, 0]}
+//! run field_through_dead() => stuck X4 B1
+//! run copy_field_beside_dead() => done ok {1}
+//! run nested_views() => done ok {9}

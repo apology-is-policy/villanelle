@@ -1,0 +1,8 @@
+// [C1] The key of `get` is an `&k` parameter: a literal is no operand there.
+
+control looks_up(m : &string ⇀ u32)
+    ■ { ok {} }
+    ⊤ ▷ g : Δ get(m, "a") ▸ found {v} │ missing {}
+    ⊤ ▷ ■ ok {}
+
+//! reject C1

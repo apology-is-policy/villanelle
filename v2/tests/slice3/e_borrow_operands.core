@@ -1,0 +1,145 @@
+// [E-Borrow] `&p` and `&~p` resolve `p` to a place and make a borrow of it
+// by [B3]: the place is looked up as [E-Var] and [E-Index] say. [E-Operands]
+// evaluates the operands of a statement that do not lend first, left to
+// right, and those that lend afterwards, left to right. [E-Fn] reads a place
+// given for a borrow parameter of a function where it is ([W5a]): a read
+// access, and no borrow is made. [W8] A name of borrow type stands for the
+// borrow where a borrow is expected and for what it refers to elsewhere;
+// `r ← e` writes through `r`.
+
+variant entry {value {text : string, n : u32} │ empty {}}
+
+function first(xs : &[u32]) ⊢ len(xs) > 0 : u32 := xs[0]
+
+control add_to(a : &~u32, n : u32)
+    ■ { ok {} }
+    ⊤ ▷ a ← a + n
+    ⊤ ▷ ■ ok {}
+
+control add_from(a : &~u32, b : &u32)
+    ■ { ok {} }
+    ⊤ ▷ a ← a + b
+    ⊤ ▷ ■ ok {}
+
+// A borrow of an element is a borrow of a place that is looked at: an
+// index out of range is stuck.
+control borrows_an_element(i : usize)
+    ■ { ok {v : u32} }
+    ⊤ ▷ xs : [u32] := [4, 5]
+    ⊤ ▷ r : &u32 := &xs[i]
+    ⊤ ▷ ■ ok {r}
+
+// X2: a borrow of a moved name.
+control borrows_a_moved_name()
+    ■ { ok {n : usize} }
+    ⊤ ▷ s : string := "a"
+    ⊤ ▷ t : string := s
+    ⊤ ▷ r : &string := &s
+    ⊤ ▷ ■ ok {len(t)}
+
+// The operand that reads `x` is evaluated before `&~x` lends it.
+control reads_before_lending(n : u32)
+    ⊢ n < 1000
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := n
+    ⊤ ▷ d : Δ add_to(&~x, x) ▸ ok {}
+    ⊤ ▷ ■ ok {x}
+
+// X4: two operands that lend one place, in their order: `&x` is a read
+// that ends `&~x`, and the callee writes through the dead borrow.
+control lends_twice()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ d : Δ add_from(&~x, &x) ▸ ok {}
+    ⊤ ▷ ■ ok {x}
+
+// Two places that do not overlap are lent together.
+control lends_two_places()
+    ■ { ok {v : [u32]} }
+    ⊤ ▷ ~xs : [u32] := [1, 2]
+    ⊤ ▷ d : Δ add_from(&~xs[0], &xs[1]) ▸ ok {}
+    ⊤ ▷ ■ ok {xs}
+
+// [E-Fn]: a function reads the place where it is, through the owner or
+// through a borrow name.
+control reads_in_place()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~xs : [u32] := [3, 4]
+    ⊤ ▷ s : &[u32] := &xs
+    ⊤ ▷ r : &~[u32] := &~xs
+    ⊤ ▷ a : u32 := first(r)
+    ⊤ ▷ r[0] ← a + 1
+    ⊤ ▷ ■ ok {first(xs)}
+
+// X4: the read of a function argument is an access: it ends an exclusive
+// borrow of the place.
+control function_read_ends_exclusive()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~xs : [u32] := [3, 4]
+    ⊤ ▷ r : &~[u32] := &~xs
+    ⊤ ▷ a : u32 := first(xs)
+    ⊤ ▷ r[0] ← a
+    ⊤ ▷ ■ ok {a}
+
+// [W8]: a name of borrow type in a bind without a written type, and in one
+// whose written type is not a borrow, gives the value it refers to; one
+// with a written borrow type copies the borrow.
+control names_of_borrows()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 2
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ a := s
+    ⊤ ▷ b : u32 := s
+    ⊤ ▷ t : &u32 := s
+    ⊤ ▷ ■ ok {a + b + t}
+
+// [W8]: `r ← e` writes what `r` refers to; `r` borrows the same place on.
+control writes_through()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 2
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ r ← r * 3
+    ⊤ ▷ r ← r + 1
+    ⊤ ▷ ■ ok {x}
+
+// [E-Outcome]: a decision on a variant through an exclusive borrow gives
+// borrows of its fields, through which the fields are written.
+control writes_fields()
+    ■ { ok {e : entry} }
+    ⊤ ▷ ~e : entry := entry.value {"a", 1}
+    ⊤ ▷ d : Δ entry(&~e) ▸ value {t, n} │ empty {}
+    d.value ▷ n ← n + 1
+    d.value ▷ t ← "b"
+    ⊤ ▷ ■ ok {e}
+
+// X4: the borrows of the fields are reborrows through the argument: a read
+// of the owner ends them.
+control read_ends_fields()
+    ■ { ok {e : entry} }
+    ⊤ ▷ ~e : entry := entry.value {"a", 1}
+    ⊤ ▷ d : Δ entry(&~e) ▸ value {t, n} │ empty {}
+    ⊤ ▷ c : entry := clone(e)
+    d.value ▷ n ← 5
+    ⊤ ▷ ■ ok {c}
+
+// [E-Outcome]: through a borrow name that refers to a variant.
+control decides_through_a_name(e : &entry)
+    ■ { ok {n : u32} }
+    ⊤ ▷ d : Δ entry(e) ▸ value {t, n} │ empty {}
+    d.value ▷ ■ ok {n + 1}
+    d.empty ▷ ■ ok {0}
+
+//! run borrows_an_element(1) => done ok {5}
+//! run borrows_an_element(2) => stuck X7 E-Index
+//! run borrows_a_moved_name() => stuck X2 E-Var
+//! run reads_before_lending(5) => done ok {10}
+//! run lends_twice() => stuck X4 B1
+//! run lends_two_places() => done ok {[3, 2]}
+//! run reads_in_place() => done ok {4}
+//! run function_read_ends_exclusive() => stuck X4 B1
+//! run names_of_borrows() => done ok {6}
+//! run writes_through() => done ok {7}
+//! run writes_fields() => done ok {entry.value {"b", 2}}
+//! run read_ends_fields() => stuck X4 B1
+//! run decides_through_a_name(entry.value {"k", 4}) => done ok {5}
+//! run decides_through_a_name(entry.empty {}) => done ok {0}

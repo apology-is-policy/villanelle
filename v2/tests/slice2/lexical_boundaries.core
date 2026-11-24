@@ -45,7 +45,8 @@ control falls_off(n : u32)
     uses console.write
     1  ⊤ ▷ b : boundary {
            1  ⊤ ▷ inside : u32 := n
-           2  ⊤ ▷ e : Δ emit("work") ▸ done {}
+              ⊤ ▷ h1 : string := "work"
+           2  ⊤ ▷ e : Δ emit(&h1) ▸ done {}
        } contingency (m : string) {
            1  ⊤ ▷ ⊥
        }

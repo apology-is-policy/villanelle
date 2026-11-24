@@ -16,7 +16,8 @@ extern control fetch(id : u32)
 control c()
     ■ { ok {} }
     ⊤ ▷ ~m : string ⇀ u32 := ∅
-    ⊤ ▷ r := capture get(&m, "a")
+    ⊤ ▷ k : string := "a"
+    ⊤ ▷ r := capture get(&m, &k)
     ⊤ ▷ ⊥
 
 //! reject T6

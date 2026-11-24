@@ -9,7 +9,7 @@ use crate::host::Host;
 use crate::int::Int;
 use crate::syntax::escape_string;
 use crate::typed::{
-    Arithmetic, BodyId, BorrowMode, BoundaryId, BuiltinOp, Command, Comparison, Control,
+    self, Arithmetic, BodyId, BorrowMode, BoundaryId, BuiltinOp, Command, Comparison, Control,
     ControlBody, ControlId, Expr, Kind, Operation, OutcomeId, Place, PlaceStep, Program,
     ResourceId, Selector, SiteId, StructId, Type, VarId, VarRef, VariantId,
 };
@@ -522,12 +522,71 @@ enum TagMode {
     Exclusive,
 }
 
+/// What an access is for: the clause of section 6.3 that makes it one. A
+/// tag that an access kills keeps it, so that a run that is stuck by [B1]
+/// says what ended the borrow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Access {
+    /// A place is read ([E-Var], [E-Field], [E-Index]).
+    Read,
+    /// A place is assigned ([E-Assign], [B4]).
+    Assign,
+    /// A value is moved out of its slot ([B4]).
+    Move,
+    /// A shared borrow of the place is made ([B3]): a read.
+    LendShared,
+    /// An exclusive borrow of the place is made ([B3]): a write.
+    LendExclusive,
+    /// The shape of a collection changes ([B5]): a write to all of it.
+    Shape,
+}
+
+impl Access {
+    fn writes(self) -> bool {
+        !matches!(self, Access::Read | Access::LendShared)
+    }
+
+    fn lend(mode: BorrowMode) -> Access {
+        match mode {
+            BorrowMode::Shared => Access::LendShared,
+            BorrowMode::Exclusive => Access::LendExclusive,
+        }
+    }
+}
+
+/// How a tag came to be dead: by an access to a place that overlaps its own
+/// ([B2]), or with the scope of the slot it was made from ([B4]). A
+/// descendant has the death of the tag that took it along.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Death {
+    By(Access),
+    ScopeEnd,
+}
+
+impl Death {
+    fn says(self) -> &'static str {
+        match self {
+            Death::By(Access::Read) => "a read of its place ended it, an exclusive borrow ([B2])",
+            Death::By(Access::LendShared) => {
+                "a shared borrow of its place ended it, an exclusive borrow ([B2], [B3])"
+            }
+            Death::By(Access::Assign) => "an assignment to its place ended it ([B2], [B4])",
+            Death::By(Access::Move) => "a move of what it refers to ended it ([B2], [B4])",
+            Death::By(Access::LendExclusive) => {
+                "an exclusive borrow of its place ended it ([B2], [B3])"
+            }
+            Death::By(Access::Shape) => "a change of shape of its collection ended it ([B2], [B5])",
+            Death::ScopeEnd => "the scope of what it refers to ended ([B4])",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Tag {
     mode: TagMode,
     place: RuntimePlace,
     parent: Option<TagId>,
-    alive: bool,
+    dead: Option<Death>,
 }
 
 /// The borrow tag table (`docs/v2/core.md` section 6.3, `[B1]`–`[B5]`).
@@ -543,7 +602,7 @@ impl TagTable {
                 mode: TagMode::Owner,
                 place: RuntimePlace::root(0, 0),
                 parent: None,
-                alive: false,
+                dead: Some(Death::ScopeEnd),
             }],
         }
     }
@@ -554,13 +613,24 @@ impl TagTable {
             mode: TagMode::Owner,
             place: RuntimePlace::root(scope, var),
             parent: None,
-            alive: true,
+            dead: None,
         });
         id
     }
 
     fn is_alive(&self, id: TagId) -> bool {
-        self.tags.get(id as usize).is_some_and(|t| t.alive)
+        self.tags.get(id as usize).is_some_and(|t| t.dead.is_none())
+    }
+
+    /// [B1]: a borrow is used only while its tag is alive.
+    fn live(&self, id: TagId) -> Result<(), Fail> {
+        match self.tags.get(id as usize) {
+            None => fail(4, "B1", "a borrow has a tag that the table does not"),
+            Some(Tag {
+                dead: Some(death), ..
+            }) => fail(4, "B1", format!("the borrow is dead: {}", death.says())),
+            Some(_) => Ok(()),
+        }
     }
 
     fn ancestors(&self, mut id: TagId) -> Vec<TagId> {
@@ -576,76 +646,77 @@ impl TagTable {
     }
 
     /// Kills `root_id` and every descendant tag derived from it (`[B2]`, `[B4]`).
-    fn kill_with_descendants(&mut self, root_id: TagId) {
+    fn kill_with_descendants(&mut self, root_id: TagId, death: Death) {
         let start = root_id as usize;
         if start == 0 || start >= self.tags.len() {
             return;
         }
-        self.tags[start].alive = false;
+        if self.tags[start].dead.is_none() {
+            self.tags[start].dead = Some(death);
+        }
         // Because every child tag has id > parent id, one forward sweep kills all descendants.
         for i in (start + 1)..self.tags.len() {
-            if self.tags[i].alive
+            if self.tags[i].dead.is_none()
                 && let Some(p) = self.tags[i].parent
-                && !self.tags[p as usize].alive
+                && self.tags[p as usize].dead.is_some()
             {
-                self.tags[i].alive = false;
+                self.tags[i].dead = Some(death);
             }
         }
     }
 
-    /// `[B1]` + `[B2]`: checks `tag_id` for a read or write access to `place`,
-    /// then invalidates conflicting non-ancestor live tags and their descendants.
-    fn access(&mut self, tag_id: TagId, place: &RuntimePlace, is_write: bool) -> Result<(), Fail> {
-        let Some(tag) = self.tags.get(tag_id as usize).cloned() else {
-            return fail(4, "B1", "access through unknown borrow tag");
-        };
-        if !tag.alive {
-            return fail(
-                4,
-                "B1",
-                "borrow tag is no longer alive (use after invalidation or scope end)",
-            );
-        }
+    /// `[B1]` + `[B2]`: checks `tag_id` for an access to `place`, then kills
+    /// the other live tags that the access conflicts with, and their
+    /// descendants. The answer is whether it killed one.
+    fn access(
+        &mut self,
+        tag_id: TagId,
+        place: &RuntimePlace,
+        access: Access,
+    ) -> Result<bool, Fail> {
+        self.live(tag_id)?;
+        let tag = &self.tags[tag_id as usize];
         if !tag.place.contains(place) {
             return fail(
                 4,
                 "B1",
-                "access through a borrow outside its borrowed place",
+                "an access through a borrow lies outside the place it borrows",
             );
         }
-        if is_write && tag.mode == TagMode::Shared {
-            return fail(4, "B1", "write access through a shared borrow");
+        if access.writes() && tag.mode == TagMode::Shared {
+            return fail(4, "B1", "a write goes through a shared borrow");
         }
         let anc = self.ancestors(tag_id);
         let mut to_kill = Vec::new();
         for u in 1..self.tags.len() {
             let u_id = u as TagId;
             let entry = &self.tags[u];
-            if !entry.alive || anc.contains(&u_id) {
+            if entry.dead.is_some() || anc.contains(&u_id) {
                 continue;
             }
             if !entry.place.overlaps(place) {
                 continue;
             }
-            if is_write || entry.mode == TagMode::Exclusive {
+            if access.writes() || entry.mode == TagMode::Exclusive {
                 to_kill.push(u_id);
             }
         }
+        let killed = !to_kill.is_empty();
         for u_id in to_kill {
-            self.kill_with_descendants(u_id);
+            self.kill_with_descendants(u_id, Death::By(access));
         }
-        Ok(())
+        Ok(killed)
     }
 
     /// `[B3]`: creates a child borrow of `place` derived from `parent_tag`.
+    /// With the tag, whether the access that makes it killed a tag.
     fn create_borrow(
         &mut self,
         parent_tag: TagId,
         place: RuntimePlace,
         mode: BorrowMode,
-    ) -> Result<TagId, Fail> {
-        let is_write = mode == BorrowMode::Exclusive;
-        self.access(parent_tag, &place, is_write)?;
+    ) -> Result<(TagId, bool), Fail> {
+        let killed = self.access(parent_tag, &place, Access::lend(mode))?;
         let id = self.tags.len() as TagId;
         self.tags.push(Tag {
             mode: match mode {
@@ -654,9 +725,9 @@ impl TagTable {
             },
             place,
             parent: Some(parent_tag),
-            alive: true,
+            dead: None,
         });
-        Ok(id)
+        Ok((id, killed))
     }
 }
 
@@ -861,22 +932,25 @@ fn read_place_from_state(
     Ok(current)
 }
 
-/// Recursively dereferences `Value::Ref` without touching tags (`[E-Formula]`).
+/// Recursively dereferences `Value::Ref` and changes no tag ([E-Formula]).
+/// A formula reads through a borrow only while its tag is alive ([B1]).
 fn deref_value_formula(
+    tags: &TagTable,
     entry_slots: &[(VarId, Slot, TagId)],
     stack: &[Activation],
     tasks: &[Task],
     value: &Value,
 ) -> Result<Value, Fail> {
     match value {
-        Value::Ref { place, .. } => {
+        Value::Ref { place, tag, .. } => {
+            tags.live(*tag)?;
             let inner = read_place_from_state(entry_slots, stack, tasks, place)?;
-            deref_value_formula(entry_slots, stack, tasks, &inner)
+            deref_value_formula(tags, entry_slots, stack, tasks, &inner)
         }
         Value::Struct { ty, name, fields } => {
             let mut out = Vec::with_capacity(fields.len());
             for f in fields {
-                out.push(deref_value_formula(entry_slots, stack, tasks, f)?);
+                out.push(deref_value_formula(tags, entry_slots, stack, tasks, f)?);
             }
             Ok(Value::Struct {
                 ty: *ty,
@@ -893,7 +967,7 @@ fn deref_value_formula(
         } => {
             let mut out = Vec::with_capacity(fields.len());
             for f in fields {
-                out.push(deref_value_formula(entry_slots, stack, tasks, f)?);
+                out.push(deref_value_formula(tags, entry_slots, stack, tasks, f)?);
             }
             Ok(Value::Variant {
                 ty: *ty,
@@ -909,6 +983,7 @@ fn deref_value_formula(
 
 struct ActivationEnv<'a> {
     body: &'a ControlBody,
+    tags: &'a TagTable,
     entry_slots: &'a [(VarId, Slot, TagId)],
     stack: &'a [Activation],
     tasks: &'a [Task],
@@ -925,9 +1000,13 @@ impl Env for ActivationEnv<'_> {
         for scope in activation.scopes.iter().rev() {
             if let Some((_, slot, _)) = scope.slots.iter().find(|(slot, _, _)| *slot == id) {
                 return match slot {
-                    Slot::Available(value) => {
-                        deref_value_formula(self.entry_slots, self.stack, self.tasks, value)
-                    }
+                    Slot::Available(value) => deref_value_formula(
+                        self.tags,
+                        self.entry_slots,
+                        self.stack,
+                        self.tasks,
+                        value,
+                    ),
                     Slot::Moved => fail(
                         2,
                         "E-Var",
@@ -1589,14 +1668,18 @@ impl<'a> Machine<'a> {
         id
     }
 
+    /// [B1], and [B2] where the access ends another borrow.
     fn access_tag(
         &mut self,
         tag_id: TagId,
         place: &RuntimePlace,
-        is_write: bool,
+        access: Access,
     ) -> Result<(), Fail> {
-        self.tags.access(tag_id, place, is_write)?;
+        let killed = self.tags.access(tag_id, place, access)?;
         self.count("B1");
+        if killed {
+            self.count("B2");
+        }
         Ok(())
     }
 
@@ -1606,8 +1689,11 @@ impl<'a> Machine<'a> {
         place: RuntimePlace,
         mode: BorrowMode,
     ) -> Result<TagId, Fail> {
-        let tag = self.tags.create_borrow(parent_tag, place, mode)?;
+        let (tag, killed) = self.tags.create_borrow(parent_tag, place, mode)?;
         self.count("B3");
+        if killed {
+            self.count("B2");
+        }
         Ok(tag)
     }
 
@@ -1646,10 +1732,8 @@ impl<'a> Machine<'a> {
                     ));
                 }
                 let made = self
-                    .tags
-                    .create_borrow(parent, lent.clone(), *mode)
+                    .create_borrow_tag(parent, lent.clone(), *mode)
                     .map_err(|failure| failure.detail)?;
-                self.count("B3");
                 *place = lent;
                 *tag = made;
                 Ok(())
@@ -1665,8 +1749,35 @@ impl<'a> Machine<'a> {
         }
     }
 
+    /// The values of the arguments at entry, which the instrumented
+    /// semantics keeps for the precondition and the conditions of the
+    /// contract ([E-Formula], [E-Call]). A borrow is read through for it and
+    /// no tag changes; a dead one is stuck by [B1]. A parameter that no
+    /// formula of the signature mentions is not read: passing a borrow on
+    /// is no access (section 6.3).
+    fn entry_values(&self, callee: ControlId, arguments: &[Value]) -> Result<Vec<Value>, Fail> {
+        let mut out = Vec::with_capacity(arguments.len());
+        for (index, argument) in arguments.iter().enumerate() {
+            match self.deref_formula(argument) {
+                Ok(value) => out.push(value),
+                Err(stuck) if self.program.controls[callee].signature_reads(index) => {
+                    return Err(stuck);
+                }
+                // No formula reads it. The place holder is of no type.
+                Err(_) => out.push(Value::Vector(Vec::new())),
+            }
+        }
+        Ok(out)
+    }
+
     fn deref_formula(&self, value: &Value) -> Result<Value, Fail> {
-        deref_value_formula(&self.entry_slots, &self.stack, &self.tasks, value)
+        deref_value_formula(
+            &self.tags,
+            &self.entry_slots,
+            &self.stack,
+            &self.tasks,
+            value,
+        )
     }
 
     /// Recursively materializes any `Value::Ref` by performing a `[B1]` read
@@ -1675,7 +1786,7 @@ impl<'a> Machine<'a> {
     fn deref_checked(&mut self, value: &Value) -> Result<Value, Fail> {
         match value {
             Value::Ref { place, tag, .. } => {
-                self.access_tag(*tag, place, false)?;
+                self.access_tag(*tag, place, Access::Read)?;
                 let inner = self.read_place(place)?;
                 self.deref_checked(&inner)
             }
@@ -1782,13 +1893,7 @@ impl<'a> Machine<'a> {
         for step in &place.steps {
             match step {
                 PlaceStep::Field(_, fidx, _) => {
-                    if !self.tags.is_alive(cur_tag) {
-                        return fail(
-                            4,
-                            "B1",
-                            "borrow tag is no longer alive (use after invalidation or scope end)",
-                        );
-                    }
+                    self.tags.live(cur_tag)?;
                     let current_val = self.read_place(&cur_place)?;
                     let Value::Struct { fields, .. } = current_val else {
                         return fail(10, "E-Field", "field access on non-struct");
@@ -1807,13 +1912,7 @@ impl<'a> Machine<'a> {
                 }
                 PlaceStep::Index(idx_expr, _) => {
                     let idx_val = integer(self.eval_expr(idx_expr, false)?)?;
-                    if !self.tags.is_alive(cur_tag) {
-                        return fail(
-                            4,
-                            "B1",
-                            "borrow tag is no longer alive (use after invalidation or scope end)",
-                        );
-                    }
+                    self.tags.live(cur_tag)?;
                     let current_val = self.read_place(&cur_place)?;
                     let Value::Vector(items) = current_val else {
                         return fail(10, "E-Index", "index on non-vector");
@@ -1861,13 +1960,7 @@ impl<'a> Machine<'a> {
                 let Some((mut cur_place, mut cur_tag)) = self.resolve_expr_place(base)? else {
                     return Ok(None);
                 };
-                if !self.tags.is_alive(cur_tag) {
-                    return fail(
-                        4,
-                        "B1",
-                        "borrow tag is no longer alive (use after invalidation or scope end)",
-                    );
-                }
+                self.tags.live(cur_tag)?;
                 let current_val = self.read_place(&cur_place)?;
                 let Value::Struct { fields, .. } = current_val else {
                     return fail(10, "E-Field", "field access on non-struct");
@@ -1891,13 +1984,7 @@ impl<'a> Machine<'a> {
                     return Ok(None);
                 };
                 let idx_val = integer(self.eval_expr(idx_expr, false)?)?;
-                if !self.tags.is_alive(cur_tag) {
-                    return fail(
-                        4,
-                        "B1",
-                        "borrow tag is no longer alive (use after invalidation or scope end)",
-                    );
-                }
+                self.tags.live(cur_tag)?;
                 let current_val = self.read_place(&cur_place)?;
                 let Value::Vector(items) = current_val else {
                     return fail(10, "E-Index", "index on non-vector");
@@ -1929,8 +2016,9 @@ impl<'a> Machine<'a> {
         tag: TagId,
         new_val: Value,
         check_replaced_obligation: bool,
+        access: Access,
     ) -> Result<(), Fail> {
-        self.access_tag(tag, place, true)?;
+        self.access_tag(tag, place, access)?;
         let Some(slot_clone) =
             find_slot_ref(&self.entry_slots, &self.stack, &self.tasks, place).cloned()
         else {
@@ -2003,7 +2091,7 @@ impl<'a> Machine<'a> {
                         // borrow moves its tag. Neither is an access to the referent.
                         if consumed && self.program.kind(&var_ty) != Kind::Copy {
                             let own_place = RuntimePlace::root(scope_id, *id);
-                            self.access_tag(owner_tag, &own_place, true)?;
+                            self.access_tag(owner_tag, &own_place, Access::Move)?;
                             *self.slot_mut(scope_id, *id).expect("slot") = Slot::Moved;
                         }
                         self.count("E-Var");
@@ -2020,7 +2108,7 @@ impl<'a> Machine<'a> {
                         let Value::Ref { place, tag, .. } = val else {
                             return fail(10, "E-Var", "borrow slot does not hold a reference");
                         };
-                        self.access_tag(tag, &place, false)?;
+                        self.access_tag(tag, &place, Access::Read)?;
                         let derefed = self.read_place(&place)?;
                         self.count("E-Var");
                         derefed
@@ -2030,11 +2118,11 @@ impl<'a> Machine<'a> {
                     let own_place = RuntimePlace::root(scope_id, *id);
                     if consumed && !is_copy {
                         // [B4]: moving a value out of a slot is a write access through owner tag.
-                        self.access_tag(owner_tag, &own_place, true)?;
+                        self.access_tag(owner_tag, &own_place, Access::Move)?;
                         *self.slot_mut(scope_id, *id).expect("slot") = Slot::Moved;
                         self.count("B4");
                     } else {
-                        self.access_tag(owner_tag, &own_place, false)?;
+                        self.access_tag(owner_tag, &own_place, Access::Read)?;
                     }
                     self.count("E-Var");
                     val
@@ -2065,14 +2153,12 @@ impl<'a> Machine<'a> {
                 if let Some((rplace, tag)) = self.resolve_expr_place(expr)? {
                     if matches!(fty, Type::Ref(_, _)) {
                         // Copying a `&τ` borrow field out of a view without touching referent.
-                        if !self.tags.is_alive(tag) {
-                            return fail(4, "B1", "borrow tag is no longer alive");
-                        }
+                        self.tags.live(tag)?;
                         let val = self.read_place(&rplace)?;
                         self.count("E-Field");
                         val
                     } else {
-                        self.access_tag(tag, &rplace, false)?;
+                        self.access_tag(tag, &rplace, Access::Read)?;
                         let val = self.read_place(&rplace)?;
                         self.count("E-Field");
                         val
@@ -2086,7 +2172,7 @@ impl<'a> Machine<'a> {
                     let val = if !matches!(fty, Type::Ref(_, _))
                         && let Value::Ref { place, tag, .. } = &raw
                     {
-                        self.access_tag(*tag, place, false)?;
+                        self.access_tag(*tag, place, Access::Read)?;
                         self.read_place(place)?
                     } else {
                         raw
@@ -2104,7 +2190,7 @@ impl<'a> Machine<'a> {
                     );
                 }
                 if let Some((rplace, tag)) = self.resolve_expr_place(expr)? {
-                    self.access_tag(tag, &rplace, false)?;
+                    self.access_tag(tag, &rplace, Access::Read)?;
                     let val = self.read_place(&rplace)?;
                     self.count("E-Index");
                     val
@@ -2263,8 +2349,17 @@ impl<'a> Machine<'a> {
                 let function = &self.program.functions[*id];
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
-                    let v = self.eval_expr(argument, false)?;
-                    // [E-Fn]: read borrowed/view arguments where they are, checking [B1].
+                    // [E-Fn], [W5a]: a place given for a borrow parameter is
+                    // read where it is, an access by [B1], and no borrow is
+                    // made. A borrow or view that an argument holds is read
+                    // through.
+                    let v = if let Expr::Borrow(_, place, _) = argument {
+                        let (place, tag) = self.resolve_place(place)?;
+                        self.access_tag(tag, &place, Access::Read)?;
+                        self.read_place(&place)?
+                    } else {
+                        self.eval_expr(argument, false)?
+                    };
                     values.push(self.deref_checked(&v)?);
                 }
                 let inner = SignatureEnv {
@@ -2308,7 +2403,7 @@ impl<'a> Machine<'a> {
                         format!("`{var_name}` has been moved on this history"),
                     );
                 };
-                self.access_tag(owner_tag, &RuntimePlace::root(scope_id, *var), false)?;
+                self.access_tag(owner_tag, &RuntimePlace::root(scope_id, *var), Access::Read)?;
                 let count = self.task_sets[set_id as usize].members.len() as u64;
                 Value::Int(Int::from_u64(count))
             }
@@ -2352,6 +2447,7 @@ impl<'a> Machine<'a> {
     fn formula(&self, formula: &Expr) -> Result<bool, Fail> {
         let env = ActivationEnv {
             body: self.body(),
+            tags: &self.tags,
             entry_slots: &self.entry_slots,
             stack: &self.stack,
             tasks: &self.tasks,
@@ -2397,7 +2493,7 @@ impl<'a> Machine<'a> {
                     ),
                 );
             }
-            self.tags.kill_with_descendants(*owner_tag);
+            self.tags.kill_with_descendants(*owner_tag, Death::ScopeEnd);
         }
         if let ScopeKind::LexicalBoundary { captures, .. } = &scope.kind {
             for val in captures {
@@ -2490,7 +2586,7 @@ impl<'a> Machine<'a> {
             if let Slot::Available(val) = slot {
                 self.unwind_value_with_clause(val, clause)?;
             }
-            self.tags.kill_with_descendants(*owner_tag);
+            self.tags.kill_with_descendants(*owner_tag, Death::ScopeEnd);
         }
         if release_boundary_captures
             && let ScopeKind::LexicalBoundary { captures, .. } = &scope.kind
@@ -3324,12 +3420,12 @@ impl<'a> Machine<'a> {
                 let Value::Ref { place, tag, .. } = vals.remove(0) else {
                     return fail(10, "E-Extern", "`push` requires an exclusive borrow");
                 };
-                self.access_tag(tag, &place, true)?;
+                self.access_tag(tag, &place, Access::Shape)?;
                 let Value::Vector(mut items) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`push` on non-vector");
                 };
                 items.push(elem);
-                self.write_runtime_place(&place, tag, Value::Vector(items), false)?;
+                self.write_runtime_place(&place, tag, Value::Vector(items), false, Access::Shape)?;
                 self.count("B5");
                 Ok((0, Vec::new()))
             }
@@ -3338,13 +3434,19 @@ impl<'a> Machine<'a> {
                 let Value::Ref { place, tag, .. } = vals.remove(0) else {
                     return fail(10, "E-Extern", "`pop` requires an exclusive borrow");
                 };
-                self.access_tag(tag, &place, true)?;
+                self.access_tag(tag, &place, Access::Shape)?;
                 let Value::Vector(mut items) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`pop` on non-vector");
                 };
                 self.count("B5");
                 if let Some(last) = items.pop() {
-                    self.write_runtime_place(&place, tag, Value::Vector(items), false)?;
+                    self.write_runtime_place(
+                        &place,
+                        tag,
+                        Value::Vector(items),
+                        false,
+                        Access::Shape,
+                    )?;
                     Ok((0, vec![last]))
                 } else {
                     Ok((1, Vec::new()))
@@ -3368,7 +3470,7 @@ impl<'a> Machine<'a> {
                 let Value::Ref { place, tag, .. } = vals.remove(0) else {
                     return fail(10, "E-Extern", "`get` requires a map borrow");
                 };
-                self.access_tag(tag, &place, false)?;
+                self.access_tag(tag, &place, Access::Read)?;
                 let Value::Map(entries) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`get` on non-map");
                 };
@@ -3395,12 +3497,12 @@ impl<'a> Machine<'a> {
                 let Value::Ref { place, tag, .. } = vals.remove(0) else {
                     return fail(10, "E-Extern", "`insert` requires an exclusive borrow");
                 };
-                self.access_tag(tag, &place, true)?;
+                self.access_tag(tag, &place, Access::Shape)?;
                 let Value::Map(mut entries) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`insert` on non-map");
                 };
                 let prev = entries.insert(key, value);
-                self.write_runtime_place(&place, tag, Value::Map(entries), false)?;
+                self.write_runtime_place(&place, tag, Value::Map(entries), false, Access::Shape)?;
                 self.count("B5");
                 match prev {
                     None => Ok((0, Vec::new())),
@@ -3414,12 +3516,12 @@ impl<'a> Machine<'a> {
                 let Value::Ref { place, tag, .. } = vals.remove(0) else {
                     return fail(10, "E-Extern", "`remove` requires an exclusive borrow");
                 };
-                self.access_tag(tag, &place, true)?;
+                self.access_tag(tag, &place, Access::Shape)?;
                 let Value::Map(mut entries) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`remove` on non-map");
                 };
                 let prev = entries.remove(&key);
-                self.write_runtime_place(&place, tag, Value::Map(entries), false)?;
+                self.write_runtime_place(&place, tag, Value::Map(entries), false, Access::Shape)?;
                 self.count("B5");
                 match prev {
                     Some(old) => Ok((0, vec![old])),
@@ -3432,7 +3534,7 @@ impl<'a> Machine<'a> {
                 let Value::Ref { place, tag, .. } = vals.remove(0) else {
                     return fail(10, "E-Extern", "`entry_at` requires a map borrow");
                 };
-                self.access_tag(tag, &place, false)?;
+                self.access_tag(tag, &place, Access::Read)?;
                 let Value::Map(entries) = self.read_place(&place)? else {
                     return fail(10, "E-Extern", "`entry_at` on non-map");
                 };
@@ -3495,10 +3597,7 @@ impl<'a> Machine<'a> {
                     return Ok(Some(self.external(*callee_id, arg_values)?));
                 }
                 // [E-Call]
-                let mut entry_snapshots = Vec::with_capacity(arg_values.len());
-                for v in &arg_values {
-                    entry_snapshots.push(self.deref_formula(v)?);
-                }
+                let entry_snapshots = self.entry_values(*callee_id, &arg_values)?;
                 if let Some(precondition) = &callee.precondition {
                     let env = SignatureEnv {
                         parameters: &entry_snapshots,
@@ -3607,10 +3706,7 @@ impl<'a> Machine<'a> {
                     return Ok(None);
                 }
                 // [E-Await]: defined async control — bind parameters in the same task and give up turn.
-                let mut entry_snapshots = Vec::with_capacity(arg_values.len());
-                for v in &arg_values {
-                    entry_snapshots.push(self.deref_formula(v)?);
-                }
+                let entry_snapshots = self.entry_values(*callee_id, &arg_values)?;
                 if let Some(precondition) = &callee.precondition {
                     let env = SignatureEnv {
                         parameters: &entry_snapshots,
@@ -3644,7 +3740,11 @@ impl<'a> Machine<'a> {
                         format!("`{var_name}` has been moved on this history"),
                     );
                 };
-                self.access_tag(owner_tag, &RuntimePlace::root(scope_id, *set_var), true)?;
+                self.access_tag(
+                    owner_tag,
+                    &RuntimePlace::root(scope_id, *set_var),
+                    Access::Shape,
+                )?;
                 self.park_current(TaskState::WaitingNext {
                     set_id,
                     set_var: *set_var,
@@ -3706,10 +3806,7 @@ impl<'a> Machine<'a> {
                     return Ok(Some(self.external(*callee_id, arg_values)?));
                 }
                 // Defined `async control` started as a nested run ([E-Run]).
-                let mut entry_snapshots = Vec::with_capacity(arg_values.len());
-                for v in &arg_values {
-                    entry_snapshots.push(self.deref_formula(v)?);
-                }
+                let entry_snapshots = self.entry_values(*callee_id, &arg_values)?;
                 if let Some(precondition) = &callee.precondition {
                     let env = SignatureEnv {
                         parameters: &entry_snapshots,
@@ -3793,7 +3890,7 @@ impl<'a> Machine<'a> {
                             "borrowed variant decision requires a borrow value",
                         );
                     };
-                    self.access_tag(tag, &place, false)?;
+                    self.access_tag(tag, &place, Access::Read)?;
                     let Value::Variant {
                         constructor,
                         fields,
@@ -3900,23 +3997,26 @@ impl<'a> Machine<'a> {
                 let value = self.eval_expr(value, true)?;
                 let var_name = self.body().vars[*var].name.clone();
                 let var_ty = self.body().vars[*var].ty.clone();
+                // [W8]: `r ← e` writes through the borrow `r`, which is read
+                // as [E-Var] says; a name that is not a borrow is assigned.
+                let through = matches!(var_ty, Type::Ref(_, _));
                 let (scope_id, slot, owner_tag) = self.find_local_slot(*var).map_err(|_| Fail {
                     state: 2,
-                    clause: "E-Assign",
+                    clause: if through { "E-Var" } else { "E-Assign" },
                     detail: format!("`{var_name}` has no slot on this history"),
                 })?;
-                if matches!(var_ty, Type::Ref(_, _)) {
+                if through {
                     let Slot::Available(Value::Ref { place, tag, .. }) = slot else {
                         return fail(
                             2,
-                            "E-Assign",
+                            "E-Var",
                             format!("`{var_name}` has been moved on this history"),
                         );
                     };
-                    self.write_runtime_place(&place, tag, value, true)?;
+                    self.write_runtime_place(&place, tag, value, true, Access::Assign)?;
                 } else {
                     let own_place = RuntimePlace::root(scope_id, *var);
-                    self.write_runtime_place(&own_place, owner_tag, value, true)?;
+                    self.write_runtime_place(&own_place, owner_tag, value, true, Access::Assign)?;
                 }
                 self.scope().pc += 1;
                 self.count("E-Assign");
@@ -3924,7 +4024,7 @@ impl<'a> Machine<'a> {
             Command::AssignPlace { target, value } => {
                 let value = self.eval_expr(value, true)?;
                 let (rplace, tag) = self.resolve_place(target)?;
-                self.write_runtime_place(&rplace, tag, value, true)?;
+                self.write_runtime_place(&rplace, tag, value, true, Access::Assign)?;
                 self.scope().pc += 1;
                 self.count("E-Assign");
             }
@@ -3965,7 +4065,7 @@ impl<'a> Machine<'a> {
                     if let Some(popped) = self.stack.last_mut().expect("an activation").scopes.pop()
                     {
                         for (_, _, tag) in &popped.slots {
-                            self.tags.kill_with_descendants(*tag);
+                            self.tags.kill_with_descendants(*tag, Death::ScopeEnd);
                         }
                     }
                     return Err(stuck);
@@ -4053,11 +4153,12 @@ impl<'a> Machine<'a> {
                         format!("`{var_name}` has been moved on this history"),
                     );
                 };
-                self.access_tag(owner_tag, &RuntimePlace::root(scope_id, *set), true)?;
-                let mut entry_snapshots = Vec::with_capacity(arg_values.len());
-                for v in &arg_values {
-                    entry_snapshots.push(self.deref_formula(v)?);
-                }
+                self.access_tag(
+                    owner_tag,
+                    &RuntimePlace::root(scope_id, *set),
+                    Access::Shape,
+                )?;
+                let entry_snapshots = self.entry_values(*control, &arg_values)?;
                 let callee = &self.program.controls[*control];
                 if let Some(precondition) = &callee.precondition {
                     let env = SignatureEnv {
@@ -4103,7 +4204,7 @@ impl<'a> Machine<'a> {
                         format!("`{var_name}` has been moved on this history"),
                     );
                 };
-                self.access_tag(owner_tag, &RuntimePlace::root(scope_id, *set), false)?;
+                self.access_tag(owner_tag, &RuntimePlace::root(scope_id, *set), Access::Read)?;
                 let members = self.task_sets[set_id as usize].members.clone();
                 for mid in members {
                     self.tasks[mid].cancelled = true;
@@ -4181,15 +4282,25 @@ impl<'a> Machine<'a> {
                     // A parameter that is or holds a borrow stands for the
                     // value at completion, read through the borrow as it was
                     // passed: the body may have passed the parameter on.
+                    // The condition reads what it mentions and no more:
+                    // a borrow that it does not mention may be dead.
                     let mut final_params = act.arguments.clone();
                     for (index, borrow) in act.borrowed.iter().enumerate() {
-                        if let Some(borrow) = borrow {
+                        if let Some(borrow) = borrow
+                            && typed::mentions(condition, VarRef::Parameter(index))
+                        {
                             final_params[index] = self.deref_formula(borrow)?;
                         }
                     }
                     let mut concrete_fields = Vec::with_capacity(values.len());
-                    for v in &values {
-                        concrete_fields.push(self.deref_formula(v)?);
+                    for (index, v) in values.iter().enumerate() {
+                        concrete_fields.push(match self.deref_formula(v) {
+                            Ok(value) => value,
+                            Err(stuck) if typed::mentions(condition, VarRef::Field(index)) => {
+                                return Err(stuck);
+                            }
+                            Err(_) => Value::Vector(Vec::new()),
+                        });
                     }
                     let env = SignatureEnv {
                         parameters: &final_params,

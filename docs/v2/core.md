@@ -498,17 +498,24 @@ Otherwise `c` runs:
   becomes available. A name that has no slot in this run cannot be assigned:
   stuck. A component is written within the value of its root, so the root
   of `p.x` or `p[e]` is looked up as [E-Var] says, and the configuration is
-  stuck where it has no slot or was moved.
+  stuck where it has no slot or was moved. So is a name of borrow type
+  through which the assignment writes ([W8]): `r ← e` reads `r` and
+  assigns what it refers to.
 - **[E-Oblige]** `⊢ φ`. If `φ` is false in the current state, stuck.
 - **[E-Formula]** A formula is evaluated on current values, over the
   mathematical integers, and makes no access: it reads through borrows and
-  changes no tag. In a contract condition a parameter stands for the value it
+  changes no tag. It reads through a borrow only while the tag of that
+  borrow is alive, as [B1] asks of an access: where the tag is dead the
+  configuration is stuck. In a contract condition a parameter stands for the value it
   had at entry, which the instrumented semantics keeps; an `&~` parameter
   stands for the value at completion, and `old(y)` for the value at entry.
   The value at completion is what the borrow that was passed refers to then,
   whatever the body did with the parameter: the instrumented semantics keeps
   that borrow too, and the condition reads through it when the parameter
-  itself has been passed on. A
+  itself has been passed on. Such a value, at entry or at completion, is
+  read where a formula of the signature mentions the parameter, and only
+  there: passing a borrow is no access (section 6.3), so a call that passes
+  a dead borrow which nothing reads is not stuck. A
   term that indexes out of range has a value of the element type, and a term
   that divides by zero has an integer value. This document does not fix those
   values, but each depends only on the operands of its term: the same term on
@@ -730,7 +737,7 @@ excludes.
 | **X1** | A body reaches its end with the history undisposed | [E-End] | Coverage [K7] |
 | **X2** | A name is read, moved or borrowed where it is unbound or moved, or assigned where it is unbound; a component that is not `copy` is consumed; a retained name is not available when the contingency of a named boundary begins | [E-Var], [E-Assign], [E-Field], [E-Index], [E-Supervise] | Availability [O2], [O3], [O4], retained names [F6] |
 | **X3** | A name is bound twice in one run | [E-Bind] | [O1] |
-| **X4** | An access goes through a dead tag, or writes through a shared one | [B1] | Loans [L3], mutable places [C1] |
+| **X4** | An access goes through a dead tag, or writes through a shared one; a formula reads through a dead tag | [B1], [E-Formula] | Loans [L3], mutable places [C1] |
 | **X5** | A value that contains an obligation is destroyed or overwritten | [E-Scope], [E-Assign], [E-Temp] | Obligations [O4], [O5], temporaries [O3a], task sets [TK2] |
 | **X6** | `⊥` runs | [E-Impossible] | [P6] |
 | **X7** | A stated or implied condition is false: `⊢`, an invariant, a precondition, an outcome condition, an arithmetic range, a divisor, an index | [E-Oblige], [E-Arith], [E-Index], [E-Call], [E-Exit], [E-Loop], [E-Again] | Proof obligations [P1] to [P5] |
@@ -963,7 +970,16 @@ causes an error, and every reported error comes with a feasible history.
   negation of a literal is a literal. Both operands of an arithmetic
   operator or of a comparison have one type; a formula is typed in the same
   way, except that a literal in it may be any integer ([E-Formula]). An operand is given by value, as `&p` or as `&~p`, as the type
-  expected there says ([W8]). An assignment, an exclusive borrow `&~p` and an
+  expected there says ([W8]). Where a borrow type is expected (a parameter
+  of an operation, a payload field, a loop parameter, a field of a view, a
+  bind with a written borrow type), the operand is `&p` or `&~p` in the
+  mode of that type, or a name or a field of a view that has that very
+  type and stands for the borrow itself. An expression of the type that the
+  borrow refers to is no operand there, and neither is a name of exclusive
+  borrow type where a shared borrow is expected: `&r` lends what is behind
+  it again. The surface binds an expression that is not a place to a hidden
+  name first ([surface](surface.md), [U11]). The argument of a function for
+  a borrow parameter is a place and is written without `&` ([W5a]). An assignment, an exclusive borrow `&~p` and an
   operation that changes a collection's shape each need a **mutable place**:
   one whose root was bound with `~`, or that passes through an exclusive
   borrow.
@@ -1563,3 +1579,7 @@ and what asked for it:
 | 24 November 2026 | [E-Host] says which values of an outcome type an operation gives, and section 8 asks that the answers of a faithful host and the arguments of the entry hold no other. | The generator of slice 2 (review finding RG7). [I12] lets a checked program assume the conditions of the operation of a value whose capture it does not see, and nothing said that a value from outside the execution has them: Theorem 1 was false as stated. A checked control that is given `out(low, 7)` of an operation whose `low` says `v ≤ 4` is stuck by `X7` at the exit that rests on it. The precondition is part of the definition because every captured value has it; [I12] uses the condition alone. |
 | 24 November 2026 | [E-Unwind] gives the order in which the slots of a scope and the parts of a value are released under a fault: the names of a body in the reverse of the order in which its text first binds them, the parts of a value from the first. [R5] refers to it. | The clause tests of the data rules (review finding RO12). The order was not stated, and a release is an event of the trace: the oracle released in the reverse of the order in which the run had bound the names, the erased semantics and compiled code in the order of the text, and the three differed on a program in which a name has a binder on each of two histories. The order of the text is the one an implementation has without a record of each run ([R4]). |
 | 24 November 2026 | [E-Assign] says that an assignment to a component looks its root up as [E-Var] does. | The same tests: [O4] asks [O2] of the root, and the semantics named the stuck state only for a whole name without a slot. The oracle reports it as `X2 E-Var`. |
+| 24 November 2026 | [E-Formula] says that a formula reads through a borrow only while its tag is alive, and is stuck otherwise; the row X4 of section 6.10 names it. | The clause tests of the borrow rules (review finding RO15). A formula makes no access, so [B1] did not apply to it, and nothing said what `⊢ r = 5` is worth when the place that `r` borrowed is gone. The oracle read the place as it was then, and was stuck by `X7 E-Index` where an element had been popped. [L2] counts a mention in a formula as a use, so the checker excludes the state. |
+| 24 November 2026 | [E-Formula] says that the value of a parameter at entry or at completion is read only where a formula of the signature mentions it. | The same tests (review finding RO17): the oracle read every argument through its borrow at a call and every borrowed parameter at an exit, so a call that passed a dead borrow to a control that never reads it was stuck, although passing a borrow is no access. |
+| 24 November 2026 | [E-Assign] says that a name of borrow type through which an assignment writes is read as [E-Var] says. | The same tests: `r ← e` where `r` was moved is a read of a moved name, and the oracle reported an assignment to one (`X2 E-Assign`). It reports `X2 E-Var`. |
+| 24 November 2026 | [C1] says what stands where a borrow type is expected: `&p` or `&~p`, or a name or a field of a view of that type. | The reader of the core text (review finding RO14): it took any expression of the type that the borrow refers to, a constructor or a literal among them, and a name of exclusive borrow type for a shared one. The grammar has `&p` and `&~p` as the only borrows, [W5a] gives a function a place, and [U11] of the surface binds other expressions to hidden names; the reader asks for these forms now. |

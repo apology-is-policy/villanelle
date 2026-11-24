@@ -1,0 +1,10 @@
+// [C1] A bind whose written type is a borrow type takes `&p` or a name of
+// that type ([W8]).
+
+control binds_a_value()
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := 1
+    ⊤ ▷ r : &u32 := x
+    ⊤ ▷ ■ ok {r}
+
+//! reject C1

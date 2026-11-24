@@ -1074,6 +1074,9 @@ pub struct Report {
     /// The controls in which a run was stuck, each with the states it was
     /// stuck in (`X2 E-Var`).
     pub stuck_in: BTreeMap<String, BTreeSet<String>>,
+    /// What the oracle said of each stuck run, by the control it was stuck
+    /// in: a borrow that is dead says what ended it ([B2], [B4]).
+    pub stuck_details: BTreeMap<String, BTreeSet<String>>,
     pub rejected: Option<String>,
 }
 
@@ -1422,6 +1425,11 @@ fn check_with(source: &str, is_surface: bool) -> Report {
                     .or_default()
                     .insert(label.clone());
                 report.stuck.insert(label);
+                report
+                    .stuck_details
+                    .entry(stuck.control.clone())
+                    .or_default()
+                    .insert(stuck.detail.clone());
                 *state == format!("X{}", stuck.state) && clause == stuck.clause
             }
             (Expect::Other(expected), end) => *expected == kind(end),

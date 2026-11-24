@@ -1,0 +1,147 @@
+// [B1] An access through a tag to a place asks three things: the tag is
+// alive, the place lies within the place of the tag, and a write goes
+// through an owner tag or an exclusive one. A program that `resolve` takes
+// can fail the first only: a path from a borrow stays within what it
+// borrows, and a write through a shared borrow has no mutable place ([C1],
+// `reject_c1_write_through_shared.core`). A formula makes no access, and
+// still reads through a borrow only while its tag is alive ([E-Formula]).
+// Passing a borrow on is no access either.
+
+copy struct pair {x : u32, y : u32}
+
+struct shelf {items : [u32], label : string}
+
+// Reads and writes through the owner, a shared borrow and an exclusive one.
+control reads_and_writes(n : u32)
+    ⊢ n < 100
+    ■ { ok {a : u32, b : u32} }
+    ⊤ ▷ ~x : u32 := n
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ a : u32 := s
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ r ← 7
+    ⊤ ▷ b : u32 := r
+    ⊤ ▷ x ← 9
+    ⊤ ▷ ■ ok {a, b}
+
+// The fields and the elements of what a borrow refers to lie within its
+// place, and are read and written through it.
+control within_the_place()
+    ■ { ok {v : u32, n : usize} }
+    ⊤ ▷ ~h : shelf := shelf {[1, 2, 3], "top"}
+    ⊤ ▷ r : &~shelf := &~h
+    ⊤ ▷ r.items[1] ← 20
+    ⊤ ▷ r.label ← "low"
+    ⊤ ▷ v : u32 := r.items[1]
+    ⊤ ▷ n : usize := len(r.label)
+    ⊤ ▷ ■ ok {v, n}
+
+// X4: a read through a shared borrow that an assignment ended.
+control read_through_dead()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ■ ok {s}
+
+// X4: a write through an exclusive borrow that a read ended.
+control write_through_dead()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ y : u32 := x
+    ⊤ ▷ r ← 2
+    ⊤ ▷ ■ ok {y}
+
+// X4: a borrow made through a dead one. Making it is an access ([B3]).
+control lend_through_dead()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ x ← 2
+    ⊤ ▷ s : &u32 := &r
+    ⊤ ▷ ■ ok {x}
+
+// X4: a component read through a dead borrow of the whole.
+control component_through_dead()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~p : pair := pair {1, 2}
+    ⊤ ▷ r : &pair := &p
+    ⊤ ▷ p ← pair {3, 4}
+    ⊤ ▷ ■ ok {r.y}
+
+// A formula changes no tag: the exclusive borrow lives on after a formula
+// has read what it refers to through the owner.
+control formula_is_no_access()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ ⊢ x = 1
+    ⊤ ▷ r ← 2
+    ⊤ ▷ ⊢ r = 2 ∧ x = 2
+    ⊤ ▷ ■ ok {x}
+
+// X4: a formula reads through a dead borrow, though the place is there.
+control formula_through_dead()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ⊢ s = 2
+    ⊤ ▷ ■ ok {x}
+
+// X4: a formula reads through a dead borrow whose place is gone.
+control formula_through_gone()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~xs : [u32] := [4, 5]
+    ⊤ ▷ r : &u32 := &xs[1]
+    ⊤ ▷ p : Δ pop(&~xs) ▸ item {it} │ empty {}
+    ⊤ ▷ ⊢ r = 5
+    ⊤ ▷ ■ ok {0}
+
+control shows(a : &u32)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ■ ok {a}
+
+control ignores(a : &u32)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ■ ok {0}
+
+// Passing a borrow on is no access: a dead borrow is passed, and the run
+// is stuck only where the callee reads through it.
+control passes_dead(read : bool)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ x ← 2
+    ⊤ ▷ t : ? read
+    t.true ▷ d : Δ shows(s) ▸ ok {v}
+    t.false ▷ e : Δ ignores(s) ▸ ok {w}
+    t.true ▷ ■ ok {v}
+    t.false ▷ ■ ok {w}
+
+control bounded(a : &u32)
+    ■ { ok {} ⇐ a < 10 }
+    ⊤ ▷ ■ ok {}
+
+// X4: the condition of an exit reads a parameter through a dead borrow.
+control condition_through_dead()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ x ← 2
+    ⊤ ▷ d : Δ bounded(s) ▸ ok {}
+    ⊤ ▷ ■ ok {x}
+
+//! run reads_and_writes(3) => done ok {3, 7}
+//! run within_the_place() => done ok {20, 3}
+//! run read_through_dead() => stuck X4 B1
+//! run write_through_dead() => stuck X4 B1
+//! run lend_through_dead() => stuck X4 B1
+//! run component_through_dead() => stuck X4 B1
+//! run formula_is_no_access() => done ok {2}
+//! run formula_through_dead() => stuck X4 B1
+//! run formula_through_gone() => stuck X4 B1
+//! run passes_dead(false) => done ok {0}
+//! run passes_dead(true) => stuck X4 B1
+//! run condition_through_dead() => stuck X4 B1

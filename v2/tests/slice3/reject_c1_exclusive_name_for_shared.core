@@ -1,0 +1,15 @@
+// [C1] A name of exclusive borrow type is no operand for a shared borrow
+// parameter: `&r` lends what is behind it again.
+
+control reads(a : &u32)
+    ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+control passes_exclusive()
+    ■ { ok {} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ d : Δ reads(r) ▸ ok {}
+    ⊤ ▷ ■ ok {}
+
+//! reject C1

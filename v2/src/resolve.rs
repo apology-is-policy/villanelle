@@ -635,6 +635,218 @@ impl Typer<'_> {
         }
     }
 
+    /// An operand for a slot of borrow type: a parameter of a control, a
+    /// payload field, a loop parameter, a field of a view, or a bind whose
+    /// written type is a borrow type. It is `&p` or `&~p` in the mode of
+    /// the slot, or a name or a field of a view that has the type of the
+    /// slot and stands for the borrow itself ([C1], [W8]). An expression of
+    /// the type that the borrow refers to is not one: the surface binds it
+    /// to a hidden name first ([U11]).
+    fn borrow_operand(
+        &self,
+        expr: &syntax::Expr,
+        expected: &Type,
+        exp_mode: BorrowMode,
+        exp_inner: &Type,
+    ) -> Result<Expr, Error> {
+        let sign = match exp_mode {
+            BorrowMode::Shared => "&",
+            BorrowMode::Exclusive => "&~",
+        };
+        match expr {
+            syntax::Expr::Borrow(mode, inner) => {
+                if *mode != exp_mode {
+                    return self.error(format!(
+                        "expected {expected}, found {} borrow",
+                        match mode {
+                            BorrowMode::Shared => "shared",
+                            BorrowMode::Exclusive => "exclusive",
+                        }
+                    ));
+                }
+                let (place, through_exc) = self.resolve_place(inner)?;
+                if *mode == BorrowMode::Exclusive
+                    && !self.scope.is_mutable(place.root)
+                    && !through_exc
+                {
+                    return self.error("cannot take an exclusive borrow of an immutable place");
+                }
+                if place.ty != *exp_inner {
+                    return self.error(format!(
+                        "borrowed place has type {}, and {} is expected",
+                        place.ty, exp_inner
+                    ));
+                }
+                Ok(Expr::Borrow(*mode, place, expected.clone()))
+            }
+            syntax::Expr::Name(name) => match self.scope.find(name) {
+                Some((var, var_ty)) if var_ty == *expected => Ok(Expr::Var(var, var_ty)),
+                Some((_, var_ty)) => self.error(format!(
+                    "`{name}` has the type {var_ty}, and a slot of type {expected} takes `{sign}p` or a name of that type"
+                )),
+                None => self.error(format!("`{name}` is not a name here")),
+            },
+            syntax::Expr::Field(base, field) => {
+                if let Ok(base_expr) = self.infer(base)
+                    && let Type::Struct(sid, _) = base_expr.ty().deref_type().clone()
+                    && let Some((fidx, fdef)) = self.globals.structs[sid]
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .find(|(_, f)| f.name == *field)
+                    && fdef.ty == *expected
+                {
+                    return Ok(Expr::Field(
+                        Box::new(base_expr),
+                        sid,
+                        fidx,
+                        expected.clone(),
+                    ));
+                }
+                self.error(format!(
+                    "a slot of type {expected} takes `{sign}p` or a name of that type"
+                ))
+            }
+            _ => self.error(format!(
+                "a slot of type {expected} takes `{sign}p` or a name of that type"
+            )),
+        }
+    }
+
+    /// An argument of a function. For a parameter of borrow type it is a
+    /// place, which the function reads where it is: no borrow is written
+    /// and none is made ([W5a], [E-Fn]). A formula has terms instead.
+    fn function_argument(
+        &self,
+        function: &str,
+        argument: &syntax::Expr,
+        ty: &Type,
+    ) -> Result<Expr, Error> {
+        let Type::Ref(_, inner) = ty else {
+            return self.build(argument, ty);
+        };
+        if self.mode != Mode::Expression {
+            return self.build(argument, ty);
+        }
+        if matches!(argument, syntax::Expr::Borrow(_, _)) {
+            return self.error(format!(
+                "the argument of `{function}` for a borrow parameter is a place, read where it is: no borrow is written"
+            ));
+        }
+        let Ok((place, _)) = self.resolve_place(argument) else {
+            return self.error(format!(
+                "the argument of `{function}` for a parameter of type {ty} is a place"
+            ));
+        };
+        if place.ty != **inner {
+            return self.error(format!(
+                "the argument of `{function}` has the type {}, and {inner} is expected",
+                place.ty
+            ));
+        }
+        self.read_in_place(argument, ty)
+    }
+
+    /// What stands for a parameter of borrow type where nothing is lent: a
+    /// term of a formula, or the place that a function reads where it is.
+    fn read_in_place(&self, expr: &syntax::Expr, expected: &Type) -> Result<Expr, Error> {
+        let Type::Ref(exp_mode, exp_inner) = expected else {
+            return self.build(expr, expected);
+        };
+        match expr {
+            syntax::Expr::Borrow(mode, inner) => {
+                if mode != exp_mode {
+                    return self.error(format!(
+                        "expected {expected}, found {} borrow",
+                        match mode {
+                            BorrowMode::Shared => "shared",
+                            BorrowMode::Exclusive => "exclusive",
+                        }
+                    ));
+                }
+                let (place, through_exc) = self.resolve_place(inner)?;
+                if *mode == BorrowMode::Exclusive
+                    && !self.scope.is_mutable(place.root)
+                    && !through_exc
+                {
+                    return self.error("cannot take an exclusive borrow of an immutable place");
+                }
+                if place.ty != **exp_inner {
+                    return self.error(format!(
+                        "borrowed place has type {}, and {} is expected",
+                        place.ty, exp_inner
+                    ));
+                }
+                return Ok(Expr::Borrow(*mode, place, expected.clone()));
+            }
+            syntax::Expr::Name(name) => {
+                if let Some((var, var_ty)) = self.scope.find(name) {
+                    if var_ty == *expected {
+                        return Ok(Expr::Var(var, var_ty));
+                    }
+                    if *exp_mode == BorrowMode::Shared
+                        && (var_ty == Type::Ref(BorrowMode::Exclusive, exp_inner.clone())
+                            || var_ty == **exp_inner)
+                    {
+                        return match var {
+                            VarRef::Local(id) => Ok(Expr::Borrow(
+                                BorrowMode::Shared,
+                                Place {
+                                    root: id,
+                                    root_ty: var_ty,
+                                    steps: Vec::new(),
+                                    ty: (**exp_inner).clone(),
+                                },
+                                expected.clone(),
+                            )),
+                            _ => Ok(Expr::Var(var, (**exp_inner).clone())),
+                        };
+                    }
+                }
+            }
+            syntax::Expr::Field(base, field) => {
+                if let Ok(base_expr) = self.infer(base)
+                    && let Type::Struct(sid, _) = base_expr.ty().deref_type().clone()
+                    && let Some((fidx, fdef)) = self.globals.structs[sid]
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .find(|(_, f)| f.name == *field)
+                {
+                    if fdef.ty == *expected {
+                        return Ok(Expr::Field(
+                            Box::new(base_expr),
+                            sid,
+                            fidx,
+                            expected.clone(),
+                        ));
+                    }
+                    if *exp_mode == BorrowMode::Shared && fdef.ty.deref_type() == &**exp_inner {
+                        if let Ok((place, _)) = self.resolve_place(expr) {
+                            return Ok(Expr::Borrow(BorrowMode::Shared, place, expected.clone()));
+                        }
+                        return Ok(Expr::Field(
+                            Box::new(base_expr),
+                            sid,
+                            fidx,
+                            (**exp_inner).clone(),
+                        ));
+                    }
+                }
+                if *exp_mode == BorrowMode::Shared {
+                    return self.build(expr, exp_inner);
+                }
+            }
+            _ if *exp_mode == BorrowMode::Shared => {
+                // For `&τ` parameters in surface calls or functions ([W5a], [U11]),
+                // allow reading an expression of type `τ` in place.
+                return self.build(expr, exp_inner);
+            }
+            _ => {}
+        }
+        self.error(format!("expected {expected}"))
+    }
+
     fn build(&self, expr: &syntax::Expr, expected: &Type) -> Result<Expr, Error> {
         if marks_a_read(expr, false) {
             return fail(
@@ -643,104 +855,14 @@ impl Typer<'_> {
                 "a move mark stands on an expression that is read: only what is consumed moves",
             );
         }
-        // When the expected type is `&τ` or `&~τ`, handle borrow operands (`[W8]`, `[U11]`).
+        // A slot of borrow type takes `&p` or `&~p`, or a name or a field of
+        // a view that has that borrow type ([C1], [W8]). A formula has
+        // terms, and reads whatever stands there ([E-Formula]).
         if let Type::Ref(exp_mode, exp_inner) = expected {
-            match expr {
-                syntax::Expr::Borrow(mode, inner) => {
-                    if mode != exp_mode {
-                        return self.error(format!(
-                            "expected {expected}, found {} borrow",
-                            match mode {
-                                BorrowMode::Shared => "shared",
-                                BorrowMode::Exclusive => "exclusive",
-                            }
-                        ));
-                    }
-                    let (place, through_exc) = self.resolve_place(inner)?;
-                    if *mode == BorrowMode::Exclusive
-                        && !self.scope.is_mutable(place.root)
-                        && !through_exc
-                    {
-                        return self.error("cannot take an exclusive borrow of an immutable place");
-                    }
-                    if place.ty != **exp_inner {
-                        return self.error(format!(
-                            "borrowed place has type {}, and {} is expected",
-                            place.ty, exp_inner
-                        ));
-                    }
-                    return Ok(Expr::Borrow(*mode, place, expected.clone()));
-                }
-                syntax::Expr::Name(name) => {
-                    if let Some((var, var_ty)) = self.scope.find(name) {
-                        if var_ty == *expected {
-                            return Ok(Expr::Var(var, var_ty));
-                        }
-                        if *exp_mode == BorrowMode::Shared
-                            && (var_ty == Type::Ref(BorrowMode::Exclusive, exp_inner.clone())
-                                || var_ty == **exp_inner)
-                        {
-                            return match var {
-                                VarRef::Local(id) => Ok(Expr::Borrow(
-                                    BorrowMode::Shared,
-                                    Place {
-                                        root: id,
-                                        root_ty: var_ty,
-                                        steps: Vec::new(),
-                                        ty: (**exp_inner).clone(),
-                                    },
-                                    expected.clone(),
-                                )),
-                                _ => Ok(Expr::Var(var, (**exp_inner).clone())),
-                            };
-                        }
-                    }
-                }
-                syntax::Expr::Field(base, field) => {
-                    if let Ok(base_expr) = self.infer(base)
-                        && let Type::Struct(sid, _) = base_expr.ty().deref_type().clone()
-                        && let Some((fidx, fdef)) = self.globals.structs[sid]
-                            .fields
-                            .iter()
-                            .enumerate()
-                            .find(|(_, f)| f.name == *field)
-                    {
-                        if fdef.ty == *expected {
-                            return Ok(Expr::Field(
-                                Box::new(base_expr),
-                                sid,
-                                fidx,
-                                expected.clone(),
-                            ));
-                        }
-                        if *exp_mode == BorrowMode::Shared && fdef.ty.deref_type() == &**exp_inner {
-                            if let Ok((place, _)) = self.resolve_place(expr) {
-                                return Ok(Expr::Borrow(
-                                    BorrowMode::Shared,
-                                    place,
-                                    expected.clone(),
-                                ));
-                            }
-                            return Ok(Expr::Field(
-                                Box::new(base_expr),
-                                sid,
-                                fidx,
-                                (**exp_inner).clone(),
-                            ));
-                        }
-                    }
-                    if *exp_mode == BorrowMode::Shared {
-                        return self.build(expr, exp_inner);
-                    }
-                }
-                _ if *exp_mode == BorrowMode::Shared => {
-                    // For `&τ` parameters in surface calls or functions ([W5a], [U11]),
-                    // allow reading an expression of type `τ` in place.
-                    return self.build(expr, exp_inner);
-                }
-                _ => {}
+            if self.mode == Mode::Expression {
+                return self.borrow_operand(expr, expected, *exp_mode, exp_inner);
             }
-            return self.error(format!("expected {expected}"));
+            return self.read_in_place(expr, expected);
         }
 
         match expr {
@@ -1015,7 +1137,7 @@ impl Typer<'_> {
                 }
                 let mut built = Vec::new();
                 for (argument, ty) in arguments.iter().zip(parameters) {
-                    built.push(self.build(argument, ty)?);
+                    built.push(self.function_argument(name, argument, ty)?);
                 }
                 Ok(Expr::Call(id, built, result.clone()))
             }

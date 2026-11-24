@@ -1,0 +1,11 @@
+// [C1] A field of borrow type in a view takes `&p` or a name of that type.
+
+view struct window {items : &[u32], start : usize}
+
+control builds_from_a_value()
+    ■ { ok {v : usize} }
+    ⊤ ▷ xs : [u32] := [1]
+    ⊤ ▷ w : window := window {xs, 0}
+    ⊤ ▷ ■ ok {w.start}
+
+//! reject C1

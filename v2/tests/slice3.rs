@@ -4,6 +4,7 @@
 //! `[F5]`, `[F6]`), Rails elaboration (`[G3]`, `[G8]`, `[G10]`, `[U6]`, `[U9]`,
 //! `[U10]`, `[U11]`, Q16), and oracle-vs-erased differential agreement.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use villanelle_v2::host::{Answer, Host};
 use villanelle_v2::int::Int;
@@ -41,22 +42,184 @@ fn surface_files() -> Vec<(String, String)> {
     files
 }
 
+/// The rules of section 6 that the borrows of slice 3 apply.
+const SLICE3_RULES: [&str; 13] = [
+    "B1",
+    "B2",
+    "B3",
+    "B4",
+    "B5",
+    "E-Borrow",
+    "E-Operands",
+    "E-Outcome",
+    "E-Extern",
+    "E-Var",
+    "E-Field",
+    "E-Index",
+    "E-Assign",
+];
+
+/// The ways of being stuck that the suite of slice 3 reaches.
+const SLICE3_STUCK: [&str; 3] = ["X4 B1", "X2 E-Var", "X7 E-Index"];
+
+/// The clauses by which `resolve` refuses a core file of the suite.
+const SLICE3_REFUSALS: [&str; 1] = ["C1"];
+
+/// The rule files of the borrows: a dead borrow in each says what ended it,
+/// and the cause is the clause that the run is about ([B2] to [B5]).
+const RULE_FILES: [&str; 7] = [
+    "b1_access.core",
+    "b2_invalidation.core",
+    "b3_creation.core",
+    "b4_moves_and_scopes.core",
+    "b5_shapes.core",
+    "e_borrow_operands.core",
+    "e_views.core",
+];
+
+const READ: &str = "a read of its place";
+const ASSIGNMENT: &str = "an assignment to its place";
+const MOVE: &str = "a move of what it refers to";
+const SHARED: &str = "a shared borrow of its place";
+const EXCLUSIVE: &str = "an exclusive borrow of its place";
+const SHAPE: &str = "a change of shape of its collection";
+const SCOPE: &str = "the scope of what it refers to ended";
+
+/// For each run of the rule files that is stuck by a dead borrow: the file,
+/// the control in which it is stuck, and what ended the borrow.
+const DEATHS: [(&str, &str, &str); 39] = [
+    ("b1_access.core", "read_through_dead", ASSIGNMENT),
+    ("b1_access.core", "write_through_dead", READ),
+    ("b1_access.core", "lend_through_dead", ASSIGNMENT),
+    ("b1_access.core", "component_through_dead", ASSIGNMENT),
+    ("b1_access.core", "formula_through_dead", ASSIGNMENT),
+    ("b1_access.core", "formula_through_gone", EXCLUSIVE),
+    ("b1_access.core", "shows", ASSIGNMENT),
+    ("b1_access.core", "condition_through_dead", ASSIGNMENT),
+    ("b2_invalidation.core", "read_kills_exclusive", READ),
+    ("b2_invalidation.core", "write_kills_shared", ASSIGNMENT),
+    ("b2_invalidation.core", "parent_kills_child", ASSIGNMENT),
+    ("b2_invalidation.core", "descendants_die", ASSIGNMENT),
+    ("b2_invalidation.core", "whole_kills_part", ASSIGNMENT),
+    ("b2_invalidation.core", "part_kills_whole", ASSIGNMENT),
+    ("b2_invalidation.core", "element_kills_element", ASSIGNMENT),
+    ("b2_invalidation.core", "whole_read_kills_part", READ),
+    ("b3_creation.core", "shared_kills_exclusive", SHARED),
+    ("b3_creation.core", "exclusive_kills_shared", EXCLUSIVE),
+    ("b3_creation.core", "exclusive_kills_exclusive", EXCLUSIVE),
+    ("b3_creation.core", "write_kills_shared_child", ASSIGNMENT),
+    (
+        "b3_creation.core",
+        "whole_kills_component_child",
+        ASSIGNMENT,
+    ),
+    ("b4_moves_and_scopes.core", "move_kills_borrow", MOVE),
+    ("b4_moves_and_scopes.core", "move_kills_component", MOVE),
+    (
+        "b4_moves_and_scopes.core",
+        "assign_kills_borrow",
+        ASSIGNMENT,
+    ),
+    ("b4_moves_and_scopes.core", "copies_share_a_tag", ASSIGNMENT),
+    ("b4_moves_and_scopes.core", "leaves_a_local", SCOPE),
+    ("b4_moves_and_scopes.core", "goes_round_with_a_local", SCOPE),
+    ("b4_moves_and_scopes.core", "returns_a_local", SCOPE),
+    ("b4_moves_and_scopes.core", "reads_a_dead_payload", SCOPE),
+    ("b5_shapes.core", "push_kills_element", SHAPE),
+    ("b5_shapes.core", "pop_kills_element", SHAPE),
+    ("b5_shapes.core", "insert_kills_entry", SHAPE),
+    ("b5_shapes.core", "remove_kills_entry", SHAPE),
+    ("e_borrow_operands.core", "add_from", SHARED),
+    (
+        "e_borrow_operands.core",
+        "function_read_ends_exclusive",
+        READ,
+    ),
+    ("e_borrow_operands.core", "read_ends_fields", READ),
+    ("e_views.core", "field_through_dead", ASSIGNMENT),
+    (
+        "borrows_and_tags.core",
+        "stuck_push_kills_elem_borrow",
+        EXCLUSIVE,
+    ),
+    ("views_and_variants.core", "stuck_dangling_view", SCOPE),
+];
+
 #[test]
 fn slice_three_core_conforms_and_matches_erased() {
     let files = core_files();
-    assert!(!files.is_empty(), "expected slice 3 core test files");
+    let mut failures = Vec::new();
+    let mut rules: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut stuck = BTreeSet::new();
+    let mut refusals = BTreeSet::new();
+    let mut details: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut runs = 0usize;
     let mut compared = 0usize;
     for (name, source) in &files {
         let report = script::check(source);
-        if !report.failures.is_empty() {
-            panic!("{} failed:\n{}", name, report.failures.join("\n"));
+        if report.runs == 0 && report.rejected.is_none() && report.failures.is_empty() {
+            failures.push(format!("{name}: no directives"));
         }
-        assert!(report.runs > 0, "{name} has no run directives");
+        for failure in &report.failures {
+            failures.push(format!("{name}: {failure}"));
+        }
         runs += report.runs;
         compared += report.compared;
+        for (rule, count) in report.rules {
+            *rules.entry(rule).or_insert(0) += count;
+        }
+        stuck.extend(report.stuck);
+        refusals.extend(report.rejected);
+        for (control, said) in report.stuck_details {
+            details.insert((name.clone(), control), said);
+        }
     }
-    assert!(runs >= 20 && compared >= 12 && compared < runs);
+    for rule in SLICE3_RULES {
+        if !rules.contains_key(rule) {
+            failures.push(format!("no slice 3 run applied [{rule}]"));
+        }
+    }
+    for state in SLICE3_STUCK {
+        if !stuck.contains(state) {
+            failures.push(format!("no slice 3 run reached stuck state {state}"));
+        }
+    }
+    for clause in SLICE3_REFUSALS {
+        if !refusals.contains(clause) {
+            failures.push(format!("no slice 3 core file was refused by [{clause}]"));
+        }
+    }
+    // Each dead borrow was ended by the access that its run is about.
+    for (file, control, cause) in DEATHS {
+        let said = details
+            .get(&(file.to_string(), control.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        if !said.iter().any(|detail| detail.contains(cause)) {
+            failures.push(format!(
+                "{file}: `{control}` is not stuck because {cause}: {said:?}"
+            ));
+        }
+    }
+    // And every dead borrow of the rule files is in the table.
+    for ((file, control), said) in &details {
+        let listed = DEATHS.iter().any(|(f, c, _)| f == file && c == control);
+        if RULE_FILES.contains(&file.as_str())
+            && said
+                .iter()
+                .any(|detail| detail.contains("the borrow is dead"))
+            && !listed
+        {
+            failures.push(format!(
+                "{file}: `{control}` is stuck by a dead borrow not in DEATHS"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(runs >= 130, "{runs} runs");
+    // Every run that is not stuck and has a host that answers is compared
+    // with the erased semantics ([R4], [R5]).
+    assert!(compared >= 67 && compared < runs, "{compared} compared");
 }
 
 #[test]

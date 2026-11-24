@@ -1,0 +1,10 @@
+// [C1], [W5a] A constructor is no place: a function reads its borrow
+// argument where it is.
+
+function first(xs : &[u32]) ⊢ len(xs) > 0 : u32 := xs[0]
+
+control gives_a_constructor()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ■ ok {first([3, 4])}
+
+//! reject C1

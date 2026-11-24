@@ -1,0 +1,12 @@
+// [C1] A constructor is no place, and a parameter of borrow type takes `&p`.
+
+control head(xs : &[u32])
+    ■ { ok {v : u32} }
+    ⊤ ▷ ■ ok {0}
+
+control gives_a_constructor()
+    ■ { ok {v : u32} }
+    ⊤ ▷ d : Δ head([7, 8]) ▸ ok {v}
+    ⊤ ▷ ■ ok {v}
+
+//! reject C1

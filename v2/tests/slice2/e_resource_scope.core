@@ -126,7 +126,8 @@ control held_and_completed()
     ⊤ ▷ d : Δ slot(▾s) ▸ full {g3} │ free {}
     d.free ▷ ⊥
     ⊤ ▷ c3 : Δ close_file(▾g3) ▸ closed {}
-    ⊤ ▷ r : Δ remove(&~m, "k") ▸ removed {g4} │ missing {}
+    ⊤ ▷ h1 : string := "k"
+    ⊤ ▷ r : Δ remove(&~m, &h1) ▸ removed {g4} │ missing {}
     r.removed ▷ c4 : Δ close_file(▾g4) ▸ closed {}
     ⊤ ▷ cm : Δ close_map(▾m) ▸ closed {}
     ⊤ ▷ ■ ok {note}

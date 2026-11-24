@@ -27,7 +27,8 @@ t3.false ∨ t3.true ▷ v4 : i8 := 8 ÷ 3
 ⊤ ▷ v6 : u32 := v5.m2
 ⊤ ▷ s7 : ↻ l8(i9 : u16 := 0, x10 : string := clone(v1), x11 : st0 := st0 {¬(v4 < v4), v6, v6 + v6}) {
     ⊤ ▷ t12 : ? i9 < 3
-    ¬t12.true ∨ t12.true ▷ d13 : Δ e0(5, st1 {v5, st0 {len(v1) = len(p1), v6, v6}, p0 ÷ 3}, p0 mod 9) ▸ more {} │ some {v14, v15} │ high {}
+    ¬t12.true ∨ t12.true ▷ h1 : st1 := st1 {v5, st0 {len(v1) = len(p1), v6, v6}, p0 ÷ 3}
+    ¬t12.true ∨ t12.true ▷ d13 : Δ e0(5, &h1, p0 mod 9) ▸ more {} │ some {v14, v15} │ high {}
     ¬t12.true ∨ t12.true ▷ ~v16 : i16 ⇀ st2 := ∅
     d13.high ∧ t12.false ▷ ~v17 := i9 mod i9 = i9 mod 9
     t12.false ∧ d13.more ▷ ~v18 := st1 {st0 {8 mod 4 = 5 - 2, x11.m1, v5.m1}, st0 {v4 ≠ 3, x11.m2, v6}, 3 + p0 mod 9}
@@ -43,8 +44,12 @@ control c1() ■ { more {} │ hit {r0 : bool, r1 : string} } uses console.write
 ⊤ ▷ v1 : i16 := 5
 ⊤ ▷ v2 : u32 := 3
 ⊤ ▷ ⊢ v2 = 3
-⊤ ▷ d3 : Δ e1(st0 {v2 ≠ 0 mod 9, 4 mod 6 * (v2 mod 6), v2 mod 8 * (v2 mod 5)}, st1 {st0 {9 = 9, 3, v2}, st0 {2 mod 2 * (2 mod 8) ≠ 4294967294, v2, v2}, v1 * 5}, 8 + 1 * 4) ▸ miss {} │ none {v4}
-¬d3.none ∨ d3.none ▷ d5 : Δ e1(st0 {0 mod 9 * (v2 mod 7) < 0, 7, v2 mod 9}, st1 {st0 {v2 ≠ v2, 8, v2}, st0 {true, v2, 9}, v1}, v2) ▸ miss {} │ none {v6}
+⊤ ▷ h2 : st0 := st0 {v2 ≠ 0 mod 9, 4 mod 6 * (v2 mod 6), v2 mod 8 * (v2 mod 5)}
+⊤ ▷ h3 : st1 := st1 {st0 {9 = 9, 3, v2}, st0 {2 mod 2 * (2 mod 8) ≠ 4294967294, v2, v2}, v1 * 5}
+⊤ ▷ d3 : Δ e1(&h2, &h3, 8 + 1 * 4) ▸ miss {} │ none {v4}
+¬d3.none ∨ d3.none ▷ h4 : st0 := st0 {0 mod 9 * (v2 mod 7) < 0, 7, v2 mod 9}
+¬d3.none ∨ d3.none ▷ h5 : st1 := st1 {st0 {v2 ≠ v2, 8, v2}, st0 {true, v2, 9}, v1}
+¬d3.none ∨ d3.none ▷ d5 : Δ e1(&h4, &h5, v2) ▸ miss {} │ none {v6}
 ¬d3.none ∨ d3.none ▷ s7 : ↻ l8(i9 : usize := 0) {
     ⊢ i9 ≤ 1
     ⊤ ▷ t10 : ? i9 = 1
@@ -65,19 +70,24 @@ control c1() ■ { more {} │ hit {r0 : bool, r1 : string} } uses console.write
 ¬d3.none ∨ d3.none ▷ v28 : u32 := 0 ÷ 5 + v2 mod 5
 ¬d3.none ∨ d3.none ▷ ⊢ v28 = 0 ÷ 5 + v2 mod 5
 ⊤ ▷ ~v29 : string ⇀ u32 := ∅
-⊤ ▷ d30 : Δ emit("b") ▸ done {}
+⊤ ▷ h9 : string := "b"
+⊤ ▷ d30 : Δ emit(&h9) ▸ done {}
 ⊤ ▷ v31 : i16 := v1
 ⊤ ▷ ~v32 := v1
 ⊤ ▷ ⊢ v32 = v1
-⊤ ▷ d33 : Δ e1(st0 {4 + v28 > v2, v26 ÷ v28, v2}, st1 {st0 {4 ÷ 2 < 5 ÷ 7, 4, v2}, st0 {v2 ≤ v28, v26, v2}, v32}, v28 mod 3 * (v26 mod 3) mod v28) ▸ miss {} │ none {v34}
+⊤ ▷ h6 : st0 := st0 {4 + v28 > v2, v26 ÷ v28, v2}
+⊤ ▷ h7 : st1 := st1 {st0 {4 ÷ 2 < 5 ÷ 7, 4, v2}, st0 {v2 ≤ v28, v26, v2}, v32}
+⊤ ▷ d33 : Δ e1(&h6, &h7, v28 mod 3 * (v26 mod 3) mod v28) ▸ miss {} │ none {v34}
 t27.true ▷ ■ hit {0 ≠ 1 ∨ v1 ÷ -4 = v1 mod 8 * (9 mod 8), "b"}
 
 control c2() ■ { miss {r0 : i16, r1 : u32} │ high {} │ hit {} } uses console.write
 ⊤ ▷ t1 : ? 2 * 7 > 13 ∨ 5 ÷ 9 ≤ 4294967295 mod 4
 t1.false ▷ ⊥
-⊤ ▷ d2 : Δ e0(9 - (7 - 3), st1 {st0 {true, 2, 1}, st0 {1 ≥ 2, 0, 0}, -8}, -7 ÷ 7) ▸ more {} │ some {v3, v4} │ high {}
+⊤ ▷ h8 : st1 := st1 {st0 {true, 2, 1}, st0 {1 ≥ 2, 0, 0}, -8}
+⊤ ▷ d2 : Δ e0(9 - (7 - 3), &h8, -7 ÷ 7) ▸ more {} │ some {v3, v4} │ high {}
 ⊤ ▷ ~v5 : bool := 8 = 8
-⊤ ▷ d6 : Δ emit("") ▸ done {}
+⊤ ▷ h10 : string := ""
+⊤ ▷ d6 : Δ emit(&h10) ▸ done {}
 d2.high ▷ t7 : ? 2 + 3 > 7 mod 4
 d2.high ∧ t7.false ▷ ⊥
 d2.more ▷ ~v8 : [st0] := [st0 {5 + 9 ≠ 5, 5, 4294967294}, st0 {2 ≤ 0, 9, 4294967294}]

@@ -1,0 +1,15 @@
+// [C1] A parameter of borrow type takes `&p`, or a name of that borrow type.
+// A value of the type that the borrow refers to is no operand there: the
+// surface binds it to a hidden name first ([U11]).
+
+control head(xs : &[u32])
+    ■ { ok {v : u32} }
+    ⊤ ▷ ■ ok {0}
+
+control gives_a_value()
+    ■ { ok {v : u32} }
+    ⊤ ▷ xs : [u32] := [3, 4]
+    ⊤ ▷ d : Δ head(xs) ▸ ok {v}
+    ⊤ ▷ ■ ok {v}
+
+//! reject C1

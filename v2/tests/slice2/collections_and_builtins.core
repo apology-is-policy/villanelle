@@ -25,10 +25,12 @@ control map_ops()
     3  ⊤ ▷ i2 : Δ insert(&~m, "b", 2) ▸ inserted {} │ replaced {p2}
     4  ⊤ ▷ i3 : Δ insert(&~m, "a", 10) ▸ inserted {} │ replaced {prev}
     5  i3.inserted ▷ ⊥
-    6  ⊤ ▷ g1 : Δ get(&m, "a") ▸ found {va} │ missing {}
+       ⊤ ▷ h1 : string := "a"
+    6  ⊤ ▷ g1 : Δ get(&m, &h1) ▸ found {va} │ missing {}
     7  g1.missing ▷ ⊥
     8  ⊤ ▷ va_val : u32 := va
-    9  ⊤ ▷ r1 : Δ remove(&~m, "b") ▸ removed {vb} │ missing {}
+       ⊤ ▷ h2 : string := "b"
+    9  ⊤ ▷ r1 : Δ remove(&~m, &h2) ▸ removed {vb} │ missing {}
     10 r1.missing ▷ ⊥
     11 ⊤ ▷ e1 : Δ entry_at(&m, 0) ▸ item {k0, v0, next0} │ finished {}
     12 e1.finished ▷ ⊥

@@ -1,0 +1,150 @@
+// [B4] Moving a value out of a slot, assigning to it and destroying it are
+// write accesses through the owner tag. When a scope ends, the owner tags of
+// its slots are killed, and with them every borrow made from them. Copying a
+// shared borrow copies its tag and moving an exclusive borrow moves its tag;
+// neither is an access.
+
+struct shelf {items : [u32], label : string}
+
+// X4: a move of the owner kills a borrow of it.
+control move_kills_borrow()
+    ■ { ok {n : usize} }
+    ⊤ ▷ s : string := "hello"
+    ⊤ ▷ r : &string := &s
+    ⊤ ▷ t : string := s
+    ⊤ ▷ ■ ok {len(r) + len(t)}
+
+// X4: a move of the owner kills a borrow of a component.
+control move_kills_component()
+    ■ { ok {n : usize} }
+    ⊤ ▷ h : shelf := shelf {[1], "top"}
+    ⊤ ▷ r : &string := &h.label
+    ⊤ ▷ g : shelf := h
+    ⊤ ▷ ■ ok {len(r)}
+
+// A copy is a read: a shared borrow lives on.
+control copy_is_a_read(n : u32)
+    ⊢ n < 1000
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := n
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ y : u32 := x
+    ⊤ ▷ ■ ok {s + y}
+
+// X4: an assignment to the owner kills a borrow of it.
+control assign_kills_borrow()
+    ■ { ok {n : usize} }
+    ⊤ ▷ ~s : string := "hello"
+    ⊤ ▷ r : &string := &s
+    ⊤ ▷ s ← "bye"
+    ⊤ ▷ ■ ok {len(r)}
+
+// A moved slot is assigned again; a borrow made afterwards reads the new
+// value.
+control borrow_after_assign()
+    ■ { ok {n : usize, t : string} }
+    ⊤ ▷ ~s : string := "hello"
+    ⊤ ▷ t : string := s
+    ⊤ ▷ s ← "bye"
+    ⊤ ▷ r : &string := &s
+    ⊤ ▷ ■ ok {len(r), t}
+
+// Copying a shared borrow copies its tag: both read, and both die with it.
+control copies_share_a_tag(write : bool)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 4
+    ⊤ ▷ s : &u32 := &x
+    ⊤ ▷ t : &u32 := s
+    ⊤ ▷ c : ? write
+    c.true ▷ x ← 5
+    ⊤ ▷ ■ ok {s + t}
+
+// Moving an exclusive borrow moves its tag: the new name writes through it.
+control moves_the_tag()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ q : &~u32 := r
+    ⊤ ▷ q ← 4
+    ⊤ ▷ ■ ok {x}
+
+// X2: the old name of a moved exclusive borrow is moved ([E-Var], [W8]).
+control old_name_is_moved()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ q : &~u32 := r
+    ⊤ ▷ r ← 4
+    ⊤ ▷ ■ ok {x}
+
+// X4: the end of an iteration kills the owner tags of the loop body, so a
+// borrow of a local of the body that leaves the loop is dead.
+control leaves_a_local()
+    ■ { ok {v : u32} }
+    ⊤ ▷ l : ↻ l(i : u32 := 0) {
+        ⊤ ▷ local : u32 := i + 1
+        ⊤ ▷ □ out {&local}
+    } ▸ out {r}
+    ⊤ ▷ ■ ok {r}
+
+// X4: and so is one that goes round to the next iteration.
+control goes_round_with_a_local()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~seed : u32 := 7
+    ⊤ ▷ l : ↻ l(r : &u32 := &seed, i : u32 := 0) {
+        ⊢ i ≤ 1
+        ⊤ ▷ local : u32 := r + 1
+        ⊤ ▷ t : ? i = 1
+        t.true ▷ □ out {local}
+        ⊤ ▷ ↑ l(&local, i + 1)
+    } ▸ out {n}
+    ⊤ ▷ ■ ok {n}
+
+// A borrow of a name of the body around the loop leaves it alive.
+control leaves_an_outer_name()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~seed : u32 := 7
+    ⊤ ▷ l : ↻ l(i : u32 := 0) {
+        ⊤ ▷ □ out {&seed}
+    } ▸ out {r}
+    ⊤ ▷ ■ ok {r}
+
+// X4: the exit of the entry kills the owner tags of its scopes, so a borrow
+// of a local in its payload is dead when the result is read.
+control returns_a_local(dummy : &string)
+    ■ { ok {out : &string ∈ dummy} }
+    ⊤ ▷ local : string := "temp"
+    ⊤ ▷ ■ ok {&local}
+
+control lends_a_local(dummy : &string)
+    ■ { ok {out : &string ∈ dummy} }
+    ⊤ ▷ local : string := "temp"
+    ⊤ ▷ ■ ok {&local}
+
+// X4: and so is one that a callee returns to its caller.
+control reads_a_dead_payload()
+    ■ { ok {n : usize} }
+    ⊤ ▷ s : string := "outer"
+    ⊤ ▷ d : Δ lends_a_local(&s) ▸ ok {r}
+    ⊤ ▷ ■ ok {len(r)}
+
+// A borrow of a parameter that the entry was given lives to the end.
+control returns_its_parameter(text : &string)
+    ■ { ok {out : &string ∈ text} }
+    ⊤ ▷ ■ ok {text}
+
+//! run move_kills_borrow() => stuck X4 B1
+//! run move_kills_component() => stuck X4 B1
+//! run copy_is_a_read(3) => done ok {6}
+//! run assign_kills_borrow() => stuck X4 B1
+//! run borrow_after_assign() => done ok {3, "hello"}
+//! run copies_share_a_tag(false) => done ok {8}
+//! run copies_share_a_tag(true) => stuck X4 B1
+//! run moves_the_tag() => done ok {4}
+//! run old_name_is_moved() => stuck X2 E-Var
+//! run leaves_a_local() => stuck X4 B1
+//! run goes_round_with_a_local() => stuck X4 B1
+//! run leaves_an_outer_name() => done ok {7}
+//! run returns_a_local("x") => stuck X4 B1
+//! run reads_a_dead_payload() => stuck X4 B1
+//! run returns_its_parameter("kept") => done ok {"kept"}

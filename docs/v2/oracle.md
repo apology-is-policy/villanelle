@@ -1105,8 +1105,9 @@ Three of them are about borrows and have their tests with slice 3.
   `insert` and `remove` is `&~p` or a name of type `&~`, which passes the
   borrow itself and is moved by it; a value or `&p` is refused by `C1`. The
   map of `get` and `entry_at`, the key of `get` and `remove` and the text of
-  `emit` are operands for a `&` parameter: `&p`, a name of that type, or a
-  value read where it is; `&~p` is refused. Four files
+  `emit` are operands for a `&` parameter: `&p` or a name of that type;
+  `&~p` is refused, and since 24 November a value too (RO14: bind it to a
+  name first, as the surface does). Four files
   `tests/slice2/reject_c1_*.core` hold the refusals, and
   `tests/slice3/builtin_operands.core` the runs, with example 6.3 of the
   reference model, whose `insert` gives back the value it replaced.
@@ -1542,6 +1543,49 @@ formatter, and conformance suite for second-class borrows and views
   idempotence, `[G3]` `■ auto` origin inference, 25 core well-formedness
   refusals, ASCII `in`/`from` and `[U11]`/Q16 surface refusals, and `[E-Host]`
   host borrow violation checks.
+
+### 15.1 The borrow rules, as requalified on 24 November 2026
+
+The suite of slice 3 has a file for each rule of the borrows, as slices 1
+and 2 have: `b1_access.core`, `b2_invalidation.core`, `b3_creation.core`,
+`b4_moves_and_scopes.core`, `b5_shapes.core`, `e_borrow_operands.core`
+([E-Borrow], [E-Operands], [E-Fn], [W8] and the borrows that a decision on
+a variant gives) and `e_views.core`, each with the runs that apply the rule
+and a run for each way of being stuck by it, and eight refusals
+`reject_c1_*.core`. With the five files before them: 20 files, 130 runs, 67
+compared with the erased semantics. `slice_three_core_conforms_and_matches_erased`
+(`v2/tests/slice3.rs`) asks for 13 rules (`SLICE3_RULES`), three stuck
+labels (`SLICE3_STUCK`) and the refusal (`SLICE3_REFUSALS`).
+
+A run that is stuck by `X4 B1` says what ended the borrow. The tag table
+(`TagTable` in `oracle.rs`) keeps, for a dead tag, the `Death`: the
+`Access` that killed it (`Read`, `Assign`, `Move`, `LendShared`,
+`LendExclusive`, `Shape`) or the end of the scope of what it refers to, and
+a descendant has the death of the tag that took it along. The detail of the
+stuck state reads, for example, "the borrow is dead: a change of shape of
+its collection ended it ([B2], [B5])". `script::Report.stuck_details` gives
+the details by control, and the table `DEATHS` of the test names the cause
+of each of the 39 dead borrows of the rule files, so that a run about [B5]
+is stuck by a change of shape and not by the borrow that the operation's
+operand makes. The count `B2` is an access that killed a tag.
+
+What the oracle did otherwise, and does now: a formula read through a dead
+borrow (RO15); a function's borrow argument made a borrow (RO16); a call
+and an exit read every borrowed argument for the formulas of the signature,
+mentioned or not (RO17: `Control::signature_reads`, `typed::mentions`,
+`Machine::entry_values`); `r ← e` through a moved borrow name was reported
+as `X2 E-Assign` and is `X2 E-Var`. The reader takes `&p`, `&~p` or a name
+or field of a view of the borrow type where a borrow type is expected
+(`Typer::borrow_operand` in `resolve.rs`), and a place for a borrow
+parameter of a function (`Typer::function_argument`); a formula reads its
+terms in place as before (`Typer::read_in_place`). The generator of slice 2
+binds a value that an operand lends to a name of its own before the
+statement (`Ctx.hidden`, `bind_hidden` in `generate/valid/data.rs`), as the
+surface does by [U11]. Such a bind runs before every operand of the
+statement, so its value moves no name that an operand before it mentions
+(`Ctx.read`); the first campaign without that rule had one program rejected
+by [O2], with `len(v2)` read after the bind had moved `v2`. The programs of
+slice 1 are unchanged, text for text over 600 seeds.
 
 ## 16. Slice 3 Phase 3: Static ROBDD Loan Checking and Borrow/View Fact Logic
 

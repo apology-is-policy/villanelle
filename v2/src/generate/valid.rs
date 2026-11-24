@@ -948,6 +948,8 @@ struct Generator<'r> {
     // The control being written.
     scopes: Vec<Scope>,
     fresh: usize,
+    /// The count of the names that hold a value an operand lends.
+    hidden: usize,
     loops: usize,
     contract: Vec<(String, Vec<(String, Type)>)>,
     parameters: Vec<String>,
@@ -2097,6 +2099,7 @@ impl Generator<'_> {
                 Type::Bool => self.gen_bool(&env, 1).0,
                 other => self.operand_for(ctx, other, callee.pre[position])?,
             };
+            data::mentioned(&argument, &mut ctx.read);
             arguments.push(argument);
         }
         Some(arguments)
@@ -2138,6 +2141,7 @@ impl Generator<'_> {
             })
             .collect();
         self.effects.extend(callee.uses.iter().cloned());
+        self.bind_hidden(selector, &mut ctx);
         self.push(
             selector,
             Command::Decide {
@@ -3265,6 +3269,7 @@ pub fn valid(rng: &mut Rng) -> Program {
         palette,
         scopes: Vec::new(),
         fresh: 0,
+        hidden: 0,
         loops: 0,
         contract: Vec::new(),
         parameters: Vec::new(),
@@ -3309,6 +3314,7 @@ pub fn valid_data(rng: &mut Rng) -> Program {
         palette,
         scopes: Vec::new(),
         fresh: 0,
+        hidden: 0,
         loops: 0,
         contract: Vec::new(),
         parameters: Vec::new(),

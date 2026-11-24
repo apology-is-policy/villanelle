@@ -115,9 +115,11 @@ control stuck_remove_kills_map_borrow()
     1  ⊤ ▷ ~m : string ⇀ u32 := ∅
     2  ⊤ ▷ i1 : Δ insert(&~m, "a", 1) ▸ inserted {} │ replaced {p1}
     3  ⊤ ▷ i2 : Δ insert(&~m, "b", 2) ▸ inserted {} │ replaced {p2}
-    4  ⊤ ▷ g1 : Δ get(&m, "a") ▸ found {va} │ missing {}
+       ⊤ ▷ h1 : string := "a"
+    4  ⊤ ▷ g1 : Δ get(&m, &h1) ▸ found {va} │ missing {}
     5  g1.missing ▷ ⊥
-    6  ⊤ ▷ r1 : Δ remove(&~m, "b") ▸ removed {vb} │ missing {}
+       ⊤ ▷ h2 : string := "b"
+    6  ⊤ ▷ r1 : Δ remove(&~m, &h2) ▸ removed {vb} │ missing {}
     7  r1.missing ▷ ⊥
     8  ⊤ ▷ ■ ok {va + vb}
 

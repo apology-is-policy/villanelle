@@ -1,0 +1,11 @@
+// [C1], [W5a] The argument of a function for a borrow parameter is a place,
+// read where it is: no borrow is written ([E-Fn]).
+
+function first(xs : &[u32]) ⊢ len(xs) > 0 : u32 := xs[0]
+
+control writes_a_borrow()
+    ■ { ok {v : u32} }
+    ⊤ ▷ xs : [u32] := [3, 4]
+    ⊤ ▷ ■ ok {first(&xs)}
+
+//! reject C1

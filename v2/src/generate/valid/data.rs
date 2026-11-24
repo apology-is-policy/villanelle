@@ -185,6 +185,44 @@ pub(super) struct Ctx {
     /// The names that an operation may have changed, of which only the type
     /// is known afterwards ([I9]).
     changed: Vec<String>,
+    /// The values that an operand lends and that no name held: each is
+    /// bound to a name of its own before the statement ([C1], [U11]).
+    hidden: Vec<Command>,
+    /// The names that the operands written so far mention. A value bound
+    /// before the statement runs before all of them, so it moves none.
+    pub(super) read: BTreeSet<String>,
+}
+
+/// Adds the names that `expr` mentions to `out`.
+pub(super) fn mentioned(expr: &Expr, out: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Integer(_)
+        | Expr::Boolean(_)
+        | Expr::String(_)
+        | Expr::EmptyMap
+        | Expr::TasksEmpty(_) => {}
+        Expr::Name(name) | Expr::Old(name) | Expr::Count(name) => {
+            out.insert(name.clone());
+        }
+        Expr::Move(inner)
+        | Expr::Borrow(_, inner)
+        | Expr::Field(inner, _)
+        | Expr::Len(inner)
+        | Expr::Clone(inner)
+        | Expr::Unary(_, inner) => mentioned(inner, out),
+        Expr::Index(left, right) | Expr::Binary(_, left, right) => {
+            mentioned(left, out);
+            mentioned(right, out);
+        }
+        Expr::Struct(_, items)
+        | Expr::Variant(_, _, items)
+        | Expr::Vector(items)
+        | Expr::Call(_, items) => {
+            for item in items {
+                mentioned(item, out);
+            }
+        }
+    }
 }
 
 /// A place: a name or a field of it.
@@ -299,6 +337,16 @@ impl Generator<'_> {
             exclusive: BTreeSet::new(),
             moved: Vec::new(),
             changed: Vec::new(),
+            hidden: Vec::new(),
+            read: BTreeSet::new(),
+        }
+    }
+
+    /// Writes the binds of the values that the operands of the statement
+    /// lend, before the statement itself.
+    pub(super) fn bind_hidden(&mut self, selector: &Selector, ctx: &mut Ctx) {
+        for bind in std::mem::take(&mut ctx.hidden) {
+            self.push(selector, bind);
         }
     }
 
@@ -939,8 +987,25 @@ impl Generator<'_> {
                 if must {
                     return None;
                 }
-                // A value that is read where it is.
-                self.sized_value(ctx, inner, pre)
+                // A value that no name holds is bound to one first: a
+                // slot of borrow type takes `&p` ([C1]).
+                let before = ctx.moved.len();
+                let value = self.sized_value(ctx, inner, pre)?;
+                if ctx.moved[before..]
+                    .iter()
+                    .any(|name| ctx.read.contains(name))
+                {
+                    return None;
+                }
+                self.hidden += 1;
+                let hidden = format!("h{}", self.hidden);
+                ctx.hidden.push(Command::Bind {
+                    mutable: false,
+                    name: hidden.clone(),
+                    ty: Some((**inner).clone()),
+                    value,
+                });
+                Some(Expr::Borrow(BorrowMode::Shared, Box::new(name(&hidden))))
             }
             other => self.sized_value(ctx, other, pre),
         }
@@ -1434,8 +1499,8 @@ impl Generator<'_> {
         true
     }
 
-    /// An operand for a parameter `&τ` of a built-in operation: `&p`, or a
-    /// value that is read where it is.
+    /// An operand for a parameter `&τ` of a built-in operation: `&p`, where
+    /// `p` may be a name that the statement binds for it.
     fn read_operand(&mut self, ctx: &mut Ctx, ty: &Type) -> Option<Expr> {
         self.operand_for(
             ctx,
@@ -1514,6 +1579,7 @@ impl Generator<'_> {
                 let found = self.fresh("v");
                 let arms = vec![arm("found", &[&found]), arm("missing", &[])];
                 let arguments = vec![lend(BorrowMode::Shared), key];
+                self.bind_hidden(selector, &mut ctx);
                 let site = self.operation(selector, "get", arguments, arms);
                 self.apply(running, &ctx);
                 let outcomes = envs(self)
@@ -1587,6 +1653,7 @@ impl Generator<'_> {
                 let previous = self.fresh("v");
                 let arms = vec![arm("removed", &[&previous]), arm("missing", &[])];
                 let arguments = vec![lend(BorrowMode::Exclusive), key];
+                self.bind_hidden(selector, &mut ctx);
                 let site = self.operation(selector, "remove", arguments, arms);
                 self.apply(running, &ctx);
                 // The contract of `remove` says nothing of the length.
@@ -1658,6 +1725,7 @@ impl Generator<'_> {
             return false;
         };
         self.effects.insert("console.write".to_string());
+        self.bind_hidden(selector, &mut ctx);
         let site = self.operation(selector, "emit", vec![text], vec![arm("done", &[])]);
         self.apply(running, &ctx);
         let outcomes = running
@@ -1736,6 +1804,7 @@ impl Generator<'_> {
         let ty = Type::OutcomeNamed(callee.name.clone());
         let typed = self.rng.chance(1, 3);
         self.effects.extend(callee.uses.iter().cloned());
+        self.bind_hidden(selector, &mut ctx);
         self.push(
             selector,
             Command::Capture {

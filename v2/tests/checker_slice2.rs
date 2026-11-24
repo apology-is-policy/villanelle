@@ -437,7 +437,8 @@ fn faults_effects_and_boundaries_clauses_f1_to_f6() {
         "F3",
         "
         control missing_console() ■ { done {} } :=
-            ⊤ ▷ e : Δ emit(\"hi\") ▸ done {}
+            ⊤ ▷ t : string := \"hi\"
+            ⊤ ▷ e : Δ emit(&t) ▸ done {}
             ⊤ ▷ ■ done {}
         ",
     );
@@ -1015,7 +1016,8 @@ control c()
     3  ⊤ ▷ d : Δ outcome(▾o) ▸ inserted {} │ replaced {previous}
     4  d.replaced ▷ ⊥
     5  d.inserted ▷ ⊢ len(m) = 1
-    6  ⊤ ▷ p := capture remove(&~m, "a")
+    6  ⊤ ▷ k : string := "a"
+    6  ⊤ ▷ p := capture remove(&~m, &k)
     7  ⊤ ▷ e : Δ outcome(▾p) ▸ removed {was} │ missing {}
     8  e.removed ▷ ⊢ len(m) = 0
     9  e.missing ▷ ⊢ len(m) = 1
@@ -1848,7 +1850,8 @@ fn the_effects_of_a_supervised_boundary_count_toward_what_supervises_f3_f6() {
     // supervises another as well.
     let program = r#"
 boundary inner() {
-    1  ⊤ ▷ e : Δ emit("in") ▸ done {}
+    1  ⊤ ▷ t : string := "in"
+    1  ⊤ ▷ e : Δ emit(&t) ▸ done {}
     2  ⊤ ▷ terminate
 } contingency (m : string) {
     1  ⊤ ▷ terminate

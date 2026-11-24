@@ -425,6 +425,23 @@ impl Control {
         self.is_async && self.body.is_none() && self.contract.iter().any(|a| a.name == "cancelled")
     }
 
+    /// Whether the precondition or a condition of the contract mentions
+    /// the parameter `index`, as it is or under `old`. The instrumented
+    /// semantics keeps the value at entry of such a parameter
+    /// ([E-Formula]); of the others it needs nothing.
+    pub fn signature_reads(&self, index: usize) -> bool {
+        self.precondition
+            .iter()
+            .chain(
+                self.contract
+                    .iter()
+                    .filter_map(|alternative| alternative.condition.as_ref()),
+            )
+            .any(|formula| {
+                mentions(formula, VarRef::Parameter(index)) || mentions_old(formula, index)
+            })
+    }
+
     /// Whether the operation is locally pure ([I10]): not `async`, no effects,
     /// and no resource type anywhere in its parameters or payloads. This is
     /// the whole of [I10] for an extern control; for a defined one, which
@@ -975,5 +992,58 @@ impl Program {
         let mut seen_bnd = vec![false; self.boundaries.len()];
         seen_ctrl[id] = true;
         !body_has_run(self, body, &mut seen_ctrl, &mut seen_bnd)
+    }
+}
+
+/// Whether `expr`, a formula of a signature, mentions the name `wanted` as
+/// it is: a parameter under `old` is not such a mention.
+pub fn mentions(expr: &Expr, wanted: VarRef) -> bool {
+    occurs(
+        expr,
+        &|part| matches!(part, Expr::Var(name, _) if *name == wanted),
+    )
+}
+
+/// Whether `expr` mentions `old` of the parameter `index`.
+pub fn mentions_old(expr: &Expr, index: usize) -> bool {
+    occurs(
+        expr,
+        &|part| matches!(part, Expr::Old(parameter, _) if *parameter == index),
+    )
+}
+
+fn occurs(expr: &Expr, wanted: &dyn Fn(&Expr) -> bool) -> bool {
+    if wanted(expr) {
+        return true;
+    }
+    match expr {
+        Expr::Boolean(_)
+        | Expr::Integer(_, _)
+        | Expr::String(_)
+        | Expr::EmptyMap(_)
+        | Expr::TasksEmpty(_, _)
+        | Expr::Count(_)
+        | Expr::Old(_, _)
+        | Expr::Var(_, _) => false,
+        Expr::Borrow(_, place, _) => place.steps.iter().any(|step| match step {
+            PlaceStep::Index(at, _) => occurs(at, wanted),
+            PlaceStep::Field(_, _, _) => false,
+        }),
+        Expr::Move(inner, _)
+        | Expr::Field(inner, _, _, _)
+        | Expr::Len(inner)
+        | Expr::Clone(inner, _)
+        | Expr::Trim(inner)
+        | Expr::Negate(inner, _)
+        | Expr::Not(inner) => occurs(inner, wanted),
+        Expr::Index(left, right, _)
+        | Expr::Arithmetic(_, left, right, _)
+        | Expr::Compare(_, left, right)
+        | Expr::And(left, right)
+        | Expr::Or(left, right) => occurs(left, wanted) || occurs(right, wanted),
+        Expr::Struct(_, items, _)
+        | Expr::Variant(_, _, items, _)
+        | Expr::Vector(items, _)
+        | Expr::Call(_, items, _) => items.iter().any(|item| occurs(item, wanted)),
     }
 }

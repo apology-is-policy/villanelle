@@ -1,0 +1,88 @@
+// [B5] An operation that changes the shape of a collection (push, pop,
+// insert, remove) is a write access to the whole collection. Reading or
+// writing one element is an access to that element's place only. Here the
+// operations take an exclusive borrow name, which passes the borrow itself
+// ([W8]): no borrow is made at the statement, so what ends the borrows of
+// elements and entries is the change of shape and not [B3].
+
+// X4: push ends a borrow of an element.
+control push_kills_element()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~xs : [u32] := [10, 20]
+    ⊤ ▷ r : &~[u32] := &~xs
+    ⊤ ▷ e : &u32 := &r[0]
+    ⊤ ▷ d : Δ push(r, 30) ▸ done {}
+    ⊤ ▷ ■ ok {e}
+
+// X4: pop ends a borrow of an element, of one that stays as well.
+control pop_kills_element()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~xs : [u32] := [10, 20]
+    ⊤ ▷ r : &~[u32] := &~xs
+    ⊤ ▷ e : &u32 := &r[0]
+    ⊤ ▷ d : Δ pop(r) ▸ item {it} │ empty {}
+    ⊤ ▷ ■ ok {e}
+
+// A borrow of an element made after the change of shape is alive.
+control borrow_after_push()
+    ■ { ok {v : u32, n : usize} }
+    ⊤ ▷ ~xs : [u32] := [10, 20]
+    ⊤ ▷ d : Δ push(&~xs, 30) ▸ done {}
+    ⊤ ▷ e : &u32 := &xs[2]
+    ⊤ ▷ ■ ok {e, len(xs)}
+
+// Writing one element leaves a borrow of another alive.
+control element_beside_element()
+    ■ { ok {v : [u32]} }
+    ⊤ ▷ ~xs : [u32] := [10, 20]
+    ⊤ ▷ r : &~[u32] := &~xs
+    ⊤ ▷ e : &~u32 := &~r[1]
+    ⊤ ▷ r[0] ← 1
+    ⊤ ▷ e ← 2
+    ⊤ ▷ ■ ok {xs}
+
+// X4: insert of another key ends a borrow that `get` gave.
+control insert_kills_entry()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~m : string ⇀ u32 := ∅
+    ⊤ ▷ i : Δ insert(&~m, "a", 1) ▸ inserted {} │ replaced {p}
+    ⊤ ▷ r : &~string ⇀ u32 := &~m
+    ⊤ ▷ k : string := "a"
+    ⊤ ▷ g : Δ get(&r, &k) ▸ found {va} │ missing {}
+    g.missing ▷ ■ ok {0}
+    g.found ▷ j : Δ insert(r, "b", 2) ▸ inserted {} │ replaced {q}
+    g.found ▷ ■ ok {va}
+
+// X4: remove ends a borrow that `entry_at` gave, of another key as well.
+control remove_kills_entry()
+    ■ { ok {n : usize} }
+    ⊤ ▷ ~m : string ⇀ u32 := ∅
+    ⊤ ▷ i : Δ insert(&~m, "a", 1) ▸ inserted {} │ replaced {p}
+    ⊤ ▷ j : Δ insert(&~m, "b", 2) ▸ inserted {} │ replaced {q}
+    ⊤ ▷ r : &~string ⇀ u32 := &~m
+    ⊤ ▷ e : Δ entry_at(&r, 0) ▸ item {key, value, next} │ finished {}
+    e.finished ▷ ■ ok {0}
+    ⊤ ▷ b : string := "b"
+    e.item ▷ d : Δ remove(r, &b) ▸ removed {was} │ missing {}
+    e.item ▷ ■ ok {len(key)}
+
+// Two borrows that `get` gives, of two keys, are read together.
+control two_entries()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~m : string ⇀ u32 := ∅
+    ⊤ ▷ i : Δ insert(&~m, "a", 1) ▸ inserted {} │ replaced {p}
+    ⊤ ▷ j : Δ insert(&~m, "b", 2) ▸ inserted {} │ replaced {q}
+    ⊤ ▷ a : string := "a"
+    ⊤ ▷ b : string := "b"
+    ⊤ ▷ g : Δ get(&m, &a) ▸ found {va} │ missing {}
+    ⊤ ▷ h : Δ get(&m, &b) ▸ found {vb} │ missing {}
+    g.found ∧ h.found ▷ ■ ok {va + vb}
+    ⊤ ▷ ■ ok {0}
+
+//! run push_kills_element() => stuck X4 B1
+//! run pop_kills_element() => stuck X4 B1
+//! run borrow_after_push() => done ok {30, 3}
+//! run element_beside_element() => done ok {[1, 2]}
+//! run insert_kills_entry() => stuck X4 B1
+//! run remove_kills_entry() => stuck X4 B1
+//! run two_entries() => done ok {3}
