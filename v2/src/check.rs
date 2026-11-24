@@ -7000,7 +7000,11 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
             | Expr::Trim(inner)
             | Expr::Negate(inner, _)
             | Expr::Not(inner) => {
-                self.eval_loan_expr(inner, false, ctx, active_temps, line)?;
+                // [L2]: the operation uses a borrow of its operand where it is
+                // applied, and its value carries none, so the borrow is not
+                // used after it; what the statement holds is used throughout.
+                let mut inner_temps = active_temps.clone();
+                self.eval_loan_expr(inner, false, ctx, &mut inner_temps, line)?;
                 Ok(Vec::new())
             }
             Expr::Arithmetic(_, l, r, _)
@@ -7015,7 +7019,10 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                 Ok(Vec::new())
             }
             Expr::Call(_, args, _) => {
-                let mut call_temps = Vec::new();
+                // The arguments are accesses while what the statement holds
+                // for its command is used (RC28); the borrows of the
+                // arguments are used by the function only.
+                let mut call_temps = active_temps.clone();
                 let _ = self.eval_loan_operands(args, ctx, &mut call_temps, line)?;
                 Ok(Vec::new())
             }

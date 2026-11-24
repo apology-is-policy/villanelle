@@ -1453,3 +1453,332 @@ fn a_borrow_name_that_moved_is_not_written_through_o2() {
     }
     done_and_accepted("O2", RC27_DONE);
 }
+
+/// The loans of the checker, a clause at a time (`tests/slice3/l_loans.core`).
+/// Each row: the rule, the control that the checker refuses and the clause by
+/// which it does, the control in which a run is stuck, and beside it a
+/// control that runs to its end and is accepted. The refused control is the
+/// stuck one, but where a run is stuck in another control that keeps its
+/// contract: in the callee that reads a borrow which the operands of its
+/// call ended ([L2]), or in the caller that reads a borrow which its callee
+/// returned ([L4]). Every other control of the file is a callee, accepted
+/// with no run stuck.
+const LOANS: [(&str, &str, &str, &str, &str); 28] = [
+    (
+        "L1",
+        "bound_name_holds",
+        "L3",
+        "bound_name_holds",
+        "bound_name_read_first",
+    ),
+    (
+        "L1",
+        "payload_holds",
+        "L3",
+        "payload_holds",
+        "payload_written_first",
+    ),
+    (
+        "L1",
+        "decision_derives",
+        "L3",
+        "decision_derives",
+        "decision_read_first",
+    ),
+    (
+        "L1",
+        "leave_payload_holds",
+        "L3",
+        "leave_payload_holds",
+        "leave_payload_read_first",
+    ),
+    ("L1", "copy_holds", "L3", "copy_holds", "copy_read_first"),
+    (
+        "L1",
+        "reborrow_inherits",
+        "L3",
+        "reborrow_inherits",
+        "reborrow_beside_a_field",
+    ),
+    (
+        "L2",
+        "used_after_write",
+        "L3",
+        "used_after_write",
+        "last_use_before_write",
+    ),
+    (
+        "L2",
+        "used_on_the_same_history",
+        "L3",
+        "used_on_the_same_history",
+        "used_on_another_history",
+    ),
+    (
+        "L2",
+        "command_uses_operand",
+        "L3",
+        "both",
+        "command_uses_another_place",
+    ),
+    (
+        "L2",
+        "later_operand_uses",
+        "L3",
+        "later_operand_uses",
+        "earlier_operand_uses",
+    ),
+    (
+        "L2",
+        "formula_mentions",
+        "L3",
+        "formula_mentions",
+        "formula_before_write",
+    ),
+    (
+        "L2a",
+        "parameter_goes_round",
+        "L3",
+        "parameter_goes_round",
+        "parameter_goes_round_with_another",
+    ),
+    (
+        "L2a",
+        "parameter_goes_round",
+        "L3",
+        "parameter_goes_round",
+        "borrow_bound_in_the_body",
+    ),
+    (
+        "L2a",
+        "round_with_a_local",
+        "L3",
+        "round_with_a_local",
+        "round_with_an_outer_name",
+    ),
+    (
+        "L3",
+        "read_beside_exclusive",
+        "L3",
+        "read_beside_exclusive",
+        "reads_beside_shared",
+    ),
+    (
+        "L3",
+        "exclusive_beside_shared",
+        "L3",
+        "exclusive_beside_shared",
+        "exclusive_after_shared",
+    ),
+    (
+        "L3",
+        "move_beside_borrow",
+        "L3",
+        "move_beside_borrow",
+        "move_after_last_use",
+    ),
+    (
+        "L3",
+        "push_beside_element",
+        "L3",
+        "push_beside_element",
+        "push_after_last_use",
+    ),
+    ("L3", "same_field", "L3", "same_field", "other_field"),
+    (
+        "L3",
+        "passes_exclusive_name",
+        "L3",
+        "passes_exclusive_name",
+        "copies_shared_name",
+    ),
+    (
+        "L4",
+        "lends_a_local",
+        "L4",
+        "reads_a_local_payload",
+        "reads_a_parameter_payload",
+    ),
+    (
+        "L4",
+        "pick_second",
+        "L4",
+        "reads_the_other_payload",
+        "reads_the_named_payload",
+    ),
+    (
+        "L4",
+        "field_of_a_local",
+        "L4",
+        "reads_a_local_field",
+        "reads_the_parameter_field",
+    ),
+    (
+        "L4",
+        "leaves_with_a_local",
+        "L3",
+        "leaves_with_a_local",
+        "leaves_with_an_outer_name",
+    ),
+    ("L5", "view_holds", "L3", "view_holds", "view_written_first"),
+    (
+        "L5",
+        "moved_view_holds",
+        "L3",
+        "moved_view_holds",
+        "copied_shared_view",
+    ),
+    (
+        "L5",
+        "exclusive_field_read",
+        "L3",
+        "exclusive_field_read",
+        "shared_field_read",
+    ),
+    (
+        "L5",
+        "move_ends_exclusive_field",
+        "L3",
+        "move_ends_exclusive_field",
+        "move_keeps_shared_field",
+    ),
+];
+
+#[test]
+fn each_loan_rule_refuses_where_a_run_is_stuck_and_accepts_beside_it() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/slice3/l_loans.core");
+    let source = std::fs::read_to_string(path).unwrap();
+    let report = villanelle_v2::script::check(&source);
+    assert!(report.failures.is_empty(), "{}", report.failures.join("\n"));
+    let program = load(&source).unwrap_or_else(|e| panic!("l_loans: {e}"));
+    let verdicts: std::collections::BTreeMap<String, Option<check::Error>> =
+        check::check_each(&program)
+            .unwrap_or_else(|e| panic!("l_loans: {e}"))
+            .into_iter()
+            .collect();
+    let accepted = |control: &str| matches!(verdicts.get(control), Some(None));
+    let stuck = |control: &str| report.stuck_in.contains_key(control);
+    let mut failures = Vec::new();
+    let mut named = std::collections::BTreeSet::new();
+    for (rule, refused, clause, stuck_in, done) in LOANS {
+        match verdicts.get(refused) {
+            Some(Some(error)) if error.clause == clause => {}
+            other => failures.push(format!(
+                "[{rule}] `{refused}` is to be refused by [{clause}]: {other:?}"
+            )),
+        }
+        if !stuck(stuck_in) {
+            failures.push(format!("[{rule}] no run of `{stuck_in}` is stuck"));
+        }
+        if refused != stuck_in && (!accepted(stuck_in) || stuck(refused)) {
+            failures.push(format!(
+                "[{rule}] `{stuck_in}` keeps the contract of `{refused}`, which broke [{clause}]"
+            ));
+        }
+        if stuck(done) || !accepted(done) {
+            failures.push(format!(
+                "[{rule}] `{done}` is to run to its end and be accepted: {:?}",
+                verdicts.get(done)
+            ));
+        }
+        named.extend([refused, stuck_in, done]);
+    }
+    let mut callees = 0;
+    for (control, verdict) in &verdicts {
+        if named.contains(control.as_str()) {
+            continue;
+        }
+        callees += 1;
+        if verdict.is_some() || stuck(control) {
+            failures.push(format!(
+                "the callee `{control}` is refused or stuck: {verdict:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!((named.len(), callees), (59, 6));
+}
+
+/// Review finding RC28: the arguments of a function applied in an operand
+/// were checked as if the statement lent nothing, so a read of a name that
+/// an earlier operand lends exclusively was accepted, and the run is stuck
+/// when the callee writes through the borrow that the read ended ([L2]: the
+/// command uses every borrow among the operands, and a later part of the
+/// statement is an access while it is live). A function applied to another
+/// name is no conflict.
+const RC28_STUCK: &str = r#"
+control two(a : &~u32, b : u32)
+    ■ { done {} }
+    ⊤ ▷ a ← b
+    ⊤ ▷ ■ done {}
+
+function id(v : u32) : u32 := v
+
+control c()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ d : Δ two(r, id(x)) ▸ done {}
+    ⊤ ▷ ■ ok {x}
+
+//! run c() => stuck X4 B1
+"#;
+
+const RC28_DONE: &str = r#"
+control two(a : &~u32, b : u32)
+    ■ { done {} }
+    ⊤ ▷ a ← b
+    ⊤ ▷ ■ done {}
+
+function id(v : u32) : u32 := v
+
+control c()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ y : u32 := 2
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ d : Δ two(r, id(y)) ▸ done {}
+    ⊤ ▷ ■ ok {x}
+
+//! run c() => done ok {2}
+"#;
+
+#[test]
+fn a_function_in_an_operand_reads_while_the_statement_lends_l2() {
+    stuck_and_rejected("L3", RC28_STUCK);
+    done_and_accepted("L2", RC28_DONE);
+}
+
+/// Review finding RC29: a borrow made in the operand of `len` counted as used
+/// by the command of the statement, so the end of the scope at an exit or a
+/// leave conflicted with it, and each of these was refused by [L3] although
+/// every run ends. `len` uses the borrow where it is applied, and its value
+/// carries none ([L2]).
+const RC29_DONE: &str = r#"
+control len_at_exit()
+    ■ { ok {n : usize} }
+    ⊤ ▷ v : [u32] := [1, 2]
+    ⊤ ▷ ■ ok {len(&v)}
+
+control len_then_move()
+    ■ { ok {n : usize, w : [u32]} }
+    ⊤ ▷ v : [u32] := [1, 2]
+    ⊤ ▷ ■ ok {len(&v), ▾v}
+
+control len_in_a_loop_payload()
+    ■ { ok {n : usize} }
+    ⊤ ▷ l : ↻ l() {
+        ⊤ ▷ v : [u32] := [1, 2, 3]
+        ⊤ ▷ □ out {len(&v)}
+    } ▸ out {m}
+    ⊤ ▷ ■ ok {m}
+
+//! run len_at_exit() => done ok {2}
+//! run len_then_move() => done ok {2, [1, 2]}
+//! run len_in_a_loop_payload() => done ok {3}
+"#;
+
+#[test]
+fn a_borrow_in_the_operand_of_len_is_not_used_after_it_l2() {
+    done_and_accepted("L2", RC29_DONE);
+}

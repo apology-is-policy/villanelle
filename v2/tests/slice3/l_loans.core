@@ -1,0 +1,634 @@
+// [L1] to [L5] The loans of the checker (section 7.5 of the core), a clause
+// at a time. For each way a rule makes a loan, keeps it live or lets it go,
+// a control in which a run is stuck by the borrow that the loan stands for,
+// and beside it one that runs to its end: the checker refuses the first and
+// accepts the second (`v2/tests/checker_slice3.rs`). [L1], [L2], [L2a] and
+// [L5] say which loans there are and when they are live; a conflict is
+// refused by [L3], and a borrow that escapes by [L4].
+
+struct counter {n : u32, label : string}
+
+variant entry {value {text : string, n : u32} │ empty {}}
+
+view struct cell {slot : &~u32}
+
+view struct two {a : &u32, b : &u32}
+
+view struct mixed {a : &u32, b : &~u32}
+
+// [L1] A borrow bound to a name is held by that name.
+control bound_name_holds()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ■ ok {r}
+
+control bound_name_read_first()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ n : u32 := r
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ■ ok {n}
+
+// [L1] A borrow passed as an argument is held by the payload names that the
+// contract derives from its parameter with `∈`.
+control slot_of(c : &~counter)
+    ■ { slot {out : &~u32 ∈ c} }
+    ⊤ ▷ ■ slot {&~c.n}
+
+control payload_holds()
+    ■ { ok {v : counter} }
+    ⊤ ▷ ~k : counter := counter {3, "a"}
+    ⊤ ▷ d : Δ slot_of(&~k) ▸ slot {s}
+    ⊤ ▷ k.n ← 4
+    ⊤ ▷ s ← 5
+    ⊤ ▷ ■ ok {k}
+
+control payload_written_first()
+    ■ { ok {v : counter} }
+    ⊤ ▷ ~k : counter := counter {3, "a"}
+    ⊤ ▷ d : Δ slot_of(&~k) ▸ slot {s}
+    ⊤ ▷ s ← 5
+    ⊤ ▷ k.label ← "b"
+    ⊤ ▷ ■ ok {k}
+
+// [L1] A decision on a variant through a borrow derives every payload name
+// from that borrow.
+control decision_derives()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~e : entry := entry.value {"k", 4}
+    ⊤ ▷ d : Δ entry(&e) ▸ value {t, n} │ empty {}
+    d.value ▷ e ← entry.empty {}
+    d.value ▷ ■ ok {n}
+    d.empty ▷ ■ ok {0}
+
+control decision_read_first()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~e : entry := entry.value {"k", 4}
+    ⊤ ▷ d : Δ entry(&e) ▸ value {t, n} │ empty {}
+    d.value ▷ m : u32 := n
+    d.value ▷ e ← entry.empty {}
+    d.value ▷ ■ ok {m}
+    d.empty ▷ ■ ok {0}
+
+// [L1] A borrow written as an operand of `□` is held by the payload name of
+// the loop's alternative.
+control leave_payload_holds()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ l : ↻ l() {
+        ⊤ ▷ □ out {&x}
+    } ▸ out {r}
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ■ ok {r}
+
+control leave_payload_read_first()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ l : ↻ l() {
+        ⊤ ▷ □ out {&x}
+    } ▸ out {r}
+    ⊤ ▷ n : u32 := r
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ■ ok {n}
+
+// [L1] A borrow that flows into a name by a copy makes that name a holder.
+control copy_holds()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ q : &u32 := r
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ■ ok {q}
+
+control copy_read_first()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ q : &u32 := r
+    ⊤ ▷ n : u32 := q
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ■ ok {n}
+
+// [L1] A borrow made through `r` is a loan on `*r`, and its holder holds
+// every loan that `r` holds: a write of the place lent to `r` ends it, and a
+// write through `r` of another field does not ([L3]).
+control reborrow_inherits()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~k : counter := counter {3, "a"}
+    ⊤ ▷ r : &~counter := &~k
+    ⊤ ▷ n : &u32 := &r.n
+    ⊤ ▷ k.label ← "b"
+    ⊤ ▷ ■ ok {n}
+
+control reborrow_beside_a_field()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~k : counter := counter {3, "a"}
+    ⊤ ▷ r : &~counter := &~k
+    ⊤ ▷ n : &u32 := &r.n
+    ⊤ ▷ r.label ← "b"
+    ⊤ ▷ m : u32 := n
+    ⊤ ▷ k.label ← "c"
+    ⊤ ▷ ■ ok {m}
+
+// [L2] A loan is live after an access while a holder is mentioned later.
+control used_after_write()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ x ← 3
+    ⊤ ▷ r ← 2
+    ⊤ ▷ ■ ok {x}
+
+control last_use_before_write()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ r ← 2
+    ⊤ ▷ x ← 3
+    ⊤ ▷ ■ ok {x}
+
+// [L2] Liveness is a formula of histories: a later use on another history
+// does not make the loan live.
+control used_on_the_same_history(b : bool)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ t : ? b
+    t.true ▷ x ← 2
+    ⊤ ▷ r ← 3
+    ⊤ ▷ ■ ok {x}
+
+control used_on_another_history(b : bool)
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ t : ? b
+    t.true ▷ x ← 2
+    t.false ▷ r ← 3
+    ⊤ ▷ ■ ok {x}
+
+// [L2] The command of a statement uses every borrow among its operands, so
+// an operand made after another is an access while the other is live.
+control both(a : &u32, b : &~u32)
+    ■ { done {} }
+    ⊤ ▷ b ← a
+    ⊤ ▷ ■ done {}
+
+control command_uses_operand()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ d : Δ both(&x, &~x) ▸ done {}
+    ⊤ ▷ ■ ok {x}
+
+control command_uses_another_place()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ y : u32 := 5
+    ⊤ ▷ d : Δ both(&y, &~x) ▸ done {}
+    ⊤ ▷ ■ ok {x}
+
+// [L2] A later part of the same statement is a use.
+control later_operand_uses()
+    ■ { ok {a : u32, b : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ ■ ok {x, r}
+
+control earlier_operand_uses()
+    ■ { ok {a : u32, b : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ ■ ok {r, x}
+
+// [L2] A formula is a mention ([E-Formula] reads through a live borrow only).
+control formula_mentions()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ⊢ r = 2
+    ⊤ ▷ ■ ok {x}
+
+control formula_before_write()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ ⊢ r = 1
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ■ ok {x}
+
+// [L2a] A loop parameter that receives a borrow through `↑` holds its loan
+// throughout the body, so a write before the borrow is made in the text is
+// a write on the next iteration while the parameter is used. A borrow bound
+// in the body is made again on each iteration and holds nothing at its start.
+control parameter_goes_round()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ y : u32 := 2
+    ⊤ ▷ l : ↻ l(r : &u32 := &y, i : u32 := 0) {
+        ⊢ i ≤ 1
+        ⊤ ▷ x ← 5
+        ⊤ ▷ n : u32 := r
+        ⊤ ▷ t : ? i = 1
+        t.true ▷ □ out {n}
+        ⊤ ▷ ↑ l(&x, i + 1)
+    } ▸ out {m}
+    ⊤ ▷ ■ ok {m}
+
+control parameter_goes_round_with_another()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ y : u32 := 2
+    ⊤ ▷ l : ↻ l(r : &u32 := &y, i : u32 := 0) {
+        ⊢ i ≤ 1
+        ⊤ ▷ x ← 5
+        ⊤ ▷ n : u32 := r
+        ⊤ ▷ t : ? i = 1
+        t.true ▷ □ out {n}
+        ⊤ ▷ ↑ l(&y, i + 1)
+    } ▸ out {m}
+    ⊤ ▷ ■ ok {m}
+
+control borrow_bound_in_the_body()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ l : ↻ l(i : u32 := 0) {
+        ⊢ i ≤ 1
+        ⊤ ▷ x ← 5
+        ⊤ ▷ r : &u32 := &x
+        ⊤ ▷ n : u32 := r
+        ⊤ ▷ t : ? i = 1
+        t.true ▷ □ out {n}
+        ⊤ ▷ ↑ l(i + 1)
+    } ▸ out {m}
+    ⊤ ▷ ■ ok {m}
+
+// [L2a], [L3] The end of an iteration is a write to the names of the body,
+// so a borrow of one cannot go round.
+control round_with_a_local()
+    ■ { ok {v : u32} }
+    ⊤ ▷ seed : u32 := 7
+    ⊤ ▷ l : ↻ l(r : &u32 := &seed, i : u32 := 0) {
+        ⊢ i ≤ 1
+        ⊤ ▷ local : u32 := r
+        ⊤ ▷ t : ? i = 1
+        t.true ▷ □ out {local}
+        ⊤ ▷ ↑ l(&local, i + 1)
+    } ▸ out {n}
+    ⊤ ▷ ■ ok {n}
+
+control round_with_an_outer_name()
+    ■ { ok {v : u32} }
+    ⊤ ▷ seed : u32 := 7
+    ⊤ ▷ l : ↻ l(r : &u32 := &seed, i : u32 := 0) {
+        ⊢ i ≤ 1
+        ⊤ ▷ local : u32 := r
+        ⊤ ▷ t : ? i = 1
+        t.true ▷ □ out {local}
+        ⊤ ▷ ↑ l(&seed, i + 1)
+    } ▸ out {n}
+    ⊤ ▷ ■ ok {n}
+
+// [L3] A read conflicts with an exclusive loan and not with a shared one.
+control read_beside_exclusive()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &~u32 := &~x
+    ⊤ ▷ n : u32 := x
+    ⊤ ▷ r ← 2
+    ⊤ ▷ ■ ok {n}
+
+control reads_beside_shared()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ n : u32 := x
+    ⊤ ▷ q : &u32 := &x
+    ⊤ ▷ m : u32 := r
+    ⊤ ▷ ■ ok {m}
+
+// [L3] An exclusive borrow is a write.
+control exclusive_beside_shared()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ q : &~u32 := &~x
+    ⊤ ▷ ■ ok {r}
+
+control exclusive_after_shared()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ r : &u32 := &x
+    ⊤ ▷ n : u32 := r
+    ⊤ ▷ q : &~u32 := &~x
+    ⊤ ▷ ■ ok {n}
+
+// [L3] A move is a write.
+control move_beside_borrow()
+    ■ { ok {n : usize} }
+    ⊤ ▷ v : [u32] := [1]
+    ⊤ ▷ r : &[u32] := &v
+    ⊤ ▷ w : [u32] := ▾v
+    ⊤ ▷ ■ ok {len(r)}
+
+control move_after_last_use()
+    ■ { ok {n : usize} }
+    ⊤ ▷ v : [u32] := [1]
+    ⊤ ▷ r : &[u32] := &v
+    ⊤ ▷ n : usize := len(r)
+    ⊤ ▷ w : [u32] := ▾v
+    ⊤ ▷ ■ ok {n}
+
+// [L3] A change of shape is a write to the collection, which overlaps each
+// of its elements: here through the borrow name that the element is
+// borrowed through as well.
+control push_beside_element()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~xs : [u32] := [1, 2]
+    ⊤ ▷ r : &~[u32] := &~xs
+    ⊤ ▷ e : &u32 := &r[0]
+    ⊤ ▷ d : Δ push(r, 3) ▸ done {}
+    ⊤ ▷ ■ ok {e}
+
+control push_after_last_use()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~xs : [u32] := [1, 2]
+    ⊤ ▷ r : &~[u32] := &~xs
+    ⊤ ▷ e : &u32 := &r[0]
+    ⊤ ▷ n : u32 := e
+    ⊤ ▷ d : Δ push(r, 3) ▸ done {}
+    ⊤ ▷ ■ ok {n}
+
+// [L3] Places overlap where one is a prefix of the other: two fields of one
+// struct do not.
+control same_field()
+    ■ { ok {v : counter} }
+    ⊤ ▷ ~k : counter := counter {3, "a"}
+    ⊤ ▷ r : &~u32 := &~k.n
+    ⊤ ▷ k.n ← 2
+    ⊤ ▷ r ← 4
+    ⊤ ▷ ■ ok {k}
+
+control other_field()
+    ■ { ok {v : counter} }
+    ⊤ ▷ ~k : counter := counter {3, "a"}
+    ⊤ ▷ r : &~u32 := &~k.n
+    ⊤ ▷ k.label ← "b"
+    ⊤ ▷ r ← 4
+    ⊤ ▷ ■ ok {k}
+
+// [L3] Passing an exclusive borrow name is a write to all that is behind it;
+// copying a shared one is a read.
+control set_count(c : &~counter)
+    ■ { done {} }
+    ⊤ ▷ c.n ← 9
+    ⊤ ▷ ■ done {}
+
+control passes_exclusive_name()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~k : counter := counter {3, "a"}
+    ⊤ ▷ r : &~counter := &~k
+    ⊤ ▷ n : &u32 := &r.n
+    ⊤ ▷ d : Δ set_count(r) ▸ done {}
+    ⊤ ▷ ■ ok {n}
+
+control copies_shared_name()
+    ■ { ok {v : u32} }
+    ⊤ ▷ k : counter := counter {3, "a"}
+    ⊤ ▷ r : &counter := &k
+    ⊤ ▷ n : &u32 := &r.n
+    ⊤ ▷ q : &counter := r
+    ⊤ ▷ ■ ok {n}
+
+// [L4] A borrow in a payload field holds loans only on what is behind the
+// parameters that the field names with `∈`: not on a local, whose scope the
+// exit ends, and not on another parameter, which the caller does not see as
+// lent. The run is stuck in the caller; the checker refuses the callee.
+control lends_a_local(d : &string)
+    ■ { ok {out : &string ∈ d} }
+    ⊤ ▷ local : string := "temp"
+    ⊤ ▷ ■ ok {&local}
+
+control reads_a_local_payload()
+    ■ { ok {n : usize} }
+    ⊤ ▷ s : string := "outer"
+    ⊤ ▷ d : Δ lends_a_local(&s) ▸ ok {r}
+    ⊤ ▷ ■ ok {len(r)}
+
+control lends_its_parameter(d : &string)
+    ■ { ok {out : &string ∈ d} }
+    ⊤ ▷ ■ ok {d}
+
+control reads_a_parameter_payload()
+    ■ { ok {n : usize} }
+    ⊤ ▷ s : string := "outer"
+    ⊤ ▷ d : Δ lends_its_parameter(&s) ▸ ok {r}
+    ⊤ ▷ ■ ok {len(r)}
+
+control pick_second(a : &u32, b : &u32)
+    ■ { ok {r : &u32 ∈ a} }
+    ⊤ ▷ ■ ok {b}
+
+control reads_the_other_payload()
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := 1
+    ⊤ ▷ ~y : u32 := 2
+    ⊤ ▷ d : Δ pick_second(&x, &y) ▸ ok {r}
+    ⊤ ▷ y ← 5
+    ⊤ ▷ ■ ok {r}
+
+control pick_first(a : &u32, b : &u32)
+    ■ { ok {r : &u32 ∈ a} }
+    ⊤ ▷ ■ ok {a}
+
+control reads_the_named_payload()
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := 1
+    ⊤ ▷ ~y : u32 := 2
+    ⊤ ▷ d : Δ pick_first(&x, &y) ▸ ok {r}
+    ⊤ ▷ y ← 5
+    ⊤ ▷ ■ ok {r}
+
+// [L4] And not on a local through a borrow name of the body.
+control field_of_a_local(c : &counter)
+    ■ { ok {r : &u32 ∈ c} }
+    ⊤ ▷ k : counter := counter {1, "local"}
+    ⊤ ▷ q : &counter := &k
+    ⊤ ▷ ■ ok {&q.n}
+
+control reads_a_local_field()
+    ■ { ok {v : u32} }
+    ⊤ ▷ k : counter := counter {3, "a"}
+    ⊤ ▷ d : Δ field_of_a_local(&k) ▸ ok {r}
+    ⊤ ▷ ■ ok {r}
+
+control field_of_the_parameter(c : &counter)
+    ■ { ok {r : &u32 ∈ c} }
+    ⊤ ▷ q : &counter := c
+    ⊤ ▷ ■ ok {&q.n}
+
+control reads_the_parameter_field()
+    ■ { ok {v : u32} }
+    ⊤ ▷ k : counter := counter {3, "a"}
+    ⊤ ▷ d : Δ field_of_the_parameter(&k) ▸ ok {r}
+    ⊤ ▷ ■ ok {r}
+
+// [L4], [L3] The same holds for `□` and the names of the loop scope it ends.
+control leaves_with_a_local()
+    ■ { ok {v : u32} }
+    ⊤ ▷ seed : u32 := 7
+    ⊤ ▷ l : ↻ l(i : u32 := 0) {
+        ⊤ ▷ local : u32 := seed
+        ⊤ ▷ □ out {&local}
+    } ▸ out {r}
+    ⊤ ▷ ■ ok {r}
+
+control leaves_with_an_outer_name()
+    ■ { ok {v : u32} }
+    ⊤ ▷ seed : u32 := 7
+    ⊤ ▷ l : ↻ l(i : u32 := 0) {
+        ⊤ ▷ local : u32 := seed
+        ⊤ ▷ □ out {&seed}
+    } ▸ out {r}
+    ⊤ ▷ ■ ok {r}
+
+// [L5] A view holds every loan its borrow fields hold, and a name it moves
+// to holds them after it.
+control view_holds()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ w : cell := cell {&~x}
+    ⊤ ▷ x ← 2
+    ⊤ ▷ w.slot ← 3
+    ⊤ ▷ ■ ok {x}
+
+control view_written_first()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ w : cell := cell {&~x}
+    ⊤ ▷ w.slot ← 3
+    ⊤ ▷ x ← 2
+    ⊤ ▷ ■ ok {x}
+
+control moved_view_holds()
+    ■ { ok {v : u32} }
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ w : cell := cell {&~x}
+    ⊤ ▷ u : cell := ▾w
+    ⊤ ▷ n : u32 := x
+    ⊤ ▷ u.slot ← 3
+    ⊤ ▷ ■ ok {n}
+
+control copied_shared_view()
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := 1
+    ⊤ ▷ y : u32 := 2
+    ⊤ ▷ w : two := two {&x, &y}
+    ⊤ ▷ u : two := w
+    ⊤ ▷ n : u32 := x
+    ⊤ ▷ ■ ok {u.b}
+
+// [L5] A use of a view uses each of its borrows in its own mode: a read of
+// the place behind a shared field is no conflict, one behind an exclusive
+// field is; moving the view writes behind its exclusive fields only.
+control exclusive_field_read()
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := 1
+    ⊤ ▷ ~y : u32 := 2
+    ⊤ ▷ w : mixed := mixed {&x, &~y}
+    ⊤ ▷ n : u32 := y
+    ⊤ ▷ w.b ← 3
+    ⊤ ▷ ■ ok {n}
+
+control shared_field_read()
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := 1
+    ⊤ ▷ ~y : u32 := 2
+    ⊤ ▷ w : mixed := mixed {&x, &~y}
+    ⊤ ▷ n : u32 := x
+    ⊤ ▷ w.b ← 3
+    ⊤ ▷ ■ ok {n}
+
+control set_view(w : mixed)
+    ■ { done {} }
+    ⊤ ▷ w.b ← 9
+    ⊤ ▷ ■ done {}
+
+control move_ends_exclusive_field()
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := 1
+    ⊤ ▷ ~y : u32 := 2
+    ⊤ ▷ w : mixed := mixed {&x, &~y}
+    ⊤ ▷ s : &u32 := &w.b
+    ⊤ ▷ d : Δ set_view(▾w) ▸ done {}
+    ⊤ ▷ ■ ok {s}
+
+control move_keeps_shared_field()
+    ■ { ok {v : u32} }
+    ⊤ ▷ x : u32 := 1
+    ⊤ ▷ ~y : u32 := 2
+    ⊤ ▷ w : mixed := mixed {&x, &~y}
+    ⊤ ▷ s : &u32 := &w.a
+    ⊤ ▷ d : Δ set_view(▾w) ▸ done {}
+    ⊤ ▷ ■ ok {s}
+
+//! run bound_name_holds() => stuck X4 B1
+//! run bound_name_read_first() => done ok {1}
+//! run payload_holds() => stuck X4 B1
+//! run payload_written_first() => done ok {counter {5, "b"}}
+//! run decision_derives() => stuck X4 B1
+//! run decision_read_first() => done ok {4}
+//! run leave_payload_holds() => stuck X4 B1
+//! run leave_payload_read_first() => done ok {1}
+//! run copy_holds() => stuck X4 B1
+//! run copy_read_first() => done ok {1}
+//! run reborrow_inherits() => stuck X4 B1
+//! run reborrow_beside_a_field() => done ok {3}
+//! run used_after_write() => stuck X4 B1
+//! run last_use_before_write() => done ok {3}
+//! run used_on_the_same_history(true) => stuck X4 B1
+//! run used_on_the_same_history(false) => done ok {3}
+//! run used_on_another_history(true) => done ok {2}
+//! run used_on_another_history(false) => done ok {3}
+//! run command_uses_operand() => stuck X4 B1
+//! run command_uses_another_place() => done ok {5}
+//! run later_operand_uses() => stuck X4 B1
+//! run earlier_operand_uses() => done ok {1, 1}
+//! run formula_mentions() => stuck X4 B1
+//! run formula_before_write() => done ok {2}
+//! run parameter_goes_round() => stuck X4 B1
+//! run parameter_goes_round_with_another() => done ok {2}
+//! run borrow_bound_in_the_body() => done ok {5}
+//! run round_with_a_local() => stuck X4 B1
+//! run round_with_an_outer_name() => done ok {7}
+//! run read_beside_exclusive() => stuck X4 B1
+//! run reads_beside_shared() => done ok {1}
+//! run exclusive_beside_shared() => stuck X4 B1
+//! run exclusive_after_shared() => done ok {1}
+//! run move_beside_borrow() => stuck X4 B1
+//! run move_after_last_use() => done ok {1}
+//! run push_beside_element() => stuck X4 B1
+//! run push_after_last_use() => done ok {1}
+//! run same_field() => stuck X4 B1
+//! run other_field() => done ok {counter {4, "b"}}
+//! run passes_exclusive_name() => stuck X4 B1
+//! run copies_shared_name() => done ok {3}
+//! run reads_a_local_payload() => stuck X4 B1
+//! run reads_a_parameter_payload() => done ok {5}
+//! run reads_the_other_payload() => stuck X4 B1
+//! run reads_the_named_payload() => done ok {1}
+//! run reads_a_local_field() => stuck X4 B1
+//! run reads_the_parameter_field() => done ok {3}
+//! run leaves_with_a_local() => stuck X4 B1
+//! run leaves_with_an_outer_name() => done ok {7}
+//! run view_holds() => stuck X4 B1
+//! run view_written_first() => done ok {2}
+//! run moved_view_holds() => stuck X4 B1
+//! run copied_shared_view() => done ok {2}
+//! run exclusive_field_read() => stuck X4 B1
+//! run shared_field_read() => done ok {1}
+//! run move_ends_exclusive_field() => stuck X4 B1
+//! run move_keeps_shared_field() => done ok {1}

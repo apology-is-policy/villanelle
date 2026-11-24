@@ -1099,7 +1099,11 @@ every index of one collection overlaps every other.
   disjunction of `Rⱼ` over those statements. A loan is **live after an access**
   on `G`, conjoined with the disjunction of those conditions for its holders.
   The origin of a borrow parameter is a loan that is live throughout the
-  control.
+  control. A function applied in an operand, and `len`, use a borrow among
+  their arguments where they are applied; their value carries no borrow, so
+  the command does not use it. Their arguments are accesses like any other
+  part of the statement, made while the borrows of the operands before them
+  are live.
 - **[L2a] Loops.** One generic iteration stands for all of them, so a loan that
   can survive an iteration is treated as present from the start of the next. If
   a loan made in a loop body has a holder that outlives the iteration (a name
@@ -1126,9 +1130,12 @@ every index of one collection overlaps every other.
   loans that those parameters hold. Loans on the control's own names cannot be
   live there, because the exit ends their scope ([L3]); the same holds for `□`
   and `↑` and the names of the loop scopes they end.
-- **[L5] Views.** A view is a holder of every loan its borrow fields hold. It
-  is used as one borrow: shared if all its borrows are shared, exclusive
-  otherwise.
+- **[L5] Views.** A view is a holder of every loan its borrow fields hold. A
+  use of the view uses each borrow field in that field's own mode: copying,
+  moving or passing the view is a read of what is behind each shared field and
+  a write of what is behind each exclusive one ([L3]). A mention of any of its
+  fields is a mention of the view, and so a use of every loan it holds
+  ([L2]).
 
 Two consequences are worth stating. Two payload fields may derive from one
 exclusive parameter only if they borrow places that do not overlap, because
@@ -1600,3 +1607,5 @@ and what asked for it:
 | 24 November 2026 | [E-Assign] says that a name of borrow type through which an assignment writes is read as [E-Var] says. | The same tests: `r ← e` where `r` was moved is a read of a moved name, and the oracle reported an assignment to one (`X2 E-Assign`). It reports `X2 E-Var`. |
 | 24 November 2026 | [C1] says what stands where a borrow type is expected: `&p` or `&~p`, or a name or a field of a view of that type. | The reader of the core text (review finding RO14): it took any expression of the type that the borrow refers to, a constructor or a literal among them, and a name of exclusive borrow type for a shared one. The grammar has `&p` and `&~p` as the only borrows, [W5a] gives a function a place, and [U11] of the surface binds other expressions to hidden names; the reader asks for these forms now. |
 | 24 November 2026 | [C1] says that a name of exclusive borrow type where a borrow is expected may carry the move mark, and a name of shared borrow type may not. | The checker against the rule files of the borrows (review findings RO18 and RC27): the reader took a bare place given for an `&~` parameter of an operation as `&~p`, and refused `▾r` there, although the name moves and [O3] allows the mark on a name that is consumed. A name of shared borrow type is read there, as RC7 has it for `len(▾v)`. |
+| 24 November 2026 | [L2] says that a function applied in an operand, and `len`, use a borrow among their arguments where they are applied, and that their arguments are accesses while the borrows of the operands before them are live. | The clause tests of the loans (review findings RC28 and RC29). The checker held the borrow in `len(&v)` as used by the command, so `■ ok {len(&v)}` conflicted with the end of the scope at the exit, and it checked the arguments of a function in an operand as if the statement lent nothing, so `two(r, id(x))` was accepted where `r` lends `x` exclusively. The rule already gave both answers; the sentence says how it reads for a value computed from a borrow. |
+| 24 November 2026 | [L5] says that a use of a view uses each borrow field in its own mode, where it said that the view is used as one borrow, exclusive if any of its borrows is. | The same tests. The checker uses each field in its own mode: a shared field can be read through by whoever holds the view and written through by no one, so moving or passing the view does not end a borrow made through that field, and the oracle runs such a program to its end. The rule as it stood refused it. What a mention of a view keeps live is unchanged. |

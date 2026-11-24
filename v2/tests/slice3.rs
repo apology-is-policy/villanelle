@@ -67,7 +67,7 @@ const SLICE3_REFUSALS: [&str; 1] = ["C1"];
 
 /// The rule files of the borrows: a dead borrow in each says what ended it,
 /// and the cause is the clause that the run is about ([B2] to [B5]).
-const RULE_FILES: [&str; 8] = [
+const RULE_FILES: [&str; 9] = [
     "b1_access.core",
     "b2_invalidation.core",
     "b3_creation.core",
@@ -76,6 +76,7 @@ const RULE_FILES: [&str; 8] = [
     "e_borrow_operands.core",
     "e_extern_writes.core",
     "e_views.core",
+    "l_loans.core",
 ];
 
 const READ: &str = "a read of its place";
@@ -89,7 +90,7 @@ const HOST: &str = "a write of the host behind it";
 
 /// For each run of the rule files that is stuck by a dead borrow: the file,
 /// the control in which it is stuck, and what ended the borrow.
-const DEATHS: [(&str, &str, &str); 40] = [
+const DEATHS: [(&str, &str, &str); 67] = [
     ("b1_access.core", "read_through_dead", ASSIGNMENT),
     ("b1_access.core", "write_through_dead", READ),
     ("b1_access.core", "lend_through_dead", ASSIGNMENT),
@@ -146,6 +147,33 @@ const DEATHS: [(&str, &str, &str); 40] = [
         EXCLUSIVE,
     ),
     ("views_and_variants.core", "stuck_dangling_view", SCOPE),
+    ("l_loans.core", "bound_name_holds", ASSIGNMENT),
+    ("l_loans.core", "payload_holds", ASSIGNMENT),
+    ("l_loans.core", "decision_derives", ASSIGNMENT),
+    ("l_loans.core", "leave_payload_holds", ASSIGNMENT),
+    ("l_loans.core", "copy_holds", ASSIGNMENT),
+    ("l_loans.core", "reborrow_inherits", ASSIGNMENT),
+    ("l_loans.core", "used_after_write", ASSIGNMENT),
+    ("l_loans.core", "used_on_the_same_history", ASSIGNMENT),
+    ("l_loans.core", "both", EXCLUSIVE),
+    ("l_loans.core", "later_operand_uses", READ),
+    ("l_loans.core", "formula_mentions", ASSIGNMENT),
+    ("l_loans.core", "parameter_goes_round", ASSIGNMENT),
+    ("l_loans.core", "round_with_a_local", SCOPE),
+    ("l_loans.core", "read_beside_exclusive", READ),
+    ("l_loans.core", "exclusive_beside_shared", EXCLUSIVE),
+    ("l_loans.core", "move_beside_borrow", MOVE),
+    ("l_loans.core", "push_beside_element", SHAPE),
+    ("l_loans.core", "same_field", ASSIGNMENT),
+    ("l_loans.core", "passes_exclusive_name", ASSIGNMENT),
+    ("l_loans.core", "reads_a_local_payload", SCOPE),
+    ("l_loans.core", "reads_the_other_payload", ASSIGNMENT),
+    ("l_loans.core", "reads_a_local_field", SCOPE),
+    ("l_loans.core", "leaves_with_a_local", SCOPE),
+    ("l_loans.core", "view_holds", ASSIGNMENT),
+    ("l_loans.core", "moved_view_holds", READ),
+    ("l_loans.core", "exclusive_field_read", READ),
+    ("l_loans.core", "move_ends_exclusive_field", ASSIGNMENT),
 ];
 
 #[test]
@@ -219,10 +247,10 @@ fn slice_three_core_conforms_and_matches_erased() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert!(runs >= 143, "{runs} runs");
+    assert!(runs >= 200, "{runs} runs");
     // Every run that is not stuck and has a host that answers is compared
     // with the erased semantics ([R4], [R5]).
-    assert!(compared >= 73 && compared < runs, "{compared} compared");
+    assert!(compared >= 103 && compared < runs, "{compared} compared");
 }
 
 #[test]

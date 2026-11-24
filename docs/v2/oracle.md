@@ -1693,6 +1693,35 @@ RO18, the operands of a decision for an `&~` parameter took a bare place as
 renames at its entry every place its body lends exclusively
 (`collect_modified_vars`).
 
+### 16.2 The clause tests of the loans, 24 November 2026
+
+`v2/tests/slice3/l_loans.core` takes the loans of section 7.5 of the core
+a clause at a time: for each way a rule makes a loan ([L1]: a bound name,
+a payload derived with `∈`, a decision through a borrow, the payload of
+`□`, a copy, a borrow through a borrow name), keeps it live ([L2]: a later
+mention, a history, the command of the statement, a later operand, a
+formula; [L2a]: a loop parameter that receives a borrow through `↑`, the
+end of an iteration), meets an access ([L3]: a read, an exclusive borrow, a
+move, a change of shape, fields, passing a borrow name), escapes ([L4]) or
+is held by a view ([L5]), a control in which a run is stuck and one beside
+it that runs to its end. `each_loan_rule_refuses_where_a_run_is_stuck_and_accepts_beside_it`
+(`v2/tests/checker_slice3.rs`, table `LOANS`) asks that the checker refuse
+the control that broke the rule, by the clause named, and accept the one
+beside it and every callee. In four rows the run is stuck in another
+control that keeps its contract: a callee that reads a borrow which the
+operands of its call ended, or a caller that reads what its callee
+returned. The oracle suite holds the cause of each of the 27 dead borrows.
+A name of borrow type cannot be declared mutable ([W8]), so the holder of
+[L2a] that outlives an iteration is a loop parameter or the payload of a
+leave in practice.
+
+Found and closed: RC28 (the arguments of a function in an operand were
+checked as if the statement lent nothing) and RC29 (a borrow in the operand
+of `len` counted as used by the command); both are in `eval_loan_expr`. The
+checker uses each field of a view in its own mode where [L5] said the view
+is one borrow; [L5] says what the checker does now (change entry of the
+core).
+
 ## 17. Slice 3 Phase 4: Theorem 4 Expansion and Typed LLVM IR / C ABI Backend for Borrows and Views
 
 Slice 3 Phase 4 completes Theorem 4 call expansion (`expand.rs`), erased borrow
