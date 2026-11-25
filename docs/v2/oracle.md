@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets with nonsuspending members (sections 18.4 to 18.6). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose members can yield to ready siblings (sections 18.4 to 18.7). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2305,8 +2305,9 @@ delivery. Selecting the owner on an empty set consumes the set.
 
 The backend accepts one set in an owner, with spawn sites in the owner's
 top-level body. Each site can therefore run at most once per invocation.
-Decisions on `await next` can repeat in a loop. The producer must finish in
-one turn, take and return owned or copy values, and let no fault escape.
+Decisions on `await next` can repeat in a loop. Section 18.6 covers producers
+that finish in one turn. Section 18.7 extends this to defined awaits. A
+producer takes and returns owned or copy values and lets no fault escape.
 Other awaits, cancellation, faulting calls and fault boundaries in an owner
 still give diagnostics. A synchronous call that starts a nested run uses a
 separate invocation. The scripted native host consumes one `turns` choice
@@ -2320,6 +2321,34 @@ the comparisons are `vn2 test tests/slice4/checked_spawn.core` and
 `cargo test --test backend_slice4`. The latter tests both widths of `usize`
 at `-O0` and `-O2`, including allocation accounting.
 
+### 18.7 A member awaits with ready siblings, 25 November 2026
+
+A spawned member can await a defined control that finishes its work in the
+same turn. At each executed await the member binds its operands and result
+destinations in its frame, saves the point where execution will resume, and
+returns to the scheduler. It keeps its original position among the ready
+members. The host can select a sibling, or the owner if a completed member
+is waiting for delivery. When the host selects the suspended member again,
+it enters the awaited callee. Its alternative and payload return to the
+decision or capture in the member, which continues on the same turn.
+
+The owner keeps the member's locals, history bits and native temporary
+slots in its activation, including any place lent to the awaited callee.
+They survive another member's turn and a return from `await next` to the
+owner. Only first entry initializes the slots. A loop can use the same
+resume point on successive iterations. A call of the producer as a root
+uses the ordinary defined-await entry.
+
+Run `cargo test --test backend_slice4` from `v2/`. The six directives in
+`tests/slice4/checked_member_await.core` compare event order, returned
+vectors and local writes across the two interpreters and compiled code.
+A C host separately links the emitted module and records the number of ready
+tasks at every turn of `rounds(2, 1)`. Its eight offers are 2, 2, 2, 2,
+1, 1, 1, 1. Its three emits are q, p, p. Both interpreters produce the
+same offers, emits and final result. A member awaiting an extern control,
+a callee that can await again, or a callee with its own set still receives
+a diagnostic.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2331,7 +2360,8 @@ at `-O0` and `-O2`, including allocation accounting.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs suspending members, repeated spawn sites,
+- **Later work.** Slice 4 still needs nested suspension in a member, defined awaits in a
+  set owner, repeated spawn sites,
   multiple sets, loans, host waits, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list

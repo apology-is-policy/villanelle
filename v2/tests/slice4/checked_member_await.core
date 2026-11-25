@@ -1,0 +1,72 @@
+// A member binds a vector and a borrow of its own local before yielding.
+// Its sibling can run and the owner can receive that sibling's result while
+// the first member is still suspended.
+async control stamp(cell : &~usize) ■ { done {} }
+    ⊤ ▷ cell ← 9
+    ⊤ ▷ ■ done {}
+
+async control deliver(phase : &string, data : [usize]) ■ { got {xs : [usize]} } uses console.write
+    ⊤ ▷ e : Δ emit(phase) ▸ done {}
+    ⊤ ▷ ■ got {▾data}
+
+async control worker(name : string, phase : string, data : [usize], twice : bool)
+    ■ { got {xs : [usize], mark : usize} } uses console.write
+    ⊤ ▷ ~cell : usize := 1
+    ⊤ ▷ start : Δ emit(&name) ▸ done {}
+    ⊤ ▷ t : ? twice
+    t.true ▷ s : Δ await stamp(&~cell) ▸ done {}
+    ⊤ ▷ r := capture await deliver(&phase, ▾data)
+    ⊤ ▷ d : Δ outcome(▾r) ▸ got {xs}
+    d.got ▷ end : Δ emit(&name) ▸ done {}
+    d.got ▷ ■ got {▾xs, cell}
+
+async control pair(a : [usize], b : [usize])
+    ■ { order {first : [usize], second : [usize], m : usize, n : usize} } uses console.write
+    ⊤ ▷ ~pool : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker("A", "a", ▾a, false) into pool
+    ⊤ ▷ spawn worker("B", "b", ▾b, true) into pool
+    ⊤ ▷ x : Δ await next(pool) ▸ got {first, m} │ empty {}
+    x.empty ▷ ⊥
+    ⊤ ▷ middle : string := "received"
+    ⊤ ▷ event : Δ emit(&middle) ▸ done {}
+    ⊤ ▷ y : Δ await next(pool) ▸ got {second, n} │ empty {}
+    y.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra, k} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ order {▾first, ▾second, m, n}
+
+//! run pair([1], [2, 3]) => done order {[1], [2, 3], 1, 9} trace [emit("A") -> done; emit("a") -> done; emit("A") -> done; emit("received") -> done; emit("B") -> done; emit("b") -> done; emit("B") -> done]
+//! run pair([1], [2, 3]) turns [0, 1, 1, 1] => done order {[2, 3], [1], 9, 1} trace [emit("A") -> done; emit("B") -> done; emit("b") -> done; emit("B") -> done; emit("received") -> done; emit("a") -> done; emit("A") -> done]
+//! run pair([4], [8]) turns [1, 0, 0, 1, 1] => done order {[4], [8], 1, 9} trace [emit("B") -> done; emit("A") -> done; emit("a") -> done; emit("A") -> done; emit("b") -> done; emit("B") -> done; emit("received") -> done]
+
+// An invocation of the same control as the root has only its own turn.
+//! run worker("root", "leaf", [7], true) => done got {[7], 9} trace [emit("root") -> done; emit("leaf") -> done; emit("root") -> done]
+
+// A later iteration reaches the same resume label with different loop
+// slots. A peer with no work can finish without ever reaching that label.
+async control echo(name : &string) ■ { done {} } uses console.write
+    ⊤ ▷ e : Δ emit(name) ▸ done {}
+    ⊤ ▷ ■ done {}
+
+async control repeat(name : string, n : usize) ■ { done {} } uses console.write
+    ⊤ ▷ lp : ↻ count(left : usize := n) {
+        ⊤ ▷ end : ? left = 0
+        end.true ▷ □ finished {}
+        end.false ▷ w : Δ await echo(&name) ▸ done {}
+        w.done ▷ ↑ count(left - 1)
+    } ▸ finished {}
+    ⊤ ▷ ■ done {}
+
+async control rounds(a : usize, b : usize) ■ { ok {} } uses console.write
+    ⊤ ▷ ~pool : tasks⟨repeat⟩ := tasks⟨repeat⟩()
+    ⊤ ▷ spawn repeat("p", a) into pool
+    ⊤ ▷ spawn repeat("q", b) into pool
+    ⊤ ▷ lp : ↻ drain() {
+        ⊤ ▷ n : Δ await next(pool) ▸ done {} │ empty {}
+        n.done ▷ ↑ drain()
+        n.empty ▷ □ finished {}
+    } ▸ finished {}
+    ⊤ ▷ ■ ok {}
+
+//! run rounds(2, 1) turns [0, 1, 1] => done ok trace [emit("q") -> done; emit("p") -> done; emit("p") -> done]
+//! run rounds(0, 1) => done ok trace [emit("q") -> done]

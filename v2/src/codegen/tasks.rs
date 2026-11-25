@@ -1,6 +1,6 @@
 //! Native task sets whose spawn sites execute at most once per invocation.
-//! The owner keeps one activation per site on its stack. A member runs from
-//! entry to exit in one turn and keeps its result until the owner receives it.
+//! The owner keeps one activation per site on its stack. A member keeps its locals
+//! across defined awaits and its result until the owner receives it.
 use super::*;
 
 fn producers(body: &ControlBody) -> impl Iterator<Item = ControlId> + '_ {
@@ -18,10 +18,10 @@ pub(super) fn uses_sets(program: &Program) -> bool {
         .any(|body| producers(body).next().is_some())
 }
 
-pub(super) fn emit_support(
+pub(super) fn emit_support<'a>(
     out: &mut String,
-    program: &Program,
-    bits: u32,
+    program: &'a Program,
+    reg: &mut RuntimeRegistry<'a>,
     term_tys: &[Option<Type>],
 ) -> Result<(), String> {
     let mut members = BTreeSet::new();
@@ -72,40 +72,99 @@ pub(super) fn emit_support(
     }
     out.push_str(include_str!("task_set.ll"));
     for id in members {
-        let member = &program.controls[id];
-        let body = member
-            .body
-            .as_ref()
-            .expect("[W10] requires a defined producer");
-        let uses_loans = member
-            .parameters
-            .iter()
-            .chain(member.contract.iter().flat_map(|alt| &alt.fields))
-            .any(|p| program.contains_borrow_or_view(&p.ty));
-        if member.faults
-            || term_tys[id].is_some()
-            || uses_loans
-            || producers(body).next().is_some()
-            || body
-                .bodies
-                .iter()
-                .flat_map(|b| &b.statements)
-                .filter_map(|s| operation(&s.command))
-                .any(|op| matches!(op, Operation::AwaitControl(_) | Operation::AwaitNext(_, _)))
-        {
-            return Err(format!(
-                "the native backend needs a nonfaulting, nonsuspending task-set producer with owned or copy inputs and results for `{}`",
-                member.name
-            ));
-        }
-        emit_member(out, program, id, bits);
+        emit_member(out, program, id, reg, term_tys)?;
     }
     Ok(())
 }
 
-// The next link is at offset zero for the queue. The rest belongs to this
-// producer: its result tag, bound inputs, and one destination per output.
-fn emit_member(out: &mut String, program: &Program, id: ControlId, bits: u32) {
+fn awaits(body: &ControlBody) -> impl Iterator<Item = ControlId> + '_ {
+    body.bodies
+        .iter()
+        .flat_map(|b| &b.statements)
+        .filter_map(|s| match operation(&s.command) {
+            Some(Operation::AwaitControl(callee)) => Some(*callee),
+            _ => None,
+        })
+}
+
+fn emit_member<'a>(
+    out: &mut String,
+    program: &'a Program,
+    id: ControlId,
+    reg: &mut RuntimeRegistry<'a>,
+    term_tys: &[Option<Type>],
+) -> Result<(), String> {
+    let member = &program.controls[id];
+    let body = member
+        .body
+        .as_ref()
+        .expect("[W10] requires a defined producer");
+    let uses_loans = member
+        .parameters
+        .iter()
+        .chain(member.contract.iter().flat_map(|alt| &alt.fields))
+        .any(|p| program.contains_borrow_or_view(&p.ty));
+    if member.faults || term_tys[id].is_some() || uses_loans || producers(body).next().is_some() {
+        return Err(format!(
+            "the native backend needs a nonfaulting task-set producer with owned or copy inputs and results and no task set of its own for `{}`",
+            member.name
+        ));
+    }
+
+    let mut callees = awaits(body).peekable();
+    if callees.peek().is_some() {
+        // Ordinary synchronous calls can start a nested run, whose tasks have
+        // their own ready set. An awaited callee shares this member's turn.
+        for callee in callees {
+            let target = &program.controls[callee];
+            let Some(target_body) = &target.body else {
+                return Err(format!(
+                    "the native backend does not yet support await of extern `{}` in task-set member `{}`",
+                    target.name, member.name
+                ));
+            };
+            if awaits(target_body).next().is_some() || producers(target_body).next().is_some() {
+                return Err(format!(
+                    "the native backend does not yet support task-set member `{}` awaiting `{}`, whose body can suspend again or create a set",
+                    member.name, target.name
+                ));
+            }
+        }
+        return emit_body_unit(
+            out,
+            program,
+            reg,
+            term_tys,
+            UnitKind::Control { id, member: true },
+            &format!("vn2_member_{id}"),
+            &control_parameters(member),
+            body,
+            None,
+            None,
+            member.parameters.len(),
+        );
+    }
+
+    let args = emit_member_entry(out, program, id, reg.usize_bits, &[], &[]);
+    let _ = writeln!(
+        out,
+        "  %tag = call fastcc i32 @vn2_ctrl_{id}({})\n  ret i32 %tag\n}}\n",
+        args.join(", ")
+    );
+    Ok(())
+}
+
+// The queue link and resume index/result tag precede the bound inputs,
+// result destinations, and slots of the resumable body. Every resume gets
+// fresh SSA addresses for the same slots in this invocation of the owner.
+pub(super) fn emit_member_entry(
+    out: &mut String,
+    program: &Program,
+    id: ControlId,
+    bits: u32,
+    slots: &[(String, String)],
+    resume_points: &[String],
+) -> Vec<String> {
     let member = &program.controls[id];
     let ty = format!("%vn2.member.{id}");
     let mut fields = vec!["ptr".to_string(), "i32".to_string()];
@@ -116,33 +175,57 @@ fn emit_member(out: &mut String, program: &Program, id: ControlId, bits: u32) {
             .chain(member.contract.iter().flat_map(|alt| &alt.fields))
             .map(|f| llvm_ty(program, &f.ty, bits)),
     );
+    let locals_start = fields.len();
+    fields.extend(slots.iter().map(|(_, ty)| ty.clone()));
     let _ = writeln!(out, "{ty} = type {{ {} }}", fields.join(", "));
     let _ = writeln!(
         out,
-        "define internal fastcc void @vn2_member_{id}(ptr %frame) {{"
+        "define internal fastcc i32 @vn2_member_{id}(ptr %frame) nounwind {{\nentry:"
     );
-    let mut args = Vec::new();
-    for (i, field) in fields.iter().enumerate().skip(2) {
-        let _ = writeln!(
-            out,
-            "  %slot{i} = getelementptr {ty}, ptr %frame, i32 0, i32 {i}"
-        );
-        if i - 2 < member.parameters.len() {
-            let _ = writeln!(out, "  %arg{i} = load {field}, ptr %slot{i}");
-            args.push(format!("{field} %arg{i}"));
-        } else {
-            args.push(format!("ptr %slot{i}"));
+    let mut args: Vec<_> = member
+        .parameters
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("{} %p{i}", fields[i + 2]))
+        .collect();
+    let mut index = 2 + member.parameters.len();
+    for (alt, alternative) in member.contract.iter().enumerate() {
+        for field in 0..alternative.fields.len() {
+            let name = format!("%out_{alt}_{field}");
+            let _ = writeln!(
+                out,
+                "  {name} = getelementptr {ty}, ptr %frame, i32 0, i32 {index}"
+            );
+            args.push(format!("ptr {name}"));
+            index += 1;
         }
     }
-    let _ = writeln!(
-        out,
-        "  %tag = call fastcc i32 @vn2_ctrl_{id}({})",
-        args.join(", ")
-    );
-    let _ = writeln!(
-        out,
-        "  %result = getelementptr {ty}, ptr %frame, i32 0, i32 1\n  store i32 %tag, ptr %result\n  ret void\n}}\n"
-    );
+    for (i, (name, _)) in slots.iter().enumerate() {
+        let index = locals_start + i;
+        let _ = writeln!(
+            out,
+            "  {name} = getelementptr {ty}, ptr %frame, i32 0, i32 {index}"
+        );
+    }
+    if !resume_points.is_empty() {
+        let _ = writeln!(
+            out,
+            "  %member_state = getelementptr {ty}, ptr %frame, i32 0, i32 1\n  %pc = load i32, ptr %member_state\n  switch i32 %pc, label %bad_pc [\n    i32 0, label %start"
+        );
+        for (i, label) in resume_points.iter().enumerate() {
+            let _ = writeln!(out, "    i32 {}, label %{label}", i + 1);
+        }
+        out.push_str("  ]\nbad_pc:\n  unreachable\nstart:\n");
+    }
+    for i in 0..member.parameters.len() {
+        let index = 2 + i;
+        let ll = &fields[index];
+        let _ = writeln!(
+            out,
+            "  %in_{i} = getelementptr {ty}, ptr %frame, i32 0, i32 {index}\n  %p{i} = load {ll}, ptr %in_{i}"
+        );
+    }
+    args
 }
 
 fn pool(em: &mut IrEmitter<'_, '_>, set: VarId) -> String {

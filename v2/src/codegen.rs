@@ -2859,7 +2859,7 @@ enum UnwindTarget {
 
 #[derive(Clone, Copy)]
 enum UnitKind {
-    Control { id: ControlId },
+    Control { id: ControlId, member: bool },
     NamedBoundaryB1 { id: BoundaryId },
     NamedBoundaryB2,
 }
@@ -2871,7 +2871,9 @@ enum UnitKind {
 struct IrEmitter<'a, 'r> {
     program: &'a Program,
     reg: &'r mut RuntimeRegistry<'a>,
-    allocas: Vec<String>,
+    slots: Vec<(String, String)>,
+    /// Resume labels of a spawned control. Its slots live in the member frame.
+    resume_points: Option<Vec<String>>,
     code: String,
     next_reg: usize,
     next_label: usize,
@@ -2892,7 +2894,8 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
         Self {
             program,
             reg,
-            allocas: Vec::new(),
+            slots: Vec::new(),
+            resume_points: None,
             code: String::new(),
             next_reg: 0,
             next_label: 0,
@@ -2914,8 +2917,14 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
     fn alloc_temp(&mut self, ty: &str) -> String {
         let ptr = format!("%tmp{}", self.next_reg);
         self.next_reg += 1;
-        self.allocas.push(format!("  {ptr} = alloca {ty}"));
+        self.slots.push((ptr.clone(), ty.to_string()));
         ptr
+    }
+
+    fn emit_stack_slots(&self, out: &mut String) {
+        for (name, ty) in &self.slots {
+            let _ = writeln!(out, "  {name} = alloca {ty}");
+        }
     }
 
     fn llvm_ty(&self, ty: &Type) -> String {
@@ -3898,54 +3907,57 @@ fn emit_body_unit<'a>(
     let plan = plan;
     let mut emitter = IrEmitter::new(program, reg);
 
-    let is_control = matches!(unit, UnitKind::Control { .. });
-    let mut sig_parts: Vec<String> = params_sig
-        .iter()
-        .map(|(n, ty)| {
-            if is_control && matches!(ty, Type::Ref(BorrowMode::Exclusive, _)) {
-                format!("ptr noalias {n}")
-            } else {
-                format!("{} {n}", emitter.llvm_ty(ty))
-            }
-        })
-        .collect();
-    if let UnitKind::Control { id, .. } = unit {
-        for (alt_idx, alt) in program.controls[id].contract.iter().enumerate() {
-            for (field_idx, _) in alt.fields.iter().enumerate() {
-                sig_parts.push(format!("ptr %out_{alt_idx}_{field_idx}"));
+    let member = matches!(unit, UnitKind::Control { member: true, .. });
+    if member {
+        emitter.resume_points = Some(Vec::new());
+    } else {
+        let is_control = matches!(unit, UnitKind::Control { .. });
+        let mut sig_parts: Vec<String> = params_sig
+            .iter()
+            .map(|(n, ty)| {
+                if is_control && matches!(ty, Type::Ref(BorrowMode::Exclusive, _)) {
+                    format!("ptr noalias {n}")
+                } else {
+                    format!("{} {n}", emitter.llvm_ty(ty))
+                }
+            })
+            .collect();
+        if let UnitKind::Control { id, .. } = unit {
+            for (alt_idx, alt) in program.controls[id].contract.iter().enumerate() {
+                for (field_idx, _) in alt.fields.iter().enumerate() {
+                    sig_parts.push(format!("ptr %out_{alt_idx}_{field_idx}"));
+                }
             }
         }
-    }
-    if let Some(ref fptr) = unit_out_fault {
-        sig_parts.push(format!("ptr {fptr}"));
-    }
-    if let Some((ref tptr, _)) = unit_out_term {
-        sig_parts.push(format!("ptr {tptr}"));
-    }
+        if let Some(ref fptr) = unit_out_fault {
+            sig_parts.push(format!("ptr {fptr}"));
+        }
+        if let Some((ref tptr, _)) = unit_out_term {
+            sig_parts.push(format!("ptr {tptr}"));
+        }
 
-    let _ = writeln!(
-        out,
-        "define internal fastcc i32 @{fn_name}({}) nounwind {{",
-        sig_parts.join(", ")
-    );
+        let _ = writeln!(
+            out,
+            "define internal fastcc i32 @{fn_name}({}) nounwind {{",
+            sig_parts.join(", ")
+        );
+    }
 
     // [R1]: Allocate flat native slots for all variables of `body.vars`.
     for (var_id, var) in body.vars.iter().enumerate() {
         let ll_ty = emitter.llvm_ty(&var.ty);
-        emitter
-            .allocas
-            .push(format!("  %slot_{var_id} = alloca {ll_ty}"));
+        emitter.slots.push((format!("%slot_{var_id}"), ll_ty));
     }
     // [R3]: Allocate `i1` history bits ONLY for atoms mentioned in reachable selectors / cleanup.
     for bit_id in 0..plan.bits {
-        emitter.allocas.push(format!("  %bit_{bit_id} = alloca i1"));
+        emitter.slots.push((format!("%bit_{bit_id}"), "i1".into()));
     }
     // Allocate lexical boundary fault message buffers and loop recover param snapshots.
     for (bid, role) in roles.iter().enumerate() {
         if matches!(role, BodyRole::LexicalB2 { .. }) {
             emitter
-                .allocas
-                .push(format!("  %lex_fault_{bid} = alloca %vn2.string"));
+                .slots
+                .push((format!("%lex_fault_{bid}"), "%vn2.string".into()));
         }
     }
 
@@ -3968,8 +3980,8 @@ fn emit_body_unit<'a>(
     }
     if let Some(message) = unit_message {
         emitter
-            .allocas
-            .push("  %unit_fault = alloca %vn2.string".to_string());
+            .slots
+            .push(("%unit_fault".into(), "%vn2.string".into()));
         let _ = writeln!(emitter.code, "  store %vn2.string %m_in, ptr %unit_fault");
         if !plan.borrowed[message] {
             let copy = emitter.emit_string_copy("%unit_fault");
@@ -4680,9 +4692,18 @@ fn emit_body_unit<'a>(
         }
     }
 
-    let _ = writeln!(out, "entry:");
-    for alloca in &emitter.allocas {
-        let _ = writeln!(out, "{alloca}");
+    if let (UnitKind::Control { id, .. }, Some(points)) = (unit, &emitter.resume_points) {
+        tasks::emit_member_entry(
+            out,
+            program,
+            id,
+            emitter.reg.usize_bits,
+            &emitter.slots,
+            points,
+        );
+    } else {
+        let _ = writeln!(out, "entry:");
+        emitter.emit_stack_slots(out);
     }
     out.push_str(&emitter.code);
     let _ = writeln!(out, "}}\n");
@@ -4838,10 +4859,26 @@ fn emit_operation_call(
                     );
                     let _ = writeln!(em.code, "  store {arg}, ptr {slot}");
                 }
-                let _ = writeln!(
-                    em.code,
-                    "  {tag_reg} = call fastcc i32 @vn2_take_only_ready(ptr @vn2_resume_{cid}, ptr {frame})"
-                );
+                if let Some(points) = &mut em.resume_points {
+                    // Resume after the operands and result destinations have been
+                    // bound. The selected task enters the awaited body on this turn.
+                    let pc = points.len() + 1;
+                    let label = format!("member_resume_{pc}");
+                    points.push(label.clone());
+                    let _ = writeln!(
+                        em.code,
+                        "  store i32 {pc}, ptr %member_state\n  ret i32 -3\n{label}:"
+                    );
+                    let _ = writeln!(
+                        em.code,
+                        "  {tag_reg} = call fastcc i32 @vn2_resume_{cid}(ptr {frame})"
+                    );
+                } else {
+                    let _ = writeln!(
+                        em.code,
+                        "  {tag_reg} = call fastcc i32 @vn2_take_only_ready(ptr @vn2_resume_{cid}, ptr {frame})"
+                    );
+                }
             } else if is_extern {
                 let _ = writeln!(
                     em.code,
@@ -5467,6 +5504,15 @@ pub fn emit_llvm(program: &Program, usize_bits: u32) -> Result<String, String> {
     Ok(out)
 }
 
+fn control_parameters(control: &Control) -> Vec<(String, Type)> {
+    control
+        .parameters
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (format!("%p{i}"), p.ty.clone()))
+        .collect()
+}
+
 fn emit_program_bodies<'a>(
     body_out: &mut String,
     program: &'a Program,
@@ -5474,7 +5520,7 @@ fn emit_program_bodies<'a>(
     term_tys: &[Option<Type>],
     usize_bits: u32,
 ) -> Result<(), String> {
-    tasks::emit_support(body_out, program, usize_bits, term_tys)?;
+    tasks::emit_support(body_out, program, reg, term_tys)?;
     // Named boundaries (`@vn2_boundary_<id>` + `@vn2_boundary_b2_<id>`).
     for (bid, bdef) in program.boundaries.iter().enumerate() {
         let b1_params: Vec<(String, Type)> = bdef
@@ -5539,12 +5585,7 @@ fn emit_program_bodies<'a>(
     // Defined controls (`@vn2_ctrl_<id>`) and C-ABI wrappers (`@vn2_call_<name>`).
     for (id, control) in program.controls.iter().enumerate() {
         if let Some(body) = &control.body {
-            let params: Vec<(String, Type)> = control
-                .parameters
-                .iter()
-                .enumerate()
-                .map(|(i, p)| (format!("%p{i}"), p.ty.clone()))
-                .collect();
+            let params = control_parameters(control);
             let fslot = if control.faults {
                 Some("%out_fault".to_string())
             } else {
@@ -5558,7 +5599,7 @@ fn emit_program_bodies<'a>(
                 program,
                 reg,
                 term_tys,
-                UnitKind::Control { id },
+                UnitKind::Control { id, member: false },
                 &format!("vn2_ctrl_{id}"),
                 &params,
                 body,
@@ -5678,9 +5719,7 @@ fn emit_function<'a>(
     let _ = writeln!(out, "entry:");
     let mut emitter = IrEmitter::new(program, reg);
     let res = emitter.emit_expr(&function.body, &VarAccess::DirectParams(function));
-    for alloca in &emitter.allocas {
-        let _ = writeln!(out, "{alloca}");
-    }
+    emitter.emit_stack_slots(out);
     out.push_str(&emitter.code);
     let _ = writeln!(out, "  ret {ret_ll} {res}");
     let _ = writeln!(out, "}}\n");

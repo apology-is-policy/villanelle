@@ -1,6 +1,8 @@
 ; A queue holds its head and the address of the link to fill on append.
-; Each queued activation starts with its next link. Both queues belong to
+; Each activation starts with its next link and its resume index/result tag.
+; Both queues belong to
 ; one invocation of the owner, including when a host re-enters the module.
+%vn2.member_header = type { ptr, i32 }
 %vn2.queue = type { ptr, ptr }
 %vn2.pool = type { %vn2.queue, %vn2.queue, i64, i64 }
 
@@ -23,20 +25,26 @@ define internal fastcc void @vn2_append(ptr %queue, ptr %member) {
   ret void
 }
 
-; Remove the indexed member, preserving the relative order of the rest.
-define internal fastcc ptr @vn2_remove(ptr %queue, i64 %index) {
+; Look up the link that points to the indexed ready member. A yielding
+; member retains its place in spawn order.
+define internal fastcc ptr @vn2_link_at(ptr %queue, i64 %index) {
 entry:
   br label %seek
 seek:
   %link = phi ptr [ %queue, %entry ], [ %member, %advance ]
   %i = phi i64 [ %index, %entry ], [ %less, %advance ]
-  %member = load ptr, ptr %link
   %found = icmp eq i64 %i, 0
-  br i1 %found, label %remove, label %advance
+  br i1 %found, label %return, label %advance
 advance:
+  %member = load ptr, ptr %link
   %less = sub i64 %i, 1
   br label %seek
-remove:
+return:
+  ret ptr %link
+}
+
+define internal fastcc ptr @vn2_unlink(ptr %queue, ptr %link) {
+  %member = load ptr, ptr %link
   %next = load ptr, ptr %member
   store ptr %next, ptr %link
   %last = icmp eq ptr %next, null
@@ -50,6 +58,8 @@ return:
 }
 
 define internal fastcc void @vn2_spawn(ptr %pool, ptr %member) {
+  %state = getelementptr %vn2.member_header, ptr %member, i32 0, i32 1
+  store i32 0, ptr %state
   call fastcc void @vn2_append(ptr %pool, ptr %member)
   %ready = getelementptr %vn2.pool, ptr %pool, i32 0, i32 2
   %total = getelementptr %vn2.pool, ptr %pool, i32 0, i32 3
@@ -85,10 +95,18 @@ choose:
   br i1 %take_owner, label %deliver, label %child
 child:
   %i = sub i64 %index, %offset
-  %member = call fastcc ptr @vn2_remove(ptr %pool, i64 %i)
+  %link = call fastcc ptr @vn2_link_at(ptr %pool, i64 %i)
+  %member = load ptr, ptr %link
+  %tag = call fastcc i32 %resume(ptr %member)
+  ; -3 gives up the turn. A nonnegative alternative finishes the member.
+  %yielded = icmp eq i32 %tag, -3
+  br i1 %yielded, label %choose, label %finished
+finished:
+  call fastcc ptr @vn2_unlink(ptr %pool, ptr %link)
+  %result = getelementptr %vn2.member_header, ptr %member, i32 0, i32 1
+  store i32 %tag, ptr %result
   %nr = sub i64 %r, 1
   store i64 %nr, ptr %ready
-  call fastcc void %resume(ptr %member)
   call fastcc void @vn2_append(ptr %done, ptr %member)
   br label %choose
 deliver:
@@ -96,7 +114,7 @@ deliver:
 no_members:
   ret ptr null
 oldest:
-  %first = call fastcc ptr @vn2_remove(ptr %done, i64 0)
+  %first = call fastcc ptr @vn2_unlink(ptr %done, ptr %done)
   %nt = sub i64 %t, 1
   store i64 %nt, ptr %total
   ret ptr %first

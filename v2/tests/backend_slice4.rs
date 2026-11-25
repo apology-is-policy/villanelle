@@ -1,15 +1,16 @@
 //! Native defined roots, awaits, and scheduling of task-set members.
-use std::{fs, process::Command};
+use std::{collections::VecDeque, fs, process::Command};
 use villanelle_v2::codegen::{emit_c_header, emit_llvm, run_native_counted};
 use villanelle_v2::differential::{Verdict, compare};
 use villanelle_v2::host::{Answer, Host, Scheduled, Script};
 use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{self, Config, Value};
-use villanelle_v2::typed::Control;
+use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
 const ROOTS: &str = include_str!("slice4/checked_run.core");
 const AWAITS: &str = include_str!("slice4/checked_await.core");
+const MEMBER_AWAIT: &str = include_str!("slice4/checked_member_await.core");
 
 fn compare_native_runs(source: &str, rules: &[&str], counts: &[u64], allocations: u64) {
     let (program, runs) = script::native_runs(source).unwrap();
@@ -85,6 +86,12 @@ fn spawned_members_run_on_the_chosen_turn_and_keep_their_payloads() {
 }
 
 #[test]
+fn a_defined_await_keeps_a_member_ready_with_its_bound_operands() {
+    // Each pair owns two input vectors. The same worker run alone owns one.
+    compare_native_runs(MEMBER_AWAIT, &["E-Await"], &[3, 3, 3, 2, 3, 1], 7);
+}
+
+#[test]
 fn native_compilation_reports_operations_that_need_a_scheduler() {
     // Put supported entries first. Both emitters compile the whole module.
     for (decls, reason) in [
@@ -144,6 +151,7 @@ async control pool() ■ { ok {} }
 #[derive(Default)]
 struct TurnHost {
     turns: u64,
+    choices: VecDeque<usize>,
     calls: Vec<String>,
 }
 
@@ -151,7 +159,7 @@ impl Host for TurnHost {
     fn pick_turn(&mut self, ready: usize) -> usize {
         self.calls.push(format!("ready {ready}"));
         self.turns += 1;
-        0
+        self.choices.pop_front().unwrap_or(0)
     }
 
     fn call(&mut self, control: &Control, args: &[Value], _: &Config) -> Result<Answer, String> {
@@ -201,19 +209,14 @@ int main(void) {
 
 #[test]
 fn the_host_picks_the_turn_before_the_awaited_body_starts() {
-    let program = load(AWAITS).unwrap();
-    let dir = std::env::temp_dir().join(format!("vn2_await_turn_{}", std::process::id()));
-    fs::create_dir(&dir).unwrap();
-    fs::write(dir.join("host.c"), C_HOST).unwrap();
-    for bits in [32, 64] {
-        let config = Config::with_usize_bits(bits);
+    compare_c_host(AWAITS, "await_turn", C_HOST, |program, config| {
         let mut expected = Vec::new();
         for wait in [false, true] {
             let args = vec![Value::Bool(wait)];
             let mut host = TurnHost::default();
-            let original = oracle::run(&program, "runs_timed", args.clone(), &mut host, &config);
+            let original = oracle::run(program, "runs_timed", args.clone(), &mut host, config);
             let mut erased_host = TurnHost::default();
-            let erased = erased::run(&program, "runs_timed", args, &mut erased_host, &config);
+            let erased = erased::run(program, "runs_timed", args, &mut erased_host, config);
             assert_eq!(erased.end.to_string(), original.end.to_string());
             assert_eq!(erased.trace, original.trace);
             assert_eq!(erased_host.calls, host.calls);
@@ -221,6 +224,78 @@ fn the_host_picks_the_turn_before_the_awaited_body_starts() {
             expected.extend(host.calls);
             expected.push(original.end.to_string());
         }
+        expected
+    });
+}
+
+#[test]
+fn the_host_sees_a_suspended_member_in_spawn_order_until_it_finishes() {
+    const DRIVER: &str = r#"
+#include "module.h"
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static unsigned turn, emitted;
+static char events[3];
+
+uint64_t vn2_pick_turn(uint64_t ready_count) {
+    const uint64_t choices[] = {0, 1, 1};
+    printf("ready %" PRIu64 "\n", ready_count);
+    unsigned i = turn++;
+    return i < 3 ? choices[i] : 0;
+}
+void vn2_builtin_emit(const struct vn2_string *value) {
+    if (emitted == sizeof(events) || value->len != 1) exit(2);
+    events[emitted++] = value->data[0];
+}
+int main(void) {
+    if (vn2_call_rounds(2, 1) != VN2_ROUNDS_OK) return 1;
+    for (unsigned i = 0; i < emitted; ++i)
+        printf("emit(\"%c\") -> done {}\n", events[i]);
+    puts("done ok {}");
+    return 0;
+}
+"#;
+    compare_c_host(MEMBER_AWAIT, "member_turn", DRIVER, |program, config| {
+        let args = vec![Value::Int(Int::from_u64(2)), Value::Int(Int::from_u64(1))];
+        let host = || TurnHost {
+            choices: [0, 1, 1].into(),
+            ..Default::default()
+        };
+        let mut original_host = host();
+        let original = oracle::run(program, "rounds", args.clone(), &mut original_host, config);
+        let mut erased_host = host();
+        let erased = erased::run(program, "rounds", args, &mut erased_host, config);
+        assert_eq!(erased.end.to_string(), original.end.to_string());
+        assert_eq!(erased.trace, original.trace);
+        assert_eq!(erased_host.calls, original_host.calls);
+        let mut expected = original_host.calls;
+        assert_eq!(
+            expected,
+            [
+                "ready 2", "ready 2", "ready 2", "ready 2", "ready 1", "ready 1", "ready 1",
+                "ready 1"
+            ]
+        );
+        expected.extend(original.trace.iter().map(ToString::to_string));
+        expected.push(original.end.to_string());
+        expected
+    });
+}
+
+fn compare_c_host(
+    source: &str,
+    name: &str,
+    driver: &str,
+    observations: impl Fn(&Program, &Config) -> Vec<String>,
+) {
+    let program = load(source).unwrap();
+    let dir = std::env::temp_dir().join(format!("vn2_{name}_{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("host.c"), driver).unwrap();
+    for bits in [32, 64] {
+        let expected = observations(&program, &Config::with_usize_bits(bits));
         fs::write(dir.join("module.ll"), emit_llvm(&program, bits).unwrap()).unwrap();
         let header = emit_c_header(&program, bits);
         assert!(header.contains("uint64_t vn2_pick_turn(uint64_t ready_count);"));
@@ -289,7 +364,14 @@ async control owner() ■ { ok {} }
     let new_set = "⊤ ▷ ~other : tasks⟨child⟩ := tasks⟨child⟩()\n    ⊤ ▷ q : Δ await next(other) ▸ ok {} │ empty {}\n    q.ok ▷ ⊥";
     for (source, reason) in [
         (base.replace(next_owner, &format!("{suspend}\n    {next_owner}")), "await of another control in a task-set owner"),
-        (base.replace("child(value : usize) ■ { ok {} }", &format!("child(value : usize) ■ {{ ok {{}} }}\n    {suspend}")), "nonsuspending task-set producer"),
+        (base.replace("async control child", "async control middle() ■ { ok {} }\n    ⊤ ▷ w : Δ await idle() ▸ ok {}\n    ⊤ ▷ ■ ok {}\n\nasync control child")
+            .replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} }\n    ⊤ ▷ w : Δ await middle() ▸ ok {}"), "can suspend again"),
+        (base.replace("async control child", "extern async control read() ■ { ok {} } uses io\n\nasync control child")
+            .replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} } uses io\n    ⊤ ▷ w : Δ await read() ▸ ok {}")
+            .replace("owner() ■ { ok {} }", "owner() ■ { ok {} } uses io")
+            .replace("turns [1] => done ok", "with [read -> ok] turns [1] => done ok trace [read() -> ok]"), "await of extern `read` in task-set member"),
+        (base.replace("async control idle() ■ { ok {} }", "async control unit() ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control idle() ■ { ok {} }\n    ⊤ ▷ ~set : tasks⟨unit⟩ := tasks⟨unit⟩()\n    ⊤ ▷ n : Δ await next(set) ▸ ok {} │ empty {}\n    n.ok ▷ ⊥")
+            .replace("child(value : usize) ■ { ok {} }", &format!("child(value : usize) ■ {{ ok {{}} }}\n    {suspend}")), "can suspend again or create a set"),
         (base.replace(next_owner, &format!("{new_set}\n    {next_owner}")), "multiple task sets"),
         (base.replace(spawn, &format!("⊤ ▷ l : ↻ once() {{\n        {spawn}\n        ⊤ ▷ □ added {{}}\n    }} ▸ added {{}}")), "spawn outside the owner's top-level body"),
         (base.replace("value : usize", "value : &usize").replace("child(v)", "child(&v)"), "owned or copy inputs"),
