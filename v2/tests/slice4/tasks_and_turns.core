@@ -54,25 +54,28 @@ async control read_at(xs : &[u32], idx : usize) ■ { val {v : u32} }
     2 t.true ▷ ■ val {xs[idx]}
     3 t.false ▷ ■ val {0}
 
-async control shared_pool(xs : &[u32]) ■ { sum {total : u32} }
+async control shared_pool(xs : &[u32]) ■ { sum {total : u32} } faults
     1 ⊤ ▷ ~pool : tasks⟨read_at⟩ := tasks⟨read_at⟩()
     2 ⊤ ▷ spawn read_at(xs, 0) into pool
     3 ⊤ ▷ spawn read_at(xs, 1) into pool
     4 ⊤ ▷ ~acc : u32 := 0
     5 ⊤ ▷ lp : ↻ drain() {
           1 ⊤ ▷ n : Δ await next(pool) ▸ val {v} │ empty {}
-          2 n.val ▷ acc ← acc + v
-          3 n.val ▷ ↑ drain()
-          4 n.empty ▷ □ done {}
+          2 n.val ▷ fits : ? acc ≤ 4294967295 - v
+          3 fits.false ▷ fault "sum exceeds u32"
+          4 fits.true ▷ acc ← acc + v
+          5 fits.true ▷ ↑ drain()
+          6 n.empty ▷ □ done {}
         } ▸ done {}
     6 ⊤ ▷ ■ sum {acc}
 
-control run_shared_pool() ■ { sum {total : u32} }
-    1 ⊤ ▷ xs : [u32] := [11, 31]
-    2 ⊤ ▷ d : Δ run shared_pool(&xs) ▸ sum {t}
-    3 d.sum ▷ ■ sum {t}
+control run_shared_pool(xs : [u32]) ■ { sum {total : u32} } faults
+    1 ⊤ ▷ d : Δ run shared_pool(&xs) ▸ sum {t}
+    2 d.sum ▷ ■ sum {t}
 
-//! run run_shared_pool() => done sum {42}
+//! run run_shared_pool([11, 31]) => done sum {42}
+//! run run_shared_pool([4294967294, 1]) => done sum {4294967295}
+//! run run_shared_pool([4294967295, 1]) => faulted "sum exceeds u32"
 
 async control bump(target : &~u32, amount : u32) ⊢ target ≤ 1000 ∧ amount ≤ 1000 ■ { ok {} }
     1 ⊤ ▷ target ← target + amount

@@ -90,20 +90,7 @@ const RULE_FILES: [&str; 11] = [
 
 /// The controls of the rule files that the checker refuses although no run
 /// of them is stuck, with the clause and the reason.
-const ASKS_MORE: [(&str, &str, &str, &str); 2] = [
-    (
-        "tasks_and_turns",
-        "shared_pool",
-        "TK3",
-        "a stand-in: the loans of a task set are not checked yet, so a spawn that may lend is refused",
-    ),
-    (
-        "tasks_and_turns",
-        "excl_pool",
-        "TK3",
-        "a stand-in: the loans of a task set are not checked yet, so a spawn that may lend is refused",
-    ),
-];
+const ASKS_MORE: [(&str, &str, &str, &str); 0] = [];
 
 /// The runs that are stuck in a control that the checker accepts, because
 /// another control broke the clause and the checker refuses that one: the
@@ -135,8 +122,8 @@ const STUCK_BY_ANOTHER: [(&str, &str, &str, &str, &str); 4] = [
         "tasks_and_turns",
         "read_at",
         "race_write",
-        "TK3",
-        "`race_write` writes `xs` while a member holds a borrow of it; the stand-in refuses the spawn that lends",
+        "L3",
+        "`race_write` writes `xs` while a member holds a borrow of it",
     ),
 ];
 
@@ -253,7 +240,7 @@ fn held_against_the_oracle(
 #[test]
 fn the_rule_files_of_the_tasks_are_rejected_exactly_where_a_run_is_stuck() {
     let counts = held_against_the_oracle(&RULE_FILES, &ASKS_MORE, &STUCK_BY_ANOTHER);
-    assert_eq!(counts, (18, 132));
+    assert_eq!(counts, (18, 134));
 }
 
 // [TK4]: what a task holds where it can be stopped. A member given a lock by
@@ -729,4 +716,232 @@ fn the_operands_of_a_spawn_are_read_as_those_of_a_call_l3() {
 fn a_run_counts_the_effects_of_what_it_runs_tk7() {
     stuck_and_rejected("F3", RUN_EFFECT);
     done_and_accepted("F3", RUN_EFFECT_ALLOWED);
+}
+
+const SHARED_MEMBER: &str = r#"
+async control member(r : &u32) ■ { done {} }
+    ⊤ ▷ seen : u32 := r
+    ⊤ ▷ ■ done {}
+"#;
+
+const EXCLUSIVE_MEMBER: &str = r#"
+async control member(r : &~u32) ■ { done {} }
+    ⊤ ▷ r ← 8
+    ⊤ ▷ ■ done {}
+"#;
+
+const DRAIN: &str = r#"
+    ⊤ ▷ l : ↻ drain() {
+        ⊤ ▷ n : Δ await next(pool) ▸ done {} │ empty {}
+        n.done ▷ ↑ drain()
+        n.empty ▷ □ drained {}
+    } ▸ drained {}
+"#;
+
+/// Run an owner with two distinct places so the accepting and rejecting
+/// examples differ only in the place accessed or the order of accesses.
+fn task_loan_program(member: &str, body: &str, expected_run: &str) -> String {
+    format!(
+        r#"
+{member}
+
+async control owner() ■ {{ ok {{}} }} faults
+    ⊤ ▷ ~x : u32 := 1
+    ⊤ ▷ ~y : u32 := 2
+    ⊤ ▷ ~pool : tasks⟨member⟩ := tasks⟨member⟩()
+{body}
+
+control start() ■ {{ ok {{}} }} faults
+    ⊤ ▷ d : Δ run owner() ▸ ok {{}}
+    d.ok ▷ ■ ok {{}}
+
+//! run start() => {expected_run}
+"#
+    )
+}
+
+#[test]
+fn a_task_set_holds_shared_and_exclusive_loans_until_drained_tk3() {
+    for (member, loan, access) in [
+        (SHARED_MEMBER, "&x", "x ← 9"),
+        (EXCLUSIVE_MEMBER, "&~x", "seen : u32 := x"),
+    ] {
+        let spawn = format!("    ⊤ ▷ spawn member({loan}) into pool");
+        let before = format!("{spawn}\n    ⊤ ▷ {access}\n{DRAIN}\n    ⊤ ▷ ■ ok {{}}");
+        let after = format!("{spawn}\n{DRAIN}\n    ⊤ ▷ {access}\n    ⊤ ▷ ■ ok {{}}");
+        stuck_and_rejected("L3", &task_loan_program(member, &before, "stuck X4 B1"));
+        done_and_accepted("TK3", &task_loan_program(member, &after, "done ok"));
+    }
+}
+
+#[test]
+fn an_available_set_uses_its_loans_even_without_a_later_mention_tk3() {
+    let prefix = "    ⊤ ▷ spawn member(&x) into pool";
+    let stop = r#"    ⊤ ▷ fault "stop""#;
+    for (write, conflicts) in [("x", true), ("y", false)] {
+        let body = format!("{prefix}\n    ⊤ ▷ {write} ← 3\n{stop}");
+        let source = task_loan_program(SHARED_MEMBER, &body, r#"faulted "stop""#);
+        if conflicts {
+            done_and_rejected("L3", &source);
+        } else {
+            done_and_accepted("TK3", &source);
+        }
+    }
+}
+
+#[test]
+fn the_end_of_an_iteration_cannot_destroy_a_task_sets_lender_tk3() {
+    for (loan, conflicts) in [("&local", true), ("&x", false)] {
+        let body = format!(
+            r#"
+    ⊤ ▷ fill : ↻ fill(i : u32 := 0) {{
+        ⊤ ▷ go : ? i = 0
+        go.true ▷ local : u32 := 4
+        go.true ▷ spawn member({loan}) into pool
+        go.true ▷ ↑ fill(1)
+        go.false ▷ □ full {{}}
+    }} ▸ full {{}}
+{DRAIN}
+    ⊤ ▷ ■ ok {{}}"#
+        );
+        if conflicts {
+            stuck_and_rejected(
+                "L3",
+                &task_loan_program(SHARED_MEMBER, &body, "stuck X4 B1"),
+            );
+        } else {
+            done_and_accepted("TK3", &task_loan_program(SHARED_MEMBER, &body, "done ok"));
+        }
+    }
+}
+
+#[test]
+fn a_set_carries_its_loans_into_the_next_iteration_tk3() {
+    for (write, conflicts) in [("x", true), ("y", false)] {
+        let body = format!(
+            r#"
+    ⊤ ▷ fill : ↻ fill(i : u32 := 0) {{
+        ⊤ ▷ go : ? i = 0
+        go.false ▷ {write} ← 9
+        go.true ▷ spawn member(&x) into pool
+        go.true ▷ ↑ fill(1)
+        go.false ▷ □ full {{}}
+    }} ▸ full {{}}
+{DRAIN}
+    ⊤ ▷ ■ ok {{}}"#
+        );
+        if conflicts {
+            stuck_and_rejected(
+                "L3",
+                &task_loan_program(SHARED_MEMBER, &body, "stuck X4 B1"),
+            );
+        } else {
+            done_and_accepted("TK3", &task_loan_program(SHARED_MEMBER, &body, "done ok"));
+        }
+    }
+}
+
+#[test]
+fn await_next_payload_holds_the_loan_after_the_set_is_consumed_tk3() {
+    let member = r#"
+async control member(r : &u32) ■ { item {out : &u32 ∈ r} }
+    ⊤ ▷ ■ item {r}
+"#;
+    for (write, conflicts) in [("x", true), ("y", false)] {
+        let body = format!(
+            r#"
+    ⊤ ▷ spawn member(&x) into pool
+    ⊤ ▷ n : Δ await next(pool) ▸ item {{item}} │ empty {{}}
+    n.empty ▷ ⊥
+    n.item ▷ e : Δ await next(pool) ▸ item {{unused}} │ empty {{}}
+    e.item ▷ ⊥
+    e.empty ▷ {write} ← 7
+    e.empty ▷ seen : u32 := item
+    e.empty ▷ ■ ok {{}}"#
+        );
+        if conflicts {
+            stuck_and_rejected("L3", &task_loan_program(member, &body, "stuck X4 B1"));
+        } else {
+            done_and_accepted("TK3", &task_loan_program(member, &body, "done ok"));
+        }
+    }
+}
+
+#[test]
+fn a_spawn_forgets_the_value_lent_exclusively_i9() {
+    for (fact, holds) in [("x = 1", false), ("y = 2", true)] {
+        let body = format!(
+            "    ⊤ ▷ spawn member(&~x) into pool\n{DRAIN}\n    ⊤ ▷ ⊢ {fact}\n    ⊤ ▷ ■ ok {{}}"
+        );
+        if holds {
+            done_and_accepted("I9", &task_loan_program(EXCLUSIVE_MEMBER, &body, "done ok"));
+        } else {
+            stuck_and_rejected(
+                "P1",
+                &task_loan_program(EXCLUSIVE_MEMBER, &body, "stuck X7 E-Oblige"),
+            );
+        }
+    }
+}
+
+#[test]
+fn lending_two_fields_to_a_member_preserves_only_the_untouched_fields_i9() {
+    let members = r#"
+struct triple {a : u32, b : u32, c : u32}
+view struct slots {one : &~u32, two : &~u32}
+
+async control member(s : slots) ■ { done {} }
+    ⊤ ▷ s.one ← 8
+    ⊤ ▷ s.two ← 9
+    ⊤ ▷ ■ done {}
+"#;
+    for (fact, holds) in [("t.a = 1", false), ("t.b = 2", false), ("t.c = 3", true)] {
+        let body = format!(
+            r#"
+    ⊤ ▷ ~t : triple := triple {{1, 2, 3}}
+    ⊤ ▷ spawn member(slots {{&~t.a, &~t.b}}) into pool
+{DRAIN}
+    ⊤ ▷ ⊢ {fact}
+    ⊤ ▷ ■ ok {{}}"#
+        );
+        if holds {
+            done_and_accepted("I9", &task_loan_program(members, &body, "done ok"));
+        } else {
+            stuck_and_rejected(
+                "P1",
+                &task_loan_program(members, &body, "stuck X7 E-Oblige"),
+            );
+        }
+    }
+}
+
+#[test]
+fn an_inner_iteration_can_lend_to_a_set_carried_by_an_outer_loop_tk3() {
+    for (write, conflicts) in [("x", true), ("y", false)] {
+        let body = format!(
+            r#"
+    ⊤ ▷ f : ↻ fill(i : u32 := 0) {{
+        ⊤ ▷ go : ? i = 0
+        go.false ▷ {write} ← 9
+        go.true ▷ inner : ↻ enqueue(j : u32 := 0) {{
+            ⊤ ▷ first : ? j = 0
+            first.true ▷ spawn member(&x) into pool
+            first.true ▷ ↑ enqueue(1)
+            first.false ▷ □ queued {{}}
+        }} ▸ queued {{}}
+        inner.queued ▷ ↑ fill(1)
+        go.false ▷ □ full {{}}
+    }} ▸ full {{}}
+{DRAIN}
+    ⊤ ▷ ■ ok {{}}"#
+        );
+        if conflicts {
+            stuck_and_rejected(
+                "L3",
+                &task_loan_program(SHARED_MEMBER, &body, "stuck X4 B1"),
+            );
+        } else {
+            done_and_accepted("TK3", &task_loan_program(SHARED_MEMBER, &body, "done ok"));
+        }
+    }
 }

@@ -2027,8 +2027,8 @@ that apply it and a run for each way of being stuck by it: `e_run.core`,
 `e_turn.core`, `e_await.core`, `e_await_host.core`, `e_spawn_next.core`
 ([E-Spawn], [E-Next], [E-Done], `count`), `e_cancel.core`,
 `e_member_fault.core`, `e_stop.core` and `e_exhaust.core`, beside the two
-files of the draft. 11 files, 93 runs, 70 of them compared with the erased
-semantics. `slice_four_core_conforms_and_matches_erased`
+files of the draft. On 24 November these 11 files had 93 runs, 70 compared
+with the erased semantics. `slice_four_core_conforms_and_matches_erased`
 (`v2/tests/slice4.rs`) asks that each of the 11 rules be applied and that
 each stuck run be stuck in the control and the state that `STUCK` lists (22
 rows: X2 `E-Var` for a set used after `empty`, X4 `B1`, X5 `E-Scope`, X7
@@ -2091,11 +2091,11 @@ no compiled code runs tasks (RB9), so no run of this suite runs natively,
 and a run with `capacity` is left out of the native comparison of the other
 slices.
 
-### 18.2 The checker of the tasks, 25 November 2026
+### 18.2 The first task-checker checkpoint, 25 November 2026
 
 `check.rs` checks the statements of the tasks by [TK1], [TK2] and [TK4] to
-[TK7] of the core (section 7.8). It does not yet check the loans of a set
-([TK3]; review, RC31).
+[TK7] of the core (section 7.8). The first checkpoint left task-set loans open.
+Section 18.3 records their checks.
 
 - **Counts.** `count(x)` is a measure ([A3]). The crate writes it with the
   symbol of `len` over the term of the set (`count_of`), so the kernel
@@ -2132,13 +2132,13 @@ slices.
   - the payloads of an extern control, at an await.
 - **Boundaries.** A lexical boundary asks that no set be available ([TK5]).
 - **Loans.** The loan pass reads the operands of a spawn as those of a
-  call. A spawn whose producer takes a borrow or a view is refused by the
-  clause TK3, a stand-in until the checker holds the loans of a set (RC31).
+  call. At this checkpoint the checker refused a spawn whose producer took
+  a borrow or a view. Section 18.3 records the replacement.
 
 The tests are in `v2/tests/checker_slice4.rs`.
 `the_rule_files_of_the_tasks_are_rejected_exactly_where_a_run_is_stuck`
 holds the checker against the 11 rule files of section 18.1, control by
-control. There are 160 controls:
+control. The first checkpoint had these verdicts for its 160 controls:
 
 - 18 are refused where a run is stuck, each by a clause that excludes the
   run's stuck state;
@@ -2149,8 +2149,8 @@ control. There are 160 controls:
   and is the one refused:
   - two members that hold a lock are stopped by the fault of a sibling;
   - a member uses an effect that its parent does not allow ([E-Effect]);
-  - a parent writes a place while a member holds a borrow of it, which the
-    stand-in refuses.
+  - a parent writes a place while a member holds a borrow of it. The
+    stand-in refused the spawn in this example.
 
 The clause tests run each program in the oracle as well:
 
@@ -2162,8 +2162,8 @@ The clause tests run each program in the oracle as well:
 - [L3]: the operands of a spawn, read as a call's;
 - [TK7]: `run`.
 
-Each part of the new code was taken out in a mutant of its own, and each of
-the 18 mutants fails at least one of these tests. The parts are:
+At this checkpoint each of 18 mutations failed at least one test. The
+mutations exercised these parts of the checker.
 
 - the facts of a count;
 - the renaming in a loop, at a spawn and at `await next`;
@@ -2190,6 +2190,35 @@ a control whose runs all end can be proved:
 
 No run changed.
 
+### 18.3 The loans of a task set, 25 November 2026
+
+[TK3] makes a set a holder of every loan passed to one of its members.
+The facts pass records the availability of sets after each statement.
+The loan pass includes those histories when it checks a read, a write
+or the end of the lender's scope. A fault can stop members without a
+drain. A borrow or view received from a member holds the loans of the set
+on its alternative, including after the owner takes the empty alternative.
+The loop pass carries loans of outer sets into the next iteration. A
+spawn made on an earlier inner iteration and an outer back edge can
+have different inner decisions.
+
+On the 160 controls of section 18.2 the verdicts are now 18 refused where
+a run gets stuck, 134 accepted, and the same four pairs. The parent
+`race_write` is refused by [L3] where it writes the borrowed vector.
+The `shared_pool` example could overflow its unsigned accumulator on
+inputs outside the original run. The fixture checks the sum before adding
+and faults explicitly on overflow. The suite exercises the original sum
+of 42, an exact sum of `u32.max` and an overflowing sum. The 11 core files
+now have 95 runs, 72 compared with the erased semantics.
+
+The command `cargo test --test checker_slice4` exercises the rule files
+and the paired owner/member examples in the oracle and the checker.
+Six deliberate mutations each broke a test. They removed the set holder at
+spawn, liveness by availability, the loop-carried set loan, inheritance by
+a payload, the exclusive update at spawn, or cumulative field updates.
+A separate nested-loop test failed when the inner spawn and outer back edge
+were treated as decisions of the same inner iteration.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2201,8 +2230,8 @@ No run changed.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** For slice 4, the loans of a task set in the checker
-  ([TK3], RC31) and the backend are not written.
+- **Later work.** For slice 4, the compiled scheduler and the generator of
+  tasks are still owed.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
   Each is brought up to date when its slice is requalified.

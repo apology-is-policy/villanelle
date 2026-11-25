@@ -2280,6 +2280,8 @@ struct BodyChecker<'a> {
     var_loan_roots: Vec<Vec<(Formula, VarId)>>,
     /// Recorded `Rᵢ` for each `(BodyId, stmt_idx)` for Pass 2 loan checking.
     stmt_r: BTreeMap<(BodyId, usize), Formula>,
+    /// [TK3]: available sets use their loans even with no later mention.
+    available_sets: BTreeMap<(BodyId, usize), BTreeMap<VarId, Formula>>,
     /// Recorded visible variables at `(BodyId, stmt_idx)` for Pass 2 counterexamples.
     stmt_visible: BTreeMap<(BodyId, usize), VisibleVars>,
     /// Recorded fallthrough `live` at end of lexical boundary `B₁` for Pass 2.
@@ -2463,6 +2465,23 @@ impl<'a> BodyChecker<'a> {
         )
     }
 
+    /// Latest version of a defined name, joining its guarded versions as needed.
+    fn current_version(&mut self, var: VarId) -> TermId {
+        if self.versions[var].len() == 1 {
+            self.versions[var][0].1
+        } else {
+            let mux = self.alloc_var_term(var);
+            let entries = self.versions[var].clone();
+            let mut union_guard = bdd::FALSE;
+            for (h, tid) in entries {
+                union_guard = self.solver.bdd.or(union_guard, h);
+                self.solver.add_def_linear(h, mux, LinearTerm::var(tid));
+            }
+            self.versions[var] = vec![(union_guard, mux)];
+            mux
+        }
+    }
+
     /// Builds an [`Env`] that maps each currently defined variable to its
     /// logical term (introducing a multiplexer variable when a variable has
     /// more than one version across histories, [I1]).
@@ -2473,19 +2492,7 @@ impl<'a> BodyChecker<'a> {
             if self.versions[var].is_empty() {
                 continue;
             }
-            let term_id = if self.versions[var].len() == 1 {
-                self.versions[var][0].1
-            } else {
-                let mux = self.alloc_var_term(var);
-                let entries = self.versions[var].clone();
-                let mut union_guard = bdd::FALSE;
-                for (h, tid) in entries {
-                    union_guard = self.solver.bdd.or(union_guard, h);
-                    self.solver.add_def_linear(h, mux, LinearTerm::var(tid));
-                }
-                self.versions[var] = vec![(union_guard, mux)];
-                mux
-            };
+            let term_id = self.current_version(var);
             locals.insert(var, LinearTerm::var(term_id));
             visible.push((
                 self.body.vars[var].name.clone(),
@@ -3281,14 +3288,20 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    fn invalidate_exclusive_view_arg(&mut self, arg: &Expr, guard: Formula, env: &Env) {
+    fn invalidate_exclusive_operand(
+        &mut self,
+        arg: &Expr,
+        guard: Formula,
+        env: &Env,
+        cumulative: bool,
+    ) {
         if guard == bdd::FALSE {
             return;
         }
         match arg {
             Expr::Borrow(BorrowMode::Exclusive, place, _) => {
                 let z_tid = self.alloc_type_term("_mut", &place.ty);
-                self.apply_place_write(place, guard, LinearTerm::var(z_tid), env);
+                self.write_place(place, guard, LinearTerm::var(z_tid), env, cumulative);
             }
             Expr::Var(VarRef::Local(vid), ty) if self.program.has_exclusive_borrow(ty) => {
                 if matches!(ty, Type::Ref(BorrowMode::Exclusive, _)) {
@@ -3300,7 +3313,7 @@ impl<'a> BodyChecker<'a> {
                         steps: Vec::new(),
                         ty: inner_ty.clone(),
                     };
-                    self.apply_place_write(&place, guard, LinearTerm::var(z_tid), env);
+                    self.write_place(&place, guard, LinearTerm::var(z_tid), env, cumulative);
                 } else {
                     let fresh_tid = self.alloc_var_term(*vid);
                     self.set_version(*vid, guard, fresh_tid);
@@ -3310,11 +3323,13 @@ impl<'a> BodyChecker<'a> {
             Expr::Struct(sid, fields, _) if self.program.structs[*sid].is_view => {
                 for field in fields {
                     if self.program.has_exclusive_borrow(&field.ty()) {
-                        self.invalidate_exclusive_view_arg(field, guard, env);
+                        self.invalidate_exclusive_operand(field, guard, env, cumulative);
                     }
                 }
             }
-            Expr::Move(inner, _) => self.invalidate_exclusive_view_arg(inner, guard, env),
+            Expr::Move(inner, _) => {
+                self.invalidate_exclusive_operand(inner, guard, env, cumulative)
+            }
             _ => {}
         }
     }
@@ -3403,14 +3418,31 @@ impl<'a> BodyChecker<'a> {
     }
 
     fn apply_place_write(&mut self, place: &Place, guard: Formula, new_val: LinearTerm, env: &Env) {
+        self.write_place(place, guard, new_val, env, false);
+    }
+
+    fn write_place(
+        &mut self,
+        place: &Place,
+        guard: Formula,
+        new_val: LinearTerm,
+        env: &Env,
+        cumulative: bool,
+    ) {
         if guard == bdd::FALSE {
             return;
         }
-        let local_root_term = env
-            .locals
-            .get(&place.root)
-            .cloned()
-            .unwrap_or_else(|| LinearTerm::from_i128(0));
+        // Alternative outcomes write from their common entry state. Multiple
+        // loans given to one member instead update the same root in sequence.
+        // In both cases index expressions denote their entry values.
+        let root_term = |checker: &mut Self, var| {
+            if cumulative {
+                LinearTerm::var(checker.current_version(var))
+            } else {
+                env.lookup(VarRef::Local(var))
+            }
+        };
+        let local_root_term = root_term(self, place.root);
         let local_root_ty = self.body.vars[place.root].ty.deref_type().clone();
         let updated_local = functional_update(
             self.program,
@@ -3429,11 +3461,7 @@ impl<'a> BodyChecker<'a> {
                     continue;
                 }
                 covered = self.solver.bdd.or(covered, g);
-                let cur_root_term = env
-                    .locals
-                    .get(&frozen.root)
-                    .cloned()
-                    .unwrap_or_else(|| LinearTerm::from_i128(0));
+                let cur_root_term = root_term(self, frozen.root);
                 let updated_sub = if place.steps.is_empty() {
                     new_val.clone()
                 } else {
@@ -3805,7 +3833,7 @@ impl<'a> BodyChecker<'a> {
                     _ => {}
                 }
             } else if self.program.has_exclusive_borrow(pty) {
-                self.invalidate_exclusive_view_arg(arg, r_i, env);
+                self.invalidate_exclusive_operand(arg, r_i, env, false);
             }
         }
     }
@@ -3828,6 +3856,16 @@ impl<'a> BodyChecker<'a> {
         let statements = self.body.bodies[body_id].statements.clone();
         let last_line = statements.last().map_or(1, |s| s.line);
 
+        let sets: Vec<_> = self
+            .body
+            .vars
+            .iter()
+            .enumerate()
+            .filter_map(|(v, var)| {
+                (matches!(var.ty, Type::Tasks(_, _)) && self.active_scopes.contains(&var.body))
+                    .then_some(v)
+            })
+            .collect();
         for (stmt_idx, statement) in statements.iter().enumerate() {
             self.at_line = statement.line;
             let guard = self.selector(&statement.selector);
@@ -3854,6 +3892,10 @@ impl<'a> BodyChecker<'a> {
                 }
                 Flow::Ended => self.solver.bdd.minus(live, guard),
             };
+            if !sets.is_empty() {
+                let guards = sets.iter().map(|&v| (v, self.avail(v))).collect();
+                self.available_sets.insert((body_id, stmt_idx), guards);
+            }
         }
 
         if !allow_fallthrough {
@@ -4134,20 +4176,6 @@ impl<'a> BodyChecker<'a> {
         set: VarId,
     ) -> Result<Flow, Error> {
         let producer = &self.program.controls[cid];
-        // A stand-in for [TK3]: the loans that a set holds are not checked
-        // yet, so a spawn whose operands may lend is refused (review,
-        // slice 4).
-        if producer
-            .parameters
-            .iter()
-            .any(|parameter| self.program.contains_borrow_or_view(&parameter.ty))
-        {
-            let message = format!(
-                "`spawn {}` may lend to a member, and the loans of a task set are not checked yet ([TK3])",
-                producer.name
-            );
-            self.refuse_if_run(at, "TK3", message)?;
-        }
         self.check_available(set, at.reach, at.line, &at.visible, at.in_loop)?;
         let old: Vec<LinearTerm> = arguments
             .iter()
@@ -4192,6 +4220,25 @@ impl<'a> BodyChecker<'a> {
                 format!("precondition of `{name}` may not hold"),
             )?;
             self.solver.add_fact(at.reach, pre_formula);
+        }
+        // The member may write through its exclusive operands after the spawn ([N5]).
+        // Only a borrow returned in a payload can be used to write a
+        // member's lender after the drain. A set whose members return
+        // plain values changes its count without renaming the lenders.
+        let may_return_exclusive = producer
+            .contract
+            .iter()
+            .flat_map(|alt| &alt.fields)
+            .any(|field| self.program.has_exclusive_borrow(&field.ty));
+        for (argument, ty) in arguments.iter().zip(&parameter_types) {
+            if self.program.has_exclusive_borrow(ty) {
+                self.invalidate_exclusive_operand(argument, at.reach, &at.env, true);
+            }
+            if may_return_exclusive && self.program.contains_borrow_or_view(ty) {
+                for (guard, root) in self.expr_loan_roots(argument, at.reach) {
+                    self.push_var_loan_root(set, guard, root);
+                }
+            }
         }
         let before = at.env.lookup(VarRef::Local(set));
         self.rename_set(set, &before, at.reach, 1);
@@ -4952,6 +4999,12 @@ impl<'a> BodyChecker<'a> {
             if let Some(field) = contract_alt.fields.get(field_idx)
                 && self.program.contains_borrow_or_view(&field.ty)
             {
+                if let Operation::AwaitNext(set, _) = decision.operation {
+                    for (guard, root) in self.var_loan_roots[*set].clone() {
+                        let g = self.solver.bdd.and(atom, guard);
+                        self.push_var_loan_root(var_id, g, root);
+                    }
+                }
                 for &oidx in &field.origins {
                     if let Some(arg) = decision.arguments.get(oidx) {
                         self.record_expr_loan_roots(var_id, arg, atom);
@@ -6076,6 +6129,7 @@ fn check_boundary(
         local_borrows: BTreeMap::new(),
         var_loan_roots: vec![Vec::new(); var_count1],
         stmt_r: BTreeMap::new(),
+        available_sets: BTreeMap::new(),
         stmt_visible: BTreeMap::new(),
         boundary_fallthrough_live: BTreeMap::new(),
         loop_entry_avail: BTreeMap::new(),
@@ -6139,6 +6193,7 @@ fn check_boundary(
         local_borrows: BTreeMap::new(),
         var_loan_roots: vec![Vec::new(); var_count2],
         stmt_r: BTreeMap::new(),
+        available_sets: BTreeMap::new(),
         stmt_visible: BTreeMap::new(),
         boundary_fallthrough_live: BTreeMap::new(),
         loop_entry_avail: BTreeMap::new(),
@@ -6213,6 +6268,7 @@ fn check_control(
         local_borrows: BTreeMap::new(),
         var_loan_roots: vec![Vec::new(); var_count],
         stmt_r: BTreeMap::new(),
+        available_sets: BTreeMap::new(),
         stmt_visible: BTreeMap::new(),
         boundary_fallthrough_live: BTreeMap::new(),
         loop_entry_avail: BTreeMap::new(),
@@ -6567,6 +6623,12 @@ fn stmt_direct_mentions(
         }
         Command::Oblige(f) => collect_expr_mentions(f, &mut out),
         Command::Test { condition, .. } => collect_expr_mentions(condition, &mut out),
+        Command::Decide {
+            op_kind: Operation::AwaitNext(set, _),
+            ..
+        } => {
+            out.insert(*set);
+        }
         Command::Capture { arguments, .. }
         | Command::Decide { arguments, .. }
         | Command::Supervise { arguments, .. }
@@ -7482,11 +7544,13 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
             ancestors.insert(p);
             cur = self.bc.body.bodies[p].parent;
         }
+        let program = self.bc.program;
+        let body = self.bc.body;
         let is_outside = |root: &LoanRoot| -> bool {
             match root {
                 LoanRoot::ParamOrigin(_) => true,
                 LoanRoot::Owned(v) | LoanRoot::Behind(v, _) => {
-                    ancestors.contains(&self.bc.body.vars[*v].body)
+                    ancestors.contains(&body.vars[*v].body)
                 }
             }
         };
@@ -7510,43 +7574,69 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
             dedup_loan_pairs(list);
         }
 
-        let program = self.bc.program;
-        let body = self.bc.body;
         let mut eval_struct_loans =
             |expr: &Expr, env: &BTreeMap<VarId, Vec<(LoanPlace, BorrowMode)>>| {
                 expr_structural_external_loans(program, body, expr, env, &is_outside)
             };
 
+        let mut spawn_sites = BTreeSet::new();
         let mut changed = true;
         while changed {
             changed = false;
             changed |= self.propagate_loop_body_loans(
                 loop_body,
                 loop_body,
-                &head.parameters,
+                &mut spawn_sites,
                 &mut env_map,
                 &mut eval_struct_loans,
             );
         }
 
-        for &lp_var in &head.parameters {
-            if !self
-                .bc
-                .program
-                .contains_borrow_or_view(&self.bc.body.vars[lp_var].ty)
+        let mut carried = BTreeMap::new();
+        for param in head.parameters {
+            if program.contains_borrow_or_view(&body.vars[param].ty)
+                && let Some(pairs) = env_map.get(&param)
             {
-                continue;
+                carried.insert(param, pairs.clone());
             }
-            let Some(pairs) = env_map.get(&lp_var) else {
-                continue;
-            };
+        }
+        // [L2a]: only a spawn on a path back to this loop head can
+        // introduce a new loan on a later iteration. Existing set loans
+        // retain their original guards.
+        if !spawn_sites.is_empty() {
+            let (repeat, _) = self.collect_repeat_and_leave_guards(loop_body, &[loop_body], false);
+            for (scope, index) in spawn_sites {
+                let Command::Spawn {
+                    control,
+                    set,
+                    arguments,
+                } = &body.bodies[scope].statements[index].command
+                else {
+                    unreachable!()
+                };
+                if !ancestors.contains(&body.vars[*set].body) {
+                    continue;
+                }
+                if !self.spawn_can_reach_repeat(scope, index, loop_body, repeat) {
+                    continue;
+                }
+                for (param, argument) in program.controls[*control].parameters.iter().zip(arguments)
+                {
+                    if program.contains_borrow_or_view(&param.ty) {
+                        let pairs = eval_struct_loans(argument, &env_map);
+                        extend_loan_pairs(carried.entry(*set).or_default(), pairs);
+                    }
+                }
+            }
+        }
+        for (holder, pairs) in &carried {
             for (place, mode) in pairs {
                 let already_covered = self.loans.iter().any(|l| {
                     l.place == *place
                         && l.mode == *mode
                         && self.bc.solver.bdd.implies(r_loop, l.created_on) == bdd::TRUE
                         && l.holders.iter().any(|&(h, hg)| {
-                            h == Holder::Var(lp_var)
+                            h == Holder::Var(*holder)
                                 && self.bc.solver.bdd.implies(r_loop, hg) == bdd::TRUE
                         })
                 });
@@ -7555,18 +7645,55 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                         place: place.clone(),
                         mode: *mode,
                         created_on: r_loop,
-                        holders: vec![(Holder::Var(lp_var), r_loop)],
+                        holders: vec![(Holder::Var(*holder), r_loop)],
                     });
                 }
             }
         }
     }
 
+    fn spawn_can_reach_repeat(
+        &mut self,
+        scope: BodyId,
+        index: usize,
+        loop_body: BodyId,
+        repeat: Formula,
+    ) -> bool {
+        let Some(&spawn) = self.bc.stmt_r.get(&(scope, index)) else {
+            return false;
+        };
+        let scopes = self.scopes_down_to(loop_body, scope);
+        let inner = scopes
+            .iter()
+            .rev()
+            .skip(1)
+            .find(|&&b| self.bc.body.bodies[b].head.is_some());
+        let entry = if let Some(&inner) = inner {
+            // The spawn may run on an earlier inner iteration than the one
+            // that leaves or repeats the outer loop. Their inner decisions
+            // can differ, but both require this inner loop to be entered.
+            if !self.bc.is_feasible(spawn, &[], true) {
+                return false;
+            }
+            let parent = self.bc.body.bodies[inner].parent.expect("nested loop");
+            let statement = self.bc.body.bodies[parent]
+                .statements
+                .iter()
+                .position(|s| matches!(s.command, Command::Loop { body, .. } if body == inner))
+                .expect("loop in parent body");
+            self.bc.stmt_r[&(parent, statement)]
+        } else {
+            spawn
+        };
+        let guard = self.bc.solver.bdd.and(entry, repeat);
+        self.bc.is_feasible(guard, &[], true)
+    }
+
     fn propagate_loop_body_loans<F>(
         &self,
         cur_body: BodyId,
         target_loop: BodyId,
-        target_params: &[VarId],
+        spawn_sites: &mut BTreeSet<(BodyId, usize)>,
         env_map: &mut BTreeMap<VarId, Vec<(LoanPlace, BorrowMode)>>,
         eval_struct: &mut F,
     ) -> bool
@@ -7577,9 +7704,25 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
         ) -> Vec<(LoanPlace, BorrowMode)>,
     {
         let mut changed = false;
-        for stmt in &self.bc.body.bodies[cur_body].statements {
+        for (index, stmt) in self.bc.body.bodies[cur_body].statements.iter().enumerate() {
             match &stmt.command {
-                Command::Spawn { .. } | Command::Cancel { .. } => {}
+                Command::Spawn {
+                    control,
+                    arguments,
+                    set,
+                } => {
+                    for (param, argument) in self.bc.program.controls[*control]
+                        .parameters
+                        .iter()
+                        .zip(arguments)
+                    {
+                        if self.bc.program.contains_borrow_or_view(&param.ty) {
+                            spawn_sites.insert((cur_body, index));
+                            let items = eval_struct(argument, env_map);
+                            changed |= extend_loan_pairs(env_map.entry(*set).or_default(), items);
+                        }
+                    }
+                }
                 Command::Bind { var, value } => {
                     if self
                         .bc
@@ -7618,6 +7761,11 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                             if let Some(field) = alt.fields.get(fidx)
                                 && self.bc.program.contains_borrow_or_view(&field.ty)
                             {
+                                if let Operation::AwaitNext(set, _) = op_kind {
+                                    let items = env_map.get(set).cloned().unwrap_or_default();
+                                    changed |=
+                                        extend_loan_pairs(env_map.entry(v).or_default(), items);
+                                }
                                 for &oidx in &field.origins {
                                     if let Some(items) = arg_items.get(oidx) {
                                         changed |= extend_loan_pairs(
@@ -7645,7 +7793,7 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                     changed |= self.propagate_loop_body_loans(
                         *inner,
                         target_loop,
-                        target_params,
+                        spawn_sites,
                         env_map,
                         eval_struct,
                     );
@@ -7659,20 +7807,27 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                     changed |= self.propagate_loop_body_loans(
                         *b1,
                         target_loop,
-                        target_params,
+                        spawn_sites,
                         env_map,
                         eval_struct,
                     );
                     changed |= self.propagate_loop_body_loans(
                         *b2,
                         target_loop,
-                        target_params,
+                        spawn_sites,
                         env_map,
                         eval_struct,
                     );
                 }
                 Command::Again { body, arguments } if *body == target_loop => {
-                    for (&lp, arg) in target_params.iter().zip(arguments) {
+                    for (&lp, arg) in self.bc.body.bodies[target_loop]
+                        .head
+                        .as_ref()
+                        .unwrap()
+                        .parameters
+                        .iter()
+                        .zip(arguments)
+                    {
                         if self
                             .bc
                             .program
@@ -7822,11 +7977,16 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                 .get(&(body_id, stmt_idx))
                 .cloned()
                 .unwrap_or_default();
-            let after_live = self
+            let mut after_live = self
                 .live_after_stmt
                 .get(&(body_id, stmt_idx))
                 .cloned()
                 .unwrap_or_default();
+            if let Some(sets) = self.bc.available_sets.get(&(body_id, stmt_idx)) {
+                for (&set, &guard) in sets {
+                    or_guard_map(&mut after_live, set, guard, &mut self.bc.solver.bdd);
+                }
+            }
             let empty = BTreeSet::new();
             let ctx = EvalCtx {
                 r_i,
@@ -7837,12 +7997,22 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
             };
 
             match &stmt.command {
-                // The operands of a spawn are those of a call. That the set
-                // holds what they lend ([TK3]) is not checked yet: the facts
-                // pass refuses a spawn that may lend (`check_spawn`).
-                Command::Spawn { arguments, .. } => {
+                Command::Spawn {
+                    control,
+                    arguments,
+                    set,
+                } => {
                     let mut temps = Vec::new();
-                    let _ = self.eval_loan_operands(arguments, &ctx, &mut temps, line)?;
+                    let loans = self.eval_loan_operands(arguments, &ctx, &mut temps, line)?;
+                    for (param, src) in self.bc.program.controls[*control]
+                        .parameters
+                        .iter()
+                        .zip(&loans)
+                    {
+                        if self.bc.program.contains_borrow_or_view(&param.ty) {
+                            self.attach_holder_loans(Holder::Var(*set), src, r_i);
+                        }
+                    }
                 }
                 // A task set is never lent ([W11]): no loan meets the read.
                 Command::Cancel { .. } => {}
@@ -7971,6 +8141,10 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
                             if let Some(field) = alt.fields.get(fidx)
                                 && self.bc.program.contains_borrow_or_view(&field.ty)
                             {
+                                if let Operation::AwaitNext(set, _) = op_kind {
+                                    let src = self.loans_for_holder(Holder::Var(*set), g);
+                                    self.attach_holder_loans(Holder::Var(var_id), &src, g);
+                                }
                                 for &oidx in &field.origins {
                                     if let Some(src) = arg_loans.get(oidx) {
                                         self.attach_holder_loans(Holder::Var(var_id), src, g);
