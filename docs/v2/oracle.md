@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots that can finish in one turn (section 18.4). The oracle of slice 1 and its
+roots and for defined awaits with one ready task (sections 18.4 and 18.5). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2250,9 +2250,9 @@ If it can neither await nor spawn, no other task can run before it returns
 or faults. A synchronous control it calls can start a nested run. Its
 caller resumes when the inner root ends. The backend uses the defined
 control's calling convention for this case, including its outcome slots
-and fault unwinding. Both the LLVM module emitter and the native test
-harness refuse the whole module if a body needs a task set, an await or
-a run of an extern control. The diagnostic names the enclosing control
+and fault unwinding. At this first checkpoint both emitters refused a module if a body
+needed a task set, an await or a run of an extern control. Section 18.5
+adds defined awaits. The diagnostic names the enclosing control
 or boundary.
 
 From `v2/`, run `cargo test --test backend_slice4`. The checker accepts
@@ -2266,6 +2266,32 @@ zero live allocations. Before the change both tests stopped at the
 unimplemented task-operation arm. No run here needs a schedule choice.
 The scheduler and comparisons on generated task programs remain open (RB9).
 
+### 18.5 A defined await gives up the turn, 25 November 2026
+
+For a decision or capture on `await f`, the caller evaluates the operands
+and binds them in a native activation. Its slots also hold the destinations
+for the alternative payload and any fault. The ready task has a continuation
+that enters `f` with this activation. The caller's stack keeps the activation
+and borrowed places alive until the task returns. Entering a root at `run`,
+and returning to its caller, give up no turn.
+
+Modules that await a defined control declare the C host function
+`uint64_t vn2_pick_turn(uint64_t ready_count)`. The host returns an index
+among the ready tasks. This checkpoint supports one ready task, so the only
+index is zero. Each executed defined await calls the host with 1 before
+resuming the task. The scripted native harness chooses zero. Task sets and
+extern async operations still require scheduler support.
+
+From `v2/`, run `cargo test --test backend_slice4`. The six directives in
+`tests/slice4/checked_await.core` give 24 compiled comparisons with the
+oracle and the erased interpreter across both widths and optimization levels.
+The owned vectors account for both allocations per batch. The C-host test
+also compares the complete sequence of turn offers and samples with each
+interpreter independently. The two nested awaits offer one ready task each.
+On four successive calls the host returns 0, 1, 2 and 2. The alternative that
+skips both awaits makes one host call and receives 0. Omitting the host
+selection or moving it after the continuation changes the transcript.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2277,8 +2303,8 @@ The scheduler and comparisons on generated task programs remain open (RB9).
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** For slice 4, the compiled scheduler and the generator of
-  tasks are still owed.
+- **Later work.** For slice 4, scheduling multiple tasks in compiled code and
+  generating task programs are still owed.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
   Each is brought up to date when its slice is requalified.

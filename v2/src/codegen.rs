@@ -694,37 +694,46 @@ fn outcome_payload_words(program: &Program, oid: usize, usize_bits: u32) -> usiz
     max_bytes.div_ceil(8).max(1)
 }
 
-fn has_emit_builtin(program: &Program) -> bool {
-    fn check_body(body: &ControlBody) -> bool {
-        body.bodies.iter().any(|b| {
-            b.statements.iter().any(|s| {
-                matches!(
-                    &s.command,
-                    Command::Decide {
-                        op_kind: Operation::Builtin {
-                            op: BuiltinOp::Emit,
-                            ..
-                        },
-                        ..
-                    } | Command::Capture {
-                        operation: Operation::Builtin {
-                            op: BuiltinOp::Emit,
-                            ..
-                        },
-                        ..
-                    }
-                )
-            })
-        })
-    }
+/// Operations in decisions and captures, including loop and contingency bodies.
+fn operations(program: &Program) -> impl Iterator<Item = &Operation> {
     program
         .controls
         .iter()
-        .any(|c| c.body.as_ref().is_some_and(check_body))
-        || program
-            .boundaries
-            .iter()
-            .any(|b| check_body(&b.body) || check_body(&b.contingency))
+        .filter_map(|c| c.body.as_ref())
+        .chain(
+            program
+                .boundaries
+                .iter()
+                .flat_map(|b| [&b.body, &b.contingency]),
+        )
+        .flat_map(|body| &body.bodies)
+        .flat_map(|body| &body.statements)
+        .filter_map(|statement| match &statement.command {
+            Command::Decide { op_kind, .. }
+            | Command::Capture {
+                operation: op_kind, ..
+            } => Some(op_kind),
+            _ => None,
+        })
+}
+
+fn has_emit_builtin(program: &Program) -> bool {
+    operations(program).any(|op| {
+        matches!(
+            op,
+            Operation::Builtin {
+                op: BuiltinOp::Emit,
+                ..
+            }
+        )
+    })
+}
+
+fn defined_await_targets(program: &Program) -> impl Iterator<Item = ControlId> + '_ {
+    operations(program).filter_map(|op| match op {
+        Operation::AwaitControl(id) if program.controls[*id].body.is_some() => Some(*id),
+        _ => None,
+    })
 }
 
 /// The type of the status of `terminate n` (if any) for each control in
@@ -759,11 +768,17 @@ fn compute_control_terminate_tys(program: &Program) -> Vec<Option<Type>> {
             for b in &body.bodies {
                 for s in &b.statements {
                     if let Command::Decide {
-                        op_kind: Operation::Control(callee) | Operation::RunControl(callee),
+                        op_kind:
+                            Operation::Control(callee)
+                            | Operation::RunControl(callee)
+                            | Operation::AwaitControl(callee),
                         ..
                     }
                     | Command::Capture {
-                        operation: Operation::Control(callee) | Operation::RunControl(callee),
+                        operation:
+                            Operation::Control(callee)
+                            | Operation::RunControl(callee)
+                            | Operation::AwaitControl(callee),
                         ..
                     } = &s.command
                         && let Some(t) = &tys[*callee]
@@ -814,6 +829,9 @@ pub fn emit_c_header(program: &Program, usize_bits: u32) -> String {
                     .any(|a| a.fields.iter().any(|f| !f.ty.is_scalar()))
         });
 
+    if defined_await_targets(program).next().is_some() {
+        let _ = writeln!(out, "uint64_t vn2_pick_turn(uint64_t ready_count);");
+    }
     if uses_slice2_data {
         let _ = writeln!(out, "#ifndef VN2_RUNTIME_TYPES_DEFINED");
         let _ = writeln!(out, "#define VN2_RUNTIME_TYPES_DEFINED");
@@ -4697,7 +4715,7 @@ fn emit_operation_call(
 
     match op_kind {
         Operation::AwaitNext(_, _) => unreachable!("task set in a native body"),
-        Operation::AwaitControl(cid) => {
+        Operation::AwaitControl(cid) if program.controls[*cid].body.is_none() => {
             return Err(format!(
                 "the native backend does not yet support await of `{}`",
                 program.controls[*cid].name
@@ -4709,10 +4727,7 @@ fn emit_operation_call(
                 program.controls[*cid].name
             ));
         }
-        // [E-Run], [E-Turn]: a defined root has the only turn until it
-        // awaits or makes another task runnable. The whole module is emitted
-        // or refused, so neither can occur in a module this backend returns.
-        Operation::Control(cid) | Operation::RunControl(cid) => {
+        Operation::Control(cid) | Operation::RunControl(cid) | Operation::AwaitControl(cid) => {
             let callee = &program.controls[*cid];
             let is_extern = callee.body.is_none();
             let mut results: Vec<Option<String>> = vec![None; arguments.len()];
@@ -4797,7 +4812,24 @@ fn emit_operation_call(
             };
 
             let tag_reg = em.fresh_reg();
-            if is_extern {
+            if matches!(op_kind, Operation::AwaitControl(_)) {
+                // [E-Await] Bind the inputs and the caller's result slots before
+                // the turn ends. The frame lives until the continuation returns.
+                let ty = format!("%vn2.await.{cid}");
+                let frame = em.alloc_temp(&ty);
+                for (index, arg) in call_args.iter().enumerate() {
+                    let slot = em.fresh_reg();
+                    let _ = writeln!(
+                        em.code,
+                        "  {slot} = getelementptr {ty}, ptr {frame}, i32 0, i32 {index}"
+                    );
+                    let _ = writeln!(em.code, "  store {arg}, ptr {slot}");
+                }
+                let _ = writeln!(
+                    em.code,
+                    "  {tag_reg} = call fastcc i32 @vn2_take_only_ready(ptr @vn2_resume_{cid}, ptr {frame})"
+                );
+            } else if is_extern {
                 let _ = writeln!(
                     em.code,
                     "  {tag_reg} = call i32 @vn2_ext_{}({})",
@@ -5398,8 +5430,13 @@ pub fn emit_llvm(program: &Program, usize_bits: u32) -> Result<String, String> {
     }
 
     // 2. Named boundaries, pure functions, and defined controls.
+    let awaited = defined_await_targets(program).collect::<BTreeSet<_>>();
+    emit_await_continuations(&mut body_out, program, &term_tys, usize_bits, &awaited);
     emit_program_bodies(&mut body_out, program, &mut reg, &term_tys, usize_bits)?;
 
+    if !awaited.is_empty() {
+        let _ = writeln!(decls_out, "declare i64 @vn2_pick_turn(i64)");
+    }
     let mut type_out = String::new();
     let _ = writeln!(
         type_out,
@@ -5527,6 +5564,67 @@ fn emit_program_bodies<'a>(
         }
     }
     Ok(())
+}
+
+/// [E-Turn] In a module without task sets or extern waits, the suspended
+/// task is the sole ready task. After the host picks its turn, enter the
+/// awaited control with the arguments already bound in its activation.
+fn emit_await_continuations(
+    out: &mut String,
+    program: &Program,
+    term_tys: &[Option<Type>],
+    usize_bits: u32,
+    awaited: &BTreeSet<ControlId>,
+) {
+    if awaited.is_empty() {
+        return;
+    }
+    out.push_str(
+        "define internal fastcc i32 @vn2_take_only_ready(ptr %resume, ptr %frame) nounwind {
+  call i64 @vn2_pick_turn(i64 1)
+  %tag = call fastcc i32 %resume(ptr %frame)
+  ret i32 %tag
+}
+
+",
+    );
+    for &id in awaited {
+        let control = &program.controls[id];
+        let mut fields: Vec<String> = control
+            .parameters
+            .iter()
+            .map(|p| llvm_ty(program, &p.ty, usize_bits))
+            .collect();
+        let output_count = control
+            .contract
+            .iter()
+            .map(|alt| alt.fields.len())
+            .sum::<usize>()
+            + usize::from(control.faults)
+            + usize::from(term_tys[id].is_some());
+        fields.extend(std::iter::repeat_n("ptr".to_string(), output_count));
+        let ty = format!("%vn2.await.{id}");
+        let _ = writeln!(out, "{ty} = type {{ {} }}", fields.join(", "));
+        let _ = writeln!(
+            out,
+            "define internal fastcc i32 @vn2_resume_{id}(ptr %frame) nounwind {{"
+        );
+        let mut arguments = Vec::with_capacity(fields.len());
+        for (index, field) in fields.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "  %slot{index} = getelementptr {ty}, ptr %frame, i32 0, i32 {index}"
+            );
+            let _ = writeln!(out, "  %arg{index} = load {field}, ptr %slot{index}");
+            arguments.push(format!("{field} %arg{index}"));
+        }
+        let _ = writeln!(
+            out,
+            "  %tag = call fastcc i32 @vn2_ctrl_{id}({})",
+            arguments.join(", ")
+        );
+        out.push_str("  ret i32 %tag\n}\n\n");
+    }
 }
 
 fn c_abi_signature_types(program: &Program, control: &Control, usize_bits: u32) -> Vec<String> {
@@ -6586,6 +6684,8 @@ pub fn emit_native_harness_llvm(
     let mut body_out = String::new();
 
     // 1. Named boundaries, functions, and defined controls into `body_out`, sharing `reg`.
+    let awaited = defined_await_targets(program).collect::<BTreeSet<_>>();
+    emit_await_continuations(&mut body_out, program, &term_tys, usize_bits, &awaited);
     emit_program_bodies(&mut body_out, program, &mut reg, &term_tys, usize_bits)?;
 
     // 2. Register harness print types & string literals into the SAME `reg`.
@@ -6629,6 +6729,10 @@ pub fn emit_native_harness_llvm(
 
     let mut h_tmp = 0usize;
     let mut ext_code = String::new();
+    if !awaited.is_empty() {
+        // The default scripted host picks the first ready task (Host::pick_turn).
+        ext_code.push_str("define i64 @vn2_pick_turn(i64 %ready_count) {\n  ret i64 0\n}\n\n");
+    }
     for res in &program.resources {
         if res.on_fault_release {
             let rg = reg.str_literal_map[res.name.as_bytes()].clone();

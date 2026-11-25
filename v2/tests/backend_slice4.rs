@@ -1,21 +1,28 @@
-//! Native [E-Run] for a defined root that has the only turn.
-use villanelle_v2::codegen::{emit_llvm, run_native_counted};
+//! Native [E-Run], [E-Await] and [E-Turn] with a single ready task.
+use std::{fs, process::Command};
+use villanelle_v2::codegen::{emit_c_header, emit_llvm, run_native_counted};
 use villanelle_v2::differential::{Verdict, compare};
-use villanelle_v2::host::Script;
-use villanelle_v2::{check, oracle::Config, script};
+use villanelle_v2::host::{Answer, Host, Script};
+use villanelle_v2::int::Int;
+use villanelle_v2::oracle::{self, Config, Value};
+use villanelle_v2::typed::Control;
+use villanelle_v2::{check, erased, load, script};
 
 const ROOTS: &str = include_str!("slice4/checked_run.core");
+const AWAITS: &str = include_str!("slice4/checked_await.core");
 
-#[test]
-fn defined_roots_return_or_unwind_in_the_callers_decision() {
-    let (program, runs) = script::native_runs(ROOTS).unwrap();
+fn compare_native_runs(source: &str, rules: &[&str], counts: &[u64], allocations: u64) {
+    let (program, runs) = script::native_runs(source).unwrap();
     check::check(&program).unwrap().revalidate().unwrap();
-    let report = script::check(ROOTS);
+    let report = script::check(source);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
-    assert_eq!((report.runs, report.compared, runs.len()), (6, 6, 6));
+    assert_eq!(
+        (report.runs, report.compared, runs.len()),
+        (counts.len(), counts.len(), counts.len())
+    );
     for bits in [32, 64] {
         let mut expected = Vec::new();
-        for spec in &runs {
+        for (spec, &count) in runs.iter().zip(counts) {
             let mut host = Script {
                 answers: spec.answers.iter().cloned().collect(),
             };
@@ -27,8 +34,14 @@ fn defined_roots_return_or_unwind_in_the_callers_decision() {
                 &Config::with_usize_bits(bits),
             );
             assert_eq!(comparison.verdict, Verdict::Same, "{}", spec.entry);
-            let roots = if spec.entry == "runs_nested" { 2 } else { 1 };
-            assert_eq!(comparison.oracle.rules.get("E-Run"), Some(&roots));
+            for &rule in rules {
+                assert_eq!(
+                    comparison.oracle.rules.get(rule).copied().unwrap_or(0),
+                    count,
+                    "{} [{rule}]",
+                    spec.entry
+                );
+            }
             let erased = comparison.erased.unwrap();
             expected.push((erased.end.to_string(), erased.trace));
         }
@@ -40,11 +53,24 @@ fn defined_roots_return_or_unwind_in_the_callers_decision() {
                 .map(|(end, trace)| (end.to_string(), trace))
                 .collect();
             assert_eq!(observations, expected, "usize={bits} -O{optimization}");
-            // The harness allocates the four nonempty vector inputs. Their
-            // payloads move, and no root needs a heap frame in this subset.
-            assert_eq!(batch.allocations, 4, "usize={bits} -O{optimization}");
+            assert_eq!(
+                batch.allocations, allocations,
+                "usize={bits} -O{optimization}"
+            );
         }
     }
+}
+
+#[test]
+fn defined_roots_return_or_unwind_in_the_callers_decision() {
+    // Four nonempty input vectors. Their payloads move to the eventual owner.
+    compare_native_runs(ROOTS, &["E-Run"], &[1, 1, 1, 2, 1, 1], 4);
+}
+
+#[test]
+fn defined_await_resumes_with_bound_operands_and_output_slots() {
+    // Only the two nonempty input vectors need heap storage.
+    compare_native_runs(AWAITS, &["E-Await", "E-Turn"], &[1, 1, 2, 0, 0, 2], 2);
 }
 
 #[test]
@@ -60,15 +86,6 @@ control bridge2() ■ { ok {} } uses io
 //! run bridge2() with [tick -> ok] => done ok trace [tick() -> ok]
 "#,
             "run of extern async control `tick`",
-        ),
-        (
-            r#"
-async control waits() ■ { ok {v : usize} } uses console.write
-    ⊤ ▷ r : Δ await say(1) ▸ ok {v}
-    r.ok ▷ ■ ok {v}
-//! run waits() => done ok {1} trace [emit("inner") -> done]
-"#,
-            "await of `say`",
         ),
         (
             r#"
@@ -110,4 +127,125 @@ async control pool() ■ { ok {} }
             error
         );
     }
+}
+
+/// The next sample reveals how many times the host has selected a ready task.
+#[derive(Default)]
+struct TurnHost {
+    turns: u64,
+    calls: Vec<String>,
+}
+
+impl Host for TurnHost {
+    fn pick_turn(&mut self, ready: usize) -> usize {
+        self.calls.push(format!("ready {ready}"));
+        self.turns += 1;
+        0
+    }
+
+    fn call(&mut self, control: &Control, args: &[Value], _: &Config) -> Result<Answer, String> {
+        assert_eq!(control.name, "sample");
+        let [Value::Int(mark)] = args else {
+            panic!("bad sample arguments {args:?}")
+        };
+        self.calls.push(format!("sample {mark} at {}", self.turns));
+        Ok(Answer {
+            alternative: "ok".into(),
+            payload: vec![Value::Int(Int::from_u64(self.turns))],
+            writes: Vec::new(),
+        })
+    }
+}
+
+const C_HOST: &str = r#"
+#include "module.h"
+#include <inttypes.h>
+#include <stdio.h>
+
+static uint32_t turns;
+
+uint64_t vn2_pick_turn(uint64_t ready_count) {
+    printf("ready %" PRIu64 "\n", ready_count);
+    ++turns;
+    return 0;
+}
+
+int32_t vn2_ext_sample(uint32_t mark, uint32_t *value) {
+    printf("sample %" PRIu32 " at %" PRIu32 "\n", mark, turns);
+    *value = turns;
+    return VN2_SAMPLE_OK;
+}
+
+int main(void) {
+    for (uint8_t wait = 0; wait <= 1; ++wait) {
+        uint32_t x, y, z, last;
+        turns = 0;
+        if (vn2_call_runs_timed(wait, &x, &y, &z, &last) != VN2_RUNS_TIMED_OUT)
+            return 1;
+        printf("done out {%" PRIu32 ", %" PRIu32 ", %" PRIu32 ", %" PRIu32 "}\n", x, y, z, last);
+    }
+    return 0;
+}
+"#;
+
+#[test]
+fn the_host_picks_the_turn_before_the_awaited_body_starts() {
+    let program = load(AWAITS).unwrap();
+    let dir = std::env::temp_dir().join(format!("vn2_await_turn_{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("host.c"), C_HOST).unwrap();
+    for bits in [32, 64] {
+        let config = Config::with_usize_bits(bits);
+        let mut expected = Vec::new();
+        for wait in [false, true] {
+            let args = vec![Value::Bool(wait)];
+            let mut host = TurnHost::default();
+            let original = oracle::run(&program, "runs_timed", args.clone(), &mut host, &config);
+            let mut erased_host = TurnHost::default();
+            let erased = erased::run(&program, "runs_timed", args, &mut erased_host, &config);
+            assert_eq!(erased.end.to_string(), original.end.to_string());
+            assert_eq!(erased.trace, original.trace);
+            assert_eq!(erased_host.calls, host.calls);
+            assert_eq!(host.turns, if wait { 2 } else { 0 });
+            expected.extend(host.calls);
+            expected.push(original.end.to_string());
+        }
+        fs::write(dir.join("module.ll"), emit_llvm(&program, bits).unwrap()).unwrap();
+        let header = emit_c_header(&program, bits);
+        assert!(header.contains("uint64_t vn2_pick_turn(uint64_t ready_count);"));
+        fs::write(dir.join("module.h"), header).unwrap();
+        for optimization in ["-O0", "-O2"] {
+            let build = Command::new("clang")
+                .current_dir(&dir)
+                .args([
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-Wno-override-module",
+                    optimization,
+                    "module.ll",
+                    "host.c",
+                    "-o",
+                    "driver",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                build.status.success(),
+                "{}",
+                String::from_utf8_lossy(&build.stderr)
+            );
+            let run = Command::new(dir.join("driver")).output().unwrap();
+            assert!(run.status.success(), "{:?}", run.status);
+            assert_eq!(
+                String::from_utf8(run.stdout)
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                expected,
+                "usize={bits} {optimization}"
+            );
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
 }

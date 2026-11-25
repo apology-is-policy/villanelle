@@ -1,0 +1,61 @@
+// [E-Await] The callee owns its arguments before the task gives up its turn.
+// The outcome and any fault return to the suspended caller.
+async control data_or_fault(keep : bool, xs : [usize]) ■ { kept {data : [usize]} } faults
+    ⊤ ▷ t : ? keep
+    t.true ▷ ■ kept {▾xs}
+    t.false ▷ fault "after await"
+
+async control takes_data(keep : bool, xs : [usize]) ■ { ok {data : [usize]} } faults
+    ⊤ ▷ r := capture await data_or_fault(keep, ▾xs)
+    ⊤ ▷ d : Δ outcome(▾r) ▸ kept {data}
+    d.kept ▷ ■ ok {▾data}
+
+control runs_data(keep : bool, xs : [usize]) ■ { ok {data : [usize]} } faults
+    ⊤ ▷ d : Δ run takes_data(keep, ▾xs) ▸ ok {data}
+    d.ok ▷ ■ ok {▾data}
+
+//! run runs_data(true, [3, 4294967295]) => done ok {[3, 4294967295]}
+//! run runs_data(false, [7]) => faulted "after await"
+
+extern control sample(mark : u32) ■ { ok {value : u32} } uses clock
+
+async control leaf(a : u32, b : u32) ■ { out {x : u32, y : u32, z : u32} } uses clock
+    ⊤ ▷ c : Δ sample(2) ▸ ok {z}
+    c.ok ▷ ■ out {a, b, z}
+
+async control middle(a : u32) ■ { out {x : u32, y : u32, z : u32} } uses clock
+    ⊤ ▷ b : Δ sample(1) ▸ ok {y}
+    b.ok ▷ d : Δ await leaf(a, y) ▸ out {x, mid, z}
+    d.out ▷ ■ out {x, mid, z}
+
+async control timed(wait : bool) ■ { out {x : u32, y : u32, z : u32, end_value : u32} } uses clock
+    ⊤ ▷ a : Δ sample(0) ▸ ok {first}
+    ⊤ ▷ t : ? wait
+    t.true ∧ a.ok ▷ res := capture await middle(first)
+    t.true ∧ a.ok ▷ d : Δ outcome(res) ▸ out {x, y, z}
+    d.out ▷ after : Δ sample(3) ▸ ok {last}
+    after.ok ▷ ■ out {x, y, z, last}
+    t.false ∧ a.ok ▷ ■ out {first, first, first, first}
+
+control runs_timed(wait : bool) ■ { out {x : u32, y : u32, z : u32, end_value : u32} } uses clock
+    ⊤ ▷ d : Δ run timed(wait) ▸ out {x, y, z, last}
+    d.out ▷ ■ out {x, y, z, last}
+
+//! run runs_timed(true) with [sample -> ok {11}; sample -> ok {22}; sample -> ok {33}; sample -> ok {44}] => done out {11, 22, 33, 44} trace [sample(0) -> ok {11}; sample(1) -> ok {22}; sample(2) -> ok {33}; sample(3) -> ok {44}]
+//! run runs_timed(false) with [sample -> ok {17}] => done out {17, 17, 17, 17} trace [sample(0) -> ok {17}]
+//! run leaf(7, 8) with [sample -> ok {9}] => done out {7, 8, 9} trace [sample(2) -> ok {9}]
+
+async control pause() ■ { done {} }
+    ⊤ ▷ ■ done {}
+
+async control replace(target : &~usize, value : usize) ■ { done {} }
+    ⊤ ▷ target ← value
+    ⊤ ▷ ■ done {}
+
+async control borrows(value : usize) ■ { ok {seen : usize} }
+    ⊤ ▷ ~cell : usize := 1
+    ⊤ ▷ p : Δ await pause() ▸ done {}
+    p.done ▷ r : Δ await replace(&~cell, value) ▸ done {}
+    r.done ▷ ■ ok {cell}
+
+//! run borrows(19) => done ok {19}
