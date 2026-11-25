@@ -307,6 +307,7 @@ control run_all(fail_now: bool) ■ done {total: u32, count: usize, slen: usize}
 
     let specs = vec![
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "run_all".to_string(),
             arguments: vec![Value::Bool(false)],
             arithmetic: false,
@@ -319,6 +320,7 @@ control run_all(fail_now: bool) ■ done {total: u32, count: usize, slen: usize}
             ],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "run_all".to_string(),
             arguments: vec![Value::Bool(true)],
             arithmetic: false,
@@ -401,6 +403,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
             include_str!("slice2_surface/records_and_variants.rails"),
             vec![
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "eval_op".to_string(),
                     arguments: vec![
                         Value::Variant {
@@ -417,6 +420,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     answers: vec![],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "eval_op".to_string(),
                     arguments: vec![
                         Value::Variant {
@@ -433,6 +437,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     answers: vec![],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "eval_op".to_string(),
                     arguments: vec![
                         Value::Variant {
@@ -449,6 +454,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     answers: vec![],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "describe_shape".to_string(),
                     arguments: vec![
                         Value::Variant {
@@ -464,6 +470,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     answers: vec![],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "describe_shape".to_string(),
                     arguments: vec![
                         Value::Variant {
@@ -485,6 +492,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
             include_str!("slice2_surface/collections_and_foreach.rails"),
             vec![
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "sum_vector".to_string(),
                     arguments: vec![Value::Vector(vec![
                         u32_val(1),
@@ -496,6 +504,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     answers: vec![],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "forward_captured".to_string(),
                     arguments: vec![
                         Value::Vector(vec![u32_val(2), u32_val(8), u32_val(5)]),
@@ -505,6 +514,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     answers: vec![],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "forward_captured".to_string(),
                     arguments: vec![
                         Value::Vector(vec![u32_val(1), u32_val(2), u32_val(3)]),
@@ -514,6 +524,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     answers: vec![],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "collect_and_map".to_string(),
                     arguments: vec![],
                     arithmetic: false,
@@ -526,6 +537,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
             include_str!("slice2_surface/show_file_resource.rails"),
             vec![
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "show_file".to_string(),
                     arguments: vec![Value::String("notes.txt".to_string())],
                     arithmetic: false,
@@ -546,18 +558,21 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     ],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "show_file".to_string(),
                     arguments: vec![Value::String("absent.txt".to_string())],
                     arithmetic: false,
                     answers: vec![("open".to_string(), ans("not_found", vec![]))],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "show_file".to_string(),
                     arguments: vec![Value::String("secret.txt".to_string())],
                     arithmetic: false,
                     answers: vec![("open".to_string(), ans("denied", vec![]))],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "show_file".to_string(),
                     arguments: vec![Value::String("broken.txt".to_string())],
                     arithmetic: false,
@@ -571,6 +586,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     ],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "show_file".to_string(),
                     arguments: vec![Value::String("badutf8.txt".to_string())],
                     arithmetic: false,
@@ -594,6 +610,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
             include_str!("slice2_surface/boundaries_and_faults.rails"),
             vec![
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "run_worker".to_string(),
                     arguments: vec![Value::Bool(false)],
                     arithmetic: false,
@@ -606,6 +623,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     ],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "run_worker".to_string(),
                     arguments: vec![Value::Bool(true)],
                     arithmetic: false,
@@ -615,6 +633,7 @@ fn slice_two_surface_programs_agree_across_oracle_erased_expanded_and_native() {
                     )],
                 },
                 NativeRunSpec {
+                    turns: Vec::new(),
                     entry: "direct_fault".to_string(),
                     arguments: vec![],
                     arithmetic: false,
@@ -643,6 +662,7 @@ fn slice_two_core_programs_agree_natively() {
     let rec_core = villanelle_v2::load(include_str!("slice2/records_and_variants.core")).unwrap();
     let rec_specs = vec![
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "calc".to_string(),
             arguments: vec![
                 Value::Variant {
@@ -659,6 +679,7 @@ fn slice_two_core_programs_agree_natively() {
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "calc".to_string(),
             arguments: vec![
                 Value::Variant {
@@ -675,6 +696,7 @@ fn slice_two_core_programs_agree_natively() {
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "calc".to_string(),
             arguments: vec![
                 Value::Variant {
@@ -691,6 +713,7 @@ fn slice_two_core_programs_agree_natively() {
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "area_and_unpack".to_string(),
             arguments: vec![
                 Value::Variant {
@@ -706,6 +729,7 @@ fn slice_two_core_programs_agree_natively() {
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "area_and_unpack".to_string(),
             arguments: vec![
                 Value::Variant {
@@ -721,6 +745,7 @@ fn slice_two_core_programs_agree_natively() {
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "copy_reuse".to_string(),
             arguments: vec![Value::Struct {
                 ty: 0,
@@ -738,24 +763,28 @@ fn slice_two_core_programs_agree_natively() {
         villanelle_v2::load(include_str!("slice2/collections_and_builtins.core")).unwrap();
     let col_specs = vec![
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "vec_ops".to_string(),
             arguments: vec![],
             arithmetic: false,
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "operands_order".to_string(),
             arguments: vec![],
             arithmetic: false,
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "map_ops".to_string(),
             arguments: vec![],
             arithmetic: false,
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "say_hello".to_string(),
             arguments: vec![Value::String("hello".to_string())],
             arithmetic: false,
@@ -768,6 +797,7 @@ fn slice_two_core_programs_agree_natively() {
     let own_core =
         villanelle_v2::load(include_str!("slice2/ownership_and_resources.core")).unwrap();
     let own_specs = vec![NativeRunSpec {
+        turns: Vec::new(),
         entry: "clean_resource".to_string(),
         arguments: vec![Value::String("a.txt".to_string())],
         arithmetic: false,
@@ -789,12 +819,14 @@ fn slice_two_core_programs_agree_natively() {
     let cap_core = villanelle_v2::load(include_str!("slice2/captured_outcomes.core")).unwrap();
     let cap_specs = vec![
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "capture_and_decide".to_string(),
             arguments: vec![u32_val(1)],
             arithmetic: false,
             answers: vec![("fetch".to_string(), ans("ok", vec![u32_val(42)]))],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "capture_and_decide".to_string(),
             arguments: vec![u32_val(2)],
             arithmetic: false,
@@ -807,6 +839,7 @@ fn slice_two_core_programs_agree_natively() {
     let flt_core = villanelle_v2::load(include_str!("slice2/faults_and_boundaries.core")).unwrap();
     let flt_specs = vec![
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "root_fault_with_release".to_string(),
             arguments: vec![Value::Bool(false)],
             arithmetic: false,
@@ -819,6 +852,7 @@ fn slice_two_core_programs_agree_natively() {
             ],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "root_fault_with_release".to_string(),
             arguments: vec![Value::Bool(true)],
             arithmetic: false,
@@ -828,12 +862,14 @@ fn slice_two_core_programs_agree_natively() {
             )],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "assumed_fault".to_string(),
             arguments: vec![],
             arithmetic: false,
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "lexical_recover".to_string(),
             arguments: vec![u32_val(7)],
             arithmetic: false,
@@ -852,24 +888,28 @@ fn slice_two_core_programs_agree_natively() {
             ],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "lexical_escalate".to_string(),
             arguments: vec![],
             arithmetic: false,
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "lexical_terminate".to_string(),
             arguments: vec![],
             arithmetic: false,
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "run_supervised".to_string(),
             arguments: vec![Value::Bool(false)],
             arithmetic: false,
             answers: vec![],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "run_supervised".to_string(),
             arguments: vec![Value::Bool(true)],
             arithmetic: false,
@@ -881,6 +921,7 @@ fn slice_two_core_programs_agree_natively() {
     // 6. lexical_boundaries.core: every run of the file that ends.
     let lex_core = villanelle_v2::load(include_str!("slice2/lexical_boundaries.core")).unwrap();
     let spec = |entry: &str, arguments: Vec<Value>, answers: Vec<(&str, Answer)>| NativeRunSpec {
+        turns: Vec::new(),
         entry: entry.to_string(),
         arguments,
         arithmetic: false,

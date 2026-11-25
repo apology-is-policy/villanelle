@@ -1,8 +1,8 @@
-//! Native [E-Run], [E-Await] and [E-Turn] with a single ready task.
+//! Native defined roots, awaits, and scheduling of task-set members.
 use std::{fs, process::Command};
 use villanelle_v2::codegen::{emit_c_header, emit_llvm, run_native_counted};
 use villanelle_v2::differential::{Verdict, compare};
-use villanelle_v2::host::{Answer, Host, Script};
+use villanelle_v2::host::{Answer, Host, Scheduled, Script};
 use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::Control;
@@ -23,9 +23,10 @@ fn compare_native_runs(source: &str, rules: &[&str], counts: &[u64], allocations
     for bits in [32, 64] {
         let mut expected = Vec::new();
         for (spec, &count) in runs.iter().zip(counts) {
-            let mut host = Script {
+            let mut host = Scheduled::new(Script {
                 answers: spec.answers.iter().cloned().collect(),
-            };
+            });
+            host.turns = spec.turns.iter().copied().collect();
             let comparison = compare(
                 &program,
                 &spec.entry,
@@ -71,6 +72,16 @@ fn defined_roots_return_or_unwind_in_the_callers_decision() {
 fn defined_await_resumes_with_bound_operands_and_output_slots() {
     // Only the two nonempty input vectors need heap storage.
     compare_native_runs(AWAITS, &["E-Await", "E-Turn"], &[1, 1, 2, 0, 0, 2], 2);
+}
+
+#[test]
+fn spawned_members_run_on_the_chosen_turn_and_keep_their_payloads() {
+    let source = include_str!("slice4/checked_spawn.core");
+    // Each collect run owns two allocated vectors. Scheduler activations
+    // for these single-execution spawn sites stay in the owner's frame.
+    compare_native_runs(source, &["E-Spawn"], &[2, 2, 2, 2, 2, 4, 4], 6);
+    let program = load(source).unwrap();
+    assert!(emit_c_header(&program, 64).contains("uint64_t vn2_pick_turn(uint64_t ready_count);"));
 }
 
 #[test]
@@ -248,4 +259,49 @@ fn the_host_picks_the_turn_before_the_awaited_body_starts() {
         }
     }
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn task_set_diagnostics_cover_suspension_loans_and_repeated_spawn_sites() {
+    let base = r#"
+async control idle() ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+async control child(value : usize) ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+async control owner() ■ { ok {} }
+    ⊤ ▷ ~pool : tasks⟨child⟩ := tasks⟨child⟩()
+    ⊤ ▷ v : usize := 3
+    ⊤ ▷ spawn child(v) into pool
+    ⊤ ▷ lp : ↻ drain() {
+          ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          n.ok ▷ ↑ drain()
+          n.empty ▷ □ drained {}
+        } ▸ drained {}
+    ⊤ ▷ ■ ok {}
+
+//! run owner() turns [1] => done ok
+"#;
+    let spawn = "⊤ ▷ spawn child(v) into pool";
+    let next_owner = "⊤ ▷ lp : ↻ drain()";
+    let suspend = "⊤ ▷ w : Δ await idle() ▸ ok {}";
+    let new_set = "⊤ ▷ ~other : tasks⟨child⟩ := tasks⟨child⟩()\n    ⊤ ▷ q : Δ await next(other) ▸ ok {} │ empty {}\n    q.ok ▷ ⊥";
+    for (source, reason) in [
+        (base.replace(next_owner, &format!("{suspend}\n    {next_owner}")), "await of another control in a task-set owner"),
+        (base.replace("child(value : usize) ■ { ok {} }", &format!("child(value : usize) ■ {{ ok {{}} }}\n    {suspend}")), "nonsuspending task-set producer"),
+        (base.replace(next_owner, &format!("{new_set}\n    {next_owner}")), "multiple task sets"),
+        (base.replace(spawn, &format!("⊤ ▷ l : ↻ once() {{\n        {spawn}\n        ⊤ ▷ □ added {{}}\n    }} ▸ added {{}}")), "spawn outside the owner's top-level body"),
+        (base.replace("value : usize", "value : &usize").replace("child(v)", "child(&v)"), "owned or copy inputs"),
+        (base.replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} } faults").replace("owner() ■ { ok {} }", "owner() ■ { ok {} } faults"), "nonfaulting"),
+    ] {
+        let (program, specs) = script::native_runs(&source).unwrap();
+        check::check(&program).unwrap().revalidate().unwrap();
+        let report = script::check(&source);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!((report.runs, report.compared), (1, 1));
+        let error = emit_llvm(&program, 64).unwrap_err();
+        assert!(error.contains(reason), "{error}");
+        assert_eq!(run_native_counted(&program, &specs, 64, 0).unwrap_err(), error);
+    }
 }

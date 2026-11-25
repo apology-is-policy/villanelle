@@ -1,0 +1,103 @@
+; A queue holds its head and the address of the link to fill on append.
+; Each queued activation starts with its next link. Both queues belong to
+; one invocation of the owner, including when a host re-enters the module.
+%vn2.queue = type { ptr, ptr }
+%vn2.pool = type { %vn2.queue, %vn2.queue, i64, i64 }
+
+define internal fastcc void @vn2_pool_init(ptr %pool) {
+  store %vn2.pool zeroinitializer, ptr %pool
+  %ready_tail = getelementptr %vn2.pool, ptr %pool, i32 0, i32 0, i32 1
+  store ptr %pool, ptr %ready_tail
+  %done = getelementptr %vn2.pool, ptr %pool, i32 0, i32 1
+  %done_tail = getelementptr %vn2.queue, ptr %done, i32 0, i32 1
+  store ptr %done, ptr %done_tail
+  ret void
+}
+
+define internal fastcc void @vn2_append(ptr %queue, ptr %member) {
+  %tail = getelementptr %vn2.queue, ptr %queue, i32 0, i32 1
+  %link = load ptr, ptr %tail
+  store ptr null, ptr %member
+  store ptr %member, ptr %link
+  store ptr %member, ptr %tail
+  ret void
+}
+
+; Remove the indexed member, preserving the relative order of the rest.
+define internal fastcc ptr @vn2_remove(ptr %queue, i64 %index) {
+entry:
+  br label %seek
+seek:
+  %link = phi ptr [ %queue, %entry ], [ %member, %advance ]
+  %i = phi i64 [ %index, %entry ], [ %less, %advance ]
+  %member = load ptr, ptr %link
+  %found = icmp eq i64 %i, 0
+  br i1 %found, label %remove, label %advance
+advance:
+  %less = sub i64 %i, 1
+  br label %seek
+remove:
+  %next = load ptr, ptr %member
+  store ptr %next, ptr %link
+  %last = icmp eq ptr %next, null
+  br i1 %last, label %last_member, label %return
+last_member:
+  %tail = getelementptr %vn2.queue, ptr %queue, i32 0, i32 1
+  store ptr %link, ptr %tail
+  br label %return
+return:
+  ret ptr %member
+}
+
+define internal fastcc void @vn2_spawn(ptr %pool, ptr %member) {
+  call fastcc void @vn2_append(ptr %pool, ptr %member)
+  %ready = getelementptr %vn2.pool, ptr %pool, i32 0, i32 2
+  %total = getelementptr %vn2.pool, ptr %pool, i32 0, i32 3
+  %r = load i64, ptr %ready
+  %t = load i64, ptr %total
+  %nr = add i64 %r, 1
+  %nt = add i64 %t, 1
+  store i64 %nr, ptr %ready
+  store i64 %nt, ptr %total
+  ret void
+}
+
+; The owner is task zero whenever it is ready. Children follow in spawn
+; order. A finished member stays counted until the owner takes its turn.
+define internal fastcc ptr @vn2_next(ptr %pool, ptr %resume) {
+entry:
+  %done = getelementptr %vn2.pool, ptr %pool, i32 0, i32 1
+  %ready = getelementptr %vn2.pool, ptr %pool, i32 0, i32 2
+  %total = getelementptr %vn2.pool, ptr %pool, i32 0, i32 3
+  %t = load i64, ptr %total
+  %empty = icmp eq i64 %t, 0
+  br label %choose
+choose:
+  %r = load i64, ptr %ready
+  %head = load ptr, ptr %done
+  %has_done = icmp ne ptr %head, null
+  %owner = or i1 %empty, %has_done
+  %offset = zext i1 %owner to i64
+  %offered = add i64 %r, %offset
+  %choice = call i64 @vn2_pick_turn(i64 %offered)
+  %index = urem i64 %choice, %offered
+  %take_owner = icmp ult i64 %index, %offset
+  br i1 %take_owner, label %deliver, label %child
+child:
+  %i = sub i64 %index, %offset
+  %member = call fastcc ptr @vn2_remove(ptr %pool, i64 %i)
+  %nr = sub i64 %r, 1
+  store i64 %nr, ptr %ready
+  call fastcc void %resume(ptr %member)
+  call fastcc void @vn2_append(ptr %done, ptr %member)
+  br label %choose
+deliver:
+  br i1 %empty, label %no_members, label %oldest
+no_members:
+  ret ptr null
+oldest:
+  %first = call fastcc ptr @vn2_remove(ptr %done, i64 0)
+  %nt = sub i64 %t, 1
+  store i64 %nt, ptr %total
+  ret ptr %first
+}

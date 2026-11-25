@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots and for defined awaits with one ready task (sections 18.4 and 18.5). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets with nonsuspending members (sections 18.4 to 18.6). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2277,10 +2277,9 @@ and returning to its caller, give up no turn.
 
 Modules that await a defined control declare the C host function
 `uint64_t vn2_pick_turn(uint64_t ready_count)`. The host returns an index
-among the ready tasks. This checkpoint supports one ready task, so the only
-index is zero. Each executed defined await calls the host with 1 before
-resuming the task. The scripted native harness chooses zero. Task sets and
-extern async operations still require scheduler support.
+among the ready tasks. A defined await in this checkpoint calls the host
+with 1 before resuming the sole ready task. Section 18.6 adds choices among
+members of a task set.
 
 From `v2/`, run `cargo test --test backend_slice4`. The six directives in
 `tests/slice4/checked_await.core` give 24 compiled comparisons with the
@@ -2291,6 +2290,35 @@ interpreter independently. The two nested awaits offer one ready task each.
 On four successive calls the host returns 0, 1, 2 and 2. The alternative that
 skips both awaits makes one host call and receives 0. Omitting the host
 selection or moving it after the continuation changes the transcript.
+
+### 18.6 Native spawn and delivery of nonsuspending members, 25 November 2026
+
+A set has two queues. A top-level `spawn` binds the arguments in an activation
+in the owner's stack frame and appends it to the ready queue. At `await next`,
+the C host receives the number of ready tasks. The owner is first when it can
+receive a completed member or observe an empty set. The ready children follow
+in spawn order. The index is taken modulo the offered count, as in the oracle.
+A selected child runs to its exit and appends its activation, including the
+tag and payload, to the done queue. The host chooses again. Selecting the owner
+delivers the oldest completion. A done member contributes to `count` until
+delivery. Selecting the owner on an empty set consumes the set.
+
+The backend accepts one set in an owner, with spawn sites in the owner's
+top-level body. Each site can therefore run at most once per invocation.
+Decisions on `await next` can repeat in a loop. The producer must finish in
+one turn, take and return owned or copy values, and let no fault escape.
+Other awaits, cancellation, faulting calls and fault boundaries in an owner
+still give diagnostics. A synchronous call that starts a nested run uses a
+separate invocation. The scripted native host consumes one `turns` choice
+at each offer and chooses the first ready task after the choices run out.
+
+In `tests/slice4/checked_spawn.core`, changing the first choice reverses two
+pairs of emits. A second owner moves a vector to one child and receives it
+under different completion orders. A third selects the middle of three ready
+children, then appends another after a delivery. The commands to reproduce
+the comparisons are `vn2 test tests/slice4/checked_spawn.core` and
+`cargo test --test backend_slice4`. The latter tests both widths of `usize`
+at `-O0` and `-O2`, including allocation accounting.
 
 ## 19. What is open
 
@@ -2303,8 +2331,9 @@ selection or moving it after the continuation changes the transcript.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** For slice 4, scheduling multiple tasks in compiled code and
-  generating task programs are still owed.
+- **Later work.** Slice 4 still needs suspending members, repeated spawn sites,
+  multiple sets, loans, host waits, cancellation, member faults, capacity and
+  generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
   Each is brought up to date when its slice is requalified.

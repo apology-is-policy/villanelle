@@ -24,6 +24,8 @@
 //!   cover the names of the bodies around it, so every scope that ends at a
 //!   statement is ended by the formulas of that statement.
 
+mod tasks;
+
 use crate::erased;
 use crate::host::Answer;
 use crate::int::Int;
@@ -45,6 +47,8 @@ pub struct NativeRunSpec {
     pub entry: String,
     pub arguments: Vec<Value>,
     pub arithmetic: bool,
+    /// Ready-task indices offered by the host, then zero after the script ends.
+    pub turns: Vec<usize>,
     pub answers: Vec<(String, Answer)>,
 }
 
@@ -708,13 +712,17 @@ fn operations(program: &Program) -> impl Iterator<Item = &Operation> {
         )
         .flat_map(|body| &body.bodies)
         .flat_map(|body| &body.statements)
-        .filter_map(|statement| match &statement.command {
-            Command::Decide { op_kind, .. }
-            | Command::Capture {
-                operation: op_kind, ..
-            } => Some(op_kind),
-            _ => None,
-        })
+        .filter_map(|statement| operation(&statement.command))
+}
+
+fn operation(command: &Command) -> Option<&Operation> {
+    match command {
+        Command::Decide { op_kind, .. }
+        | Command::Capture {
+            operation: op_kind, ..
+        } => Some(op_kind),
+        _ => None,
+    }
 }
 
 fn has_emit_builtin(program: &Program) -> bool {
@@ -829,7 +837,7 @@ pub fn emit_c_header(program: &Program, usize_bits: u32) -> String {
                     .any(|a| a.fields.iter().any(|f| !f.ty.is_scalar()))
         });
 
-    if defined_await_targets(program).next().is_some() {
+    if defined_await_targets(program).next().is_some() || tasks::uses_sets(program) {
         let _ = writeln!(out, "uint64_t vn2_pick_turn(uint64_t ready_count);");
     }
     if uses_slice2_data {
@@ -3146,7 +3154,8 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
                     "false".to_string()
                 }
             }
-            Expr::TasksEmpty(_, _) | Expr::Count(_) => unreachable!("task set in a native body"),
+            Expr::TasksEmpty(_, _) => tasks::new_set(self),
+            Expr::Count(set) => tasks::count(self, *set),
             Expr::Integer(val, int_ty) => {
                 let bits = int_bits(*int_ty, self.reg.usize_bits);
                 let raw = val.to_i128().unwrap_or(0) as u128;
@@ -3863,15 +3872,6 @@ fn emit_body_unit<'a>(
     unit_out_term: Option<(String, Type)>,
     pre_bound_var_count: usize,
 ) -> Result<(), String> {
-    // [W11] gives every task set a local of this type. Its count and members
-    // need a scheduler even where the source uses them only in a nested body.
-    if body
-        .vars
-        .iter()
-        .any(|var| matches!(var.ty, Type::Tasks(_, _)))
-    {
-        return Err("the native backend does not yet support task sets".to_string());
-    }
     let mut plan = build_plan(program, body, pre_bound_var_count);
     let roles = classify_body_roles(body);
     // The message of a fault has one owner. A contingency holds it for
@@ -4155,8 +4155,16 @@ fn emit_body_unit<'a>(
             }
 
             match &stmt.command {
-                Command::Spawn { .. } | Command::Cancel { .. } => {
-                    unreachable!("task set in a native body")
+                Command::Spawn {
+                    control,
+                    arguments,
+                    set,
+                } => {
+                    tasks::spawn(&mut emitter, body, *set, *control, arguments);
+                    let _ = writeln!(emitter.code, "  br label %{next_lbl}");
+                }
+                Command::Cancel { .. } => {
+                    unreachable!("task set cancellation rejected before emission")
                 }
                 Command::Bind { var, value } => {
                     let val = emitter.emit_expr(value, &VarAccess::ControlSlots(body));
@@ -4695,6 +4703,11 @@ fn emit_operation_call(
     emit_unwind: &impl Fn(&mut IrEmitter<'_, '_>, BodyId, usize, &str),
     caller_out_term: Option<&str>,
 ) -> Result<(), String> {
+    if let Operation::AwaitNext(set, id) = op_kind {
+        let (tag, slots) = tasks::next(em, *set, *id);
+        on_done(em, &tag, &slots, Vec::new());
+        return Ok(());
+    }
     let contract = op_kind.contract(program);
     let mut out_slots: Vec<Vec<String>> = Vec::new();
     let is_extern_ctrl =
@@ -4714,7 +4727,7 @@ fn emit_operation_call(
     }
 
     match op_kind {
-        Operation::AwaitNext(_, _) => unreachable!("task set in a native body"),
+        Operation::AwaitNext(_, _) => unreachable!("handled before allocating output slots"),
         Operation::AwaitControl(cid) if program.controls[*cid].body.is_none() => {
             return Err(format!(
                 "the native backend does not yet support await of `{}`",
@@ -5434,7 +5447,7 @@ pub fn emit_llvm(program: &Program, usize_bits: u32) -> Result<String, String> {
     emit_await_continuations(&mut body_out, program, &term_tys, usize_bits, &awaited);
     emit_program_bodies(&mut body_out, program, &mut reg, &term_tys, usize_bits)?;
 
-    if !awaited.is_empty() {
+    if !awaited.is_empty() || tasks::uses_sets(program) {
         let _ = writeln!(decls_out, "declare i64 @vn2_pick_turn(i64)");
     }
     let mut type_out = String::new();
@@ -5461,6 +5474,7 @@ fn emit_program_bodies<'a>(
     term_tys: &[Option<Type>],
     usize_bits: u32,
 ) -> Result<(), String> {
+    tasks::emit_support(body_out, program, usize_bits, term_tys)?;
     // Named boundaries (`@vn2_boundary_<id>` + `@vn2_boundary_b2_<id>`).
     for (bid, bdef) in program.boundaries.iter().enumerate() {
         let b1_params: Vec<(String, Type)> = bdef
@@ -6729,9 +6743,30 @@ pub fn emit_native_harness_llvm(
 
     let mut h_tmp = 0usize;
     let mut ext_code = String::new();
-    if !awaited.is_empty() {
-        // The default scripted host picks the first ready task (Host::pick_turn).
-        ext_code.push_str("define i64 @vn2_pick_turn(i64 %ready_count) {\n  ret i64 0\n}\n\n");
+    let picks_turns = !awaited.is_empty() || tasks::uses_sets(program);
+    if picks_turns {
+        ext_code.push_str(
+            "@vn2_turn_ptr = internal global ptr null
+@vn2_turn_left = internal global i64 0
+
+define i64 @vn2_pick_turn(i64 %ready_count) {
+  %left = load i64, ptr @vn2_turn_left
+  %default = icmp eq i64 %left, 0
+  br i1 %default, label %first, label %scripted
+first:
+  ret i64 0
+scripted:
+  %ptr = load ptr, ptr @vn2_turn_ptr
+  %choice = load i64, ptr %ptr
+  %next = getelementptr i64, ptr %ptr, i64 1
+  %remaining = sub i64 %left, 1
+  store ptr %next, ptr @vn2_turn_ptr
+  store i64 %remaining, ptr @vn2_turn_left
+  ret i64 %choice
+}
+
+",
+        );
     }
     for res in &program.resources {
         if res.on_fault_release {
@@ -7070,6 +7105,26 @@ pub fn emit_native_harness_llvm(
     let _ = writeln!(main_out, "define i32 @main() nounwind {{");
     let _ = writeln!(main_out, "entry:");
     for (run_idx, spec) in specs.iter().enumerate() {
+        if picks_turns {
+            let len = spec.turns.len();
+            let _ = writeln!(main_out, "  store i64 {len}, ptr @vn2_turn_left");
+            if len > 0 {
+                let choices = spec
+                    .turns
+                    .iter()
+                    .map(|i| format!("i64 {i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(
+                    ext_code,
+                    "@vn2_turns_{run_idx} = private constant [{len} x i64] [{choices}]"
+                );
+                let _ = writeln!(
+                    main_out,
+                    "  store ptr @vn2_turns_{run_idx}, ptr @vn2_turn_ptr"
+                );
+            }
+        }
         let (start, end) = run_offsets[run_idx];
         let _ = writeln!(main_out, "  store i64 {start}, ptr @script_pos");
         let _ = writeln!(main_out, "  store i64 {end}, ptr @script_end");

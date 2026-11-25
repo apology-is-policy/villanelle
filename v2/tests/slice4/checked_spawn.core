@@ -1,0 +1,93 @@
+// A member that awaits nothing runs to its end in one turn.
+async control straight(name : string) ■ { ok {} } uses console.write
+    1 ⊤ ▷ a : Δ emit(&name) ▸ done {}
+    2 ⊤ ▷ b : Δ emit(&name) ▸ done {}
+    3 ⊤ ▷ ■ ok {}
+
+async control straights() ■ { ok {} } uses console.write
+    1 ⊤ ▷ ~pool : tasks⟨straight⟩ := tasks⟨straight⟩()
+    2 ⊤ ▷ spawn straight("x") into pool
+    3 ⊤ ▷ spawn straight("y") into pool
+    4 ⊤ ▷ lp : ↻ drain() {
+          1 ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+          2 n.ok ▷ ↑ drain()
+          3 n.empty ▷ □ drained {}
+        } ▸ drained {}
+    5 ⊤ ▷ ■ ok {}
+
+control runs_straights() ■ { ok {} } uses console.write
+    1 ⊤ ▷ d : Δ run straights() ▸ ok {}
+    2 d.ok ▷ ■ ok {}
+
+//! run runs_straights() => done ok trace [emit("x") -> done; emit("x") -> done; emit("y") -> done; emit("y") -> done]
+//! run runs_straights() turns [1] => done ok trace [emit("y") -> done; emit("y") -> done; emit("x") -> done; emit("x") -> done]
+
+// The owner emits after spawning but before yielding. A member keeps its
+// vector until its alternative is delivered. Its sibling can finish before
+// or after the owner observes the first result.
+async control pack(data : [usize], keep : bool) ■ { kept {xs : [usize]} │ skipped {} } uses console.write
+    ⊤ ▷ t : ? keep
+    t.true ▷ label : string := "keep"
+    t.true ▷ a : Δ emit(&label) ▸ done {}
+    t.true ▷ ■ kept {▾data}
+    t.false ▷ other : string := "skip"
+    t.false ▷ b : Δ emit(&other) ▸ done {}
+    t.false ▷ ■ skipped {}
+
+async control collect(data : [usize]) ■ { ok {xs : [usize], left : usize, first_kept : bool} } uses console.write
+    ⊤ ▷ ~pool : tasks⟨pack⟩ := tasks⟨pack⟩()
+    ⊤ ▷ spawn pack(▾data, true) into pool
+    ⊤ ▷ spawn pack([7], false) into pool
+    ⊤ ▷ start : string := "parent"
+    ⊤ ▷ a : Δ emit(&start) ▸ done {}
+    ⊤ ▷ n : Δ await next(pool) ▸ kept {xs} │ skipped {} │ empty {}
+    n.empty ▷ ⊥
+    ⊤ ▷ left : usize := count(pool)
+    ⊤ ▷ middle : string := "received"
+    ⊤ ▷ b : Δ emit(&middle) ▸ done {}
+    ⊤ ▷ m : Δ await next(pool) ▸ kept {ys} │ skipped {} │ empty {}
+    m.empty ▷ ⊥
+    ⊤ ▷ end : Δ await next(pool) ▸ kept {zs} │ skipped {} │ empty {}
+    end.kept ▷ ⊥
+    end.skipped ▷ ⊥
+    n.kept ▷ ■ ok {▾xs, left, true}
+    m.kept ▷ ■ ok {▾ys, left, false}
+    ⊤ ▷ ■ ok {[], left, false}
+
+control runs_collect(data : [usize]) ■ { ok {xs : [usize], left : usize, first_kept : bool} } uses console.write
+    ⊤ ▷ r : Δ run collect(▾data) ▸ ok {xs, left, first_kept}
+    r.ok ▷ ■ ok {▾xs, left, first_kept}
+
+//! run runs_collect([3, 5]) => done ok {[3, 5], 1, true} trace [emit("parent") -> done; emit("keep") -> done; emit("received") -> done; emit("skip") -> done]
+//! run runs_collect([31]) turns [1, 1] => done ok {[31], 1, false} trace [emit("parent") -> done; emit("skip") -> done; emit("keep") -> done; emit("received") -> done]
+//! run runs_collect([32]) turns [4, 3] => done ok {[32], 1, true} trace [emit("parent") -> done; emit("keep") -> done; emit("skip") -> done; emit("received") -> done]
+
+// Pick the middle of three ready children. The fourth joins after the first
+// delivery, behind the two still ready. Each spawn binds the value of id at
+// that statement.
+async control number(id : usize) ■ { value {n : usize} }
+    ⊤ ▷ ■ value {id}
+
+async control numbers() ■ { order {a : usize, b : usize, c : usize, d : usize} }
+    ⊤ ▷ ~pool : tasks⟨number⟩ := tasks⟨number⟩()
+    ⊤ ▷ ~id : usize := 10
+    ⊤ ▷ spawn number(id) into pool
+    ⊤ ▷ id ← 20
+    ⊤ ▷ spawn number(id) into pool
+    ⊤ ▷ id ← 30
+    ⊤ ▷ spawn number(id) into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ value {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ spawn number(40) into pool
+    ⊤ ▷ b : Δ await next(pool) ▸ value {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ c : Δ await next(pool) ▸ value {third} │ empty {}
+    c.empty ▷ ⊥
+    ⊤ ▷ d : Δ await next(pool) ▸ value {fourth} │ empty {}
+    d.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ value {extra} │ empty {}
+    e.value ▷ ⊥
+    e.empty ▷ ■ order {first, second, third, fourth}
+
+//! run numbers() turns [1, 0] => done order {20, 10, 30, 40}
+//! run numbers() turns [2, 1, 1] => done order {30, 10, 20, 40}

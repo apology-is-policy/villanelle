@@ -185,24 +185,28 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         villanelle_v2::load_surface(include_str!("slice1_surface/spend.rails")).unwrap();
     let spend_specs = vec![
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "spend".to_string(),
             arguments: vec![Value::Int(Int::from_u64(10)), Value::Int(Int::from_u64(4))],
             arithmetic: true,
             answers: Vec::new(),
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "spend".to_string(),
             arguments: vec![Value::Int(Int::from_u64(4)), Value::Int(Int::from_u64(10))],
             arithmetic: true,
             answers: Vec::new(),
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "spend_plain".to_string(),
             arguments: vec![Value::Int(Int::from_u64(10)), Value::Int(Int::from_u64(4))],
             arithmetic: true,
             answers: Vec::new(),
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "spend_plain".to_string(),
             arguments: vec![Value::Int(Int::from_u64(4)), Value::Int(Int::from_u64(10))],
             arithmetic: true,
@@ -216,6 +220,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         villanelle_v2::load_surface(include_str!("slice1_surface/show_file.rails")).unwrap();
     let show_specs = vec![
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "show_file".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -229,6 +234,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             )],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "show_file".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -285,6 +291,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
     let groups_exp_prog = resolve::resolve(&expand::expand(&groups_tree).unwrap()).unwrap();
     let groups_specs = vec![
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "inspect".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -298,6 +305,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             )],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "inspect".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -311,6 +319,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             )],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "inspect".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -324,6 +333,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             )],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "inspect".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -345,6 +355,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         villanelle_v2::load_surface(include_str!("slice1_surface/loops_and_paths.rails")).unwrap();
     let loops_specs = vec![
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "step_search".to_string(),
             arguments: vec![
                 Value::Int(Int::from_u64(0)),
@@ -380,6 +391,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             ],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "sum_and_trim".to_string(),
             arguments: vec![Value::Int(Int::from_u64(4))],
             arithmetic: false,
@@ -393,6 +405,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             )],
         },
         NativeRunSpec {
+            turns: Vec::new(),
             entry: "sum_and_trim".to_string(),
             arguments: vec![Value::Int(Int::from_u64(4))],
             arithmetic: false,
@@ -491,6 +504,7 @@ fn the_expansion_and_the_compiled_code_agree(
             "{name}: the trace of the expansion in the oracle"
         );
         specs.push(NativeRunSpec {
+            turns: Vec::new(),
             entry: ended.entry,
             arguments: ended.arguments,
             arithmetic: false,
