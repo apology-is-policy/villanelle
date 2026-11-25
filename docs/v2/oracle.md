@@ -3,7 +3,8 @@
 Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
-IR backend, and for slice 4 in the oracle. The oracle of slice 1 and its
+IR backend. Slice 4 has an oracle, a checker, and native code for defined
+roots that can finish in one turn (section 18.4). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2110,10 +2111,9 @@ files). Before the change of [E-Run], `runs_finish` with `cancel_at 1`
 ended in `host-failed`.
 
 Limits of the instrumented profile: the host sets the flag of the root of
-the innermost run only, where [E-Cancel] lets it set that of any root; and
-no compiled code runs tasks (RB9), so no run of this suite runs natively,
-and a run with `capacity` is left out of the native comparison of the other
-slices.
+the innermost run only, where [E-Cancel] lets it set that of any root.
+The native harness omits directives with explicit turns, waiting order,
+cancellation or capacity. Section 18.4 records the native comparisons.
 
 ### 18.2 The first task-checker checkpoint, 25 November 2026
 
@@ -2242,6 +2242,29 @@ spawn, liveness by availability, the loop-carried set loan, inheritance by
 a payload, the exclusive update at spawn, or cumulative field updates.
 A separate nested-loop test failed when the inner spawn and outer back edge
 were treated as decisions of the same inner iteration.
+
+### 18.4 Native run of a defined root, 25 November 2026
+
+Under [E-Turn] a defined root has the only turn when its run starts.
+If it can neither await nor spawn, no other task can run before it returns
+or faults. A synchronous control it calls can start a nested run. Its
+caller resumes when the inner root ends. The backend uses the defined
+control's calling convention for this case, including its outcome slots
+and fault unwinding. Both the LLVM module emitter and the native test
+harness refuse the whole module if a body needs a task set, an await or
+a run of an extern control. The diagnostic names the enclosing control
+or boundary.
+
+From `v2/`, run `cargo test --test backend_slice4`. The checker accepts
+`tests/slice4/checked_run.core` as a whole. Its six directives give explicit
+outcomes and traces. The test compares those oracle and erased runs with
+compiled code at both widths of `usize`, at `-O0` and `-O2`. On the fault
+path the root releases its lease before the caller releases its own.
+On the nested path the three emits occur in order. Four vector inputs
+account for the four allocations in each six-run batch. Each run ends with
+zero live allocations. Before the change both tests stopped at the
+unimplemented task-operation arm. No run here needs a schedule choice.
+The scheduler and comparisons on generated task programs remain open (RB9).
 
 ## 19. What is open
 

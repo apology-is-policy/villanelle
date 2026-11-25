@@ -367,7 +367,7 @@ fn main() -> ExitCode {
                 } else {
                     load_surface(&source)?
                 };
-                print!("{}", codegen::emit_llvm(&program, usize_bits));
+                print!("{}", codegen::emit_llvm(&program, usize_bits)?);
                 Ok(true)
             })
         }

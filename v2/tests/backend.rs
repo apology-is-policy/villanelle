@@ -145,8 +145,8 @@ fn phase_4_emission_erases_obligations_and_unused_history_bits() {
     let source = include_str!("slice1_surface/spend.rails");
     let program = villanelle_v2::load_surface(source).unwrap();
 
-    let ir_64 = emit_llvm(&program, 64);
-    let ir_32 = emit_llvm(&program, 32);
+    let ir_64 = emit_llvm(&program, 64).unwrap();
+    let ir_32 = emit_llvm(&program, 32).unwrap();
     let header = emit_c_header(&program, 64);
 
     // [R1], [R2], [R3]: `spend` has 2 sites (`_t0` with 2 alternatives and
@@ -720,7 +720,7 @@ pub control hot_bench(iters: u64) ⊢ iters ≤ 50000000 ■ result {checksum: u
     let checked = check::check(&program).unwrap();
     checked.revalidate().unwrap();
 
-    let mut v2_ir = emit_llvm(&program, 64);
+    let mut v2_ir = emit_llvm(&program, 64).unwrap();
     // Append a C timing driver around `@vn2_call_hot_bench` that measures only
     // the hot call with `clock_gettime` / `timespec`.
     v2_ir.push_str(

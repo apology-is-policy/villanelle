@@ -759,11 +759,11 @@ fn compute_control_terminate_tys(program: &Program) -> Vec<Option<Type>> {
             for b in &body.bodies {
                 for s in &b.statements {
                     if let Command::Decide {
-                        op_kind: Operation::Control(callee),
+                        op_kind: Operation::Control(callee) | Operation::RunControl(callee),
                         ..
                     }
                     | Command::Capture {
-                        operation: Operation::Control(callee),
+                        operation: Operation::Control(callee) | Operation::RunControl(callee),
                         ..
                     } = &s.command
                         && let Some(t) = &tys[*callee]
@@ -3128,8 +3128,7 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
                     "false".to_string()
                 }
             }
-            Expr::TasksEmpty(_, _) => "null".to_string(),
-            Expr::Count(_) => "0".to_string(),
+            Expr::TasksEmpty(_, _) | Expr::Count(_) => unreachable!("task set in a native body"),
             Expr::Integer(val, int_ty) => {
                 let bits = int_bits(*int_ty, self.reg.usize_bits);
                 let raw = val.to_i128().unwrap_or(0) as u128;
@@ -3845,7 +3844,16 @@ fn emit_body_unit<'a>(
     unit_out_fault: Option<String>,
     unit_out_term: Option<(String, Type)>,
     pre_bound_var_count: usize,
-) {
+) -> Result<(), String> {
+    // [W11] gives every task set a local of this type. Its count and members
+    // need a scheduler even where the source uses them only in a nested body.
+    if body
+        .vars
+        .iter()
+        .any(|var| matches!(var.ty, Type::Tasks(_, _)))
+    {
+        return Err("the native backend does not yet support task sets".to_string());
+    }
     let mut plan = build_plan(program, body, pre_bound_var_count);
     let roles = classify_body_roles(body);
     // The message of a fault has one owner. A contingency holds it for
@@ -4130,7 +4138,7 @@ fn emit_body_unit<'a>(
 
             match &stmt.command {
                 Command::Spawn { .. } | Command::Cancel { .. } => {
-                    let _ = writeln!(emitter.code, "  br label %{next_lbl}");
+                    unreachable!("task set in a native body")
                 }
                 Command::Bind { var, value } => {
                     let val = emitter.emit_expr(value, &VarAccess::ControlSlots(body));
@@ -4297,7 +4305,7 @@ fn emit_body_unit<'a>(
                         },
                         &emit_fault,
                         unit_out_term.as_ref().map(|(t, _)| t.as_str()),
-                    );
+                    )?;
                 }
                 Command::Decide {
                     site,
@@ -4398,7 +4406,7 @@ fn emit_body_unit<'a>(
                         },
                         &emit_fault,
                         unit_out_term.as_ref().map(|(t, _)| t.as_str()),
-                    );
+                    )?;
                 }
                 Command::Loop {
                     body: inner,
@@ -4652,6 +4660,7 @@ fn emit_body_unit<'a>(
     }
     out.push_str(&emitter.code);
     let _ = writeln!(out, "}}\n");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4667,7 +4676,7 @@ fn emit_operation_call(
     on_done: impl FnOnce(&mut IrEmitter<'_, '_>, &str, &[Vec<String>], Vec<ReadOperand>),
     emit_unwind: &impl Fn(&mut IrEmitter<'_, '_>, BodyId, usize, &str),
     caller_out_term: Option<&str>,
-) {
+) -> Result<(), String> {
     let contract = op_kind.contract(program);
     let mut out_slots: Vec<Vec<String>> = Vec::new();
     let is_extern_ctrl =
@@ -4687,10 +4696,23 @@ fn emit_operation_call(
     }
 
     match op_kind {
-        Operation::AwaitControl(_) | Operation::AwaitNext(_, _) | Operation::RunControl(_) => {
-            unreachable!("Slice 4 task codegen is scheduled for Phase 4")
+        Operation::AwaitNext(_, _) => unreachable!("task set in a native body"),
+        Operation::AwaitControl(cid) => {
+            return Err(format!(
+                "the native backend does not yet support await of `{}`",
+                program.controls[*cid].name
+            ));
         }
-        Operation::Control(cid) => {
+        Operation::RunControl(cid) if program.controls[*cid].body.is_none() => {
+            return Err(format!(
+                "the native backend does not yet support run of extern async control `{}`",
+                program.controls[*cid].name
+            ));
+        }
+        // [E-Run], [E-Turn]: a defined root has the only turn until it
+        // awaits or makes another task runnable. The whole module is emitted
+        // or refused, so neither can occur in a module this backend returns.
+        Operation::Control(cid) | Operation::RunControl(cid) => {
             let callee = &program.controls[*cid];
             let is_extern = callee.body.is_none();
             let mut results: Vec<Option<String>> = vec![None; arguments.len()];
@@ -4961,6 +4983,7 @@ fn emit_operation_call(
             }
         }
     }
+    Ok(())
 }
 
 fn emit_builtin_call(
@@ -5343,7 +5366,7 @@ fn emit_builtin_call(
 
 /// Emits the textual LLVM IR module for all functions, boundaries, and controls
 /// of `program`.
-pub fn emit_llvm(program: &Program, usize_bits: u32) -> String {
+pub fn emit_llvm(program: &Program, usize_bits: u32) -> Result<String, String> {
     let mut reg = RuntimeRegistry::new(program, usize_bits);
     let term_tys = compute_control_terminate_tys(program);
 
@@ -5375,7 +5398,7 @@ pub fn emit_llvm(program: &Program, usize_bits: u32) -> String {
     }
 
     // 2. Named boundaries, pure functions, and defined controls.
-    emit_program_bodies(&mut body_out, program, &mut reg, &term_tys, usize_bits);
+    emit_program_bodies(&mut body_out, program, &mut reg, &term_tys, usize_bits)?;
 
     let mut type_out = String::new();
     let _ = writeln!(
@@ -5391,7 +5414,7 @@ pub fn emit_llvm(program: &Program, usize_bits: u32) -> String {
     out.push_str(&decls_out);
     out.push_str(&helpers_out);
     out.push_str(&body_out);
-    out
+    Ok(out)
 }
 
 fn emit_program_bodies<'a>(
@@ -5400,7 +5423,7 @@ fn emit_program_bodies<'a>(
     reg: &mut RuntimeRegistry<'a>,
     term_tys: &[Option<Type>],
     usize_bits: u32,
-) {
+) -> Result<(), String> {
     // Named boundaries (`@vn2_boundary_<id>` + `@vn2_boundary_b2_<id>`).
     for (bid, bdef) in program.boundaries.iter().enumerate() {
         let b1_params: Vec<(String, Type)> = bdef
@@ -5426,7 +5449,8 @@ fn emit_program_bodies<'a>(
             b1_fault,
             None,
             bdef.parameters.len(),
-        );
+        )
+        .map_err(|e| format!("boundary `{}`: {e}", bdef.name))?;
 
         let mut b2_params: Vec<(String, Type)> = bdef
             .retains
@@ -5452,7 +5476,8 @@ fn emit_program_bodies<'a>(
             b2_fault,
             None,
             b2_params.len(),
-        );
+        )
+        .map_err(|e| format!("contingency of `{}`: {e}", bdef.name))?;
     }
 
     // Pure functions (`@vn2_fn_<id>`).
@@ -5489,7 +5514,8 @@ fn emit_program_bodies<'a>(
                 fslot,
                 tslot,
                 control.parameters.len(),
-            );
+            )
+            .map_err(|e| format!("control `{}`: {e}", control.name))?;
             emit_control_c_wrapper(
                 body_out,
                 program,
@@ -5500,6 +5526,7 @@ fn emit_program_bodies<'a>(
             );
         }
     }
+    Ok(())
 }
 
 fn c_abi_signature_types(program: &Program, control: &Control, usize_bits: u32) -> Vec<String> {
@@ -6553,13 +6580,13 @@ pub fn emit_native_harness_llvm(
     program: &Program,
     specs: &[NativeRunSpec],
     usize_bits: u32,
-) -> String {
+) -> Result<String, String> {
     let mut reg = RuntimeRegistry::new(program, usize_bits);
     let term_tys = compute_control_terminate_tys(program);
     let mut body_out = String::new();
 
     // 1. Named boundaries, functions, and defined controls into `body_out`, sharing `reg`.
-    emit_program_bodies(&mut body_out, program, &mut reg, &term_tys, usize_bits);
+    emit_program_bodies(&mut body_out, program, &mut reg, &term_tys, usize_bits)?;
 
     // 2. Register harness print types & string literals into the SAME `reg`.
     let mut used_print = BTreeSet::new();
@@ -7218,7 +7245,7 @@ pub fn emit_native_harness_llvm(
     out.push_str(&ext_code);
     out.push_str(&body_out);
     out.push_str(&main_out);
-    count_allocations(&out)
+    Ok(count_allocations(&out))
 }
 
 /// The module `ir` with every allocation counted: the calls of `malloc`,
@@ -7351,7 +7378,7 @@ pub fn run_native_counted(
     if specs.is_empty() {
         return Ok(NativeBatch::default());
     }
-    let ir = emit_native_harness_llvm(program, specs, usize_bits);
+    let ir = emit_native_harness_llvm(program, specs, usize_bits)?;
     run_native_ir(program, specs, &ir, opt_level)
 }
 

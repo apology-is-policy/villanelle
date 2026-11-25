@@ -378,10 +378,10 @@ fn slice_three_phase_4_ir_and_c_abi_erasure() {
     let vl_prog =
         villanelle_v2::load_surface(include_str!("slice3_surface/views_and_loops.rails")).unwrap();
 
-    let bv_ir = emit_llvm(&bv_prog, 64);
+    let bv_ir = emit_llvm(&bv_prog, 64).unwrap();
     let bv_hdr = emit_c_header(&bv_prog, 64);
-    let vl_ir = emit_llvm(&vl_prog, 64);
-    let vl_ir_32 = emit_llvm(&vl_prog, 32);
+    let vl_ir = emit_llvm(&vl_prog, 64).unwrap();
+    let vl_ir_32 = emit_llvm(&vl_prog, 32).unwrap();
     let vl_hdr = emit_c_header(&vl_prog, 64);
 
     // [R1]: Flat `ptr` borrows and flat `view struct` layouts; zero tags, Value wrappers,
@@ -956,7 +956,7 @@ pub control borrow_view_bench(n: usize, passes: u64)
     let checked = check::check(&program).unwrap();
     checked.revalidate().unwrap();
 
-    let mut v2_ir = emit_llvm(&program, 64);
+    let mut v2_ir = emit_llvm(&program, 64).unwrap();
     v2_ir.push_str(
         r#"
 %timespec = type { i64, i64 }

@@ -347,13 +347,13 @@ fn slice_two_phase_4_ir_and_c_abi_erasure() {
         villanelle_v2::load_surface(include_str!("slice2_surface/boundaries_and_faults.rails"))
             .unwrap();
 
-    let rec_ir = emit_llvm(&rec_prog, 64);
+    let rec_ir = emit_llvm(&rec_prog, 64).unwrap();
     let rec_hdr = emit_c_header(&rec_prog, 64);
-    let col_ir = emit_llvm(&col_prog, 64);
-    let col_ir_32 = emit_llvm(&col_prog, 32);
-    let res_ir = emit_llvm(&res_prog, 64);
+    let col_ir = emit_llvm(&col_prog, 64).unwrap();
+    let col_ir_32 = emit_llvm(&col_prog, 32).unwrap();
+    let res_ir = emit_llvm(&res_prog, 64).unwrap();
     let res_hdr = emit_c_header(&res_prog, 64);
-    let bnd_ir = emit_llvm(&bnd_prog, 64);
+    let bnd_ir = emit_llvm(&bnd_prog, 64).unwrap();
     let bnd_hdr = emit_c_header(&bnd_prog, 64);
 
     // [R1]: Flat static native representations, zero dynamic Value wrapper.
@@ -1094,7 +1094,7 @@ fn a_run_of_compiled_code_that_leaves_an_allocation_live_is_seen() {
     let mut runs = 0;
     let mut made = Vec::new();
     for (name, program, specs) in &checked_core_files() {
-        let ir = emit_native_harness_llvm(program, specs, 64);
+        let ir = emit_native_harness_llvm(program, specs, 64).unwrap();
         let leaking = without_string_releases(&ir);
         assert_ne!(ir, leaking, "{name} releases no string");
         for level in [0, 2] {
@@ -1141,7 +1141,7 @@ fn paired_native_performance_matches_optimized_rust_on_slice_two_data_kernel() {
     let checked = check::check(&program).unwrap();
     checked.revalidate().unwrap();
 
-    let mut v2_ir = emit_llvm(&program, 64);
+    let mut v2_ir = emit_llvm(&program, 64).unwrap();
     v2_ir.push_str(
         r#"
 %timespec = type { i64, i64 }

@@ -1,0 +1,58 @@
+// [E-Run] A defined root that never awaits finishes or faults on its first turn.
+async control choose(keep : bool, data : [usize]) ■ { kept {xs : [usize]} │ skipped {} }
+    ⊤ ▷ t : ? keep
+    t.true ▷ ■ kept {▾data}
+    t.false ▷ ■ skipped {}
+
+control runs_choose(keep : bool, data : [usize]) ■ { yes {xs : [usize]} │ no {} }
+    ⊤ ▷ d : Δ run choose(keep, ▾data) ▸ kept {xs} │ skipped {}
+    d.kept ▷ ■ yes {▾xs}
+    d.skipped ▷ ■ no {}
+
+//! run runs_choose(true, [3, 7]) => done yes {[3, 7]}
+//! run runs_choose(false, [4]) => done no
+
+extern resource lease on fault release
+extern control open_lease(id : u32) ■ { ok {l : lease} } uses io.res
+
+async control fail_with(inner : lease) ■ { ok {} } faults
+    ⊤ ▷ fault "root fault"
+
+control runs_fail(outer : lease) ■ { ok {} } faults uses io.res
+    ⊤ ▷ o : Δ open_lease(2) ▸ ok {inner}
+    o.ok ▷ d : Δ run fail_with(▾inner) ▸ ok {}
+    d.ok ▷ fault "unexpected return"
+
+//! run runs_fail(lease#1) with [open_lease -> ok {lease#2}] => faulted "root fault" trace [open_lease(2) -> ok {lease#2}; lease.release(lease#2) -> released; lease.release(lease#1) -> released]
+
+async control say(value : usize) ■ { ok {v : usize} } uses console.write
+    ⊤ ▷ inner : string := "inner"
+    ⊤ ▷ e : Δ emit(&inner) ▸ done {}
+    ⊤ ▷ ■ ok {value}
+
+control bridge(value : usize) ■ { ok {v : usize} } uses console.write
+    ⊤ ▷ d : Δ run say(value) ▸ ok {v}
+    d.ok ▷ ■ ok {v}
+
+async control outer(value : usize) ■ { ok {v : usize} } uses console.write
+    ⊤ ▷ before : string := "before"
+    ⊤ ▷ a : Δ emit(&before) ▸ done {}
+    ⊤ ▷ d : Δ bridge(value) ▸ ok {v}
+    d.ok ▷ after : string := "after"
+    d.ok ▷ b : Δ emit(&after) ▸ done {}
+    d.ok ▷ ■ ok {v}
+
+control runs_nested(value : usize) ■ { ok {v : usize} } uses console.write
+    ⊤ ▷ d : Δ run outer(value) ▸ ok {v}
+    d.ok ▷ ■ ok {v}
+
+//! run runs_nested(4294967295) => done ok {4294967295} trace [emit("before") -> done; emit("inner") -> done; emit("after") -> done]
+
+control captures_choose(keep : bool, data : [usize]) ■ { yes {xs : [usize]} │ no {} }
+    ⊤ ▷ selected := capture run choose(keep, ▾data)
+    ⊤ ▷ d : Δ outcome(▾selected) ▸ kept {xs} │ skipped {}
+    d.kept ▷ ■ yes {▾xs}
+    d.skipped ▷ ■ no {}
+
+//! run captures_choose(true, [9, 0]) => done yes {[9, 0]}
+//! run captures_choose(false, [5]) => done no
