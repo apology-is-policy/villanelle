@@ -3288,20 +3288,14 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    fn invalidate_exclusive_operand(
-        &mut self,
-        arg: &Expr,
-        guard: Formula,
-        env: &Env,
-        cumulative: bool,
-    ) {
+    fn invalidate_exclusive_operand(&mut self, arg: &Expr, guard: Formula, env: &Env) {
         if guard == bdd::FALSE {
             return;
         }
         match arg {
             Expr::Borrow(BorrowMode::Exclusive, place, _) => {
                 let z_tid = self.alloc_type_term("_mut", &place.ty);
-                self.write_place(place, guard, LinearTerm::var(z_tid), env, cumulative);
+                self.write_place(place, guard, LinearTerm::var(z_tid), env, true);
             }
             Expr::Var(VarRef::Local(vid), ty) if self.program.has_exclusive_borrow(ty) => {
                 if matches!(ty, Type::Ref(BorrowMode::Exclusive, _)) {
@@ -3313,7 +3307,7 @@ impl<'a> BodyChecker<'a> {
                         steps: Vec::new(),
                         ty: inner_ty.clone(),
                     };
-                    self.write_place(&place, guard, LinearTerm::var(z_tid), env, cumulative);
+                    self.write_place(&place, guard, LinearTerm::var(z_tid), env, true);
                 } else {
                     let fresh_tid = self.alloc_var_term(*vid);
                     self.set_version(*vid, guard, fresh_tid);
@@ -3323,13 +3317,11 @@ impl<'a> BodyChecker<'a> {
             Expr::Struct(sid, fields, _) if self.program.structs[*sid].is_view => {
                 for field in fields {
                     if self.program.has_exclusive_borrow(&field.ty()) {
-                        self.invalidate_exclusive_operand(field, guard, env, cumulative);
+                        self.invalidate_exclusive_operand(field, guard, env);
                     }
                 }
             }
-            Expr::Move(inner, _) => {
-                self.invalidate_exclusive_operand(inner, guard, env, cumulative)
-            }
+            Expr::Move(inner, _) => self.invalidate_exclusive_operand(inner, guard, env),
             _ => {}
         }
     }
@@ -3433,7 +3425,7 @@ impl<'a> BodyChecker<'a> {
             return;
         }
         // Alternative outcomes write from their common entry state. Multiple
-        // loans given to one member instead update the same root in sequence.
+        // exclusive operands of one call or spawn update the root in sequence.
         // In both cases index expressions denote their entry values.
         let root_term = |checker: &mut Self, var| {
             if cumulative {
@@ -3819,7 +3811,7 @@ impl<'a> BodyChecker<'a> {
                 post_args[pidx] = z_term.clone();
                 match arg {
                     Expr::Borrow(BorrowMode::Exclusive, place, _) => {
-                        self.apply_place_write(place, r_i, z_term, env);
+                        self.write_place(place, r_i, z_term, env, true);
                     }
                     Expr::Var(VarRef::Local(vid), _) => {
                         let place = Place {
@@ -3828,12 +3820,12 @@ impl<'a> BodyChecker<'a> {
                             steps: Vec::new(),
                             ty: inner_ty.clone(),
                         };
-                        self.apply_place_write(&place, r_i, z_term, env);
+                        self.write_place(&place, r_i, z_term, env, true);
                     }
                     _ => {}
                 }
             } else if self.program.has_exclusive_borrow(pty) {
-                self.invalidate_exclusive_operand(arg, r_i, env, false);
+                self.invalidate_exclusive_operand(arg, r_i, env);
             }
         }
     }
@@ -4232,7 +4224,7 @@ impl<'a> BodyChecker<'a> {
             .any(|field| self.program.has_exclusive_borrow(&field.ty));
         for (argument, ty) in arguments.iter().zip(&parameter_types) {
             if self.program.has_exclusive_borrow(ty) {
-                self.invalidate_exclusive_operand(argument, at.reach, &at.env, true);
+                self.invalidate_exclusive_operand(argument, at.reach, &at.env);
             }
             if may_return_exclusive && self.program.contains_borrow_or_view(ty) {
                 for (guard, root) in self.expr_loan_roots(argument, at.reach) {

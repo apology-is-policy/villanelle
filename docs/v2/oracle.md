@@ -1836,6 +1836,30 @@ moved the borrow name), and in no other; the test fails with a conflicting
 borrow made in the same mode, with payload names that hold no place, and
 with a checker that allows a read beside an exclusive loan.
 
+### 16.5 Two exclusive operands in one call, 25 November 2026
+
+[I9] applies each write to the record produced by the preceding write in
+the same invocation. The indices of the lent places and the values used
+by `old` come from entry to the call. The updates occur when the call
+runs, including when its outcome is captured ([I12]).
+
+Two tests in `v2/tests/checker_slice3.rs` exercise RC33 in the checker and
+oracle. Run them with `cargo test --test checker_slice3 rc33`.
+
+- `exclusive_call_operands_update_the_same_record_rc33` passes two fields
+  of a record as direct borrows, inside a constructed view, and by local
+  borrow names. In each form the checker refuses an assertion of the old
+  value of either changed field by [P1]. The oracle gets stuck at the
+  assertion. Both accept the assertion that the third field kept its value.
+- `a_capture_keeps_both_exclusive_postconditions_rc33` decides the
+  captured outcome of a call. Its contract relates each changed field to
+  the other parameter’s entry value. The checker proves both resulting
+  values and the unchanged third field. The assertion that the first field
+  kept its old value is refused. The oracle confirms both verdicts.
+
+Before the repair the checker accepted the stale first field in the
+direct call and refused the true assertion after the capture.
+
 ## 17. Slice 3 Phase 4: Theorem 4 Expansion and Typed LLVM IR / C ABI Backend for Borrows and Views
 
 Slice 3 Phase 4 completes Theorem 4 call expansion (`expand.rs`), erased borrow

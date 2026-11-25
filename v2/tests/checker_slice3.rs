@@ -2034,3 +2034,92 @@ fn mutations_of_borrows_are_stuck_and_rejected() {
         "{stuck:?}"
     );
 }
+
+/// [I9], RC33. Each write in one invocation updates the record left by the
+/// preceding write. Its other fields keep their facts.
+#[test]
+fn exclusive_call_operands_update_the_same_record_rc33() {
+    let direct = r#"
+control update(one : &~u32, two : &~u32) ■ { done {} }
+    ⊤ ▷ one ← 8
+    ⊤ ▷ two ← 9
+    ⊤ ▷ ■ done {}"#;
+    let view = r#"
+view struct slots {one : &~u32, two : &~u32}
+control update(s : slots) ■ { done {} }
+    ⊤ ▷ s.one ← 8
+    ⊤ ▷ s.two ← 9
+    ⊤ ▷ ■ done {}"#;
+    for (callee, setup, args) in [
+        (direct, "", "&~t.a, &~t.b"),
+        (view, "", "slots {&~t.a, &~t.b}"),
+        (
+            direct,
+            "⊤ ▷ a : &~u32 := &~t.a\n    ⊤ ▷ b : &~u32 := &~t.b",
+            "a, b",
+        ),
+    ] {
+        for (field, value, expected) in [
+            ("a", 1, "stuck X7 E-Oblige"),
+            ("b", 2, "stuck X7 E-Oblige"),
+            ("c", 3, "done ok"),
+        ] {
+            let source = format!(
+                r#"
+struct triple {{a : u32, b : u32, c : u32}}
+{callee}
+
+control start() ■ {{ ok {{}} }}
+    ⊤ ▷ ~t : triple := triple {{1, 2, 3}}
+    {setup}
+    ⊤ ▷ d : Δ update({args}) ▸ done {{}}
+    d.done ▷ ⊢ t.{field} = {value}
+    d.done ▷ ■ ok {{}}
+
+//! run start() => {expected}
+"#
+            );
+            if field == "c" {
+                done_and_accepted("I9", &source);
+            } else {
+                stuck_and_rejected("P1", &source);
+            }
+        }
+    }
+}
+
+/// [I12] records a post-call term for each exclusive operand. A decision
+/// on a captured value must relate both terms to the caller's fields.
+#[test]
+fn a_capture_keeps_both_exclusive_postconditions_rc33() {
+    for (fact, expected) in [
+        ("t.a = 8 ∧ t.b = 9 ∧ t.c = 3", "done ok"),
+        ("t.a = 1", "stuck X7 E-Oblige"),
+    ] {
+        let source = format!(
+            r#"
+struct triple {{a : u32, b : u32, c : u32}}
+
+control update(one : &~u32, two : &~u32) ⊢ one = 1 ∧ two = 2
+    ■ {{ done {{}} ⇐ one = old(two) + 6 ∧ two = old(one) + 8 }}
+    ⊤ ▷ one ← 8
+    ⊤ ▷ two ← 9
+    ⊤ ▷ ■ done {{}}
+
+control start() ■ {{ ok {{}} }}
+    ⊤ ▷ ~t : triple := triple {{1, 2, 3}}
+    ⊤ ▷ result := capture update(&~t.a, &~t.b)
+    ⊤ ▷ d : Δ outcome(▾result) ▸ done {{}}
+    d.done ▷ ⊢ {fact}
+    d.done ▷ ■ ok {{}}
+
+//! run start() => {expected}
+"#
+        );
+        if expected == "done ok" {
+            done_and_accepted("I12", &source);
+        } else {
+            stuck_and_rejected("P1", &source);
+        }
+    }
+}
