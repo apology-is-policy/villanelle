@@ -547,7 +547,7 @@ fn interval_unfolded(expr: &Expr, constants: &BTreeMap<VarId, Int>) -> (Option<I
         Expr::Var(_, ty) | Expr::Old(_, ty) => int_bounds_for_type(ty),
         Expr::Move(inner, _) | Expr::Clone(inner, _) => interval_unfolded(inner, constants),
         Expr::Borrow(_, place, _) => int_bounds_for_type(&place.ty),
-        Expr::Len(_) => (Some(Int::zero()), None),
+        Expr::Len(_) | Expr::Count(_) => (Some(Int::zero()), None),
         // The declared interval of a component belongs to a place. Read out
         // of a constructor, at any depth, a component is the term that was
         // written there, and a formula does not hold that term to the range
@@ -877,7 +877,19 @@ fn translate_term(program: &Program, solver: &mut Solver, expr: &Expr, env: &Env
             solver.instantiate_all();
             LinearTerm::var(id)
         }
-        Expr::TasksEmpty(_, _) | Expr::Count(_) => LinearTerm::from_i128(0),
+        // A new set is a value the logic knows nothing of here: a bind of
+        // it gives it its count ([TK6], `bind_empty_set`).
+        Expr::TasksEmpty(_, _) => {
+            LinearTerm::var(solver.fresh_var("_tasks".to_string(), None, false))
+        }
+        // `count` is a measure ([A3]), written with the symbol of `len`: the
+        // term of a set is of no sort that `len` has another axiom for.
+        Expr::Count(set) => {
+            let bt = env.lookup(VarRef::Local(*set));
+            let id = solver.intern_term(AtomTerm::Len(bt));
+            solver.instantiate_all();
+            LinearTerm::var(id)
+        }
         Expr::Len(inner) => {
             let bt = translate_term(program, solver, inner, env);
             let id = solver.intern_term(AtomTerm::Len(bt));
@@ -1954,9 +1966,15 @@ fn collect_modified_vars(
                 out.insert(target.root);
                 collect_operand_modified(program, value, out);
             }
+            // [I9]: `spawn … into x` and `await next(x)` rename the set.
+            Command::Spawn { arguments, set, .. } => {
+                out.insert(*set);
+                for arg in arguments {
+                    collect_operand_modified(program, arg, out);
+                }
+            }
             Command::Again { arguments, .. }
             | Command::Supervise { arguments, .. }
-            | Command::Spawn { arguments, .. }
             | Command::Leave {
                 payload: arguments, ..
             }
@@ -1970,12 +1988,17 @@ fn collect_modified_vars(
             Command::Decide {
                 op_kind, arguments, ..
             } => {
-                if let Operation::Builtin {
-                    target: Some(place),
-                    ..
-                } = op_kind
-                {
-                    out.insert(place.root);
+                match op_kind {
+                    Operation::Builtin {
+                        target: Some(place),
+                        ..
+                    } => {
+                        out.insert(place.root);
+                    }
+                    Operation::AwaitNext(set, _) => {
+                        out.insert(*set);
+                    }
+                    _ => {}
                 }
                 for arg in arguments {
                     collect_operand_modified(program, arg, out);
@@ -2634,9 +2657,9 @@ impl<'a> BodyChecker<'a> {
             | Expr::String(_)
             | Expr::Old(_, _)
             | Expr::EmptyMap(_)
-            | Expr::TasksEmpty(_, _)
-            | Expr::Count(_) => Ok(()),
-            Expr::Var(VarRef::Local(id), _) => {
+            | Expr::TasksEmpty(_, _) => Ok(()),
+            // [TK2]: `count(x)` asks for `x` ([O2]).
+            Expr::Var(VarRef::Local(id), _) | Expr::Count(id) => {
                 self.check_available(*id, r_i, line, visible_vars, in_loop)
             }
             Expr::Var(_, _) => Ok(()),
@@ -3861,7 +3884,12 @@ impl<'a> BodyChecker<'a> {
         live: Formula,
     ) -> Result<Flow, Error> {
         match command {
-            Command::Spawn { .. } | Command::Cancel { .. } => Err(self.tasks_unchecked(at.line)),
+            Command::Spawn {
+                control,
+                arguments,
+                set,
+            } => self.check_spawn(at, *control, arguments, *set),
+            Command::Cancel { set } => self.check_cancel(at, *set),
             Command::Bind { var, value } => self.check_bind(at, *var, value),
             Command::Unpack {
                 struct_id,
@@ -3932,15 +3960,249 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    /// The tasks of slice 4 are not checked yet.
-    fn tasks_unchecked(&self, line: u32) -> Error {
-        Error {
-            control: self.owner_name.clone(),
-            line,
-            clause: "TK1",
-            message: "static checking for Slice 4 tasks is scheduled for Phase 3".to_string(),
-            counterexample: None,
+    /// An error at a statement that a feasible history runs, for a clause
+    /// that goes by the types of the program.
+    fn refuse_if_run(
+        &mut self,
+        at: &Point,
+        clause: &'static str,
+        message: String,
+    ) -> Result<(), Error> {
+        if self.is_feasible(at.reach, &at.visible, at.in_loop) {
+            return Err(Error {
+                control: self.owner_name.clone(),
+                line: at.line,
+                clause,
+                message,
+                counterexample: None,
+            });
         }
+        Ok(())
+    }
+
+    /// `count(x)` of the set whose term is `set` ([TK6]; fact logic, [A3]).
+    fn count_of(&mut self, set: &LinearTerm) -> LinearTerm {
+        let id = self.solver.intern_term(AtomTerm::Len(set.clone()));
+        self.solver.instantiate_all();
+        LinearTerm::var(id)
+    }
+
+    /// `x := tasks⟨f⟩()`: the set has no members, `Rᵢ ⇒ count(x) = 0`
+    /// ([TK6]).
+    fn bind_empty_set(&mut self, var: VarId, histories: Formula) {
+        let term = self.alloc_var_term(var);
+        let count = self.count_of(&LinearTerm::var(term));
+        let none = self.solver.eq(&count, &LinearTerm::from_i128(0));
+        self.solver.add_fact(histories, none);
+        self.set_version(var, histories, term);
+    }
+
+    /// [I9], [TK6]: the set `var` gets a fresh name `x′` on `histories`,
+    /// with `count(x′) = count(x) + step`.
+    fn rename_set(&mut self, var: VarId, before: &LinearTerm, histories: Formula, step: i128) {
+        let count_before = self.count_of(before);
+        let renamed = self.alloc_var_term(var);
+        let count_after = self.count_of(&LinearTerm::var(renamed));
+        let fact = self.solver.eq(
+            &count_after,
+            &count_before.add(&LinearTerm::from_i128(step)),
+        );
+        self.solver.add_fact(histories, fact);
+        self.set_version(var, histories, renamed);
+    }
+
+    /// [TK4]: a task can be stopped wherever it waits at an `await`
+    /// ([E-Stop]), so no name in scope whose type is not fault-releasable is
+    /// available there, after the statement's own arguments have moved, and
+    /// what a boundary around the `await` has in its care is
+    /// fault-releasable. In the `B₂` of a lexical boundary the names around
+    /// it are as they were where `B₁` faulted, and [F2] asked as much of
+    /// them there ([F5]).
+    fn check_stop(&mut self, at: &Point) -> Result<(), Error> {
+        let around = self.after_fault.as_ref().map_or(0, |(_, around)| *around);
+        for var in 0..self.body.vars.len() {
+            if !self.active_scopes[around..].contains(&self.body.vars[var].body)
+                || self.program.is_fault_releasable(&self.body.vars[var].ty)
+            {
+                continue;
+            }
+            let available = self.avail(var);
+            let held = self.solver.bdd.and(at.reach, available);
+            self.exclude(
+                at,
+                held,
+                "TK4",
+                format!(
+                    "`{}` holds a value that is not fault-releasable at an `await`, where the task can be stopped",
+                    self.body.vars[var].name
+                ),
+            )?;
+        }
+        for (_, cared) in self.care.clone() {
+            for var in cared {
+                if !self.program.is_fault_releasable(&self.body.vars[var].ty) {
+                    let name = self.body.vars[var].name.clone();
+                    self.refuse_if_run(
+                        at,
+                        "TK4",
+                        format!(
+                            "`{name}`, in the care of a boundary around this `await`, is not fault-releasable, and the task can be stopped here"
+                        ),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [TK4]: what `f` is given by value by `await f`, `spawn f` and a `run
+    /// f` of a cancellable `extern async control` is held by `f` or by the
+    /// host while the task can be stopped, so its type is fault-releasable.
+    fn check_held_operands(&mut self, at: &Point, cid: ControlId, how: &str) -> Result<(), Error> {
+        let callee = &self.program.controls[cid];
+        for parameter in &callee.parameters {
+            if !self.program.is_fault_releasable(&parameter.ty) {
+                let message = format!(
+                    "`{how} {}` gives `{}` of type `{}` by value, which is not fault-releasable",
+                    callee.name, parameter.name, parameter.ty
+                );
+                return self.refuse_if_run(at, "TK4", message);
+            }
+        }
+        Ok(())
+    }
+
+    /// [TK4]: a payload of a producer, or of an `extern async control` that a
+    /// task awaits, reaches a task that can be stopped before it runs again,
+    /// so its type is fault-releasable.
+    fn check_held_payloads(&mut self, at: &Point, cid: ControlId) -> Result<(), Error> {
+        let callee = &self.program.controls[cid];
+        for alternative in &callee.contract {
+            for field in &alternative.fields {
+                if !self.program.is_fault_releasable(&field.ty) {
+                    let message = format!(
+                        "the payload `{}` of `{}` in `{}` reaches a task that can be stopped, and its type `{}` is not fault-releasable",
+                        field.name, alternative.name, callee.name, field.ty
+                    );
+                    return self.refuse_if_run(at, "TK4", message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [TK5]: the histories of a statement on which a member's fault can
+    /// arrive: a set whose producer permits `faults` is available.
+    fn member_fault_histories(&mut self, reach: Formula) -> Formula {
+        let mut any = bdd::FALSE;
+        for var in 0..self.body.vars.len() {
+            if let Type::Tasks(producer, _) = self.body.vars[var].ty
+                && self.program.controls[producer].faults
+                && self.active_scopes.contains(&self.body.vars[var].body)
+            {
+                let available = self.avail(var);
+                any = self.solver.bdd.or(any, available);
+            }
+        }
+        self.solver.bdd.and(reach, any)
+    }
+
+    /// What every `await` asks: the task can be stopped there ([TK4]), and
+    /// the fault of a member can arrive there unless the callee's own fault
+    /// already counts ([TK5], [F1], [F2]).
+    fn check_await(&mut self, at: &Point, callee_faults: bool) -> Result<(), Error> {
+        self.check_stop(at)?;
+        if !callee_faults {
+            let arrives = self.member_fault_histories(at.reach);
+            if arrives != bdd::FALSE {
+                self.check_may_fault(arrives, at.line, &at.visible, at.in_loop)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `spawn f(ō) into x` ([TK1] to [TK4], [TK6], [TK7]): the operands are
+    /// those of a call of `f`, with its precondition ([P3]); the set is
+    /// available ([TK2]) and renamed with one more member. A spawn passes no
+    /// turn and does not fault: the fault of a member arrives at an `await`
+    /// ([TK5]).
+    fn check_spawn(
+        &mut self,
+        at: &Point,
+        cid: ControlId,
+        arguments: &[Expr],
+        set: VarId,
+    ) -> Result<Flow, Error> {
+        let producer = &self.program.controls[cid];
+        // A stand-in for [TK3]: the loans that a set holds are not checked
+        // yet, so a spawn whose operands may lend is refused (review,
+        // slice 4).
+        if producer
+            .parameters
+            .iter()
+            .any(|parameter| self.program.contains_borrow_or_view(&parameter.ty))
+        {
+            let message = format!(
+                "`spawn {}` may lend to a member, and the loans of a task set are not checked yet ([TK3])",
+                producer.name
+            );
+            self.refuse_if_run(at, "TK3", message)?;
+        }
+        self.check_available(set, at.reach, at.line, &at.visible, at.in_loop)?;
+        let old: Vec<LinearTerm> = arguments
+            .iter()
+            .map(|a| translate_term(self.program, &mut self.solver, a, &at.env))
+            .collect();
+        let parameter_types: Vec<Type> = producer.parameters.iter().map(|p| p.ty.clone()).collect();
+        self.check_operands_o0(
+            arguments,
+            Some(&parameter_types),
+            at.reach,
+            &at.env,
+            at.line,
+            &at.visible,
+            at.in_loop,
+        )?;
+        self.check_call_in_contingency(at, cid)?;
+        self.check_held_operands(at, cid, "spawn")?;
+        self.check_held_payloads(at, cid)?;
+        let producer = &self.program.controls[cid];
+        self.check_effects(
+            &producer.uses,
+            &producer.name,
+            at.reach,
+            at.line,
+            &at.visible,
+            at.in_loop,
+        )?;
+        if let Some(pre) = &producer.precondition {
+            let name = producer.name.clone();
+            let call_env = Env {
+                locals: BTreeMap::new(),
+                parameters: old.clone(),
+                old_parameters: old,
+                fields: Vec::new(),
+                constants: BTreeMap::new(),
+            };
+            let pre_formula = translate_formula(self.program, &mut self.solver, pre, &call_env);
+            self.require(
+                at,
+                pre_formula,
+                "P3",
+                format!("precondition of `{name}` may not hold"),
+            )?;
+            self.solver.add_fact(at.reach, pre_formula);
+        }
+        let before = at.env.lookup(VarRef::Local(set));
+        self.rename_set(set, &before, at.reach, 1);
+        Ok(Flow::On)
+    }
+
+    /// `cancel x` reads the set, which is available ([TK2]); it changes no
+    /// count.
+    fn check_cancel(&mut self, at: &Point, set: VarId) -> Result<Flow, Error> {
+        self.check_available(set, at.reach, at.line, &at.visible, at.in_loop)?;
+        Ok(Flow::On)
     }
 
     /// `Θ; Rᵢ ⊨ goal` at a statement ([N2]).
@@ -4081,7 +4343,11 @@ impl<'a> BodyChecker<'a> {
         self.check_consume_expr(value, at.reach, at.line, &at.visible, at.in_loop)?;
         // [O1]: Θ ⊨ ¬(Rᵢ ∧ D(x))
         self.unbound(at, var, at.reach)?;
-        self.bind_value(var, at.reach, value, &at.env);
+        if let Expr::TasksEmpty(_, _) = value {
+            self.bind_empty_set(var, at.reach);
+        } else {
+            self.bind_value(var, at.reach, value, &at.env);
+        }
         self.bound_on(var, at.reach);
         if let Expr::Borrow(_, place, _) = value {
             self.bind_local_borrow(var, at.reach, place, &at.env);
@@ -4326,6 +4592,46 @@ impl<'a> BodyChecker<'a> {
         Ok(())
     }
 
+    /// An invocation of `cid` by a decision or a capture, once its operands
+    /// are checked: a call, `await f` or `run f`. `await f` and `run f` give
+    /// the facts, faults and effects of a call ([TK6], [TK7]); `await f`
+    /// is where the task can be stopped and the fault of a member can arrive
+    /// ([TK4], [TK5]), and what a cancellable extern control is given by a
+    /// `run` the host releases when the run is cancelled ([TK4], [E-Run]).
+    fn check_invocation(
+        &mut self,
+        at: &Point,
+        operation: &Operation,
+        cid: ControlId,
+        arguments: &[Expr],
+        old: &[LinearTerm],
+        post: &mut [LinearTerm],
+    ) -> Result<(), Error> {
+        let callee = &self.program.controls[cid];
+        let (faults, external, cancellable) = (
+            callee.faults,
+            callee.body.is_none(),
+            callee.is_cancellable(),
+        );
+        match operation {
+            Operation::AwaitControl(_) => {
+                self.check_held_operands(at, cid, "await")?;
+                if external {
+                    self.check_held_payloads(at, cid)?;
+                }
+            }
+            Operation::RunControl(_) if cancellable => {
+                self.check_held_operands(at, cid, "run")?;
+            }
+            _ => {}
+        }
+        self.check_call(at, cid, arguments, old, post)?;
+        if let Operation::AwaitControl(_) = operation {
+            self.check_await(at, faults)?;
+        }
+        Ok(())
+    }
+
     /// A captured operation: it runs here, and what its alternative says is
     /// known where the outcome is decided ([I12]).
     fn check_capture(
@@ -4340,13 +4646,15 @@ impl<'a> BodyChecker<'a> {
             .map(|a| translate_term(self.program, &mut self.solver, a, &at.env))
             .collect();
         let cap_param_tys: Option<Vec<Type>> = match operation {
-            Operation::Control(cid) => Some(
-                self.program.controls[*cid]
-                    .parameters
-                    .iter()
-                    .map(|p| p.ty.clone())
-                    .collect(),
-            ),
+            Operation::Control(cid) | Operation::AwaitControl(cid) | Operation::RunControl(cid) => {
+                Some(
+                    self.program.controls[*cid]
+                        .parameters
+                        .iter()
+                        .map(|p| p.ty.clone())
+                        .collect(),
+                )
+            }
             _ => None,
         };
         self.check_operands_o0(
@@ -4361,9 +4669,9 @@ impl<'a> BodyChecker<'a> {
 
         let mut post_args = old_args.clone();
         match operation {
-            Operation::Control(cid) => {
+            Operation::Control(cid) | Operation::AwaitControl(cid) | Operation::RunControl(cid) => {
                 self.check_call_in_contingency(at, *cid)?;
-                self.check_call(at, *cid, arguments, &old_args, &mut post_args)?;
+                self.check_invocation(at, operation, *cid, arguments, &old_args, &mut post_args)?;
             }
             Operation::Builtin {
                 op: BuiltinOp::Emit,
@@ -4563,10 +4871,13 @@ impl<'a> BodyChecker<'a> {
         post: &mut [LinearTerm],
     ) -> Result<(), Error> {
         match op_kind {
-            Operation::AwaitControl(_) | Operation::AwaitNext(_, _) | Operation::RunControl(_) => {
-                return Err(self.tasks_unchecked(at.line));
+            // [TK2]: the set is available; the task gives up its turn here
+            // ([TK4], [TK5]).
+            Operation::AwaitNext(set, _) => {
+                self.check_available(*set, at.reach, at.line, &at.visible, at.in_loop)?;
+                self.check_await(at, false)?;
             }
-            Operation::Control(cid) => {
+            Operation::Control(cid) | Operation::AwaitControl(cid) | Operation::RunControl(cid) => {
                 self.check_call_in_contingency(at, *cid)?;
                 let parameter_types: Vec<Type> = self.program.controls[*cid]
                     .parameters
@@ -4582,7 +4893,7 @@ impl<'a> BodyChecker<'a> {
                     &at.visible,
                     at.in_loop,
                 )?;
-                self.check_call(at, *cid, arguments, old, post)?;
+                self.check_invocation(at, op_kind, *cid, arguments, old, post)?;
             }
             Operation::Builtin { op, .. } => {
                 self.check_operands_o0(
@@ -4679,8 +4990,10 @@ impl<'a> BodyChecker<'a> {
     ) {
         let contract_alt = &decision.contract[arm.alternative];
         match decision.operation {
-            Operation::AwaitControl(_) | Operation::AwaitNext(_, _) | Operation::RunControl(_) => {}
-            Operation::Control(_) => {
+            Operation::AwaitNext(set, producer) => {
+                self.next_facts(at, *set, *producer, atom, arm.alternative, field_terms);
+            }
+            Operation::Control(_) | Operation::AwaitControl(_) | Operation::RunControl(_) => {
                 if let Some(cond) = &contract_alt.condition {
                     let cond_env = Env {
                         locals: BTreeMap::new(),
@@ -4751,7 +5064,9 @@ impl<'a> BodyChecker<'a> {
                     continue;
                 }
                 match &info.operation {
-                    Operation::Control(cid) => {
+                    Operation::Control(cid)
+                    | Operation::AwaitControl(cid)
+                    | Operation::RunControl(cid) => {
                         if let Some(cond) =
                             &self.program.controls[*cid].contract[arm.alternative].condition
                         {
@@ -4803,27 +5118,8 @@ impl<'a> BodyChecker<'a> {
         if unseen != bdd::FALSE
             && let Some(cond) = condition
         {
-            let mut parameters = Vec::new();
-            let mut old_parameters = Vec::new();
-            for p in 0..max_param_index(&cond) {
-                let ty = source
-                    .and_then(|cid| self.program.controls[cid].parameters.get(p))
-                    .map(|parameter| parameter.ty.clone());
-                let fresh = |checker: &mut Self, tag: &str| match &ty {
-                    Some(ty) => checker.alloc_type_term(&format!("{tag}{p}"), ty),
-                    None => checker.solver.fresh_var(format!("{tag}{p}"), None, false),
-                };
-                let now = LinearTerm::var(fresh(self, "_out_arg"));
-                // `old(p)` is another value than `p`
-                // for an `&~` parameter alone ([P4]).
-                let exclusive = matches!(ty, None | Some(Type::Ref(BorrowMode::Exclusive, _)));
-                old_parameters.push(if exclusive {
-                    LinearTerm::var(fresh(self, "_out_old"))
-                } else {
-                    now.clone()
-                });
-                parameters.push(now);
-            }
+            let (parameters, old_parameters) =
+                self.fresh_arguments(source, &cond, "_out_arg", "_out_old");
             let cond_env = Env {
                 locals: BTreeMap::new(),
                 parameters,
@@ -4835,6 +5131,82 @@ impl<'a> BodyChecker<'a> {
             let not_seen = self.solver.bdd.not(seen);
             let guard = self.solver.bdd.and(atom, not_seen);
             self.solver.add_fact(guard, cf);
+        }
+    }
+
+    /// Fresh names for the arguments of an operation whose condition `cond`
+    /// is read where its operands are not known ([I12], [TK6]): one for each
+    /// parameter that `cond` can name, of the parameter's type, and a second
+    /// one for `old` of an `&~` parameter or of one whose type is not known
+    /// ([P4]).
+    fn fresh_arguments(
+        &mut self,
+        source: Option<ControlId>,
+        cond: &Expr,
+        now_tag: &str,
+        old_tag: &str,
+    ) -> (Vec<LinearTerm>, Vec<LinearTerm>) {
+        let mut parameters = Vec::new();
+        let mut old_parameters = Vec::new();
+        for p in 0..max_param_index(cond) {
+            let ty = source
+                .and_then(|cid| self.program.controls[cid].parameters.get(p))
+                .map(|parameter| parameter.ty.clone());
+            let fresh = |checker: &mut Self, tag: &str| match &ty {
+                Some(ty) => checker.alloc_type_term(&format!("{tag}{p}"), ty),
+                None => checker.solver.fresh_var(format!("{tag}{p}"), None, false),
+            };
+            let now = LinearTerm::var(fresh(self, now_tag));
+            // `old(p)` is another value than `p` for an `&~` parameter
+            // alone ([P4]).
+            let exclusive = matches!(ty, None | Some(Type::Ref(BorrowMode::Exclusive, _)));
+            old_parameters.push(if exclusive {
+                LinearTerm::var(fresh(self, old_tag))
+            } else {
+                now.clone()
+            });
+            parameters.push(now);
+        }
+        (parameters, old_parameters)
+    }
+
+    /// [TK2], [TK6]: what an alternative of `await next(x)` says. On `empty`
+    /// the set has no members, and it moves. On an alternative of the
+    /// producer one member has left the set, which is renamed, and the
+    /// payload satisfies the condition of that alternative over fresh names
+    /// for the member's arguments.
+    fn next_facts(
+        &mut self,
+        at: &Point,
+        set: VarId,
+        producer: ControlId,
+        atom: Formula,
+        alternative: usize,
+        field_terms: Vec<LinearTerm>,
+    ) {
+        let before = at.env.lookup(VarRef::Local(set));
+        let contract = &self.program.controls[producer].contract;
+        if alternative == contract.len() {
+            let count = self.count_of(&before);
+            let none = self.solver.eq(&count, &LinearTerm::from_i128(0));
+            self.solver.add_fact(atom, none);
+            self.moved[set] = self.solver.bdd.or(self.moved[set], atom);
+            return;
+        }
+        let condition = contract[alternative].condition.clone();
+        self.rename_set(set, &before, atom, -1);
+        if let Some(cond) = condition {
+            let (parameters, old_parameters) =
+                self.fresh_arguments(Some(producer), &cond, "_next_arg", "_next_old");
+            let cond_env = Env {
+                locals: BTreeMap::new(),
+                parameters,
+                old_parameters,
+                fields: field_terms,
+                constants: BTreeMap::new(),
+            };
+            let cf = translate_formula(self.program, &mut self.solver, &cond, &cond_env);
+            self.solver.add_fact(atom, cf);
         }
     }
 
@@ -5142,6 +5514,25 @@ impl<'a> BodyChecker<'a> {
         message_var: Option<VarId>,
         b2_body: BodyId,
     ) -> Result<Flow, Error> {
+        // [TK5]: no task set is available at a lexical boundary, so the
+        // fault of a member of a set around it never arrives inside it.
+        for var in 0..self.body.vars.len() {
+            if matches!(self.body.vars[var].ty, Type::Tasks(_, _))
+                && self.active_scopes.contains(&self.body.vars[var].body)
+            {
+                let available = self.avail(var);
+                let held = self.solver.bdd.and(at.reach, available);
+                self.exclude(
+                    at,
+                    held,
+                    "TK5",
+                    format!(
+                        "task set `{}` may be available at a boundary statement",
+                        self.body.vars[var].name
+                    ),
+                )?;
+            }
+        }
         let cap_terms = self.take_into_care(at, captures)?;
         let outer = self.names();
         let outer_permits_faults = self.permits_faults;
@@ -7446,7 +7837,15 @@ impl<'a, 'b> LoanChecker<'a, 'b> {
             };
 
             match &stmt.command {
-                Command::Spawn { .. } | Command::Cancel { .. } => {}
+                // The operands of a spawn are those of a call. That the set
+                // holds what they lend ([TK3]) is not checked yet: the facts
+                // pass refuses a spawn that may lend (`check_spawn`).
+                Command::Spawn { arguments, .. } => {
+                    let mut temps = Vec::new();
+                    let _ = self.eval_loan_operands(arguments, &ctx, &mut temps, line)?;
+                }
+                // A task set is never lent ([W11]): no loan meets the read.
+                Command::Cancel { .. } => {}
                 Command::Bind { var, value } => {
                     let mut temps = Vec::new();
                     let ret = self.eval_loan_expr(value, true, &ctx, &mut temps, line)?;

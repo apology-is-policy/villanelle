@@ -2,10 +2,10 @@
 // borrows, `count(x)`, `capture await/run`, nested `run`, and stuck states
 // (`X4 B1`, `X5 E-Scope`, `X9 E-Effect`).
 
-extern async control host_work(id : u32) ■ { done {value : u32} │ cancelled {} } uses io.net
+extern async control host_work(id : u32) ■ { done {value : u32} ⇐ value ≤ 1000 │ cancelled {} } uses io.net
 extern async control secret_io(id : u32) ■ { done {} } uses io.secret
 
-async control worker(id : u32, tag : string) ■ { ok {value : u32} } uses io.net, console.write
+async control worker(id : u32, tag : string) ■ { ok {value : u32} ⇐ value ≤ 1000 } uses io.net, console.write
     1 ⊤ ▷ e : Δ emit(&tag) ▸ done {}
     2 e.done ▷ d : Δ await host_work(id) ▸ done {v} │ cancelled {}
     3 d.done ▷ ■ ok {v}
@@ -18,7 +18,7 @@ async control two_workers(a : u32, b : u32) ■ { sum {total : u32, before : usi
     4 ⊤ ▷ spawn worker(b, "second") into pool
     5 ⊤ ▷ m0 : usize := count(pool)
     6 ⊤ ▷ ~acc : u32 := 0
-    7 ⊤ ▷ lp : ↻ drain() {
+    7 ⊤ ▷ lp : ↻ drain() { ⊢ (count(pool) = 2 ∧ acc = 0) ∨ (count(pool) = 1 ∧ acc ≤ 1000) ∨ (count(pool) = 0 ∧ acc ≤ 2000)
           1 ⊤ ▷ nxt : Δ await next(pool) ▸ ok {v} │ empty {}
           2 nxt.ok ▷ acc ← acc + v
           3 nxt.ok ▷ ↑ drain()
@@ -33,15 +33,15 @@ control run_two(a : u32, b : u32) ■ { sum {total : u32, before : usize, mid : 
 //! run run_two(1, 2) with [host_work -> done {10}; host_work -> done {20}] => done sum {30, 0, 2} trace [emit("first") -> done; emit("second") -> done; host_work(1) -> done {10}; host_work(2) -> done {20}]
 //! run run_two(1, 2) with [host_work -> done {10}; host_work -> done {20}] turns [1, 0, 0, 0, 0, 0, 0, 0] => done sum {30, 0, 2} trace [emit("second") -> done; emit("first") -> done; host_work(1) -> done {10}; host_work(2) -> done {20}]
 
-async control sub_add(x : u32, y : u32) ■ { ok {value : u32} }
+async control sub_add(x : u32, y : u32) ⊢ x ≤ 1000 ∧ y ≤ 1000 ■ { ok {value : u32} }
     1 ⊤ ▷ ■ ok {x + y}
 
-async control await_defined(x : u32) ■ { ok {value : u32} }
+async control await_defined(x : u32) ⊢ x ≤ 1000 ■ { ok {value : u32} }
     1 ⊤ ▷ cap := capture await sub_add(x, 5)
     2 ⊤ ▷ d : Δ outcome(cap) ▸ ok {v}
     3 d.ok ▷ ■ ok {v}
 
-control run_capture(x : u32) ■ { ok {value : u32} }
+control run_capture(x : u32) ⊢ x ≤ 1000 ■ { ok {value : u32} }
     1 ⊤ ▷ cap := capture run await_defined(x)
     2 ⊤ ▷ d : Δ outcome(cap) ▸ ok {v}
     3 d.ok ▷ ■ ok {v}
@@ -74,11 +74,11 @@ control run_shared_pool() ■ { sum {total : u32} }
 
 //! run run_shared_pool() => done sum {42}
 
-async control bump(target : &~u32, amount : u32) ■ { ok {} }
+async control bump(target : &~u32, amount : u32) ⊢ target ≤ 1000 ∧ amount ≤ 1000 ■ { ok {} }
     1 ⊤ ▷ target ← target + amount
     2 ⊤ ▷ ■ ok {}
 
-async control excl_pool(start : u32) ■ { ok {value : u32} }
+async control excl_pool(start : u32) ⊢ start ≤ 1000 ■ { ok {value : u32} }
     1 ⊤ ▷ ~acc : u32 := start
     2 ⊤ ▷ ~pool : tasks⟨bump⟩ := tasks⟨bump⟩()
     3 ⊤ ▷ spawn bump(&~acc, 9) into pool
@@ -89,22 +89,22 @@ async control excl_pool(start : u32) ■ { ok {value : u32} }
         } ▸ done {}
     5 ⊤ ▷ ■ ok {acc}
 
-control run_excl_pool(start : u32) ■ { ok {value : u32} }
+control run_excl_pool(start : u32) ⊢ start ≤ 1000 ■ { ok {value : u32} }
     1 ⊤ ▷ d : Δ run excl_pool(start) ▸ ok {v}
     2 d.ok ▷ ■ ok {v}
 
 //! run run_excl_pool(33) => done ok {42}
 
 // Nested `run` inside a synchronous helper called from an `async control`.
-control sync_helper(x : u32) ■ { ok {value : u32} }
+control sync_helper(x : u32) ⊢ x ≤ 1000 ■ { ok {value : u32} }
     1 ⊤ ▷ d : Δ run await_defined(x) ▸ ok {v}
     2 d.ok ▷ ■ ok {v}
 
-async control outer_nested(x : u32) ■ { ok {value : u32} }
+async control outer_nested(x : u32) ⊢ x ≤ 1000 ■ { ok {value : u32} }
     1 ⊤ ▷ d : Δ sync_helper(x) ▸ ok {v}
     2 d.ok ▷ ■ ok {v}
 
-control run_nested(x : u32) ■ { ok {value : u32} }
+control run_nested(x : u32) ⊢ x ≤ 1000 ■ { ok {value : u32} }
     1 ⊤ ▷ d : Δ run outer_nested(x) ▸ ok {v}
     2 d.ok ▷ ■ ok {v}
 

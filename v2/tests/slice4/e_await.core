@@ -28,7 +28,7 @@ control runs_parent() ■ { ok {} } uses console.write
 // The arguments are bound when the call is made: the awaited control sees the
 // value the parent had, though the parent changes its own name before the
 // awaited control runs.
-async control echo(n : u32) ■ { ok {v : u32} }
+async control echo(n : u32) ■ { ok {v : u32} ⇐ v = n }
     1 ⊤ ▷ ■ ok {n}
 
 async control binds() ■ { ok {v : u32} }

@@ -85,7 +85,7 @@ control runs_owner_waits() ■ { ok {} } faults uses io.res, io.net
 // The owner awaits a defined control that waits for the host: that
 // activation is stopped, its operation withdrawn and its lease given by
 // value released, and the lease it holds in its scope too.
-async control waiter(id : u32) ■ { ok {} } uses io.res, io.net
+async control waiter(id : u32) ⊢ id < 1000 ■ { ok {} } uses io.res, io.net
     1 ⊤ ▷ o : Δ open_lease(id) ▸ ok {l}
     2 o.ok ▷ p : Δ open_lease(id + 1) ▸ ok {kept}
     3 p.ok ▷ w : Δ await hold(l) ▸ done {v} │ cancelled {}

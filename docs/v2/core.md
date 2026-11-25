@@ -1338,8 +1338,10 @@ the set that owns it.
   ([E-Run]). The root of a run is a member of no set and is never stopped,
   so the operands of a `run` of any other control are free of this rule:
   the checks at the awaits of the control that is run cover them. The payloads
-  of a producer and of an `extern async control` have fault-releasable types:
-  a payload can reach a task that is stopped before it runs again.
+  of a producer, and of an `extern async control` that a task awaits, have
+  fault-releasable types: a payload can reach a task that is stopped before
+  it runs again. A run of an `extern async control` gives its payload to the
+  control that started the run, which is not `async` and is never stopped.
 - **[TK5] Faults from members.** An `await` at statement `i` may fault, in the
   sense of [F1], unless `Θ ⊨ ¬(Rᵢ ∧ D(x) ∧ ¬M(x))` for every name `x` in scope
   whose type is `tasks⟨f⟩` with a producer that permits `faults`. No task set
@@ -1673,3 +1675,4 @@ and what asked for it:
 | 24 November 2026 | [E-MemberFault] withdraws the operation that the owner itself awaits when the fault of a member reaches it, and releases its arguments given by value. | The same review (RT2). The rule stopped the activations above the owner, whose operations [E-Stop] withdraws, and said nothing of an operation the owner awaits: the lease it holds would have been neither released nor completed, against Theorem 2. The oracle withdrew it already. |
 | 24 November 2026 | [E-Exhaust] (section 6.6): a step that makes a value or a task may end the execution with the final result `exhausted`, and does where a length or a count would pass `usize.max`. [E-Spawn], [TK6], sections 6.10 and 6.11, Theorem 2 and [R7] refer to it. | The same review (RT3) and the author's choice of 24 November (section 11). A loop that spawns without an await could give a set `usize.max + 1` members, and [TK6] and [A3] then had no valuation on a reachable history; `push` and `insert` had the same gap for `len`, and the prelude said only that memory exhaustion is not an outcome. |
 | 24 November 2026 | Theorem 4 is about decisions on controls that are not `async`, says why `await f` and `run f` are not expanded, and leaves out a decision in an `async` control on a control whose body contains `run`. | The same review (RT4). Putting the body of an awaited control in place drops the turn that [E-Await] gives up before its first statement, so a member that would have run first runs later, which is a different trace. The last exception was found by the test of the expansion of slice 4: the crate put the body of a synchronous control that runs an async one into the async control that called it, and [W10] refused the result. |
+| 25 November 2026 | [TK4] asks fault-releasable payloads of an `extern async control` where a task awaits it, and no longer where a `run` starts it. | The checker of slice 4. The root of a run of an extern control has no activation, and the `run` decision completes in a control that is not `async`, which is never stopped ([E-Run], section 6.12): no task holds the payload. The rule asked it of every `extern async control`, also of one that only synchronous code runs. |

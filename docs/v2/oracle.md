@@ -2091,6 +2091,105 @@ no compiled code runs tasks (RB9), so no run of this suite runs natively,
 and a run with `capacity` is left out of the native comparison of the other
 slices.
 
+### 18.2 The checker of the tasks, 25 November 2026
+
+`check.rs` checks the statements of the tasks by [TK1], [TK2] and [TK4] to
+[TK7] of the core (section 7.8). It does not yet check the loans of a set
+([TK3]; review, RC31).
+
+- **Counts.** `count(x)` is a measure ([A3]). The crate writes it with the
+  symbol of `len` over the term of the set (`count_of`), so the kernel
+  grants `0 ≤ count(x) ≤ usize.max` as it does for a length.
+  - `x := tasks⟨f⟩()` binds a fresh term whose count is 0
+    (`bind_empty_set`).
+  - `spawn … into x`, and each alternative of the producer in `await
+    next(x)`, rename the set with one member more or one fewer
+    (`rename_set`, [I9]).
+  - A loop renames a set that its body spawns into or awaits
+    (`collect_modified_vars`).
+  - On `empty` the set has no members, and it moves ([TK2]).
+  - The payload of an alternative satisfies that alternative's condition,
+    over fresh names for the member's arguments. `fresh_arguments` makes
+    these names; [I12] uses it too.
+- **Spawn, cancel and count.** `check_spawn` asks that the set be available
+  and checks the operands as those of a call: the producer's precondition
+  ([P3]) and its effects ([TK7]). A spawn does not fault. `cancel` reads the
+  set, and `count(x)` asks for it ([O2]).
+- **`await f` and `run f`.** These are checked as calls
+  (`check_invocation`): facts, faults, effects, and what they write through
+  `&~` parameters.
+- **What every await asks.** An `await` asks [TK4] in `check_stop`: after
+  the operands move, no name that is not fault-releasable is available, and
+  what a boundary around the await has in its care is fault-releasable. It
+  also asks [TK5] in `member_fault_histories`: where a set whose producer
+  permits `faults` is available, the await may fault, and [F1] and [F2]
+  apply.
+- **What a stopped task can hold.** `check_held_operands` and
+  `check_held_payloads` ask for fault-releasable types in four places:
+  - the operands given by value to `await f` and to `spawn f`;
+  - the operands given by value to a `run` of a cancellable extern control;
+  - the payloads of a producer, at a spawn;
+  - the payloads of an extern control, at an await.
+- **Boundaries.** A lexical boundary asks that no set be available ([TK5]).
+- **Loans.** The loan pass reads the operands of a spawn as those of a
+  call. A spawn whose producer takes a borrow or a view is refused by the
+  clause TK3, a stand-in until the checker holds the loans of a set (RC31).
+
+The tests are in `v2/tests/checker_slice4.rs`.
+`the_rule_files_of_the_tasks_are_rejected_exactly_where_a_run_is_stuck`
+holds the checker against the 11 rule files of section 18.1, control by
+control. There are 160 controls:
+
+- 18 are refused where a run is stuck, each by a clause that excludes the
+  run's stuck state;
+- 132 are accepted;
+- two are refused by the stand-in (`ASKS_MORE`);
+- eight form four pairs (`STUCK_BY_ANOTHER`) in which a run is stuck in a
+  control that keeps its contract, because the other control broke a rule
+  and is the one refused:
+  - two members that hold a lock are stopped by the fault of a sibling;
+  - a member uses an effect that its parent does not allow ([E-Effect]);
+  - a parent writes a place while a member holds a borrow of it, which the
+    stand-in refuses.
+
+The clause tests run each program in the oracle as well:
+
+- [TK4]: four programs stuck and refused, one accepted, and one refused
+  although every run ends (an awaited extern payload, RC32);
+- [TK5]: a set at a boundary;
+- [TK6]: counts, the condition of a payload, and a loop that renames the
+  set;
+- [L3]: the operands of a spawn, read as a call's;
+- [TK7]: `run`.
+
+Each part of the new code was taken out in a mutant of its own, and each of
+the 18 mutants fails at least one of these tests. The parts are:
+
+- the facts of a count;
+- the renaming in a loop, at a spawn and at `await next`;
+- the names at an await, the operands held and the payloads held;
+- the faults of members, and the boundary;
+- the count of `empty`, and the move of the set on `empty`;
+- the read of the set by `count`;
+- the effects, the precondition and the loans of a spawn;
+- the stand-in;
+- the operands of a run of a cancellable extern control;
+- the set asked for by `await next`;
+- the condition of a payload.
+
+Sixteen controls of the rule files, one of them extern, got bounds, so that
+a control whose runs all end can be proved:
+
+- preconditions on `add`, `runs_add`, `waiter`, `sub_add` and its five
+  callers, `bump`, `excl_pool` and `run_excl_pool`;
+- the condition `⇐ v = n` on `echo`;
+- bounds on the payloads of `host_work` and `worker`;
+- an invariant on the loop of `two_workers`, written by cases on
+  `count(pool)`: the core has no conversion between integer types, so the
+  sum and the count cannot meet in one formula.
+
+No run changed.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2102,8 +2201,8 @@ slices.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** For slice 4, the checker ([TK1] to [TK7], `count(x)`
-  facts) and the backend are not written.
+- **Later work.** For slice 4, the loans of a task set in the checker
+  ([TK3], RC31) and the backend are not written.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
   Each is brought up to date when its slice is requalified.

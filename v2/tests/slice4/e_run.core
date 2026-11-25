@@ -14,7 +14,7 @@ extern async control finish(l : lease) ■ { ok {code : u32} │ cancelled {} } 
 extern async control finish_lock(k : lock) ■ { ok {} │ cancelled {} } uses io.net
 extern async control settle(n : u32) ⊢ n > 0 ■ { ok {v : u32} } uses io.net
 
-async control add(a : u32, b : u32) ■ { sum {v : u32} }
+async control add(a : u32, b : u32) ⊢ a ≤ 1000 ∧ b ≤ 1000 ■ { sum {v : u32} }
     1 ⊤ ▷ ■ sum {a + b}
 
 async control boom(n : u32) ■ { ok {} } faults
@@ -24,7 +24,7 @@ async control positive(n : u32) ⊢ n > 0 ■ { ok {v : u32} }
     1 ⊤ ▷ ■ ok {n}
 
 // A defined control: the decision takes the root's alternative and payload.
-control runs_add(a : u32, b : u32) ■ { sum {v : u32} }
+control runs_add(a : u32, b : u32) ⊢ a ≤ 1000 ∧ b ≤ 1000 ■ { sum {v : u32} }
     1 ⊤ ▷ d : Δ run add(a, b) ▸ sum {v}
     2 d.sum ▷ ■ sum {v}
 
