@@ -92,6 +92,17 @@ fn a_defined_await_keeps_a_member_ready_with_its_bound_operands() {
 }
 
 #[test]
+fn a_defined_owner_await_preserves_completions_until_next() {
+    // Two child vectors on each collect, plus two nonempty owner inputs.
+    compare_native_runs(
+        include_str!("slice4/checked_owner_await.core"),
+        &["E-Await"],
+        &[3, 3, 3, 3],
+        8,
+    );
+}
+
+#[test]
 fn native_compilation_reports_operations_that_need_a_scheduler() {
     // Put supported entries first. Both emitters compile the whole module.
     for (decls, reason) in [
@@ -284,6 +295,73 @@ int main(void) {
     });
 }
 
+#[test]
+fn the_host_chooses_between_an_awaiting_owner_and_its_child() {
+    const DRIVER: &str = r#"
+#include "module.h"
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static uint64_t first;
+uint64_t vn2_pick_turn(uint64_t count) {
+    printf("ready %" PRIu64 "\n", count);
+    uint64_t choice = first;
+    first = 0;
+    return choice;
+}
+static char events[2][7];
+static unsigned emitted;
+void vn2_builtin_emit(const struct vn2_string *s) {
+    if (emitted == 2 || s->len >= sizeof(events[0])) exit(2);
+    memcpy(events[emitted], s->data, s->len);
+    events[emitted++][s->len] = 0;
+}
+int main(void) {
+    for (unsigned choice = 0; choice < 2; ++choice) {
+        first = choice;
+        emitted = 0;
+        if (vn2_call_runs_parent() != VN2_RUNS_PARENT_OK || emitted != 2) return 1;
+        for (unsigned i = 0; i < emitted; ++i)
+            printf("emit(\"%s\") -> done {}\n", events[i]);
+        puts("done ok {}");
+    }
+    return 0;
+}
+"#;
+    compare_c_host(
+        include_str!("slice4/e_await.core"),
+        "owner_turn",
+        DRIVER,
+        |program, config| {
+            let mut expected = Vec::new();
+            for choice in [0, 1] {
+                let host = || TurnHost {
+                    choices: [choice].into(),
+                    ..Default::default()
+                };
+                let mut original_host = host();
+                let original =
+                    oracle::run(program, "runs_parent", vec![], &mut original_host, config);
+                let mut erased_host = host();
+                let erased = erased::run(program, "runs_parent", vec![], &mut erased_host, config);
+                assert_eq!(erased.end.to_string(), original.end.to_string());
+                assert_eq!(erased.trace, original.trace);
+                assert_eq!(erased_host.calls, original_host.calls);
+                assert_eq!(
+                    original_host.calls,
+                    ["ready 2", "ready 1", "ready 1", "ready 1"]
+                );
+                expected.extend(original_host.calls);
+                expected.extend(original.trace.iter().map(ToString::to_string));
+                expected.push(original.end.to_string());
+            }
+            expected
+        },
+    );
+}
+
 fn compare_c_host(
     source: &str,
     name: &str,
@@ -363,7 +441,17 @@ async control owner() ■ { ok {} }
     let suspend = "⊤ ▷ w : Δ await idle() ▸ ok {}";
     let new_set = "⊤ ▷ ~other : tasks⟨child⟩ := tasks⟨child⟩()\n    ⊤ ▷ q : Δ await next(other) ▸ ok {} │ empty {}\n    q.ok ▷ ⊥";
     for (source, reason) in [
-        (base.replace(next_owner, &format!("{suspend}\n    {next_owner}")), "await of another control in a task-set owner"),
+        (base.replace("async control idle", "async control leaf() ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control idle")
+            .replace("async control idle() ■ { ok {} }", "async control idle() ■ { ok {} }\n    ⊤ ▷ w : Δ await leaf() ▸ ok {}")
+            .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "task-set owner `owner` awaiting `idle`, whose body can suspend again"),
+        (base.replace("async control idle() ■ { ok {} }", &format!("async control idle() ■ {{ ok {{}} }}\n    {new_set}"))
+            .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "task-set owner `owner` awaiting `idle`, whose body can suspend again or create a set"),
+        (base.replace("async control idle() ■ { ok {} }", "async control idle() ■ { ok {} } faults")
+            .replace("async control owner() ■ { ok {} }", &format!("async control owner() ■ {{ ok {{}} }} faults\n    {suspend}")), "a faulting or terminating call in a task-set owner"),
+        (base.replace("async control idle", "extern async control read() ■ { ok {} } uses io\n\nasync control idle")
+            .replace("owner() ■ { ok {} }", "owner() ■ { ok {} } uses io")
+            .replace(next_owner, &format!("⊤ ▷ w : Δ await read() ▸ ok {{}}\n    {next_owner}"))
+            .replace("turns [1] => done ok", "with [read -> ok] turns [1] => done ok trace [read() -> ok]"), "await of extern `read` in task-set owner"),
         (base.replace("async control child", "async control middle() ■ { ok {} }\n    ⊤ ▷ w : Δ await idle() ▸ ok {}\n    ⊤ ▷ ■ ok {}\n\nasync control child")
             .replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} }\n    ⊤ ▷ w : Δ await middle() ▸ ok {}"), "can suspend again"),
         (base.replace("async control child", "extern async control read() ■ { ok {} } uses io\n\nasync control child")

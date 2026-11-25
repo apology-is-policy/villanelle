@@ -74,8 +74,16 @@ define internal fastcc void @vn2_spawn(ptr %pool, ptr %member) {
 
 ; The owner is task zero whenever it is ready. Children follow in spawn
 ; order. A finished member stays counted until the owner takes its turn.
-define internal fastcc ptr @vn2_next(ptr %pool, ptr %resume) {
+; At a defined await the owner is ready even with outstanding children.
+; At await next it is ready only when a result or empty can be delivered.
+define internal fastcc void @vn2_choose_owner(ptr %pool, ptr %resume, i1 %defined_await) {
 entry:
+  %inactive = icmp eq ptr %pool, null
+  br i1 %inactive, label %alone, label %active
+alone:
+  call i64 @vn2_pick_turn(i64 1)
+  ret void
+active:
   %done = getelementptr %vn2.pool, ptr %pool, i32 0, i32 1
   %ready = getelementptr %vn2.pool, ptr %pool, i32 0, i32 2
   %total = getelementptr %vn2.pool, ptr %pool, i32 0, i32 3
@@ -86,13 +94,14 @@ choose:
   %r = load i64, ptr %ready
   %head = load ptr, ptr %done
   %has_done = icmp ne ptr %head, null
-  %owner = or i1 %empty, %has_done
+  %can_deliver = or i1 %empty, %has_done
+  %owner = or i1 %defined_await, %can_deliver
   %offset = zext i1 %owner to i64
   %offered = add i64 %r, %offset
   %choice = call i64 @vn2_pick_turn(i64 %offered)
   %index = urem i64 %choice, %offered
   %take_owner = icmp ult i64 %index, %offset
-  br i1 %take_owner, label %deliver, label %child
+  br i1 %take_owner, label %selected, label %child
 child:
   %i = sub i64 %index, %offset
   %link = call fastcc ptr @vn2_link_at(ptr %pool, i64 %i)
@@ -109,7 +118,16 @@ finished:
   store i64 %nr, ptr %ready
   call fastcc void @vn2_append(ptr %done, ptr %member)
   br label %choose
-deliver:
+selected:
+  ret void
+}
+
+define internal fastcc ptr @vn2_next(ptr %pool, ptr %resume) {
+  call fastcc void @vn2_choose_owner(ptr %pool, ptr %resume, i1 false)
+  %done = getelementptr %vn2.pool, ptr %pool, i32 0, i32 1
+  %total = getelementptr %vn2.pool, ptr %pool, i32 0, i32 3
+  %t = load i64, ptr %total
+  %empty = icmp eq i64 %t, 0
   br i1 %empty, label %no_members, label %oldest
 no_members:
   ret ptr null

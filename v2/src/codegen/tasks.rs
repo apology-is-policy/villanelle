@@ -3,11 +3,14 @@
 //! across defined awaits and its result until the owner receives it.
 use super::*;
 
-fn producers(body: &ControlBody) -> impl Iterator<Item = ControlId> + '_ {
-    body.vars.iter().filter_map(|var| match var.ty {
-        Type::Tasks(id, _) => Some(id),
-        _ => None,
-    })
+fn sets(body: &ControlBody) -> impl Iterator<Item = (VarId, ControlId)> + '_ {
+    body.vars
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, var)| match var.ty {
+            Type::Tasks(id, _) => Some((slot, id)),
+            _ => None,
+        })
 }
 
 pub(super) fn uses_sets(program: &Program) -> bool {
@@ -15,7 +18,7 @@ pub(super) fn uses_sets(program: &Program) -> bool {
         .controls
         .iter()
         .filter_map(|c| c.body.as_ref())
-        .any(|body| producers(body).next().is_some())
+        .any(|body| sets(body).next().is_some())
 }
 
 pub(super) fn emit_support<'a>(
@@ -27,8 +30,10 @@ pub(super) fn emit_support<'a>(
     let mut members = BTreeSet::new();
     for control in &program.controls {
         let Some(body) = &control.body else { continue };
-        let mut sets = producers(body);
-        let Some(member) = sets.next() else { continue };
+        let mut sets = sets(body);
+        let Some((_, member)) = sets.next() else {
+            continue;
+        };
         let reason = if sets.next().is_some() {
             Some("multiple task sets in one owner")
         } else {
@@ -47,12 +52,11 @@ pub(super) fn emit_support<'a>(
                         Some("a fault boundary or fault in a task-set owner")
                     }
                     _ => match operation(command) {
-                        Some(Operation::AwaitControl(_)) => {
-                            Some("await of another control in a task-set owner")
-                        }
-                        Some(Operation::Control(cid) | Operation::RunControl(cid))
-                            if program.controls[*cid].faults || term_tys[*cid].is_some() =>
-                        {
+                        Some(
+                            Operation::Control(cid)
+                            | Operation::RunControl(cid)
+                            | Operation::AwaitControl(cid),
+                        ) if program.controls[*cid].faults || term_tys[*cid].is_some() => {
                             Some("a faulting or terminating call in a task-set owner")
                         }
                         _ => None,
@@ -64,6 +68,9 @@ pub(super) fn emit_support<'a>(
                 "control `{}`: the native backend does not yet support {reason}",
                 control.name
             ));
+        }
+        for callee in awaits(body) {
+            check_await_target(program, callee, "owner", &control.name)?;
         }
         members.insert(member);
     }
@@ -87,6 +94,30 @@ fn awaits(body: &ControlBody) -> impl Iterator<Item = ControlId> + '_ {
         })
 }
 
+// A nested run has its own ready set. An awaited control runs in the
+// caller's task and must return before it would need the shared scheduler again.
+fn check_await_target(
+    program: &Program,
+    callee: ControlId,
+    role: &str,
+    caller: &str,
+) -> Result<(), String> {
+    let target = &program.controls[callee];
+    let Some(body) = &target.body else {
+        return Err(format!(
+            "the native backend does not yet support await of extern `{}` in task-set {role} `{caller}`",
+            target.name
+        ));
+    };
+    if awaits(body).next().is_some() || sets(body).next().is_some() {
+        return Err(format!(
+            "the native backend does not yet support task-set {role} `{caller}` awaiting `{}`, whose body can suspend again or create a set",
+            target.name
+        ));
+    }
+    Ok(())
+}
+
 fn emit_member<'a>(
     out: &mut String,
     program: &'a Program,
@@ -104,7 +135,7 @@ fn emit_member<'a>(
         .iter()
         .chain(member.contract.iter().flat_map(|alt| &alt.fields))
         .any(|p| program.contains_borrow_or_view(&p.ty));
-    if member.faults || term_tys[id].is_some() || uses_loans || producers(body).next().is_some() {
+    if member.faults || term_tys[id].is_some() || uses_loans || sets(body).next().is_some() {
         return Err(format!(
             "the native backend needs a nonfaulting task-set producer with owned or copy inputs and results and no task set of its own for `{}`",
             member.name
@@ -116,19 +147,7 @@ fn emit_member<'a>(
         // Ordinary synchronous calls can start a nested run, whose tasks have
         // their own ready set. An awaited callee shares this member's turn.
         for callee in callees {
-            let target = &program.controls[callee];
-            let Some(target_body) = &target.body else {
-                return Err(format!(
-                    "the native backend does not yet support await of extern `{}` in task-set member `{}`",
-                    target.name, member.name
-                ));
-            };
-            if awaits(target_body).next().is_some() || producers(target_body).next().is_some() {
-                return Err(format!(
-                    "the native backend does not yet support task-set member `{}` awaiting `{}`, whose body can suspend again or create a set",
-                    member.name, target.name
-                ));
-            }
+            check_await_target(program, callee, "member", &member.name)?;
         }
         return emit_body_unit(
             out,
@@ -232,6 +251,20 @@ fn pool(em: &mut IrEmitter<'_, '_>, set: VarId) -> String {
     let ptr = em.fresh_reg();
     let _ = writeln!(em.code, "  {ptr} = load ptr, ptr %slot_{set}");
     ptr
+}
+
+/// Give ready children turns until the host selects the owner. Its set slot
+/// holds null before creation and after the owner receives empty.
+pub(super) fn choose_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) {
+    let Some((slot, member)) = sets(body).next() else {
+        em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
+        return;
+    };
+    let ptr = pool(em, slot);
+    let _ = writeln!(
+        em.code,
+        "  call fastcc void @vn2_choose_owner(ptr {ptr}, ptr @vn2_member_{member}, i1 true)"
+    );
 }
 
 fn field(em: &mut IrEmitter<'_, '_>, ty: &str, ptr: &str, index: usize) -> String {

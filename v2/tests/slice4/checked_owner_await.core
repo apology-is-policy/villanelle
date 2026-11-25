@@ -1,0 +1,51 @@
+// A defined await gives the owner a turn alongside both spawned tasks.
+// A finished member remains counted until the owner receives it.
+async control give(label : string, xs : [usize]) ■ { value {data : [usize]} } uses console.write
+    ⊤ ▷ event : Δ emit(&label) ▸ done {}
+    ⊤ ▷ ■ value {▾xs}
+
+async control member(label : string, xs : [usize]) ■ { value {data : [usize]} } uses console.write
+    ⊤ ▷ w : Δ await give(▾label, ▾xs) ▸ value {data}
+    w.value ▷ ■ value {▾data}
+
+async control collect(xs : [usize])
+    ■ { order {own : [usize], first : [usize], second : [usize], pending : usize} } uses console.write
+    ⊤ ▷ ~pool : tasks⟨member⟩ := tasks⟨member⟩()
+    ⊤ ▷ spawn member("A", [1]) into pool
+    ⊤ ▷ spawn member("B", [2]) into pool
+    ⊤ ▷ r := capture await give("owner", ▾xs)
+    ⊤ ▷ d : Δ outcome(▾r) ▸ value {own}
+    ⊤ ▷ pending : usize := count(pool)
+    ⊤ ▷ a : Δ await next(pool) ▸ value {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(pool) ▸ value {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ value {extra} │ empty {}
+    e.value ▷ ⊥
+    e.empty ▷ ■ order {▾own, ▾first, ▾second, pending}
+
+//! run collect([8]) => done order {[8], [1], [2], 2} trace [emit("owner") -> done; emit("A") -> done; emit("B") -> done]
+//! run collect([9]) turns [2, 2, 1, 1] => done order {[9], [2], [1], 2} trace [emit("B") -> done; emit("A") -> done; emit("owner") -> done]
+//! run collect([]) turns [2, 0, 1] => done order {[], [2], [1], 2} trace [emit("owner") -> done; emit("B") -> done; emit("A") -> done]
+
+// The owner awaits before it creates its set, with the set empty, and after
+// consuming it. Each await still gives the host one ready task.
+async control touch(cell : &~usize) ■ { ok {} }
+    ⊤ ▷ step : ? cell < 100
+    step.true ▷ cell ← cell + 1
+    ⊤ ▷ ■ ok {}
+
+async control alone() ■ { ok {n : usize} }
+    ⊤ ▷ ~cell : usize := 3
+    ⊤ ▷ a : Δ await touch(&~cell) ▸ ok {}
+    ⊤ ▷ ~pool : tasks⟨idle⟩ := tasks⟨idle⟩()
+    ⊤ ▷ b : Δ await touch(&~cell) ▸ ok {}
+    ⊤ ▷ e : Δ await next(pool) ▸ ok {} │ empty {}
+    e.ok ▷ ⊥
+    ⊤ ▷ c : Δ await touch(&~cell) ▸ ok {}
+    ⊤ ▷ ■ ok {cell}
+
+async control idle() ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+//! run alone() turns [4, 3, 2, 1] => done ok {6}

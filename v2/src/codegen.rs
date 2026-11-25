@@ -4869,16 +4869,13 @@ fn emit_operation_call(
                         em.code,
                         "  store i32 {pc}, ptr %member_state\n  ret i32 -3\n{label}:"
                     );
-                    let _ = writeln!(
-                        em.code,
-                        "  {tag_reg} = call fastcc i32 @vn2_resume_{cid}(ptr {frame})"
-                    );
                 } else {
-                    let _ = writeln!(
-                        em.code,
-                        "  {tag_reg} = call fastcc i32 @vn2_take_only_ready(ptr @vn2_resume_{cid}, ptr {frame})"
-                    );
+                    tasks::choose_owner(em, body);
                 }
+                let _ = writeln!(
+                    em.code,
+                    "  {tag_reg} = call fastcc i32 @vn2_resume_{cid}(ptr {frame})"
+                );
             } else if is_extern {
                 let _ = writeln!(
                     em.code,
@@ -5631,18 +5628,6 @@ fn emit_await_continuations(
     usize_bits: u32,
     awaited: &BTreeSet<ControlId>,
 ) {
-    if awaited.is_empty() {
-        return;
-    }
-    out.push_str(
-        "define internal fastcc i32 @vn2_take_only_ready(ptr %resume, ptr %frame) nounwind {
-  call i64 @vn2_pick_turn(i64 1)
-  %tag = call fastcc i32 %resume(ptr %frame)
-  ret i32 %tag
-}
-
-",
-    );
     for &id in awaited {
         let control = &program.controls[id];
         let mut fields: Vec<String> = control

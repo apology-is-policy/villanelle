@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose members can yield to ready siblings (sections 18.4 to 18.7). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.8). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2308,8 +2308,8 @@ top-level body. Each site can therefore run at most once per invocation.
 Decisions on `await next` can repeat in a loop. Section 18.6 covers producers
 that finish in one turn. Section 18.7 extends this to defined awaits. A
 producer takes and returns owned or copy values and lets no fault escape.
-Other awaits, cancellation, faulting calls and fault boundaries in an owner
-still give diagnostics. A synchronous call that starts a nested run uses a
+Section 18.8 covers defined awaits in the owner. Host waits, cancellation,
+faulting calls and fault boundaries in an owner still give diagnostics. A synchronous call that starts a nested run uses a
 separate invocation. The scripted native host consumes one `turns` choice
 at each offer and chooses the first ready task after the choices run out.
 
@@ -2349,6 +2349,25 @@ same offers, emits and final result. A member awaiting an extern control,
 a callee that can await again, or a callee with its own set still receives
 a diagnostic.
 
+### 18.8 A set owner awaits with ready children, 25 November 2026
+
+At a defined await the owner binds the operands and gives up its turn. The
+host sees the owner first, followed by ready members in spawn order. A member
+can yield, or finish and leave its result queued. When the host selects the
+owner, it enters the awaited callee. Results stay queued and counted until
+the owner receives them through `await next`. A defined await before the set
+is created, while it is empty, or after it is consumed offers one ready task.
+
+The native backend supports this when the awaited control is defined, has no
+task set of its own and finishes on that turn without a fault or termination.
+Run `cargo test --test backend_slice4` from `v2/`. In `runs_parent` from
+`tests/slice4/e_await.core`, both interpreters and a separately linked C host
+observe ready counts of 2, 1, 1, 1. The default schedule emits parent then
+child. Choosing index 1 on the first offer emits child then parent.
+`tests/slice4/checked_owner_await.core` also exercises two suspended children,
+a captured vector result, delivery in completion order and a borrow of an
+owner local across an await.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2360,8 +2379,7 @@ a diagnostic.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs nested suspension in a member, defined awaits in a
-  set owner, repeated spawn sites,
+- **Later work.** Slice 4 still needs nested suspension in the owner or a member, repeated spawn sites,
   multiple sets, loans, host waits, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
