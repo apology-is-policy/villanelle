@@ -1,18 +1,19 @@
 ; A queue holds its head and the address of the link to fill on append.
 ; Each activation starts with its next link and its resume index/result tag.
-; Both queues belong to
-; one invocation of the owner, including when a host re-enters the module.
+; Both queues and the producer entry belong to one invocation of the owner.
 %vn2.member_header = type { ptr, i32 }
 %vn2.queue = type { ptr, ptr }
-%vn2.pool = type { %vn2.queue, %vn2.queue, i64, i64 }
+%vn2.pool = type { %vn2.queue, %vn2.queue, i64, i64, ptr }
 
-define internal fastcc void @vn2_pool_init(ptr %pool) {
+define internal fastcc void @vn2_pool_init(ptr %pool, ptr %resume) {
   store %vn2.pool zeroinitializer, ptr %pool
   %ready_tail = getelementptr %vn2.pool, ptr %pool, i32 0, i32 0, i32 1
   store ptr %pool, ptr %ready_tail
   %done = getelementptr %vn2.pool, ptr %pool, i32 0, i32 1
   %done_tail = getelementptr %vn2.queue, ptr %done, i32 0, i32 1
   store ptr %done, ptr %done_tail
+  %entry_slot = getelementptr %vn2.pool, ptr %pool, i32 0, i32 4
+  store ptr %resume, ptr %entry_slot
   ret void
 }
 
@@ -73,10 +74,10 @@ define internal fastcc void @vn2_spawn(ptr %pool, ptr %member) {
 }
 
 ; The owner is task zero whenever it is ready. Children follow in spawn
-; order. A finished member stays counted until the owner takes its turn.
+; order. A finished member stays counted until delivered by await next.
 ; At a defined await the owner is ready even with outstanding children.
 ; At await next it is ready only when a result or empty can be delivered.
-define internal fastcc void @vn2_choose_owner(ptr %pool, ptr %resume, i1 %defined_await) {
+define internal fastcc void @vn2_choose_owner(ptr %pool, i1 %defined_await) {
 entry:
   %inactive = icmp eq ptr %pool, null
   br i1 %inactive, label %alone, label %active
@@ -84,6 +85,8 @@ alone:
   call i64 @vn2_pick_turn(i64 1)
   ret void
 active:
+  %entry_slot = getelementptr %vn2.pool, ptr %pool, i32 0, i32 4
+  %resume = load ptr, ptr %entry_slot
   %done = getelementptr %vn2.pool, ptr %pool, i32 0, i32 1
   %ready = getelementptr %vn2.pool, ptr %pool, i32 0, i32 2
   %total = getelementptr %vn2.pool, ptr %pool, i32 0, i32 3
@@ -122,8 +125,8 @@ selected:
   ret void
 }
 
-define internal fastcc ptr @vn2_next(ptr %pool, ptr %resume) {
-  call fastcc void @vn2_choose_owner(ptr %pool, ptr %resume, i1 false)
+define internal fastcc ptr @vn2_next(ptr %pool) {
+  call fastcc void @vn2_choose_owner(ptr %pool, i1 false)
   %done = getelementptr %vn2.pool, ptr %pool, i32 0, i32 1
   %total = getelementptr %vn2.pool, ptr %pool, i32 0, i32 3
   %t = load i64, ptr %total

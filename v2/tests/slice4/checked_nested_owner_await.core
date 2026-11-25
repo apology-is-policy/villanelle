@@ -1,0 +1,60 @@
+// The host records which task has the turn, including inside a nested run.
+extern control sample(mark : u32) ■ { ok {value : u32} } uses clock
+
+async control peer() ■ { ok {} } uses clock
+    ⊤ ▷ p : Δ sample(9) ▸ ok {seen}
+    ⊤ ▷ ■ ok {}
+
+async control tick() ■ { ok {} } uses clock
+    ⊤ ▷ p : Δ sample(7) ▸ ok {seen}
+    ⊤ ▷ ■ ok {}
+
+async control inner() ■ { ok {} } uses clock
+    ⊤ ▷ t : Δ await tick() ▸ ok {}
+    ⊤ ▷ ■ ok {}
+
+control isolated() ■ { ok {} } uses clock
+    ⊤ ▷ i : Δ run inner() ▸ ok {}
+    ⊤ ▷ ■ ok {}
+
+async control leaf(xs : [usize], cell : &~u32) ■ { value {data : [usize]} } uses clock
+    ⊤ ▷ p : Δ sample(3) ▸ ok {seen}
+    p.ok ▷ cell ← seen
+    ⊤ ▷ ■ value {▾xs}
+
+async control layer(xs : [usize], cell : &~u32) ■ { value {data : [usize]} } uses clock
+    ⊤ ▷ p : Δ sample(2) ▸ ok {seen}
+    ⊤ ▷ l : Δ await leaf(▾xs, cell) ▸ value {data}
+    l.value ▷ ■ value {▾data}
+
+async control middle(xs : [usize], nest_run : bool) ■ { value {data : [usize], mark : u32} } uses clock
+    ⊤ ▷ p : Δ sample(1) ▸ ok {seen}
+    ⊤ ▷ branch : ? nest_run
+    branch.true ▷ i : Δ isolated() ▸ ok {}
+    ⊤ ▷ ~cell : u32 := 0
+    ⊤ ▷ c := capture await layer(▾xs, &~cell)
+    ⊤ ▷ l : Δ outcome(▾c) ▸ value {data}
+    l.value ▷ ■ value {▾data, cell}
+
+async control owner(xs : [usize], nest_run : bool)
+    ■ { ok {data : [usize], mark : u32, pending : usize} } uses clock
+    ⊤ ▷ ~pool : tasks⟨peer⟩ := tasks⟨peer⟩()
+    ⊤ ▷ spawn peer() into pool
+    ⊤ ▷ m : Δ await middle(▾xs, nest_run) ▸ value {data, mark}
+    ⊤ ▷ pending : usize := count(pool)
+    ⊤ ▷ a : Δ await next(pool) ▸ ok {} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(pool) ▸ ok {} │ empty {}
+    b.ok ▷ ⊥
+    b.empty ▷ ■ ok {▾data, mark, pending}
+
+control example() ■ { ok {mark : u32} } uses clock
+    ⊤ ▷ o : Δ run owner([8], true) ▸ ok {data, mark, pending}
+    o.ok ▷ ■ ok {mark}
+
+//! run owner([5], false) with [sample -> ok {11}; sample -> ok {22}; sample -> ok {33}; sample -> ok {99}] => done ok {[5], 33, 1} trace [sample(1) -> ok {11}; sample(2) -> ok {22}; sample(3) -> ok {33}; sample(9) -> ok {99}]
+//! run owner([6], false) with [sample -> ok {11}; sample -> ok {99}; sample -> ok {22}; sample -> ok {33}] turns [0, 1] => done ok {[6], 33, 1} trace [sample(1) -> ok {11}; sample(9) -> ok {99}; sample(2) -> ok {22}; sample(3) -> ok {33}]
+//! run owner([], false) with [sample -> ok {11}; sample -> ok {22}; sample -> ok {99}; sample -> ok {33}] turns [0, 0, 1] => done ok {[], 33, 1} trace [sample(1) -> ok {11}; sample(2) -> ok {22}; sample(9) -> ok {99}; sample(3) -> ok {33}]
+//! run owner([4], false) with [sample -> ok {99}; sample -> ok {11}; sample -> ok {22}; sample -> ok {33}] turns [1] => done ok {[4], 33, 1} trace [sample(9) -> ok {99}; sample(1) -> ok {11}; sample(2) -> ok {22}; sample(3) -> ok {33}]
+//! run example() with [sample -> ok {11}; sample -> ok {77}; sample -> ok {22}; sample -> ok {99}; sample -> ok {33}] turns [0, 1, 0, 1] => done ok {33} trace [sample(1) -> ok {11}; sample(7) -> ok {77}; sample(2) -> ok {22}; sample(9) -> ok {99}; sample(3) -> ok {33}]
+//! run middle([3], false) with [sample -> ok {11}; sample -> ok {22}; sample -> ok {33}] turns [1, 1] => done value {[3], 33} trace [sample(1) -> ok {11}; sample(2) -> ok {22}; sample(3) -> ok {33}]

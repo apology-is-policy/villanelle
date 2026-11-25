@@ -994,6 +994,7 @@ struct RuntimeRegistry<'a> {
     type_ids: HashMap<Type, usize>,
     registered_maps: Vec<(Type, Type)>,
     map_ids: HashMap<(Type, Type), usize>,
+    has_task_sets: bool,
     needed_libc: bool,
     needed_str: bool,
     needed_vec_grow: bool,
@@ -1017,6 +1018,7 @@ impl<'a> RuntimeRegistry<'a> {
             type_ids: HashMap::new(),
             registered_maps: Vec::new(),
             map_ids: HashMap::new(),
+            has_task_sets: tasks::uses_sets(program),
             needed_libc: false,
             needed_str: false,
             needed_vec_grow: false,
@@ -3163,7 +3165,7 @@ impl<'a, 'r> IrEmitter<'a, 'r> {
                     "false".to_string()
                 }
             }
-            Expr::TasksEmpty(_, _) => tasks::new_set(self),
+            Expr::TasksEmpty(id, _) => tasks::new_set(self, *id),
             Expr::Count(set) => tasks::count(self, *set),
             Expr::Integer(val, int_ty) => {
                 let bits = int_bits(*int_ty, self.reg.usize_bits);
@@ -3936,6 +3938,11 @@ fn emit_body_unit<'a>(
             sig_parts.push(format!("ptr {tptr}"));
         }
 
+        if let UnitKind::Control { id, .. } = unit
+            && program.controls[id].is_async
+        {
+            sig_parts.push("ptr %owner_pool".into());
+        }
         let _ = writeln!(
             out,
             "define internal fastcc i32 @{fn_name}({}) nounwind {{",
@@ -4859,7 +4866,7 @@ fn emit_operation_call(
                     );
                     let _ = writeln!(em.code, "  store {arg}, ptr {slot}");
                 }
-                if let Some(points) = &mut em.resume_points {
+                let peers = if let Some(points) = &mut em.resume_points {
                     // Resume after the operands and result destinations have been
                     // bound. The selected task enters the awaited body on this turn.
                     let pc = points.len() + 1;
@@ -4869,12 +4876,13 @@ fn emit_operation_call(
                         em.code,
                         "  store i32 {pc}, ptr %member_state\n  ret i32 -3\n{label}:"
                     );
+                    "null".into()
                 } else {
-                    tasks::choose_owner(em, body);
-                }
+                    tasks::choose_owner(em, body)
+                };
                 let _ = writeln!(
                     em.code,
-                    "  {tag_reg} = call fastcc i32 @vn2_resume_{cid}(ptr {frame})"
+                    "  {tag_reg} = call fastcc i32 @vn2_resume_{cid}(ptr {frame}, ptr {peers})"
                 );
             } else if is_extern {
                 let _ = writeln!(
@@ -4884,6 +4892,9 @@ fn emit_operation_call(
                     call_args.join(", ")
                 );
             } else {
+                if matches!(op_kind, Operation::RunControl(_)) {
+                    call_args.push("ptr null".into());
+                }
                 let _ = writeln!(
                     em.code,
                     "  {tag_reg} = call fastcc i32 @vn2_ctrl_{cid}({})",
@@ -5481,7 +5492,7 @@ pub fn emit_llvm(program: &Program, usize_bits: u32) -> Result<String, String> {
     emit_await_continuations(&mut body_out, program, &term_tys, usize_bits, &awaited);
     emit_program_bodies(&mut body_out, program, &mut reg, &term_tys, usize_bits)?;
 
-    if !awaited.is_empty() || tasks::uses_sets(program) {
+    if !awaited.is_empty() || reg.has_task_sets {
         let _ = writeln!(decls_out, "declare i64 @vn2_pick_turn(i64)");
     }
     let mut type_out = String::new();
@@ -5618,9 +5629,8 @@ fn emit_program_bodies<'a>(
     Ok(())
 }
 
-/// [E-Turn] In a module without task sets or extern waits, the suspended
-/// task is the sole ready task. After the host picks its turn, enter the
-/// awaited control with the arguments already bound in its activation.
+/// Enter an awaited control on its chosen turn with the bound operands and
+/// the set of the same owner task. Fresh runs start with a null set.
 fn emit_await_continuations(
     out: &mut String,
     program: &Program,
@@ -5647,7 +5657,7 @@ fn emit_await_continuations(
         let _ = writeln!(out, "{ty} = type {{ {} }}", fields.join(", "));
         let _ = writeln!(
             out,
-            "define internal fastcc i32 @vn2_resume_{id}(ptr %frame) nounwind {{"
+            "define internal fastcc i32 @vn2_resume_{id}(ptr %frame, ptr %owner_pool) nounwind {{"
         );
         let mut arguments = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
@@ -5658,6 +5668,7 @@ fn emit_await_continuations(
             let _ = writeln!(out, "  %arg{index} = load {field}, ptr %slot{index}");
             arguments.push(format!("{field} %arg{index}"));
         }
+        arguments.push("ptr %owner_pool".into());
         let _ = writeln!(
             out,
             "  %tag = call fastcc i32 @vn2_ctrl_{id}({})",
@@ -5804,6 +5815,10 @@ fn emit_control_c_wrapper(
     }
     if term_ty.is_some() {
         internal_args.push("ptr %c_out_term".to_string());
+    }
+
+    if control.is_async {
+        internal_args.push("ptr null".into());
     }
 
     let _ = writeln!(
@@ -6767,7 +6782,7 @@ pub fn emit_native_harness_llvm(
 
     let mut h_tmp = 0usize;
     let mut ext_code = String::new();
-    let picks_turns = !awaited.is_empty() || tasks::uses_sets(program);
+    let picks_turns = !awaited.is_empty() || reg.has_task_sets;
     if picks_turns {
         ext_code.push_str(
             "@vn2_turn_ptr = internal global ptr null
@@ -7255,6 +7270,9 @@ scripted:
             (ts, tty.clone())
         });
 
+        if control.is_async {
+            call_args.push("ptr null".into());
+        }
         let tag = format!("%r{run_idx}_tag");
         let _ = writeln!(
             main_out,

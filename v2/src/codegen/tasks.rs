@@ -52,11 +52,9 @@ pub(super) fn emit_support<'a>(
                         Some("a fault boundary or fault in a task-set owner")
                     }
                     _ => match operation(command) {
-                        Some(
-                            Operation::Control(cid)
-                            | Operation::RunControl(cid)
-                            | Operation::AwaitControl(cid),
-                        ) if program.controls[*cid].faults || term_tys[*cid].is_some() => {
+                        Some(Operation::Control(cid) | Operation::RunControl(cid))
+                            if program.controls[*cid].faults || term_tys[*cid].is_some() =>
+                        {
                             Some("a faulting or terminating call in a task-set owner")
                         }
                         _ => None,
@@ -69,9 +67,7 @@ pub(super) fn emit_support<'a>(
                 control.name
             ));
         }
-        for callee in awaits(body) {
-            check_await_target(program, callee, "owner", &control.name)?;
-        }
+        check_owner_awaits(program, control, body, term_tys)?;
         members.insert(member);
     }
     if members.is_empty() {
@@ -94,26 +90,48 @@ fn awaits(body: &ControlBody) -> impl Iterator<Item = ControlId> + '_ {
         })
 }
 
-// A nested run has its own ready set. An awaited control runs in the
-// caller's task and must return before it would need the shared scheduler again.
-fn check_await_target(
-    program: &Program,
-    callee: ControlId,
+fn awaited_body<'a>(
+    target: &'a Control,
     role: &str,
     caller: &str,
-) -> Result<(), String> {
-    let target = &program.controls[callee];
+) -> Result<&'a ControlBody, String> {
     let Some(body) = &target.body else {
         return Err(format!(
             "the native backend does not yet support await of extern `{}` in task-set {role} `{caller}`",
             target.name
         ));
     };
-    if awaits(body).next().is_some() || sets(body).next().is_some() {
+    if sets(body).next().is_some() {
         return Err(format!(
-            "the native backend does not yet support task-set {role} `{caller}` awaiting `{}`, whose body can suspend again or create a set",
+            "the native backend does not yet support task-set {role} `{caller}` awaiting `{}`, which creates a set",
             target.name
         ));
+    }
+    Ok(body)
+}
+
+// Follow only await edges. A nested run has its own ready tasks.
+fn check_owner_awaits(
+    program: &Program,
+    owner: &Control,
+    body: &ControlBody,
+    term_tys: &[Option<Type>],
+) -> Result<(), String> {
+    let mut pending: Vec<_> = awaits(body).collect();
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        let target = &program.controls[id];
+        let body = awaited_body(target, "owner", &owner.name)?;
+        if target.faults || term_tys[id].is_some() {
+            return Err(format!(
+                "await of `{}` from `{}`: the native backend does not yet support a faulting or terminating call in a task-set owner",
+                target.name, owner.name
+            ));
+        }
+        pending.extend(awaits(body));
     }
     Ok(())
 }
@@ -147,7 +165,14 @@ fn emit_member<'a>(
         // Ordinary synchronous calls can start a nested run, whose tasks have
         // their own ready set. An awaited callee shares this member's turn.
         for callee in callees {
-            check_await_target(program, callee, "member", &member.name)?;
+            let target = &program.controls[callee];
+            let body = awaited_body(target, "member", &member.name)?;
+            if awaits(body).next().is_some() {
+                return Err(format!(
+                    "the native backend does not yet support task-set member `{}` awaiting `{}`, whose body can suspend again",
+                    member.name, target.name
+                ));
+            }
         }
         return emit_body_unit(
             out,
@@ -164,7 +189,8 @@ fn emit_member<'a>(
         );
     }
 
-    let args = emit_member_entry(out, program, id, reg.usize_bits, &[], &[]);
+    let mut args = emit_member_entry(out, program, id, reg.usize_bits, &[], &[]);
+    args.push("ptr null".into());
     let _ = writeln!(
         out,
         "  %tag = call fastcc i32 @vn2_ctrl_{id}({})\n  ret i32 %tag\n}}\n",
@@ -253,18 +279,21 @@ fn pool(em: &mut IrEmitter<'_, '_>, set: VarId) -> String {
     ptr
 }
 
-/// Give ready children turns until the host selects the owner. Its set slot
-/// holds null before creation and after the owner receives empty.
-pub(super) fn choose_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) {
-    let Some((slot, member)) = sets(body).next() else {
+/// Give the host a turn choice and pass the same set to the next activation.
+pub(super) fn choose_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) -> String {
+    if !em.reg.has_task_sets {
         em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
-        return;
+        return "null".into();
+    }
+    let peers = match sets(body).next() {
+        Some((slot, _)) => pool(em, slot),
+        None => "%owner_pool".to_string(),
     };
-    let ptr = pool(em, slot);
     let _ = writeln!(
         em.code,
-        "  call fastcc void @vn2_choose_owner(ptr {ptr}, ptr @vn2_member_{member}, i1 true)"
+        "  call fastcc void @vn2_choose_owner(ptr {peers}, i1 true)"
     );
+    peers
 }
 
 fn field(em: &mut IrEmitter<'_, '_>, ty: &str, ptr: &str, index: usize) -> String {
@@ -276,9 +305,12 @@ fn field(em: &mut IrEmitter<'_, '_>, ty: &str, ptr: &str, index: usize) -> Strin
     result
 }
 
-pub(super) fn new_set(em: &mut IrEmitter<'_, '_>) -> String {
+pub(super) fn new_set(em: &mut IrEmitter<'_, '_>, member: ControlId) -> String {
     let ptr = em.alloc_temp("%vn2.pool");
-    let _ = writeln!(em.code, "  call fastcc void @vn2_pool_init(ptr {ptr})");
+    let _ = writeln!(
+        em.code,
+        "  call fastcc void @vn2_pool_init(ptr {ptr}, ptr @vn2_member_{member})"
+    );
     ptr
 }
 
@@ -329,10 +361,7 @@ pub(super) fn next(
     let empty_label = em.fresh_label("pool_empty");
     let member_label = em.fresh_label("pool_member");
     let join = em.fresh_label("pool_result");
-    let _ = writeln!(
-        em.code,
-        "  {frame} = call fastcc ptr @vn2_next(ptr {ptr}, ptr @vn2_member_{id})"
-    );
+    let _ = writeln!(em.code, "  {frame} = call fastcc ptr @vn2_next(ptr {ptr})");
     let _ = writeln!(
         em.code,
         "  {empty} = icmp eq ptr {frame}, null\n  br i1 {empty}, label %{empty_label}, label %{member_label}"

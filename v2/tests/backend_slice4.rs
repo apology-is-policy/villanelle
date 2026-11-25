@@ -10,6 +10,7 @@ use villanelle_v2::{check, erased, load, script};
 
 const ROOTS: &str = include_str!("slice4/checked_run.core");
 const AWAITS: &str = include_str!("slice4/checked_await.core");
+const NESTED_OWNER: &str = include_str!("slice4/checked_nested_owner_await.core");
 const MEMBER_AWAIT: &str = include_str!("slice4/checked_member_await.core");
 
 fn compare_native_runs(source: &str, rules: &[&str], counts: &[u64], allocations: u64) {
@@ -100,6 +101,11 @@ fn a_defined_owner_await_preserves_completions_until_next() {
         &[3, 3, 3, 3],
         8,
     );
+}
+
+#[test]
+fn nested_owner_awaits_schedule_the_same_children_at_each_depth() {
+    compare_native_runs(NESTED_OWNER, &["E-Await"], &[3, 3, 3, 3, 4, 2], 5);
 }
 
 #[test]
@@ -362,6 +368,67 @@ int main(void) {
     );
 }
 
+#[test]
+fn a_nested_run_freezes_the_outer_set_until_the_next_owner_await() {
+    const DRIVER: &str = r#"
+#include "module.h"
+#include <inttypes.h>
+#include <stdio.h>
+
+static uint32_t turns;
+uint64_t vn2_pick_turn(uint64_t count) {
+    const uint64_t choices[] = {0, 1, 0, 1};
+    printf("ready %" PRIu64 "\n", count);
+    uint32_t i = turns++;
+    return i < 4 ? choices[i] : 0;
+}
+int32_t vn2_ext_sample(uint32_t mark, uint32_t *value) {
+    printf("sample %" PRIu32 " at %" PRIu32 "\n", mark, turns);
+    *value = turns;
+    return VN2_SAMPLE_OK;
+}
+int main(void) {
+    uint32_t mark;
+    if (vn2_call_example(&mark) != VN2_EXAMPLE_OK) return 1;
+    printf("done ok {%" PRIu32 "}\n", mark);
+    return 0;
+}
+"#;
+    compare_c_host(NESTED_OWNER, "nested_owner", DRIVER, |program, config| {
+        let host = || TurnHost {
+            choices: [0, 1, 0, 1].into(),
+            ..Default::default()
+        };
+        let mut original_host = host();
+        let original = oracle::run(program, "example", vec![], &mut original_host, config);
+        let mut erased_host = host();
+        let erased = erased::run(program, "example", vec![], &mut erased_host, config);
+        assert_eq!(erased.end.to_string(), original.end.to_string());
+        assert_eq!(erased.trace, original.trace);
+        assert_eq!(erased_host.calls, original_host.calls);
+        assert_eq!(
+            original_host.calls,
+            [
+                "ready 2",
+                "sample 1 at 1",
+                "ready 1",
+                "sample 7 at 2",
+                "ready 2",
+                "sample 2 at 3",
+                "ready 2",
+                "sample 9 at 4",
+                "ready 1",
+                "sample 3 at 5",
+                "ready 1",
+                "ready 1",
+            ]
+        );
+        let mut expected = original_host.calls;
+        expected.push(original.end.to_string());
+        expected
+    });
+}
+
 fn compare_c_host(
     source: &str,
     name: &str,
@@ -441,16 +508,20 @@ async control owner() ■ { ok {} }
     let suspend = "⊤ ▷ w : Δ await idle() ▸ ok {}";
     let new_set = "⊤ ▷ ~other : tasks⟨child⟩ := tasks⟨child⟩()\n    ⊤ ▷ q : Δ await next(other) ▸ ok {} │ empty {}\n    q.ok ▷ ⊥";
     for (source, reason) in [
-        (base.replace("async control idle", "async control leaf() ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control idle")
+        (base.replace("async control idle", &format!("async control leaf() ■ {{ ok {{}} }}\n    {new_set}\n    ⊤ ▷ ■ ok {{}}\n\nasync control idle"))
             .replace("async control idle() ■ { ok {} }", "async control idle() ■ { ok {} }\n    ⊤ ▷ w : Δ await leaf() ▸ ok {}")
-            .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "task-set owner `owner` awaiting `idle`, whose body can suspend again"),
+            .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "task-set owner `owner` awaiting `leaf`, which creates a set"),
         (base.replace("async control idle() ■ { ok {} }", &format!("async control idle() ■ {{ ok {{}} }}\n    {new_set}"))
-            .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "task-set owner `owner` awaiting `idle`, whose body can suspend again or create a set"),
+            .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "task-set owner `owner` awaiting `idle`, which creates a set"),
         (base.replace("async control idle() ■ { ok {} }", "async control idle() ■ { ok {} } faults")
             .replace("async control owner() ■ { ok {} }", &format!("async control owner() ■ {{ ok {{}} }} faults\n    {suspend}")), "a faulting or terminating call in a task-set owner"),
         (base.replace("async control idle", "extern async control read() ■ { ok {} } uses io\n\nasync control idle")
             .replace("owner() ■ { ok {} }", "owner() ■ { ok {} } uses io")
             .replace(next_owner, &format!("⊤ ▷ w : Δ await read() ▸ ok {{}}\n    {next_owner}"))
+            .replace("turns [1] => done ok", "with [read -> ok] turns [1] => done ok trace [read() -> ok]"), "await of extern `read` in task-set owner"),
+        (base.replace("async control idle() ■ { ok {} }", "extern async control read() ■ { ok {} } uses io\n\nasync control idle() ■ { ok {} } uses io\n    ⊤ ▷ w : Δ await read() ▸ ok {}")
+            .replace("owner() ■ { ok {} }", "owner() ■ { ok {} } uses io")
+            .replace(next_owner, &format!("{suspend}\n    {next_owner}"))
             .replace("turns [1] => done ok", "with [read -> ok] turns [1] => done ok trace [read() -> ok]"), "await of extern `read` in task-set owner"),
         (base.replace("async control child", "async control middle() ■ { ok {} }\n    ⊤ ▷ w : Δ await idle() ▸ ok {}\n    ⊤ ▷ ■ ok {}\n\nasync control child")
             .replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} }\n    ⊤ ▷ w : Δ await middle() ▸ ok {}"), "can suspend again"),
@@ -459,7 +530,7 @@ async control owner() ■ { ok {} }
             .replace("owner() ■ { ok {} }", "owner() ■ { ok {} } uses io")
             .replace("turns [1] => done ok", "with [read -> ok] turns [1] => done ok trace [read() -> ok]"), "await of extern `read` in task-set member"),
         (base.replace("async control idle() ■ { ok {} }", "async control unit() ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control idle() ■ { ok {} }\n    ⊤ ▷ ~set : tasks⟨unit⟩ := tasks⟨unit⟩()\n    ⊤ ▷ n : Δ await next(set) ▸ ok {} │ empty {}\n    n.ok ▷ ⊥")
-            .replace("child(value : usize) ■ { ok {} }", &format!("child(value : usize) ■ {{ ok {{}} }}\n    {suspend}")), "can suspend again or create a set"),
+            .replace("child(value : usize) ■ { ok {} }", &format!("child(value : usize) ■ {{ ok {{}} }}\n    {suspend}")), "task-set member `child` awaiting `idle`, which creates a set"),
         (base.replace(next_owner, &format!("{new_set}\n    {next_owner}")), "multiple task sets"),
         (base.replace(spawn, &format!("⊤ ▷ l : ↻ once() {{\n        {spawn}\n        ⊤ ▷ □ added {{}}\n    }} ▸ added {{}}")), "spawn outside the owner's top-level body"),
         (base.replace("value : usize", "value : &usize").replace("child(v)", "child(&v)"), "owned or copy inputs"),
