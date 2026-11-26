@@ -1,7 +1,9 @@
-//! Native task sets whose spawn sites execute at most once per invocation.
-//! The owner keeps one activation per site on its stack. A member keeps its locals
-//! across defined awaits and its result until the owner receives it.
+//! Native task sets. A top-level spawn has storage in the owner's activation.
+//! A loop takes a distinct frame for each outstanding member.
 use super::*;
+
+// Keep the common prefix in sync with %vn2.member_header in task_set.ll.
+const FIRST_INPUT: usize = 3;
 
 #[derive(Clone, Copy)]
 pub(super) enum Frame {
@@ -45,19 +47,15 @@ pub(super) fn emit_support<'a>(
         } else {
             body.bodies
                 .iter()
-                .enumerate()
-                .flat_map(|(id, body)| body.statements.iter().map(move |s| (id, &s.command)))
-                .find_map(|(id, command)| match command {
-                    Command::Spawn { .. } if id != 0 => {
-                        Some("task-set spawn outside the owner's top-level body")
-                    }
+                .flat_map(|body| &body.statements)
+                .find_map(|s| match &s.command {
                     Command::Cancel { .. } => Some("task set cancellation"),
                     Command::Fault { .. }
                     | Command::Boundary { .. }
                     | Command::Supervise { .. } => {
                         Some("a fault boundary or fault in a task-set owner")
                     }
-                    _ => match operation(command) {
+                    _ => match operation(&s.command) {
                         Some(Operation::Control(cid) | Operation::RunControl(cid))
                             if program.controls[*cid].faults || term_tys[*cid].is_some() =>
                         {
@@ -79,6 +77,7 @@ pub(super) fn emit_support<'a>(
     if members.is_empty() {
         return Ok(());
     }
+    reg.needed_libc = true;
     out.push_str(include_str!("task_set.ll"));
     let mut nested = BTreeSet::new();
     for id in members {
@@ -226,7 +225,7 @@ fn emit_member<'a>(
     Ok(())
 }
 
-// The queue link and resume index/result tag precede the bound inputs,
+// The queue link, resume index/result tag and storage flag precede the inputs,
 // result destinations, and slots of the resumable body. Every resume gets
 // fresh SSA addresses for the same slots in this invocation of the owner.
 pub(super) fn emit_member_entry(
@@ -239,7 +238,7 @@ pub(super) fn emit_member_entry(
 ) -> Vec<String> {
     let member = &program.controls[id];
     let ty = format!("%vn2.member.{id}");
-    let mut fields = vec!["ptr".to_string(), "i32".to_string()];
+    let mut fields = vec!["ptr".into(), "i32".into(), "i1".into()];
     fields.extend(
         member
             .parameters
@@ -258,9 +257,9 @@ pub(super) fn emit_member_entry(
         .parameters
         .iter()
         .enumerate()
-        .map(|(i, _)| format!("{} %p{i}", fields[i + 2]))
+        .map(|(i, _)| format!("{} %p{i}", fields[FIRST_INPUT + i]))
         .collect();
-    let mut index = 2 + member.parameters.len();
+    let mut index = FIRST_INPUT + member.parameters.len();
     for (alt, alternative) in member.contract.iter().enumerate() {
         for field in 0..alternative.fields.len() {
             let name = format!("%out_{alt}_{field}");
@@ -281,7 +280,7 @@ pub(super) fn emit_member_entry(
         emit_resume_switch(out, resume_points);
     }
     for i in 0..member.parameters.len() {
-        let index = 2 + i;
+        let index = FIRST_INPUT + i;
         let ll = &fields[index];
         let _ = writeln!(
             out,
@@ -446,19 +445,34 @@ pub(super) fn spawn(
     set: VarId,
     id: ControlId,
     args: &[Expr],
+    repeated: bool,
 ) {
     let ty = format!("%vn2.member.{id}");
-    let frame = em.alloc_temp(&ty);
     let values = em.emit_exprs_ordered(args, &VarAccess::ControlSlots(body));
+    let ptr = pool(em, set);
+    let frame = if repeated {
+        let frame = em.fresh_reg();
+        let _ = writeln!(
+            em.code,
+            "  {frame} = call fastcc ptr @vn2_take_frame(ptr {ptr}, i64 ptrtoint (ptr getelementptr ({ty}, ptr null, i32 1) to i64))"
+        );
+        frame
+    } else {
+        em.alloc_temp(&ty)
+    };
     for (i, (arg, value)) in args.iter().zip(values).enumerate() {
-        let ptr = field(em, &ty, &frame, i + 2);
+        let ptr = field(em, &ty, &frame, FIRST_INPUT + i);
         let ll = em.llvm_ty(&arg.ty());
         let _ = writeln!(em.code, "  store {ll} {value}, ptr {ptr}");
     }
-    let ptr = pool(em, set);
+    let max = if em.reg.usize_bits == 32 {
+        u64::from(u32::MAX)
+    } else {
+        u64::MAX
+    };
     let _ = writeln!(
         em.code,
-        "  call fastcc void @vn2_spawn(ptr {ptr}, ptr {frame})"
+        "  call fastcc void @vn2_spawn(ptr {ptr}, ptr {frame}, i1 {repeated}, i64 {max})"
     );
 }
 
@@ -498,7 +512,7 @@ pub(super) fn next(
     );
     // Only the selected alternative loads through these addresses. Empty has
     // no fields; an ordinary (non-inbounds) GEP does not dereference its base.
-    let mut index = 2 + member.parameters.len();
+    let mut index = FIRST_INPUT + member.parameters.len();
     let mut slots = Vec::new();
     for alt in &member.contract {
         let mut fields = Vec::new();

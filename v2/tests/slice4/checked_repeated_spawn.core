@@ -1,0 +1,62 @@
+// Each loop visit binds a new vector. Its member can yield, discard it,
+// or return it to the owner through the completion queue.
+async control tick() ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+async control pack(xs : [u32], skip : bool, pause : bool) ■ { kept {data : [u32]} │ skipped {} }
+    ⊤ ▷ p : ? pause
+    p.true ▷ t : Δ await tick() ▸ ok {}
+    ⊤ ▷ b : ? skip
+    b.true ▷ ■ skipped {}
+    b.false ▷ ■ kept {▾xs}
+
+async control bulk(n : u32, fixed : bool, pause : bool)
+    ■ { ok {ordered : [[u32]], pending : usize} }
+    ⊤ ▷ ~pool : tasks⟨pack⟩ := tasks⟨pack⟩()
+    ⊤ ▷ f : ? fixed
+    f.true ▷ spawn pack([90], false, pause) into pool
+    ⊤ ▷ fill : ↻ produce(left : u32 := n) {
+        ⊤ ▷ end : ? left = 0
+        end.true ▷ □ filled {}
+        end.false ▷ spawn pack([left], left = 1, pause) into pool
+        end.false ▷ ↑ produce(left - 1)
+    } ▸ filled {}
+    ⊤ ▷ pending : usize := count(pool)
+    ⊤ ▷ ~ordered : [[u32]] := []
+    ⊤ ▷ lp : ↻ drain() {
+        ⊤ ▷ a : Δ await next(pool) ▸ kept {data} │ skipped {} │ empty {}
+        a.kept ▷ p : Δ push(&~ordered, ▾data) ▸ done {}
+        a.skipped ▷ q : Δ push(&~ordered, []) ▸ done {}
+        a.empty ▷ □ drained {}
+        ⊤ ▷ ↑ drain()
+    } ▸ drained {}
+    ⊤ ▷ ■ ok {▾ordered, pending}
+
+//! run bulk(0, false, false) => done ok {[], 0}
+//! run bulk(0, true, false) => done ok {[[90]], 1}
+//! run bulk(3, true, false) => done ok {[[90], [3], [2], []], 4}
+//! run bulk(3, true, false) turns [2, 3, 1, 0] => done ok {[[2], [], [90], [3]], 4}
+//! run bulk(2, false, true) turns [0, 1, 1] => done ok {[[], [2]], 2}
+
+// Deliver a member before the next visit to the same spawn. Everything
+// already collected must still be live when the member storage is reused.
+async control alternating(n : u32) ■ { ok {ordered : [[u32]]} }
+    ⊤ ▷ ~pool : tasks⟨pack⟩ := tasks⟨pack⟩()
+    ⊤ ▷ ~ordered : [[u32]] := []
+    ⊤ ▷ fill : ↻ each(left : u32 := n) {
+        ⊤ ▷ end : ? left = 0
+        end.true ▷ □ finished {}
+        end.false ▷ spawn pack([left], false, true) into pool
+        end.false ▷ a : Δ await next(pool) ▸ kept {data} │ skipped {} │ empty {}
+        a.empty ▷ ⊥
+        a.kept ▷ p : Δ push(&~ordered, ▾data) ▸ done {}
+        end.false ▷ ↑ each(left - 1)
+    } ▸ finished {}
+    ⊤ ▷ lp : ↻ drain() {
+        ⊤ ▷ tail : Δ await next(pool) ▸ kept {last} │ skipped {} │ empty {}
+        tail.empty ▷ □ drained {}
+        ⊤ ▷ ↑ drain()
+    } ▸ drained {}
+    ⊤ ▷ ■ ok {▾ordered}
+
+//! run alternating(4) => done ok {[[4], [3], [2], [1]]}

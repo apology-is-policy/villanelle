@@ -1,6 +1,8 @@
 //! Native defined roots, awaits, and scheduling of task-set members.
 use std::{collections::VecDeque, fs, process::Command};
-use villanelle_v2::codegen::{emit_c_header, emit_llvm, run_native_counted};
+use villanelle_v2::codegen::{
+    emit_c_header, emit_llvm, emit_native_harness_llvm, run_native_counted, run_native_ir,
+};
 use villanelle_v2::differential::{Verdict, compare};
 use villanelle_v2::host::{Answer, Host, Scheduled, Script};
 use villanelle_v2::int::Int;
@@ -8,6 +10,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const REPEATED_SPAWN: &str = include_str!("slice4/checked_repeated_spawn.core");
 const ROOTS: &str = include_str!("slice4/checked_run.core");
 const AWAITS: &str = include_str!("slice4/checked_await.core");
 const NESTED_MEMBER: &str = include_str!("slice4/checked_nested_member_await.core");
@@ -85,6 +88,66 @@ fn spawned_members_run_on_the_chosen_turn_and_keep_their_payloads() {
     compare_native_runs(source, &["E-Spawn"], &[2, 2, 2, 2, 2, 4, 4], 6);
     let program = load(source).unwrap();
     assert!(emit_c_header(&program, 64).contains("uint64_t vn2_pick_turn(uint64_t ready_count);"));
+}
+
+#[test]
+fn repeated_spawns_preserve_each_member_until_its_payload_is_delivered() {
+    // The alternating run visits its spawn four times and needs one heap frame.
+    compare_native_runs(REPEATED_SPAWN, &["E-Spawn"], &[0, 1, 4, 4, 2, 4], 29);
+}
+
+#[test]
+fn repeated_spawn_stops_before_count_would_exceed_the_target_limit() {
+    // Use small limits at the emitted spawn sites to reach the target-width
+    // guard without building billions of members. Identify its trap by exit code.
+    let (program, runs) = script::native_runs(REPEATED_SPAWN).unwrap();
+    let four = &runs[2..3];
+    for (bits, max) in [(32, u64::from(u32::MAX)), (64, u64::MAX)] {
+        for (cap, end) in [(4, "done ok {[[90], [3], [2], []], 4}"), (3, "exhausted")] {
+            let mut config = Config::with_usize_bits(bits);
+            config.capacity = Some(Int::from_u64(cap));
+            let spec = &four[0];
+            let mut host = Script {
+                answers: Default::default(),
+            };
+            let comparison = compare(
+                &program,
+                &spec.entry,
+                spec.arguments.clone(),
+                &mut host,
+                &config,
+            );
+            assert_eq!(comparison.verdict, Verdict::Same);
+            assert_eq!(comparison.oracle.end.to_string(), end);
+        }
+        let ir = emit_native_harness_llvm(&program, four, bits).unwrap();
+        let limit = format!(", i64 {max})");
+        let scaled = |cap| {
+            ir.lines()
+                .map(|line| {
+                    if line.contains("call fastcc void @vn2_spawn(") {
+                        assert!(line.ends_with(&limit), "{line}");
+                        line.replace(&limit, &format!(", i64 {cap})"))
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for optimization in [0, 2] {
+            let at_limit = run_native_ir(&program, four, &scaled(4), optimization).unwrap();
+            assert_eq!(
+                at_limit.runs[0].0.to_string(),
+                "done ok {[[90], [3], [2], []], 4}"
+            );
+            let beyond = scaled(3).replace("call void @llvm.trap()", "call void @exit(i32 70)");
+            assert_eq!(
+                run_native_ir(&program, four, &beyond, optimization).unwrap_err(),
+                "native binary exited with Some(70) after 0 of 1 runs"
+            );
+        }
+    }
 }
 
 #[test]
@@ -525,7 +588,7 @@ fn compare_c_host(
 }
 
 #[test]
-fn task_set_diagnostics_cover_suspension_loans_and_repeated_spawn_sites() {
+fn task_set_diagnostics_cover_unsupported_awaits_sets_and_loans() {
     let base = r#"
 async control idle() ■ { ok {} }
     ⊤ ▷ ■ ok {}
@@ -576,7 +639,7 @@ async control owner() ■ { ok {} }
         (base.replace("async control idle() ■ { ok {} }", "async control unit() ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control idle() ■ { ok {} }\n    ⊤ ▷ ~set : tasks⟨unit⟩ := tasks⟨unit⟩()\n    ⊤ ▷ n : Δ await next(set) ▸ ok {} │ empty {}\n    n.ok ▷ ⊥")
             .replace("child(value : usize) ■ { ok {} }", &format!("child(value : usize) ■ {{ ok {{}} }}\n    {suspend}")), "task-set member `child` awaiting `idle`, which creates a set"),
         (base.replace(next_owner, &format!("{new_set}\n    {next_owner}")), "multiple task sets"),
-        (base.replace(spawn, &format!("⊤ ▷ l : ↻ once() {{\n        {spawn}\n        ⊤ ▷ □ added {{}}\n    }} ▸ added {{}}")), "spawn outside the owner's top-level body"),
+        (base.replace(spawn, &format!("⊤ ▷ l : ↻ once() {{\n        {spawn}\n        ⊤ ▷ □ added {{}}\n    }} ▸ added {{}}")).replace("value : usize", "value : &usize").replace("child(v)", "child(&v)"), "owned or copy inputs"),
         (base.replace("value : usize", "value : &usize").replace("child(v)", "child(&v)"), "owned or copy inputs"),
         (base.replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} } faults").replace("owner() ■ { ok {} }", "owner() ■ { ok {} } faults"), "nonfaulting"),
     ] {

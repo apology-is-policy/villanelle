@@ -4183,7 +4183,8 @@ fn emit_body_unit<'a>(
                     arguments,
                     set,
                 } => {
-                    tasks::spawn(&mut emitter, body, *set, *control, arguments);
+                    // Only body zero runs at most once per owner invocation.
+                    tasks::spawn(&mut emitter, body, *set, *control, arguments, b_id != 0);
                     let _ = writeln!(emitter.code, "  br label %{next_lbl}");
                 }
                 Command::Cancel { .. } => {

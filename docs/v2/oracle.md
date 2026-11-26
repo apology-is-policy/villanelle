@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.10). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.11). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2303,8 +2303,9 @@ tag and payload, to the done queue. The host chooses again. Selecting the owner
 delivers the oldest completion. A done member contributes to `count` until
 delivery. Selecting the owner on an empty set consumes the set.
 
-The backend accepts one set in an owner, with spawn sites in the owner's
-top-level body. Each site can therefore run at most once per invocation.
+This checkpoint covers one set with spawn sites in the owner's top-level
+body. Each site runs at most once per invocation. Section 18.11 covers
+spawns inside loops.
 Decisions on `await next` can repeat in a loop. Section 18.6 covers producers
 that finish in one turn. Section 18.7 extends this to defined awaits. A
 producer takes and returns owned or copy values and lets no fault escape.
@@ -2416,6 +2417,31 @@ callee frames, and releases each. A separately linked C host selects the
 sibling on turn 4. The owner receives its result on turn 5. On turn 6 the
 leaf writes through the borrow of the local in `middle`.
 
+### 18.11 Repeated spawn sites, 26 November 2026
+
+A loop can spawn several outstanding members of one set at the same site.
+Each visit binds its arguments in a distinct member frame. A member keeps
+its frame while ready, suspended or waiting for delivery. At `await next`
+the owner moves the selected payload out before it can spawn again.
+
+Top-level sites keep their stack frames. Loop sites draw from the heap.
+A set keeps at most one delivered heap frame for the next loop spawn,
+which resets its resume index and binds new arguments. Delivering another
+heap frame frees the previous spare. Receiving `empty` frees the last spare.
+A spawn traps if increasing the count would exceed the target's
+`usize.max`. Native reporting of the `exhausted` end and scripted capacity
+limits remain open.
+
+From `v2/`, run `vn2 test tests/slice4/checked_repeated_spawn.core` and
+`cargo test --test backend_slice4 repeated_spawn`. The six directives
+cover zero iterations, mixed stack and heap frames, several completions queued
+before delivery, and a suspended member overtaken by its sibling.
+In `alternating(4)` four visits to one site use one member allocation.
+Across all six runs the counted batch makes 29 allocations and releases
+each. A separate test lowers the emitted count limit to four and three.
+The fourth spawn fits at four and reaches the trap at three. Both
+interpreters run the same program at both limits.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2427,8 +2453,7 @@ leaf writes through the borrow of the local in `middle`.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs repeated spawn sites,
-  multiple sets, loans, host waits, cancellation, member faults, capacity and
+- **Later work.** Slice 4 still needs multiple sets, loans, host waits, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
