@@ -10,6 +10,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const HOST_RUN: &str = include_str!("slice4/checked_host_run.core");
 const HOST_WAIT: &str = include_str!("slice4/checked_host_wait.core");
 const NESTED_MEMBER_SET: &str = include_str!("slice4/checked_nested_member_set.core");
 const MEMBER_SET: &str = include_str!("slice4/checked_member_set.core");
@@ -77,6 +78,24 @@ fn compare_native_runs(source: &str, rules: &[&str], counts: &[u64], allocations
 fn defined_roots_return_or_unwind_in_the_callers_decision() {
     // Four nonempty input vectors. Their payloads move to the eventual owner.
     compare_native_runs(ROOTS, &["E-Run"], &[1, 1, 1, 2, 1, 1], 4);
+}
+
+#[test]
+fn direct_host_runs_return_the_selected_payload_to_the_caller() {
+    // Two vectors in swap. Each host request itself is in the caller's frame.
+    compare_native_runs(HOST_RUN, &["E-Run"], &[2, 1, 1, 2, 2, 2, 2, 1, 1, 1, 2], 2);
+    let (source, _) = HOST_RUN.split_once("async control tag(").unwrap();
+    let program = load(source).unwrap();
+    for bits in [32, 64] {
+        let header = emit_c_header(&program, bits);
+        assert!(header.contains("uint64_t vn2_pick_waiting("));
+        assert!(!header.contains("vn2_pick_turn"));
+        assert!(
+            !emit_llvm(&program, bits)
+                .unwrap()
+                .contains("@vn2_pick_turn")
+        );
+    }
 }
 
 #[test]
@@ -241,13 +260,24 @@ fn native_compilation_reports_operations_that_need_a_scheduler() {
     for (decls, reason) in [
         (
             r#"
-extern async control tick() ■ { ok {} } uses io
+extern async control tick() ■ { ok {} │ cancelled {} } uses io
 control bridge2() ■ { ok {} } uses io
-    ⊤ ▷ r : Δ run tick() ▸ ok {}
-    r.ok ▷ ■ ok {}
+    ⊤ ▷ r : Δ run tick() ▸ ok {} │ cancelled {}
+    ⊤ ▷ ■ ok {}
 //! run bridge2() with [tick -> ok] => done ok trace [tick() -> ok]
 "#,
-            "run of extern async control `tick`",
+            "cancellable or faulting host run of `tick`",
+        ),
+        (
+            r#"
+extern async control tick() ■ { ok {} } faults uses io
+control bridge2() ■ { ok {} } faults uses io
+    ⊤ ▷ r := capture run tick()
+    ⊤ ▷ d : Δ outcome(r) ▸ ok {}
+    d.ok ▷ ■ ok {}
+//! run bridge2() with [tick -> ok] => done ok trace [tick() -> ok]
+"#,
+            "faulting host run of `tick`",
         ),
         (
             r#"
@@ -303,6 +333,42 @@ async control pool() ■ { ok {} }
 
 #[test]
 fn root_host_wait_offers_the_pending_request_before_resuming_the_root() {
+    let (source, _) = HOST_WAIT.split_once("async control unit()").unwrap();
+    compare_fetch_host(
+        source,
+        "root_host_wait",
+        &[
+            "waiting 4 true",
+            "complete 4 true",
+            "ready 1",
+            "waiting 8 false",
+            "complete 8 false",
+            "ready 1",
+        ],
+    );
+}
+
+#[test]
+fn direct_host_runs_finish_before_the_outer_tasks_are_offered() {
+    let (source, _) = HOST_RUN.split_once("extern async control tick()").unwrap();
+    compare_fetch_host(
+        source,
+        "direct_host_run",
+        &[
+            "waiting 4 true",
+            "complete 4 true",
+            "waiting 8 false",
+            "complete 8 false",
+            "ready 2",
+            "ready 2",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+        ],
+    );
+}
+
+fn compare_fetch_host(source: &str, name: &str, expected: &[&str]) {
     #[derive(Default)]
     struct FetchHost(Vec<String>);
 
@@ -383,8 +449,7 @@ int main(void) {
     return 0;
 }
 "#;
-    let (source, _) = HOST_WAIT.split_once("async control unit()").unwrap();
-    compare_c_host(source, "root_host_wait", DRIVER, |program, config| {
+    compare_c_host(source, name, DRIVER, |program, config| {
         let mut host = FetchHost::default();
         let original = oracle::run(program, "example", vec![], &mut host, config);
         let mut erased_host = FetchHost::default();
@@ -392,17 +457,7 @@ int main(void) {
         assert_eq!(erased.trace, original.trace);
         assert_eq!(erased.end.to_string(), original.end.to_string());
         assert_eq!(erased_host.0, host.0);
-        assert_eq!(
-            host.0,
-            [
-                "waiting 4 true",
-                "complete 4 true",
-                "ready 1",
-                "waiting 8 false",
-                "complete 8 false",
-                "ready 1"
-            ]
-        );
+        assert_eq!(host.0, expected);
         assert_eq!(original.end.to_string(), "done ok {37}");
         host.0.push(original.end.to_string());
         host.0

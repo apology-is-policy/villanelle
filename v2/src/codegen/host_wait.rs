@@ -1,10 +1,14 @@
-//! A host operation awaited by the only task in its run ([E-AwaitHost]).
+//! A single pending host operation in an await or a direct run ([E-AwaitHost], [E-Run]).
 use super::*;
 
 pub(super) fn targets(program: &Program) -> BTreeSet<ControlId> {
     operations(program)
         .filter_map(|op| match op {
-            Operation::AwaitControl(id) if program.controls[*id].body.is_none() => Some(*id),
+            Operation::AwaitControl(id) | Operation::RunControl(id)
+                if program.controls[*id].body.is_none() =>
+            {
+                Some(*id)
+            }
             _ => None,
         })
         .collect()
@@ -37,7 +41,7 @@ pub(super) fn emit_header(
 
 // The request and all its input and result slots outlive the pending operation.
 // Task-set paths still go through the guards in tasks::emit_support.
-pub(super) fn emit_await(em: &mut IrEmitter<'_, '_>, id: ControlId, args: &[String], tag: &str) {
+pub(super) fn emit_request(em: &mut IrEmitter<'_, '_>, id: ControlId, args: &[String], tag: &str) {
     let ty = format!("%vn2.wait.{id}");
     let request = em.alloc_temp(&ty);
     let _ = writeln!(em.code, "  store ptr null, ptr {request}");
@@ -60,7 +64,6 @@ pub(super) fn emit_await(em: &mut IrEmitter<'_, '_>, id: ControlId, args: &[Stri
         em.code,
         "  {tag} = call i32 @vn2_complete_{name}(ptr {request})"
     );
-    em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
 }
 
 pub(super) fn emit_support(

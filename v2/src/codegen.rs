@@ -738,6 +738,10 @@ fn has_emit_builtin(program: &Program) -> bool {
     })
 }
 
+fn has_control_await(program: &Program) -> bool {
+    operations(program).any(|op| matches!(op, Operation::AwaitControl(_)))
+}
+
 fn defined_await_targets(program: &Program) -> impl Iterator<Item = ControlId> + '_ {
     operations(program).filter_map(|op| match op {
         Operation::AwaitControl(id) if program.controls[*id].body.is_some() => Some(*id),
@@ -845,10 +849,7 @@ pub fn emit_c_header(program: &Program, usize_bits: u32) -> String {
             "uint64_t vn2_pick_waiting(void *const *states, uint64_t count);"
         );
     }
-    if !host_waits.is_empty()
-        || defined_await_targets(program).next().is_some()
-        || tasks::uses_sets(program)
-    {
+    if has_control_await(program) || tasks::uses_sets(program) {
         let _ = writeln!(out, "uint64_t vn2_pick_turn(uint64_t ready_count);");
     }
     if uses_slice2_data {
@@ -4740,7 +4741,7 @@ fn emit_body_unit<'a>(
 }
 
 fn uses_host_abi(program: &Program, op: &Operation) -> bool {
-    matches!(op, Operation::Control(id) | Operation::AwaitControl(id) if program.controls[*id].body.is_none())
+    matches!(op, Operation::Control(id) | Operation::AwaitControl(id) | Operation::RunControl(id) if program.controls[*id].body.is_none())
 }
 
 fn load_result(em: &mut IrEmitter<'_, '_>, op: &Operation, ty: &Type, ptr: &str) -> String {
@@ -4796,18 +4797,17 @@ fn emit_operation_call(
 
     match op_kind {
         Operation::AwaitNext(_, _) => unreachable!("handled before allocating output slots"),
-        Operation::AwaitControl(cid)
-            if program.controls[*cid].is_cancellable()
-                || (program.controls[*cid].body.is_none() && program.controls[*cid].faults) =>
+        Operation::AwaitControl(cid) | Operation::RunControl(cid)
+            if is_extern_ctrl
+                && (program.controls[*cid].is_cancellable() || program.controls[*cid].faults) =>
         {
+            let kind = if matches!(op_kind, Operation::RunControl(_)) {
+                "run"
+            } else {
+                "await"
+            };
             return Err(format!(
-                "the native backend does not yet support a cancellable or faulting host await of `{}`",
-                program.controls[*cid].name
-            ));
-        }
-        Operation::RunControl(cid) if program.controls[*cid].body.is_none() => {
-            return Err(format!(
-                "the native backend does not yet support run of extern async control `{}`",
+                "the native backend does not yet support a cancellable or faulting host {kind} of `{}`",
                 program.controls[*cid].name
             ));
         }
@@ -4896,9 +4896,15 @@ fn emit_operation_call(
             };
 
             let tag_reg = em.fresh_reg();
-            if is_extern && matches!(op_kind, Operation::AwaitControl(_)) {
-                host_wait::emit_await(em, *cid, &call_args, &tag_reg);
-            } else if matches!(op_kind, Operation::AwaitControl(_)) {
+            let awaits = matches!(op_kind, Operation::AwaitControl(_));
+            if is_extern && (awaits || matches!(op_kind, Operation::RunControl(_))) {
+                host_wait::emit_request(em, *cid, &call_args, &tag_reg);
+                // An await makes the root ready. A direct extern run ends here,
+                // and its caller continues on the turn that entered the run.
+                if awaits {
+                    em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
+                }
+            } else if awaits {
                 // [E-Await] Bind the inputs and the caller's result slots before
                 // the turn ends. The frame lives until the continuation returns.
                 let ty = format!("%vn2.await.{cid}");
@@ -5530,7 +5536,7 @@ pub fn emit_llvm(program: &Program, usize_bits: u32) -> Result<String, String> {
 
     let host_waits = host_wait::targets(program);
     host_wait::emit_support(&mut decls_out, program, &host_waits, usize_bits, false);
-    if !host_waits.is_empty() || !awaited.is_empty() || reg.has_task_sets {
+    if has_control_await(program) || reg.has_task_sets {
         let _ = writeln!(decls_out, "declare i64 @vn2_pick_turn(i64)");
     }
     let mut type_out = String::new();
@@ -6842,7 +6848,7 @@ pub fn emit_native_harness_llvm(
     let mut ext_code = String::new();
     let host_waits = host_wait::targets(program);
     host_wait::emit_support(&mut ext_code, program, &host_waits, usize_bits, true);
-    let picks_turns = !host_waits.is_empty() || !awaited.is_empty() || reg.has_task_sets;
+    let picks_turns = has_control_await(program) || reg.has_task_sets;
     if picks_turns {
         ext_code.push_str(
             "@vn2_turn_ptr = internal global ptr null

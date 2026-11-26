@@ -1,0 +1,83 @@
+// The host operation is the root of each run. Completion returns directly
+// to the caller, which can pass the first payload to the second operation.
+extern async control fetch(key : usize, cached : bool)
+    ■ { found {value : usize, valid : bool} │ missing {} } uses io
+
+control twice(key : usize) ■ { ok {value : usize} } uses io
+    ⊤ ▷ c := capture run fetch(key, true)
+    ⊤ ▷ a : Δ outcome(c) ▸ found {next_key, valid} │ missing {}
+    a.missing ▷ ■ ok {0}
+    a.found ▷ b : ? valid
+    b.false ▷ ■ ok {1}
+    b.true ▷ r : Δ run fetch(next_key, false) ▸ found {value, use_it} │ missing {}
+    r.missing ▷ ■ ok {2}
+    r.found ▷ t : ? use_it
+    t.true ▷ ■ ok {value}
+    t.false ▷ ■ ok {3}
+
+//! run twice(4) with [fetch -> found {8, true}; fetch -> found {37, true}] => done ok {37} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> found {37, true}]
+//! run twice(4) with [fetch -> missing] => done ok {0} trace [fetch(4, true) -> missing]
+//! run twice(4) with [fetch -> found {8, false}] => done ok {1} trace [fetch(4, true) -> found {8, false}]
+//! run twice(4) with [fetch -> found {8, true}; fetch -> missing] => done ok {2} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> missing]
+//! run twice(4) with [fetch -> found {8, true}; fetch -> found {37, false}] => done ok {3} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> found {37, false}]
+
+async control tag(n : usize) ■ { got {value : usize} }
+    ⊤ ▷ ■ got {n}
+
+// Two outer members are ready throughout the inner runs. The first turn
+// choice is spent at the outer await next.
+async control outer() ■ { ok {value : usize, first : usize, second : usize} } uses io
+    ⊤ ▷ ~set : tasks⟨tag⟩ := tasks⟨tag⟩()
+    ⊤ ▷ spawn tag(11) into set
+    ⊤ ▷ spawn tag(22) into set
+    ⊤ ▷ h : Δ twice(4) ▸ ok {value}
+    ⊤ ▷ a : Δ await next(set) ▸ got {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(set) ▸ got {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(set) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {value, first, second}
+
+control example() ■ { ok {value : usize} } uses io
+    ⊤ ▷ d : Δ run outer() ▸ ok {value, first, second}
+    d.ok ▷ ■ ok {value}
+
+//! run outer() with [fetch -> found {8, true}; fetch -> found {37, true}] => done ok {37, 11, 22} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> found {37, true}]
+//! run outer() with [fetch -> found {8, true}; fetch -> found {37, true}] turns [1] => done ok {37, 22, 11} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> found {37, true}]
+
+extern async control tick() ■ { ok {} } uses io
+control bridge() ■ { ok {} } uses io
+    ⊤ ▷ r : Δ run tick() ▸ ok {}
+    r.ok ▷ ■ ok {}
+
+//! run bridge() with [tick -> ok] => done ok trace [tick() -> ok]
+
+extern async control exchange(xs : [u32]) ■ { item {data : [u32]} } uses io
+control swap(xs : [u32]) ■ { ok {result : [u32]} } uses io
+    ⊤ ▷ r := capture run exchange(▾xs)
+    ⊤ ▷ d : Δ outcome(▾r) ▸ item {data}
+    d.item ▷ ■ ok {▾data}
+
+//! run swap([9, 10]) with [exchange -> item {[12, 13, 14]}] => done ok {[12, 13, 14]} trace [exchange([9, 10]) -> item {[12, 13, 14]}]
+
+// A run may return a resource that has no release on fault. The caller
+// consumes it exactly once.
+extern resource lock
+extern async control acquire(id : u32) ■ { got {item : lock} } uses io
+extern control close_lock(item : lock) ■ { ok {} } uses io
+control use_lock() ■ { ok {} } uses io
+    ⊤ ▷ a : Δ run acquire(7) ▸ got {item}
+    a.got ▷ c : Δ close_lock(▾item) ▸ ok {}
+    c.ok ▷ ■ ok {}
+
+//! run use_lock() with [acquire -> got {lock#7}; close_lock -> ok] => done ok trace [acquire(7) -> got {lock#7}; close_lock(lock#7) -> ok]
+
+// The same host control also has an ordinary await site in this module.
+async control mixed() ■ { ok {value : usize} } uses io
+    ⊤ ▷ d : Δ twice(4) ▸ ok {key}
+    ⊤ ▷ a : Δ await fetch(key, false) ▸ found {value, valid} │ missing {}
+    a.missing ▷ ■ ok {0}
+    a.found ▷ ■ ok {value}
+
+//! run mixed() with [fetch -> found {8, true}; fetch -> missing; fetch -> found {19, true}] => done ok {19} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> missing; fetch(2, false) -> found {19, true}]

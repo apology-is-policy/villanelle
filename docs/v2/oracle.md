@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.18). The oracle of slice 1 and its
+roots, direct runs of nonfaulting and noncancellable host operations, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.19). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2621,6 +2621,29 @@ each waiting and ready offer, request identity and bound operands. It supplies
 the byte 2 for true in both a capture and a decision. The scripted native
 host uses the only pending operation and consumes its answer at completion.
 
+### 18.19 A direct run of a host operation, 26 November 2026
+
+In `run fetch(...)`, the host operation itself is the root of the fresh run
+([E-Run]). The caller binds inputs and result slots and starts the same
+typed request described in section 18.18. The host selects the sole pending
+operation and completes it. That ends the run. The caller immediately receives
+the chosen alternative and its fields, in a decision or a capture. A module
+using only direct host runs needs `vn2_pick_waiting` and can link without
+`vn2_pick_turn`.
+
+Tasks ready in an enclosing run keep their place while the inner run executes.
+In `checked_host_run.core`, two successive calls to `fetch` finish before the
+host is offered either outer member. The caller receives 37. The first scripted
+turn still determines whether the caller receives member 11 or member 22 first.
+
+Run `vn2 test tests/slice4/checked_host_run.core` and
+`cargo test --test backend_slice4 direct_host_runs` from `v2/`. The fixture
+also transfers an owned vector and returns a resource whose type has no
+fault release. The caller consumes that resource once. A linked C host checks
+the order of waiting, completion and ready offers, and writes byte 2 for true
+to the boolean result slot. The native subset here covers noncancellable,
+nonfaulting host operations.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2632,7 +2655,7 @@ host uses the only pending operation and consumes its answer at completion.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs host waits with competing tasks, direct extern roots, cancellation, member faults, capacity and
+- **Later work.** Slice 4 still needs host waits with competing tasks, cancellation, faulting host operations, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
