@@ -1,5 +1,5 @@
 ; A queue holds its head and the address of the link to fill on append.
-; One ready queue and count serve all sets in the owner. Each set holds
+; One ready queue and count serve all sets in the run. Each set holds
 ; its own completion queue, undelivered count, producer entry and spare frame.
 %vn2.queue = type { ptr, ptr }
 %vn2.scheduler = type { %vn2.queue, i64 }
@@ -9,11 +9,19 @@
 
 declare void @llvm.trap()
 
-define internal fastcc void @vn2_scheduler_init(ptr %scheduler) {
+; An awaited owner joins the current run. The first owner in a fresh run
+; supplies storage that stays live until its last set has been drained.
+define internal fastcc ptr @vn2_owner_scheduler(ptr %inherited, ptr %scheduler) {
+entry:
+  %fresh = icmp eq ptr %inherited, null
+  br i1 %fresh, label %initialize, label %inherit
+inherit:
+  ret ptr %inherited
+initialize:
   store %vn2.scheduler zeroinitializer, ptr %scheduler
   %tail = getelementptr %vn2.queue, ptr %scheduler, i32 0, i32 1
   store ptr %scheduler, ptr %tail
-  ret void
+  ret ptr %scheduler
 }
 
 define internal fastcc void @vn2_pool_init(ptr %pool, ptr %resume) {

@@ -1,0 +1,74 @@
+// Outer and inner packets share a producer. Their payloads go to different sets.
+extern control sample(mark : u32) ■ { ok {value : u32} } uses clock
+
+async control packet(mark : u32, xs : [u32]) ■ { got {data : [u32], turn : u32} } uses clock
+    ⊤ ▷ p : Δ sample(mark) ▸ ok {seen}
+    p.ok ▷ ■ got {▾xs, seen}
+
+async control tick() ■ { ok {} } uses clock
+    ⊤ ▷ p : Δ sample(4) ▸ ok {seen}
+    ⊤ ▷ ■ ok {}
+
+async control inner(xs : [u32]) ■ { got {data : [u32], turn : u32} } uses clock
+    ⊤ ▷ ~packets : tasks⟨packet⟩ := tasks⟨packet⟩()
+    ⊤ ▷ spawn packet(2, ▾xs) into packets
+    ⊤ ▷ t : Δ await tick() ▸ ok {}
+    ⊤ ▷ a : Δ await next(packets) ▸ got {data, turn} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ p : Δ sample(3) ▸ ok {seen}
+    ⊤ ▷ b : Δ await next(packets) ▸ got {extra, n} │ empty {}
+    b.got ▷ ⊥
+    b.empty ▷ ■ got {▾data, turn}
+
+control fresh(xs : [u32]) ■ { got {data : [u32], turn : u32} } uses clock
+    ⊤ ▷ r : Δ run inner(▾xs) ▸ got {data, turn}
+    r.got ▷ ■ got {▾data, turn}
+
+async control relay(xs : [u32], fresh_run : bool) ■ { got {data : [u32], turn : u32} } uses clock
+    ⊤ ▷ b : ? fresh_run
+    b.true ▷ r : Δ fresh(▾xs) ▸ got {own, rm}
+    r.got ▷ ■ got {▾own, rm}
+    b.false ▷ a : Δ await inner(▾xs) ▸ got {shared, am}
+    a.got ▷ ■ got {▾shared, am}
+
+async control outer(fresh_run : bool)
+    ■ { ok {outer_data : [u32], inner_data : [u32], outer_turn : u32, inner_turn : u32} } uses clock
+    ⊤ ▷ ~packets : tasks⟨packet⟩ := tasks⟨packet⟩()
+    ⊤ ▷ spawn packet(1, [11]) into packets
+    ⊤ ▷ i : Δ await relay([22], fresh_run) ▸ got {inside, it}
+    ⊤ ▷ a : Δ await next(packets) ▸ got {outside, ot} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(packets) ▸ got {extra, n} │ empty {}
+    b.got ▷ ⊥
+    b.empty ▷ ■ ok {▾outside, ▾inside, ot, it}
+
+control example() ■ { ok {mark : u32} } uses clock
+    ⊤ ▷ r : Δ run outer(false) ▸ ok {outside, inside, ot, it}
+    r.ok ▷ ■ ok {it}
+
+//! run outer(false) with [sample -> ok {40}; sample -> ok {10}; sample -> ok {20}; sample -> ok {30}] => done ok {[11], [22], 10, 20} trace [sample(4) -> ok {40}; sample(1) -> ok {10}; sample(2) -> ok {20}; sample(3) -> ok {30}]
+//! run outer(false) with [sample -> ok {40}; sample -> ok {20}; sample -> ok {30}; sample -> ok {10}] turns [0, 0, 0, 1] => done ok {[11], [22], 10, 20} trace [sample(4) -> ok {40}; sample(2) -> ok {20}; sample(3) -> ok {30}; sample(1) -> ok {10}]
+//! run outer(false) with [sample -> ok {20}; sample -> ok {40}; sample -> ok {30}; sample -> ok {10}] turns [0, 0, 2] => done ok {[11], [22], 10, 20} trace [sample(2) -> ok {20}; sample(4) -> ok {40}; sample(3) -> ok {30}; sample(1) -> ok {10}]
+//! run outer(true) with [sample -> ok {40}; sample -> ok {20}; sample -> ok {30}; sample -> ok {10}] => done ok {[11], [22], 10, 20} trace [sample(4) -> ok {40}; sample(2) -> ok {20}; sample(3) -> ok {30}; sample(1) -> ok {10}]
+//! run outer(true) with [sample -> ok {20}; sample -> ok {40}; sample -> ok {30}; sample -> ok {10}] turns [0, 1] => done ok {[11], [22], 10, 20} trace [sample(2) -> ok {20}; sample(4) -> ok {40}; sample(3) -> ok {30}; sample(1) -> ok {10}]
+//! run inner([8]) with [sample -> ok {40}; sample -> ok {20}; sample -> ok {30}] => done got {[8], 20} trace [sample(4) -> ok {40}; sample(2) -> ok {20}; sample(3) -> ok {30}]
+
+// Each recursive activation drains its own set on the way back.
+async control number(n : u32) ■ { got {v : u32} }
+    ⊤ ▷ ■ got {n}
+
+async control collect(depth : u32) ■ { got {data : [u32]} }
+    ⊤ ▷ ~set : tasks⟨number⟩ := tasks⟨number⟩()
+    ⊤ ▷ spawn number(depth) into set
+    ⊤ ▷ ~values : [u32] := []
+    ⊤ ▷ b : ? depth = 0
+    b.false ▷ r : Δ await collect(depth - 1) ▸ got {prior}
+    r.got ▷ values ← ▾prior
+    ⊤ ▷ a : Δ await next(set) ▸ got {value} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ p : Δ push(&~values, value) ▸ done {}
+    ⊤ ▷ e : Δ await next(set) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ got {▾values}
+
+//! run collect(2) => done got {[0, 1, 2]}

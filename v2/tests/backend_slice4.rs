@@ -10,6 +10,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const AWAITED_SET: &str = include_str!("slice4/checked_awaited_set.core");
 const MULTIPLE_SETS: &str = include_str!("slice4/checked_multiple_sets.core");
 const REPEATED_SPAWN: &str = include_str!("slice4/checked_repeated_spawn.core");
 const ROOTS: &str = include_str!("slice4/checked_run.core");
@@ -171,6 +172,12 @@ fn repeated_spawn_stops_before_count_would_exceed_the_target_limit() {
             );
         }
     }
+}
+
+#[test]
+fn awaited_set_owners_deliver_their_own_results() {
+    // Ten packet vectors in the outer runs, one in inner, one in collect.
+    compare_native_runs(AWAITED_SET, &["E-Spawn"], &[2, 2, 2, 2, 2, 1, 3], 12);
 }
 
 #[test]
@@ -515,6 +522,52 @@ fn the_owner_receives_a_sibling_while_a_nested_member_is_suspended() {
 }
 
 #[test]
+fn awaited_set_owners_offer_inner_and_outer_members_in_spawn_order() {
+    // At the inner next, the outer packet can finish without waking the owner.
+    compare_sampled_example(
+        AWAITED_SET,
+        "awaited_set_outer_first",
+        [0, 0, 0, 0],
+        &[
+            "ready 2",
+            "ready 2",
+            "ready 3",
+            "sample 4 at 3",
+            "ready 2",
+            "sample 1 at 4",
+            "ready 1",
+            "sample 2 at 5",
+            "ready 1",
+            "sample 3 at 6",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+        ],
+    );
+    // Selecting the inner packet wakes the owner while the outer packet is ready.
+    compare_sampled_example(
+        AWAITED_SET,
+        "awaited_set_inner_first",
+        [0, 0, 0, 1],
+        &[
+            "ready 2",
+            "ready 2",
+            "ready 3",
+            "sample 4 at 3",
+            "ready 2",
+            "sample 2 at 4",
+            "ready 2",
+            "sample 3 at 5",
+            "ready 2",
+            "ready 1",
+            "sample 1 at 7",
+            "ready 1",
+            "ready 1",
+        ],
+    );
+}
+
+#[test]
 fn multiple_sets_offer_all_ready_members_in_spawn_order() {
     // Two packets finish before the stamp. Neither wakes the waiting owner.
     compare_sampled_example(
@@ -694,11 +747,9 @@ async control owner() ■ { ok {} }
     let suspend = "⊤ ▷ w : Δ await idle() ▸ ok {}";
     let new_set = "⊤ ▷ ~other : tasks⟨child⟩ := tasks⟨child⟩()\n    ⊤ ▷ q : Δ await next(other) ▸ ok {} │ empty {}\n    q.ok ▷ ⊥";
     for (source, reason) in [
-        (base.replace("async control idle", &format!("async control leaf() ■ {{ ok {{}} }}\n    {new_set}\n    ⊤ ▷ ■ ok {{}}\n\nasync control idle"))
-            .replace("async control idle() ■ { ok {} }", "async control idle() ■ { ok {} }\n    ⊤ ▷ w : Δ await leaf() ▸ ok {}")
-            .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "task-set owner `owner` awaiting `leaf`, which creates a set"),
         (base.replace("async control idle() ■ { ok {} }", &format!("async control idle() ■ {{ ok {{}} }}\n    {new_set}"))
-            .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "task-set owner `owner` awaiting `idle`, which creates a set"),
+            .replace("⊤ ▷ q : Δ await next(other)", "⊤ ▷ cancel other\n    ⊤ ▷ q : Δ await next(other)")
+            .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "control `idle`: the native backend does not yet support task set cancellation"),
         (base.replace("async control idle() ■ { ok {} }", "async control idle() ■ { ok {} } faults")
             .replace("async control owner() ■ { ok {} }", &format!("async control owner() ■ {{ ok {{}} }} faults\n    {suspend}")), "a faulting or terminating call in a task-set owner"),
         (base.replace("async control idle", "extern async control read() ■ { ok {} } uses io\n\nasync control idle")

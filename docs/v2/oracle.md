@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.14). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.15). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2381,9 +2381,10 @@ returns to the outer run and reaches another await.
 
 The internal async entry takes a pointer to the owner’s scheduler. Each set
 records its producer's resume function. A public C entry and a fresh run
-start without inherited children. The native backend follows the owner's await calls to check that
-their targets are defined, have no set of their own and cannot fault or
-terminate the run. Section 18.10 extends nested suspension to a spawned member.
+start without inherited children. At this checkpoint, targets on the owner's await chain had to be defined,
+have no set of their own and neither fault nor terminate. Section 18.10
+extends nested suspension to a spawned member. Section 18.15 covers sets
+created on the owner's await chain.
 
 From `v2/`, run `vn2 test tests/slice4/checked_nested_owner_await.core`
 and `cargo test --test backend_slice4`. The fixture gives the child the
@@ -2516,6 +2517,26 @@ the same accesses to a different local. While the payload is still used,
 each conflict is rejected and the oracle gets stuck. Each access to the
 different local is accepted and the oracle reaches the owner's exit.
 
+### 18.15 Task sets in an awaited callee, 26 November 2026
+
+A defined callee on the root task's await chain can create and drain its
+own sets. The first activation that owns a set supplies storage for the run's
+ready queue. Awaited activations use that queue, including through a callee
+that owns no set. Each set keeps its completion queue. At an inner
+`await next`, an outer member can run, but its completion goes back to its
+own set. A fresh `run` starts its own queue.
+
+From `v2/`, run `vn2 test tests/slice4/checked_awaited_set.core` and
+`cargo test --test backend_slice4 awaited_set_owners`. In `outer(false)`
+the host sees three choices at the await inside `inner`: the root, the
+outer packet and the inner packet. At the following `await next` only
+the two packets are eligible. Selecting the outer packet leaves one ready
+task, the inner packet. Selecting the inner packet first gives the root
+a turn while the outer packet is still ready. In both schedules the two
+callers receive their own vectors. `outer(true)` enters the same inner
+control through a fresh run. In `collect(2)` three recursive activations
+drain distinct sets of the same producer and return `[0, 1, 2]`.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2527,7 +2548,7 @@ different local is accepted and the oracle reaches the owner's exit.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs sets created in members and awaited callees,
+- **Later work.** Slice 4 still needs sets created by spawned members or by their awaited callees,
   host waits, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list

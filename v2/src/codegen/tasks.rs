@@ -77,7 +77,14 @@ pub(super) fn emit_support<'a>(
         // A run starts its own scheduler. Only await extends this task's stack.
         let mut pending: Vec<_> = awaits(member.body.as_ref().unwrap()).collect();
         while let Some(callee) = pending.pop() {
-            let body = awaited_body(&program.controls[callee], "member", &member.name)?;
+            let target = &program.controls[callee];
+            let body = awaited_body(target, "member", &member.name)?;
+            if producers(body).next().is_some() {
+                return Err(format!(
+                    "the native backend does not yet support task-set member `{}` awaiting `{}`, which creates a set",
+                    member.name, target.name
+                ));
+            }
             if awaits(body).next().is_some() && nested.insert(callee) {
                 pending.extend(awaits(body));
             }
@@ -129,12 +136,6 @@ fn awaited_body<'a>(
             target.name
         ));
     };
-    if producers(body).next().is_some() {
-        return Err(format!(
-            "the native backend does not yet support task-set {role} `{caller}` awaiting `{}`, which creates a set",
-            target.name
-        ));
-    }
     Ok(body)
 }
 
@@ -381,9 +382,9 @@ fn pool(em: &mut IrEmitter<'_, '_>, set: VarId) -> String {
 pub(super) fn init_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) {
     if producers(body).next().is_some() {
         em.slots
-            .push(("%local_scheduler".into(), "%vn2.scheduler".into()));
+            .push(("%root_scheduler".into(), "%vn2.scheduler".into()));
         em.code
-            .push_str("  call fastcc void @vn2_scheduler_init(ptr %local_scheduler)\n");
+            .push_str("  %task_scheduler = call fastcc ptr @vn2_owner_scheduler(ptr %owner_scheduler, ptr %root_scheduler)\n");
     }
 }
 
@@ -394,7 +395,7 @@ pub(super) fn choose_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) -> &'
         return "null";
     }
     let scheduler = if producers(body).next().is_some() {
-        "%local_scheduler"
+        "%task_scheduler"
     } else {
         "%owner_scheduler"
     };
@@ -469,7 +470,7 @@ pub(super) fn spawn(
     };
     let _ = writeln!(
         em.code,
-        "  call fastcc void @vn2_spawn(ptr %local_scheduler, ptr {ptr}, ptr {frame}, i1 {repeated}, i64 {max})"
+        "  call fastcc void @vn2_spawn(ptr %task_scheduler, ptr {ptr}, ptr {frame}, i1 {repeated}, i64 {max})"
     );
 }
 
@@ -487,7 +488,7 @@ pub(super) fn next(
     let join = em.fresh_label("pool_result");
     let _ = writeln!(
         em.code,
-        "  {frame} = call fastcc ptr @vn2_next(ptr %local_scheduler, ptr {ptr})"
+        "  {frame} = call fastcc ptr @vn2_next(ptr %task_scheduler, ptr {ptr})"
     );
     let _ = writeln!(
         em.code,
