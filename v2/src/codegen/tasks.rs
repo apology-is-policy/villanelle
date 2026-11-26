@@ -176,14 +176,9 @@ fn emit_member<'a>(
         .body
         .as_ref()
         .expect("[W10] requires a defined producer");
-    let lends_result = member
-        .contract
-        .iter()
-        .flat_map(|alt| &alt.fields)
-        .any(|p| program.contains_borrow_or_view(&p.ty));
-    if member.faults || term_tys[id].is_some() || lends_result || producers(body).next().is_some() {
+    if member.faults || term_tys[id].is_some() || producers(body).next().is_some() {
         return Err(format!(
-            "the native backend needs a nonfaulting task-set producer with owned or copy results and no task set of its own for `{}`",
+            "the native backend needs a nonfaulting task-set producer with no task set of its own for `{}`",
             member.name
         ));
     }
@@ -515,8 +510,9 @@ pub(super) fn next(
         "  {tag} = phi i32 [ {}, %{empty_label} ], [ {member_tag}, %{member_label} ]",
         member.contract.len()
     );
-    // Only the selected alternative loads through these addresses. Empty has
-    // no fields; an ordinary (non-inbounds) GEP does not dereference its base.
+    // The selected arm loads each value before the frame can be reused. For a
+    // borrow this copies the pointer into the owner's slot. Empty has no fields;
+    // an ordinary (non-inbounds) GEP does not dereference its base.
     let mut index = FIRST_INPUT + member.parameters.len();
     let mut slots = Vec::new();
     for alt in &member.contract {

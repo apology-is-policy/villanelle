@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.13). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.14). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2309,7 +2309,7 @@ body. Each site runs at most once per invocation. Section 18.11 covers
 spawns inside loops.
 Decisions on `await next` can repeat in a loop. Section 18.6 covers producers
 that finish in one turn. Section 18.7 extends this to defined awaits. A
-producer at that checkpoint took and returned owned or copy values and let no fault escape. Section 18.13 adds borrowed inputs.
+producer at that checkpoint took and returned owned or copy values and let no fault escape. Sections 18.13 and 18.14 add borrowed inputs and results.
 Section 18.8 covers defined awaits in the owner. Host waits, cancellation,
 faulting calls and fault boundaries in an owner still give diagnostics. A synchronous call that starts a nested run uses a
 separate invocation. The scripted native host consumes one `turns` choice
@@ -2490,6 +2490,32 @@ the owner writing a shared lender or reading an exclusive lender. Each
 conflict is rejected and gets stuck in the oracle. Moving that access
 after the drain is accepted and the oracle reaches the owner's exit.
 
+### 18.14 Borrowed task results, 26 November 2026
+
+At `await next`, the selected arm loads the result from the completed
+member's frame into the owner's payload slot. For a shared or exclusive
+borrow, the value it loads is the address the member returned. A view
+carries the addresses of its fields in the same way. The owner can keep
+the payload through another spawn that reuses the member frame and through
+the empty arm that frees it. Under [TK3] the payload inherits the loans
+held by its set and continues to hold them while it is live.
+
+From `v2/`, run `vn2 test tests/slice4/checked_borrowed_result.core` and
+`cargo test --test backend_slice4 borrowed_results_keep`. In `order`, two
+suspended members return different fields of the same owner record. Two
+schedules deliver the values in opposite orders. In `recycle`, two loop
+spawns use one heap frame. After draining the set the owner reads 79
+through the first reference and 31 through the second. In `edit`, one set
+delivers a shared reference. Another delivers either an exclusive reference
+or a view containing shared and exclusive fields. Writing through each
+alternative after draining both sets changes the selected owner field.
+
+The checker test `await_next_payload_holds_the_loan_after_the_set_is_consumed_tk3`
+pairs a write to a shared lender and a read of an exclusive lender with
+the same accesses to a different local. While the payload is still used,
+each conflict is rejected and the oracle gets stuck. Each access to the
+different local is accepted and the oracle reaches the owner's exit.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2501,8 +2527,8 @@ after the drain is accepted and the oracle reaches the owner's exit.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs sets created in members and awaited callees, borrowed
-  results at delivery, host waits, cancellation, member faults, capacity and
+- **Later work.** Slice 4 still needs sets created in members and awaited callees,
+  host waits, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).

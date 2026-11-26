@@ -843,26 +843,35 @@ fn a_set_carries_its_loans_into_the_next_iteration_tk3() {
 
 #[test]
 fn await_next_payload_holds_the_loan_after_the_set_is_consumed_tk3() {
-    let member = r#"
-async control member(r : &u32) ■ { item {out : &u32 ∈ r} }
-    ⊤ ▷ ■ item {r}
-"#;
-    for (write, conflicts) in [("x", true), ("y", false)] {
-        let body = format!(
-            r#"
-    ⊤ ▷ spawn member(&x) into pool
+    for (ty, loan, use_item) in [
+        ("&u32", "&x", "seen : u32 := item"),
+        ("&~u32", "&~x", "item ← 9"),
+    ] {
+        let member = format!(
+            "async control member(r : {ty}) ■ {{ item {{out : {ty} ∈ r}} }}\n    ⊤ ▷ ■ item {{r}}"
+        );
+        for (place, conflicts) in [("x", true), ("y", false)] {
+            let access = if ty == "&u32" {
+                format!("{place} ← 7")
+            } else {
+                format!("seen : u32 := {place}")
+            };
+            let body = format!(
+                r#"
+    ⊤ ▷ spawn member({loan}) into pool
     ⊤ ▷ n : Δ await next(pool) ▸ item {{item}} │ empty {{}}
     n.empty ▷ ⊥
     n.item ▷ e : Δ await next(pool) ▸ item {{unused}} │ empty {{}}
     e.item ▷ ⊥
-    e.empty ▷ {write} ← 7
-    e.empty ▷ seen : u32 := item
+    e.empty ▷ {access}
+    e.empty ▷ {use_item}
     e.empty ▷ ■ ok {{}}"#
-        );
-        if conflicts {
-            stuck_and_rejected("L3", &task_loan_program(member, &body, "stuck X4 B1"));
-        } else {
-            done_and_accepted("TK3", &task_loan_program(member, &body, "done ok"));
+            );
+            if conflicts {
+                stuck_and_rejected("L3", &task_loan_program(&member, &body, "stuck X4 B1"));
+            } else {
+                done_and_accepted("TK3", &task_loan_program(&member, &body, "done ok"));
+            }
         }
     }
 }

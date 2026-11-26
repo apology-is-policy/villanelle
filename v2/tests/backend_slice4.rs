@@ -103,6 +103,17 @@ fn borrowed_spawn_inputs_keep_the_owner_places_across_turns() {
 }
 
 #[test]
+fn borrowed_results_keep_their_origins_after_delivery_and_frame_reuse() {
+    // The second loop spawn in recycle takes the first delivered frame.
+    compare_native_runs(
+        include_str!("slice4/checked_borrowed_result.core"),
+        &["E-Spawn"],
+        &[2, 2, 2, 2, 2],
+        1,
+    );
+}
+
+#[test]
 fn repeated_spawns_preserve_each_member_until_its_payload_is_delivered() {
     // The alternating run visits its spawn four times and needs one heap frame.
     compare_native_runs(REPEATED_SPAWN, &["E-Spawn"], &[0, 1, 4, 4, 2, 4], 29);
@@ -658,7 +669,7 @@ fn compare_c_host(
 }
 
 #[test]
-fn task_set_diagnostics_cover_unsupported_awaits_sets_and_loans() {
+fn task_set_diagnostics_cover_unsupported_awaits_sets_and_faults() {
     let base = r#"
 async control idle() ■ { ok {} }
     ⊤ ▷ ■ ok {}
@@ -679,7 +690,6 @@ async control owner() ■ { ok {} }
 
 //! run owner() turns [1] => done ok
 "#;
-    let spawn = "⊤ ▷ spawn child(v) into pool";
     let next_owner = "⊤ ▷ lp : ↻ drain()";
     let suspend = "⊤ ▷ w : Δ await idle() ▸ ok {}";
     let new_set = "⊤ ▷ ~other : tasks⟨child⟩ := tasks⟨child⟩()\n    ⊤ ▷ q : Δ await next(other) ▸ ok {} │ empty {}\n    q.ok ▷ ⊥";
@@ -708,11 +718,8 @@ async control owner() ■ { ok {} }
             .replace("turns [1] => done ok", "with [read -> ok] turns [1] => done ok trace [read() -> ok]"), "await of extern `read` in task-set member"),
         (base.replace("async control idle() ■ { ok {} }", "async control unit() ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control idle() ■ { ok {} }\n    ⊤ ▷ ~set : tasks⟨unit⟩ := tasks⟨unit⟩()\n    ⊤ ▷ n : Δ await next(set) ▸ ok {} │ empty {}\n    n.ok ▷ ⊥")
             .replace("child(value : usize) ■ { ok {} }", &format!("child(value : usize) ■ {{ ok {{}} }}\n    {suspend}")), "task-set member `child` awaiting `idle`, which creates a set"),
-        (base.replace("async control owner", "async control borrower(value : &usize) ■ { ok {loan : &usize ∈ value} }\n    ⊤ ▷ ■ ok {value}\n\nasync control owner")
-            .replace(next_owner, &format!("⊤ ▷ ~other : tasks⟨borrower⟩ := tasks⟨borrower⟩()\n    ⊤ ▷ spawn borrower(&v) into other\n    ⊤ ▷ a : Δ await next(other) ▸ ok {{loan}} │ empty {{}}\n    a.empty ▷ ⊥\n    ⊤ ▷ b : Δ await next(other) ▸ ok {{extra}} │ empty {{}}\n    b.ok ▷ ⊥\n    {next_owner}")), "owned or copy results and no task set of its own for `borrower`"),
-        (base.replace(spawn, &format!("⊤ ▷ l : ↻ once() {{\n        {spawn}\n        ⊤ ▷ □ added {{}}\n    }} ▸ added {{}}"))
-            .replace("child(value : usize) ■ { ok {} }\n    ⊤ ▷ ■ ok {}", "child(value : &usize) ■ { ok {loan : &usize ∈ value} }\n    ⊤ ▷ ■ ok {value}")
-            .replace("child(v)", "child(&v)").replace("next(pool) ▸ ok {}", "next(pool) ▸ ok {loan}"), "owned or copy results"),
+        (base.replace("async control owner", &format!("async control borrower(value : &usize) ■ {{ ok {{loan : &usize ∈ value}} }}\n    {new_set}\n    ⊤ ▷ ■ ok {{value}}\n\nasync control owner"))
+            .replace(next_owner, &format!("⊤ ▷ ~other : tasks⟨borrower⟩ := tasks⟨borrower⟩()\n    ⊤ ▷ spawn borrower(&v) into other\n    ⊤ ▷ a : Δ await next(other) ▸ ok {{loan}} │ empty {{}}\n    a.empty ▷ ⊥\n    ⊤ ▷ b : Δ await next(other) ▸ ok {{extra}} │ empty {{}}\n    b.ok ▷ ⊥\n    {next_owner}")), "no task set of its own for `borrower`"),
         (base.replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} } faults").replace("owner() ■ { ok {} }", "owner() ■ { ok {} } faults"), "nonfaulting"),
     ] {
         let (program, specs) = script::native_runs(&source).unwrap();

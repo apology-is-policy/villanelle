@@ -1,0 +1,84 @@
+// The same producer can return either declared origin after suspending.
+struct cells {left : u32, right : u32}
+
+async control tick() ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+async control choose(a : &u32, b : &u32, second : bool)
+    ■ { item {out : &u32 ∈ a, b} }
+    ⊤ ▷ t : Δ await tick() ▸ ok {}
+    ⊤ ▷ s : ? second
+    s.false ▷ ■ item {a}
+    s.true ▷ ■ item {b}
+
+async control order() ■ { ok {first : u32, second : u32} }
+    ⊤ ▷ x : cells := cells {17, 83}
+    ⊤ ▷ ~pool : tasks⟨choose⟩ := tasks⟨choose⟩()
+    ⊤ ▷ spawn choose(&x.left, &x.right, false) into pool
+    ⊤ ▷ spawn choose(&x.left, &x.right, true) into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ item {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(pool) ▸ item {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ item {extra} │ empty {}
+    e.item ▷ ⊥
+    e.empty ▷ ■ ok {first, second}
+
+//! run order() => done ok {17, 83}
+//! run order() turns [0, 1, 1] => done ok {83, 17}
+
+// Keep the first loan across a second heap spawn in the same set.
+// Consuming the empty set frees the cached frame before either read.
+async control recycle() ■ { ok {first : u32, second : u32} }
+    ⊤ ▷ x : cells := cells {31, 79}
+    ⊤ ▷ ~pool : tasks⟨choose⟩ := tasks⟨choose⟩()
+    ⊤ ▷ l : ↻ once() {
+        ⊢ count(pool) = 0
+        ⊤ ▷ spawn choose(&x.left, &x.right, true) into pool
+        ⊤ ▷ □ added {}
+    } ▸ added {}
+    ⊤ ▷ a : Δ await next(pool) ▸ item {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ m : ↻ refill() {
+        ⊢ count(pool) = 0
+        ⊤ ▷ spawn choose(&x.left, &x.right, false) into pool
+        ⊤ ▷ □ added {}
+    } ▸ added {}
+    ⊤ ▷ b : Δ await next(pool) ▸ item {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ item {extra} │ empty {}
+    e.item ▷ ⊥
+    e.empty ▷ ■ ok {first, second}
+
+//! run recycle() => done ok {79, 31}
+
+view struct handle {source : &u32, target : &~u32}
+
+async control lend(x : &~cells, both : bool)
+    ■ { single {out : &~u32 ∈ x} │ pair {out : handle ∈ x} }
+    ⊤ ▷ b : ? both
+    b.false ▷ ■ single {&~x.right}
+    b.true ▷ ■ pair {handle {&x.right, &~x.left}}
+
+async control edit(both : bool) ■ { ok {left : u32, right : u32} }
+    ⊤ ▷ ~x : cells := cells {5, 12}
+    ⊤ ▷ values : cells := cells {48, 97}
+    ⊤ ▷ ~numbers : tasks⟨choose⟩ := tasks⟨choose⟩()
+    ⊤ ▷ spawn choose(&values.left, &values.right, true) into numbers
+    ⊤ ▷ ~pool : tasks⟨lend⟩ := tasks⟨lend⟩()
+    ⊤ ▷ spawn lend(&~x, both) into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ single {slot} │ pair {ports} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ single {unused} │ pair {extra} │ empty {}
+    e.single ▷ ⊥
+    e.pair ▷ ⊥
+    ⊤ ▷ n : Δ await next(numbers) ▸ item {value} │ empty {}
+    n.empty ▷ ⊥
+    ⊤ ▷ z : Δ await next(numbers) ▸ item {more} │ empty {}
+    z.item ▷ ⊥
+    a.single ▷ slot ← value
+    a.pair ▷ ports.target ← ports.source
+    ⊤ ▷ ■ ok {x.left, x.right}
+
+//! run edit(false) => done ok {5, 97}
+//! run edit(true) => done ok {12, 12}
