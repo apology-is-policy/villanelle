@@ -2861,8 +2861,13 @@ enum UnwindTarget {
 
 #[derive(Clone, Copy)]
 enum UnitKind {
-    Control { id: ControlId, member: bool },
-    NamedBoundaryB1 { id: BoundaryId },
+    Control {
+        id: ControlId,
+        frame: Option<tasks::Frame>,
+    },
+    NamedBoundaryB1 {
+        id: BoundaryId,
+    },
     NamedBoundaryB2,
 }
 
@@ -2874,7 +2879,7 @@ struct IrEmitter<'a, 'r> {
     program: &'a Program,
     reg: &'r mut RuntimeRegistry<'a>,
     slots: Vec<(String, String)>,
-    /// Resume labels of a spawned control. Its slots live in the member frame.
+    /// Resume labels within one activation of a spawned task.
     resume_points: Option<Vec<String>>,
     code: String,
     next_reg: usize,
@@ -3909,8 +3914,7 @@ fn emit_body_unit<'a>(
     let plan = plan;
     let mut emitter = IrEmitter::new(program, reg);
 
-    let member = matches!(unit, UnitKind::Control { member: true, .. });
-    if member {
+    if matches!(unit, UnitKind::Control { frame: Some(_), .. }) {
         emitter.resume_points = Some(Vec::new());
     } else {
         let is_control = matches!(unit, UnitKind::Control { .. });
@@ -4699,15 +4703,31 @@ fn emit_body_unit<'a>(
         }
     }
 
-    if let (UnitKind::Control { id, .. }, Some(points)) = (unit, &emitter.resume_points) {
-        tasks::emit_member_entry(
-            out,
-            program,
+    if let (
+        UnitKind::Control {
             id,
-            emitter.reg.usize_bits,
-            &emitter.slots,
-            points,
-        );
+            frame: Some(frame),
+        },
+        Some(points),
+    ) = (unit, &emitter.resume_points)
+    {
+        match frame {
+            tasks::Frame::Member => {
+                tasks::emit_member_entry(
+                    out,
+                    program,
+                    id,
+                    emitter.reg.usize_bits,
+                    &emitter.slots,
+                    points,
+                );
+            }
+            tasks::Frame::Nested => {
+                let fields =
+                    await_fields(program, id, term_tys[id].is_some(), emitter.reg.usize_bits);
+                tasks::emit_nested_entry(out, id, &fields, &emitter.slots, points);
+            }
+        }
     } else {
         let _ = writeln!(out, "entry:");
         emitter.emit_stack_slots(out);
@@ -4866,24 +4886,15 @@ fn emit_operation_call(
                     );
                     let _ = writeln!(em.code, "  store {arg}, ptr {slot}");
                 }
-                let peers = if let Some(points) = &mut em.resume_points {
-                    // Resume after the operands and result destinations have been
-                    // bound. The selected task enters the awaited body on this turn.
-                    let pc = points.len() + 1;
-                    let label = format!("member_resume_{pc}");
-                    points.push(label.clone());
+                if em.resume_points.is_some() {
+                    tasks::await_in_member(em, *cid, &frame, &tag_reg);
+                } else {
+                    let peers = tasks::choose_owner(em, body);
                     let _ = writeln!(
                         em.code,
-                        "  store i32 {pc}, ptr %member_state\n  ret i32 -3\n{label}:"
+                        "  {tag_reg} = call fastcc i32 @vn2_resume_{cid}(ptr {frame}, ptr {peers})"
                     );
-                    "null".into()
-                } else {
-                    tasks::choose_owner(em, body)
-                };
-                let _ = writeln!(
-                    em.code,
-                    "  {tag_reg} = call fastcc i32 @vn2_resume_{cid}(ptr {frame}, ptr {peers})"
-                );
+                }
             } else if is_extern {
                 let _ = writeln!(
                     em.code,
@@ -5607,7 +5618,7 @@ fn emit_program_bodies<'a>(
                 program,
                 reg,
                 term_tys,
-                UnitKind::Control { id, member: false },
+                UnitKind::Control { id, frame: None },
                 &format!("vn2_ctrl_{id}"),
                 &params,
                 body,
@@ -5629,6 +5640,43 @@ fn emit_program_bodies<'a>(
     Ok(())
 }
 
+// Layout shared by the ordinary continuation and a resumable member callee.
+fn await_fields(
+    program: &Program,
+    id: ControlId,
+    terminates: bool,
+    bits: u32,
+) -> Vec<(String, String)> {
+    let control = &program.controls[id];
+    let mut fields: Vec<_> = control
+        .parameters
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (llvm_ty(program, &p.ty, bits), format!("%p{i}")))
+        .collect();
+    for (a, alt) in control.contract.iter().enumerate() {
+        for f in 0..alt.fields.len() {
+            fields.push(("ptr".into(), format!("%out_{a}_{f}")));
+        }
+    }
+    if control.faults {
+        fields.push(("ptr".into(), "%out_fault".into()));
+    }
+    if terminates {
+        fields.push(("ptr".into(), "%out_term".into()));
+    }
+    fields
+}
+
+fn load_await_fields(out: &mut String, id: ControlId, fields: &[(String, String)]) {
+    for (i, (ll, name)) in fields.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "  %bound{i} = getelementptr %vn2.await.{id}, ptr %frame, i32 0, i32 {i}\n  {name} = load {ll}, ptr %bound{i}"
+        );
+    }
+}
+
 /// Enter an awaited control on its chosen turn with the bound operands and
 /// the set of the same owner task. Fresh runs start with a null set.
 fn emit_await_continuations(
@@ -5639,35 +5687,18 @@ fn emit_await_continuations(
     awaited: &BTreeSet<ControlId>,
 ) {
     for &id in awaited {
-        let control = &program.controls[id];
-        let mut fields: Vec<String> = control
-            .parameters
-            .iter()
-            .map(|p| llvm_ty(program, &p.ty, usize_bits))
-            .collect();
-        let output_count = control
-            .contract
-            .iter()
-            .map(|alt| alt.fields.len())
-            .sum::<usize>()
-            + usize::from(control.faults)
-            + usize::from(term_tys[id].is_some());
-        fields.extend(std::iter::repeat_n("ptr".to_string(), output_count));
-        let ty = format!("%vn2.await.{id}");
-        let _ = writeln!(out, "{ty} = type {{ {} }}", fields.join(", "));
+        let fields = await_fields(program, id, term_tys[id].is_some(), usize_bits);
+        let types: Vec<_> = fields.iter().map(|(ll, _)| ll.as_str()).collect();
+        let _ = writeln!(out, "%vn2.await.{id} = type {{ {} }}", types.join(", "));
         let _ = writeln!(
             out,
             "define internal fastcc i32 @vn2_resume_{id}(ptr %frame, ptr %owner_pool) nounwind {{"
         );
-        let mut arguments = Vec::with_capacity(fields.len());
-        for (index, field) in fields.iter().enumerate() {
-            let _ = writeln!(
-                out,
-                "  %slot{index} = getelementptr {ty}, ptr %frame, i32 0, i32 {index}"
-            );
-            let _ = writeln!(out, "  %arg{index} = load {field}, ptr %slot{index}");
-            arguments.push(format!("{field} %arg{index}"));
-        }
+        load_await_fields(out, id, &fields);
+        let mut arguments: Vec<_> = fields
+            .iter()
+            .map(|(ll, name)| format!("{ll} {name}"))
+            .collect();
         arguments.push("ptr %owner_pool".into());
         let _ = writeln!(
             out,

@@ -1,0 +1,70 @@
+// A sibling can finish while this member is inside either awaited callee.
+// The owner samples the host after receiving the first vector.
+extern control sample(mark : u32) ■ { ok {value : u32} } uses clock
+
+async control leaf(xs : [usize], cell : &~u32) ■ { got {data : [usize]} } uses clock
+    ⊤ ▷ p : Δ sample(3) ▸ ok {seen}
+    p.ok ▷ cell ← seen
+    ⊤ ▷ ■ got {▾xs}
+
+async control layer(xs : [usize], cell : &~u32) ■ { got {data : [usize]} } uses clock
+    ⊤ ▷ p : Δ sample(2) ▸ ok {seen}
+    ⊤ ▷ l : Δ await leaf(▾xs, cell) ▸ got {data}
+    l.got ▷ ■ got {▾data}
+
+async control middle(xs : [usize]) ■ { got {data : [usize], mark : u32} } uses clock
+    ⊤ ▷ p : Δ sample(1) ▸ ok {seen}
+    ⊤ ▷ ~cell : u32 := 0
+    ⊤ ▷ c := capture await layer(▾xs, &~cell)
+    ⊤ ▷ l : Δ outcome(▾c) ▸ got {data}
+    l.got ▷ ■ got {▾data, cell}
+
+async control worker(xs : [usize], slow : bool) ■ { got {data : [usize], mark : u32} } uses clock
+    ⊤ ▷ b : ? slow
+    b.false ▷ p : Δ sample(9) ▸ ok {seen}
+    b.false ▷ ■ got {▾xs, seen}
+    b.true ▷ m : Δ await middle(▾xs) ▸ got {data, mark}
+    m.got ▷ ■ got {▾data, mark}
+
+async control pair(a : [usize], b : [usize], both : bool)
+    ■ { order {first : [usize], second : [usize], m : u32, n : u32} } uses clock
+    ⊤ ▷ ~pool : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(▾a, true) into pool
+    ⊤ ▷ spawn worker(▾b, both) into pool
+    ⊤ ▷ x : Δ await next(pool) ▸ got {first, m} │ empty {}
+    x.empty ▷ ⊥
+    ⊤ ▷ p : Δ sample(7) ▸ ok {seen}
+    ⊤ ▷ y : Δ await next(pool) ▸ got {second, n} │ empty {}
+    y.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra, k} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ order {▾first, ▾second, m, n}
+
+control example() ■ { ok {mark : u32} } uses clock
+    ⊤ ▷ p : Δ run pair([5], [8], false) ▸ order {first, second, m, n}
+    p.order ▷ ■ ok {n}
+
+//! run pair([5], [8], false) with [sample -> ok {11}; sample -> ok {22}; sample -> ok {33}; sample -> ok {77}; sample -> ok {99}] => done order {[5], [8], 33, 99} trace [sample(1) -> ok {11}; sample(2) -> ok {22}; sample(3) -> ok {33}; sample(7) -> ok {77}; sample(9) -> ok {99}]
+//! run pair([5], [8], false) with [sample -> ok {11}; sample -> ok {22}; sample -> ok {99}; sample -> ok {77}; sample -> ok {33}] turns [0, 0, 0, 1] => done order {[8], [5], 99, 33} trace [sample(1) -> ok {11}; sample(2) -> ok {22}; sample(9) -> ok {99}; sample(7) -> ok {77}; sample(3) -> ok {33}]
+//! run pair([4], [6], true) with [sample -> ok {11}; sample -> ok {12}; sample -> ok {22}; sample -> ok {32}; sample -> ok {77}; sample -> ok {21}; sample -> ok {31}] turns [0, 0, 1, 1, 1, 1] => done order {[6], [4], 32, 31} trace [sample(1) -> ok {11}; sample(1) -> ok {12}; sample(2) -> ok {22}; sample(3) -> ok {32}; sample(7) -> ok {77}; sample(2) -> ok {21}; sample(3) -> ok {31}]
+//! run worker([7], true) with [sample -> ok {11}; sample -> ok {22}; sample -> ok {33}] => done got {[7], 33} trace [sample(1) -> ok {11}; sample(2) -> ok {22}; sample(3) -> ok {33}]
+
+// Three active invocations can share a resume label, each with its own local.
+async control descend(depth : usize, xs : [usize]) ■ { got {data : [usize], sum : usize} }
+    ⊤ ▷ end : ? depth = 0
+    end.true ▷ ■ got {▾xs, 0}
+    end.false ▷ d : Δ await descend(depth - 1, ▾xs) ▸ got {data, sum}
+    d.got ▷ small : ? depth ≤ 8 ∧ sum ≤ 100
+    small.true ▷ ■ got {▾data, sum + depth}
+    small.false ▷ ■ got {▾data, 0}
+
+async control recursive_member() ■ { ok {data : [usize], sum : usize} }
+    ⊤ ▷ ~pool : tasks⟨descend⟩ := tasks⟨descend⟩()
+    ⊤ ▷ spawn descend(3, [4]) into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ got {data, sum} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra, n} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {▾data, sum}
+
+//! run recursive_member() => done ok {[4], 6}

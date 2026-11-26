@@ -10,6 +10,7 @@ use villanelle_v2::{check, erased, load, script};
 
 const ROOTS: &str = include_str!("slice4/checked_run.core");
 const AWAITS: &str = include_str!("slice4/checked_await.core");
+const NESTED_MEMBER: &str = include_str!("slice4/checked_nested_member_await.core");
 const NESTED_OWNER: &str = include_str!("slice4/checked_nested_owner_await.core");
 const MEMBER_AWAIT: &str = include_str!("slice4/checked_member_await.core");
 
@@ -106,6 +107,12 @@ fn a_defined_owner_await_preserves_completions_until_next() {
 #[test]
 fn nested_owner_awaits_schedule_the_same_children_at_each_depth() {
     compare_native_runs(NESTED_OWNER, &["E-Await"], &[3, 3, 3, 3, 4, 2], 5);
+}
+
+#[test]
+fn nested_member_awaits_keep_each_invocations_payload_and_resume_point() {
+    // Eight vectors and eleven suspending callee activations across the five runs.
+    compare_native_runs(NESTED_MEMBER, &["E-Await"], &[3, 3, 6, 3, 3], 19);
 }
 
 #[test]
@@ -370,6 +377,52 @@ int main(void) {
 
 #[test]
 fn a_nested_run_freezes_the_outer_set_until_the_next_owner_await() {
+    compare_sampled_example(
+        NESTED_OWNER,
+        "nested_owner",
+        [0, 1, 0, 1],
+        &[
+            "ready 2",
+            "sample 1 at 1",
+            "ready 1",
+            "sample 7 at 2",
+            "ready 2",
+            "sample 2 at 3",
+            "ready 2",
+            "sample 9 at 4",
+            "ready 1",
+            "sample 3 at 5",
+            "ready 1",
+            "ready 1",
+        ],
+    );
+}
+
+#[test]
+fn the_owner_receives_a_sibling_while_a_nested_member_is_suspended() {
+    compare_sampled_example(
+        NESTED_MEMBER,
+        "nested_member",
+        [0, 0, 0, 1],
+        &[
+            "ready 2",
+            "ready 2",
+            "sample 1 at 2",
+            "ready 2",
+            "sample 2 at 3",
+            "ready 2",
+            "sample 9 at 4",
+            "ready 2",
+            "sample 7 at 5",
+            "ready 1",
+            "sample 3 at 6",
+            "ready 1",
+            "ready 1",
+        ],
+    );
+}
+
+fn compare_sampled_example(source: &str, name: &str, choices: [usize; 4], calls: &[&str]) {
     const DRIVER: &str = r#"
 #include "module.h"
 #include <inttypes.h>
@@ -377,7 +430,7 @@ fn a_nested_run_freezes_the_outer_set_until_the_next_owner_await() {
 
 static uint32_t turns;
 uint64_t vn2_pick_turn(uint64_t count) {
-    const uint64_t choices[] = {0, 1, 0, 1};
+    const uint64_t choices[] = {CHOICES};
     printf("ready %" PRIu64 "\n", count);
     uint32_t i = turns++;
     return i < 4 ? choices[i] : 0;
@@ -394,39 +447,29 @@ int main(void) {
     return 0;
 }
 "#;
-    compare_c_host(NESTED_OWNER, "nested_owner", DRIVER, |program, config| {
-        let host = || TurnHost {
-            choices: [0, 1, 0, 1].into(),
-            ..Default::default()
-        };
-        let mut original_host = host();
-        let original = oracle::run(program, "example", vec![], &mut original_host, config);
-        let mut erased_host = host();
-        let erased = erased::run(program, "example", vec![], &mut erased_host, config);
-        assert_eq!(erased.end.to_string(), original.end.to_string());
-        assert_eq!(erased.trace, original.trace);
-        assert_eq!(erased_host.calls, original_host.calls);
-        assert_eq!(
-            original_host.calls,
-            [
-                "ready 2",
-                "sample 1 at 1",
-                "ready 1",
-                "sample 7 at 2",
-                "ready 2",
-                "sample 2 at 3",
-                "ready 2",
-                "sample 9 at 4",
-                "ready 1",
-                "sample 3 at 5",
-                "ready 1",
-                "ready 1",
-            ]
-        );
-        let mut expected = original_host.calls;
-        expected.push(original.end.to_string());
-        expected
-    });
+    let values = choices.map(|choice| choice.to_string()).join(", ");
+    compare_c_host(
+        source,
+        name,
+        &DRIVER.replace("CHOICES", &values),
+        |program, config| {
+            let host = || TurnHost {
+                choices: choices.into(),
+                ..Default::default()
+            };
+            let mut original_host = host();
+            let original = oracle::run(program, "example", vec![], &mut original_host, config);
+            let mut erased_host = host();
+            let erased = erased::run(program, "example", vec![], &mut erased_host, config);
+            assert_eq!(erased.end.to_string(), original.end.to_string());
+            assert_eq!(erased.trace, original.trace);
+            assert_eq!(erased_host.calls, original_host.calls);
+            assert_eq!(original_host.calls, calls);
+            let mut expected = original_host.calls;
+            expected.push(original.end.to_string());
+            expected
+        },
+    );
 }
 
 fn compare_c_host(
@@ -523,8 +566,9 @@ async control owner() ■ { ok {} }
             .replace("owner() ■ { ok {} }", "owner() ■ { ok {} } uses io")
             .replace(next_owner, &format!("{suspend}\n    {next_owner}"))
             .replace("turns [1] => done ok", "with [read -> ok] turns [1] => done ok trace [read() -> ok]"), "await of extern `read` in task-set owner"),
-        (base.replace("async control child", "async control middle() ■ { ok {} }\n    ⊤ ▷ w : Δ await idle() ▸ ok {}\n    ⊤ ▷ ■ ok {}\n\nasync control child")
-            .replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} }\n    ⊤ ▷ w : Δ await middle() ▸ ok {}"), "can suspend again"),
+        (base.replace("async control idle() ■ { ok {} }", &format!("async control idle() ■ {{ ok {{}} }}\n    {new_set}"))
+            .replace("async control child", "async control middle() ■ { ok {} }\n    ⊤ ▷ w : Δ await idle() ▸ ok {}\n    ⊤ ▷ ■ ok {}\n\nasync control child")
+            .replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} }\n    ⊤ ▷ w : Δ await middle() ▸ ok {}"), "task-set member `child` awaiting `idle`, which creates a set"),
         (base.replace("async control child", "extern async control read() ■ { ok {} } uses io\n\nasync control child")
             .replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} } uses io\n    ⊤ ▷ w : Δ await read() ▸ ok {}")
             .replace("owner() ■ { ok {} }", "owner() ■ { ok {} } uses io")

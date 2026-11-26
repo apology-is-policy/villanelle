@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.9). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.10). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2345,9 +2345,9 @@ vectors and local writes across the two interpreters and compiled code.
 A C host separately links the emitted module and records the number of ready
 tasks at every turn of `rounds(2, 1)`. Its eight offers are 2, 2, 2, 2,
 1, 1, 1, 1. Its three emits are q, p, p. Both interpreters produce the
-same offers, emits and final result. A member awaiting an extern control,
-a callee that can await again, or a callee with its own set still receives
-a diagnostic.
+same offers, emits and final result. A member awaiting an extern control
+or a callee with its own set still receives a diagnostic. Section 18.10
+covers a defined callee that awaits again.
 
 ### 18.8 A set owner awaits with ready children, 25 November 2026
 
@@ -2381,8 +2381,7 @@ The internal async entry takes the set as an argument. The set records its
 producer's resume function. A public C entry and a fresh run start with a
 null set. The native backend follows the owner's await calls to check that
 their targets are defined, have no set of their own and cannot fault or
-terminate the run. A spawned member still needs an awaited callee that
-finishes on its selected turn.
+terminate the run. Section 18.10 extends nested suspension to a spawned member.
 
 From `v2/`, run `vn2 test tests/slice4/checked_nested_owner_await.core`
 and `cargo test --test backend_slice4`. The fixture gives the child the
@@ -2391,6 +2390,31 @@ indices 0, 1, 0, 1 in `example`. The second request sees only the root of
 the nested run. The fourth sees the outer child, which runs before the
 leaf. Both interpreters and the C host see the leaf write 5 through the
 borrow of the local in `middle`.
+
+### 18.10 Nested defined awaits in a spawned member, 26 November 2026
+
+When a member awaits a defined control, it binds the operands and result
+destinations before it yields. If the callee reaches another defined
+await, the same member gives up the turn again. The host can select a
+sibling while the caller and callee are both suspended. When the callee
+returns, its caller continues on that turn.
+
+The scheduler keeps one queue entry for the member. Each active awaited
+callee whose body can suspend has its own resume index and local slots.
+The caller allocates this frame on entry to the await and frees it when
+the callee returns. Bound arguments and result destinations stay in the
+caller. A borrow into a suspended activation therefore still names the
+same place when the host selects the member again. A callee that finishes
+in one turn uses the existing bound arguments without a heap frame.
+
+From `v2/`, run `vn2 test tests/slice4/checked_nested_member_await.core`
+and `cargo test --test backend_slice4`. Five runs exercise both delivery
+orders, two members suspended in the same callees, an ordinary root call
+and a recursive member that resumes three callers at the same await site.
+The counted native batch makes 19 allocations, eight vectors and eleven
+callee frames, and releases each. A separately linked C host selects the
+sibling on turn 4. The owner receives its result on turn 5. On turn 6 the
+leaf writes through the borrow of the local in `middle`.
 
 ## 19. What is open
 
@@ -2403,7 +2427,7 @@ borrow of the local in `middle`.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs nested suspension in a member, repeated spawn sites,
+- **Later work.** Slice 4 still needs repeated spawn sites,
   multiple sets, loans, host waits, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list

@@ -3,6 +3,12 @@
 //! across defined awaits and its result until the owner receives it.
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) enum Frame {
+    Member,
+    Nested,
+}
+
 fn sets(body: &ControlBody) -> impl Iterator<Item = (VarId, ControlId)> + '_ {
     body.vars
         .iter()
@@ -74,8 +80,39 @@ pub(super) fn emit_support<'a>(
         return Ok(());
     }
     out.push_str(include_str!("task_set.ll"));
+    let mut nested = BTreeSet::new();
     for id in members {
+        let member = &program.controls[id];
+        // A run starts its own scheduler. Only await extends this task's stack.
+        let mut pending: Vec<_> = awaits(member.body.as_ref().unwrap()).collect();
+        while let Some(callee) = pending.pop() {
+            let body = awaited_body(&program.controls[callee], "member", &member.name)?;
+            if awaits(body).next().is_some() && nested.insert(callee) {
+                pending.extend(awaits(body));
+            }
+        }
         emit_member(out, program, id, reg, term_tys)?;
+    }
+    for id in nested {
+        let control = &program.controls[id];
+        emit_body_unit(
+            out,
+            program,
+            reg,
+            term_tys,
+            UnitKind::Control {
+                id,
+                frame: Some(Frame::Nested),
+            },
+            &format!("vn2_nested_{id}"),
+            &control_parameters(control),
+            control.body.as_ref().unwrap(),
+            control.faults.then(|| "%out_fault".into()),
+            term_tys[id]
+                .as_ref()
+                .map(|ty| ("%out_term".into(), ty.clone())),
+            control.parameters.len(),
+        )?;
     }
     Ok(())
 }
@@ -160,26 +197,16 @@ fn emit_member<'a>(
         ));
     }
 
-    let mut callees = awaits(body).peekable();
-    if callees.peek().is_some() {
-        // Ordinary synchronous calls can start a nested run, whose tasks have
-        // their own ready set. An awaited callee shares this member's turn.
-        for callee in callees {
-            let target = &program.controls[callee];
-            let body = awaited_body(target, "member", &member.name)?;
-            if awaits(body).next().is_some() {
-                return Err(format!(
-                    "the native backend does not yet support task-set member `{}` awaiting `{}`, whose body can suspend again",
-                    member.name, target.name
-                ));
-            }
-        }
+    if awaits(body).next().is_some() {
         return emit_body_unit(
             out,
             program,
             reg,
             term_tys,
-            UnitKind::Control { id, member: true },
+            UnitKind::Control {
+                id,
+                frame: Some(Frame::Member),
+            },
             &format!("vn2_member_{id}"),
             &control_parameters(member),
             body,
@@ -245,22 +272,13 @@ pub(super) fn emit_member_entry(
             index += 1;
         }
     }
-    for (i, (name, _)) in slots.iter().enumerate() {
-        let index = locals_start + i;
-        let _ = writeln!(
-            out,
-            "  {name} = getelementptr {ty}, ptr %frame, i32 0, i32 {index}"
-        );
-    }
+    emit_local_addresses(out, &ty, "%frame", locals_start, slots);
     if !resume_points.is_empty() {
         let _ = writeln!(
             out,
-            "  %member_state = getelementptr {ty}, ptr %frame, i32 0, i32 1\n  %pc = load i32, ptr %member_state\n  switch i32 %pc, label %bad_pc [\n    i32 0, label %start"
+            "  %member_state = getelementptr {ty}, ptr %frame, i32 0, i32 1"
         );
-        for (i, label) in resume_points.iter().enumerate() {
-            let _ = writeln!(out, "    i32 {}, label %{label}", i + 1);
-        }
-        out.push_str("  ]\nbad_pc:\n  unreachable\nstart:\n");
+        emit_resume_switch(out, resume_points);
     }
     for i in 0..member.parameters.len() {
         let index = 2 + i;
@@ -271,6 +289,101 @@ pub(super) fn emit_member_entry(
         );
     }
     args
+}
+
+fn emit_local_addresses(
+    out: &mut String,
+    ty: &str,
+    base: &str,
+    start: usize,
+    slots: &[(String, String)],
+) {
+    for (i, (name, _)) in slots.iter().enumerate() {
+        let index = start + i;
+        let _ = writeln!(
+            out,
+            "  {name} = getelementptr {ty}, ptr {base}, i32 0, i32 {index}"
+        );
+    }
+}
+
+fn emit_resume_switch(out: &mut String, points: &[String]) {
+    out.push_str("  %pc = load i32, ptr %member_state\n  switch i32 %pc, label %bad_pc [\n    i32 0, label %start\n");
+    for (i, label) in points.iter().enumerate() {
+        let _ = writeln!(out, "    i32 {}, label %{label}", i + 1);
+    }
+    out.push_str("  ]\nbad_pc:\n  unreachable\nstart:\n");
+}
+
+pub(super) fn emit_nested_entry(
+    out: &mut String,
+    id: ControlId,
+    bound: &[(String, String)],
+    slots: &[(String, String)],
+    points: &[String],
+) {
+    let ty = format!("%vn2.activation.{id}");
+    let mut fields = vec!["i32"];
+    fields.extend(slots.iter().map(|(_, ll)| ll.as_str()));
+    let _ = writeln!(out, "{ty} = type {{ {} }}", fields.join(", "));
+    let _ = writeln!(
+        out,
+        "define internal fastcc ptr @vn2_activate_{id}() nounwind {{\n  %ptr = call ptr @malloc(i64 ptrtoint (ptr getelementptr ({ty}, ptr null, i32 1) to i64))\n  store i32 0, ptr %ptr\n  ret ptr %ptr\n}}"
+    );
+    let _ = writeln!(
+        out,
+        "define internal fastcc i32 @vn2_nested_{id}(ptr %frame, ptr %member_state) nounwind {{\nentry:"
+    );
+    load_await_fields(out, id, bound);
+    emit_local_addresses(out, &ty, "%member_state", 1, slots);
+    emit_resume_switch(out, points);
+}
+
+// The bound arguments live in the caller. A callee that can itself suspend
+// needs its own PC and locals until it returns, including on a recursive edge.
+pub(super) fn await_in_member(em: &mut IrEmitter<'_, '_>, id: ControlId, frame: &str, tag: &str) {
+    let nested = em.program.controls[id]
+        .body
+        .as_ref()
+        .is_some_and(|body| awaits(body).next().is_some());
+    let activation = nested.then(|| {
+        let slot = em.alloc_temp("ptr");
+        let ptr = em.fresh_reg();
+        em.reg.needed_libc = true;
+        let _ = writeln!(
+            em.code,
+            "  {ptr} = call fastcc ptr @vn2_activate_{id}()\n  store ptr {ptr}, ptr {slot}"
+        );
+        slot
+    });
+
+    let points = em.resume_points.as_mut().unwrap();
+    let pc = points.len() + 1;
+    let label = format!("member_resume_{pc}");
+    points.push(label.clone());
+    let _ = writeln!(
+        em.code,
+        "  store i32 {pc}, ptr %member_state\n  ret i32 -3\n{label}:"
+    );
+    if let Some(slot) = activation {
+        let ptr = em.fresh_reg();
+        let yielded = em.fresh_reg();
+        let pending = em.fresh_label("nested_yield");
+        let done = em.fresh_label("nested_done");
+        let _ = writeln!(
+            em.code,
+            "  {ptr} = load ptr, ptr {slot}\n  {tag} = call fastcc i32 @vn2_nested_{id}(ptr {frame}, ptr {ptr})"
+        );
+        let _ = writeln!(
+            em.code,
+            "  {yielded} = icmp eq i32 {tag}, -3\n  br i1 {yielded}, label %{pending}, label %{done}\n{pending}:\n  ret i32 -3\n{done}:\n  call void @free(ptr {ptr})"
+        );
+    } else {
+        let _ = writeln!(
+            em.code,
+            "  {tag} = call fastcc i32 @vn2_resume_{id}(ptr {frame}, ptr null)"
+        );
+    }
 }
 
 fn pool(em: &mut IrEmitter<'_, '_>, set: VarId) -> String {
