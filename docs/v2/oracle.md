@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.17). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.18). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2584,6 +2584,43 @@ across a recursive await. The deepest activation drains an empty set. Two
 schedules return `[1, 2, 3]`, including one in which each child finishes
 before the deeper call returns.
 
+### 18.18 A defined root waits for the host, 26 November 2026
+
+A root alone in its run can await a noncancellable, nonfaulting extern async
+control. The operands and the caller's output slots are bound before the
+request starts. While the root waits, its run has one pending operation. The
+host selects that operation, completes it, and chooses the ready root for its
+next turn ([E-AwaitHost], [E-Turn]). A later await can use the first result.
+If a synchronous caller starts a fresh run, tasks in the outer run stay
+suspended while that root waits.
+
+For `await fetch(...)`, the generated C header declares
+`struct vn2_wait_fetch`. Its fields hold the host's opaque `host_state`
+(initially null), the typed inputs (`in_key`, for example) and result-slot
+pointers in alternative and field order. The request lives through completion
+and belongs to the caller. The host can keep its operation handle in
+`host_state`. By-value operands transfer to the host once. Borrowed operands
+remain valid for the operation and returned loans name their declared origins.
+
+1. `vn2_start_fetch(request)` starts the operation on the bound inputs.
+2. With no ready task, `vn2_pick_waiting(states, count)` receives the host
+   state values of the pending operations. It may wait until a completion is
+   available. In this subset the sole operation has index zero for every
+   choice modulo `count`.
+3. `vn2_complete_fetch(request)` receives the same request, fills the
+   selected alternative's result slots, releases any host-owned operation
+   state, and returns the alternative tag. A C boolean payload uses one byte.
+4. `vn2_pick_turn(1)` offers the ready root. Execution continues in the
+   selected arm or with the captured outcome.
+
+Run `vn2 test tests/slice4/checked_host_wait.core` and
+`cargo test --test backend_slice4 root_host_wait` from `v2/`. The fixture
+exercises both outcomes, a unit result, an owned vector, a returned exclusive
+loan, and an inner run with an outer member ready. A linked C host checks
+each waiting and ready offer, request identity and bound operands. It supplies
+the byte 2 for true in both a capture and a decision. The scripted native
+host uses the only pending operation and consumes its answer at completion.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2595,7 +2632,7 @@ before the deeper call returns.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs host waits, cancellation, member faults, capacity and
+- **Later work.** Slice 4 still needs host waits with competing tasks, direct extern roots, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).

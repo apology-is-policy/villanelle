@@ -10,6 +10,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const HOST_WAIT: &str = include_str!("slice4/checked_host_wait.core");
 const NESTED_MEMBER_SET: &str = include_str!("slice4/checked_nested_member_set.core");
 const MEMBER_SET: &str = include_str!("slice4/checked_member_set.core");
 const AWAITED_SET: &str = include_str!("slice4/checked_awaited_set.core");
@@ -76,6 +77,12 @@ fn compare_native_runs(source: &str, rules: &[&str], counts: &[u64], allocations
 fn defined_roots_return_or_unwind_in_the_callers_decision() {
     // Four nonempty input vectors. Their payloads move to the eventual owner.
     compare_native_runs(ROOTS, &["E-Run"], &[1, 1, 1, 2, 1, 1], 4);
+}
+
+#[test]
+fn root_host_wait_binds_each_completion_and_releases_owned_arguments() {
+    // Only the input and output vectors of exchange_data need heap storage.
+    compare_native_runs(HOST_WAIT, &["E-AwaitHost"], &[2, 1, 1, 2, 2, 1, 1, 1, 2], 2);
 }
 
 #[test]
@@ -244,14 +251,24 @@ control bridge2() ■ { ok {} } uses io
         ),
         (
             r#"
-extern async control tick() ■ { ok {} } uses io
+extern async control tick() ■ { ok {} │ cancelled {} } uses io
 async control waits() ■ { ok {} } uses io
     ⊤ ▷ r := capture await tick()
-    ⊤ ▷ d : Δ outcome(r) ▸ ok {}
-    d.ok ▷ ■ ok {}
+    ⊤ ▷ d : Δ outcome(r) ▸ ok {} │ cancelled {}
+    ⊤ ▷ ■ ok {}
 //! run waits() with [tick -> ok] => done ok trace [tick() -> ok]
 "#,
-            "await of `tick`",
+            "cancellable or faulting host await of `tick`",
+        ),
+        (
+            r#"
+extern async control tick() ■ { ok {} } faults uses io
+async control waits() ■ { ok {} } faults uses io
+    ⊤ ▷ r : Δ await tick() ▸ ok {}
+    r.ok ▷ ■ ok {}
+//! run waits() with [tick -> ok] => done ok trace [tick() -> ok]
+"#,
+            "faulting host await of `tick`",
         ),
         (
             r#"
@@ -282,6 +299,114 @@ async control pool() ■ { ok {} }
             error
         );
     }
+}
+
+#[test]
+fn root_host_wait_offers_the_pending_request_before_resuming_the_root() {
+    #[derive(Default)]
+    struct FetchHost(Vec<String>);
+
+    impl Host for FetchHost {
+        fn pick_waiting(&mut self, waiting: &[(&Control, &[Value])]) -> usize {
+            let [(control, [Value::Int(key), Value::Bool(cached)])] = waiting else {
+                panic!("expected one fetch");
+            };
+            assert_eq!(control.name, "fetch");
+            self.0.push(format!("waiting {key} {cached}"));
+            7 // Every index selects the sole pending operation.
+        }
+
+        fn call(
+            &mut self,
+            control: &Control,
+            args: &[Value],
+            _: &Config,
+        ) -> Result<Answer, String> {
+            assert_eq!(control.name, "fetch");
+            let [Value::Int(key), Value::Bool(cached)] = args else {
+                panic!("expected fetch arguments")
+            };
+            self.0.push(format!("complete {key} {cached}"));
+            Ok(Answer {
+                alternative: "found".into(),
+                payload: vec![
+                    Value::Int(Int::from_u64(if *cached { 8 } else { 37 })),
+                    Value::Bool(true),
+                ],
+                writes: vec![],
+            })
+        }
+
+        fn pick_turn(&mut self, ready: usize) -> usize {
+            self.0.push(format!("ready {ready}"));
+            0
+        }
+    }
+
+    const DRIVER: &str = r#"
+#include "module.h"
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static struct vn2_wait_fetch *pending;
+static unsigned token, selected;
+
+void vn2_start_fetch(struct vn2_wait_fetch *r) {
+    if (pending || r->host_state) abort();
+    pending = r;
+    r->host_state = &token;
+}
+uint64_t vn2_pick_waiting(void *const *states, uint64_t count) {
+    if (!pending || selected || count != 1 || states[0] != &token) abort();
+    selected = 1;
+    printf("waiting %" PRIu64 " %s\n", (uint64_t)pending->in_key, pending->in_cached ? "true" : "false");
+    return 7;
+}
+int32_t vn2_complete_fetch(struct vn2_wait_fetch *r) {
+    if (!selected || r != pending || r->host_state != &token) abort();
+    printf("complete %" PRIu64 " %s\n", (uint64_t)r->in_key, r->in_cached ? "true" : "false");
+    *r->out_0_found_0 = r->in_cached ? 8 : 37;
+    *r->out_0_found_1 = 2;  /* Nonzero C byte, including for a captured outcome. */
+    pending = NULL;
+    selected = 0;
+    return VN2_FETCH_FOUND;
+}
+uint64_t vn2_pick_turn(uint64_t count) {
+    printf("ready %" PRIu64 "\n", count);
+    return 0;
+}
+int main(void) {
+    struct vn2_wait_fetch result;
+    if (vn2_call_example(&result.in_key) != VN2_EXAMPLE_OK) return 1;
+    printf("done ok {%" PRIu64 "}\n", (uint64_t)result.in_key);
+    return 0;
+}
+"#;
+    let (source, _) = HOST_WAIT.split_once("async control unit()").unwrap();
+    compare_c_host(source, "root_host_wait", DRIVER, |program, config| {
+        let mut host = FetchHost::default();
+        let original = oracle::run(program, "example", vec![], &mut host, config);
+        let mut erased_host = FetchHost::default();
+        let erased = erased::run(program, "example", vec![], &mut erased_host, config);
+        assert_eq!(erased.trace, original.trace);
+        assert_eq!(erased.end.to_string(), original.end.to_string());
+        assert_eq!(erased_host.0, host.0);
+        assert_eq!(
+            host.0,
+            [
+                "waiting 4 true",
+                "complete 4 true",
+                "ready 1",
+                "waiting 8 false",
+                "complete 8 false",
+                "ready 1"
+            ]
+        );
+        assert_eq!(original.end.to_string(), "done ok {37}");
+        host.0.push(original.end.to_string());
+        host.0
+    });
 }
 
 /// The next sample reveals how many times the host has selected a ready task.

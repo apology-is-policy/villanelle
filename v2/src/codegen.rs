@@ -24,6 +24,7 @@
 //!   cover the names of the bodies around it, so every scope that ends at a
 //!   statement is ended by the formulas of that statement.
 
+mod host_wait;
 mod tasks;
 
 use crate::erased;
@@ -837,7 +838,17 @@ pub fn emit_c_header(program: &Program, usize_bits: u32) -> String {
                     .any(|a| a.fields.iter().any(|f| !f.ty.is_scalar()))
         });
 
-    if defined_await_targets(program).next().is_some() || tasks::uses_sets(program) {
+    let host_waits = host_wait::targets(program);
+    if !host_waits.is_empty() {
+        let _ = writeln!(
+            out,
+            "uint64_t vn2_pick_waiting(void *const *states, uint64_t count);"
+        );
+    }
+    if !host_waits.is_empty()
+        || defined_await_targets(program).next().is_some()
+        || tasks::uses_sets(program)
+    {
         let _ = writeln!(out, "uint64_t vn2_pick_turn(uint64_t ready_count);");
     }
     if uses_slice2_data {
@@ -962,6 +973,15 @@ pub fn emit_c_header(program: &Program, usize_bits: u32) -> String {
                 "{}out_terminated",
                 c_header_out_ty(program, tty, usize_bits)
             ));
+        }
+        if host_waits.contains(&cid) {
+            host_wait::emit_header(
+                &mut out,
+                program,
+                control,
+                usize_bits,
+                &params[control.parameters.len()..],
+            );
         }
         let param_list = if params.is_empty() {
             "void".to_string()
@@ -4340,12 +4360,8 @@ fn emit_body_unit<'a>(
                                             em.code,
                                             "  {gp} = getelementptr {sub_ll}, ptr {pp}, i32 0, i32 {fi}"
                                         );
-                                        let loaded = em.fresh_reg();
-                                        let src_p = &out_slots[k][fi];
-                                        let _ = writeln!(
-                                            em.code,
-                                            "  {loaded} = load {f_ll}, ptr {src_p}"
-                                        );
+                                        let loaded =
+                                            load_result(em, operation, &f.ty, &out_slots[k][fi]);
                                         let _ =
                                             writeln!(em.code, "  store {f_ll} {loaded}, ptr {gp}");
                                     }
@@ -4383,7 +4399,6 @@ fn emit_body_unit<'a>(
                             let mut arm_labels = Vec::new();
                             let mut switch_cases = Vec::new();
                             let contract = op_kind.contract(program);
-                            let is_extern = matches!(op_kind, Operation::Control(cid) if program.controls[*cid].body.is_none());
 
                             for (pos, arm) in arms.iter().enumerate() {
                                 let directly_impossible =
@@ -4426,28 +4441,12 @@ fn emit_body_unit<'a>(
                                 for (field_idx, &var_id) in arm.vars.iter().enumerate() {
                                     let field_ty = &contract_alt.fields[field_idx].ty;
                                     let ptr = &out_slots[arm.alternative][field_idx];
-                                    if is_extern && *field_ty == Type::Bool {
-                                        let raw = em.fresh_reg();
-                                        let _ = writeln!(em.code, "  {raw} = load i8, ptr {ptr}");
-                                        let b_reg = em.fresh_reg();
-                                        let _ =
-                                            writeln!(em.code, "  {b_reg} = icmp ne i8 {raw}, 0");
-                                        let _ = writeln!(
-                                            em.code,
-                                            "  store i1 {b_reg}, ptr %slot_{var_id}"
-                                        );
-                                    } else {
-                                        let ll_ty = em.llvm_ty(field_ty);
-                                        let val_reg = em.fresh_reg();
-                                        let _ = writeln!(
-                                            em.code,
-                                            "  {val_reg} = load {ll_ty}, ptr {ptr}"
-                                        );
-                                        let _ = writeln!(
-                                            em.code,
-                                            "  store {ll_ty} {val_reg}, ptr %slot_{var_id}"
-                                        );
-                                    }
+                                    let ll = em.llvm_ty(field_ty);
+                                    let value = load_result(em, op_kind, field_ty, ptr);
+                                    let _ = writeln!(
+                                        em.code,
+                                        "  store {ll} {value}, ptr %slot_{var_id}"
+                                    );
                                 }
                                 let arm_next = plan.branch_targets[b_id][s_idx]
                                     .as_ref()
@@ -4740,6 +4739,25 @@ fn emit_body_unit<'a>(
     Ok(())
 }
 
+fn uses_host_abi(program: &Program, op: &Operation) -> bool {
+    matches!(op, Operation::Control(id) | Operation::AwaitControl(id) if program.controls[*id].body.is_none())
+}
+
+fn load_result(em: &mut IrEmitter<'_, '_>, op: &Operation, ty: &Type, ptr: &str) -> String {
+    let value = em.fresh_reg();
+    if *ty == Type::Bool && uses_host_abi(em.program, op) {
+        let byte = em.fresh_reg();
+        let _ = writeln!(
+            em.code,
+            "  {byte} = load i8, ptr {ptr}\n  {value} = icmp ne i8 {byte}, 0"
+        );
+    } else {
+        let ll = em.llvm_ty(ty);
+        let _ = writeln!(em.code, "  {value} = load {ll}, ptr {ptr}");
+    }
+    value
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_operation_call(
     em: &mut IrEmitter<'_, '_>,
@@ -4761,8 +4779,7 @@ fn emit_operation_call(
     }
     let contract = op_kind.contract(program);
     let mut out_slots: Vec<Vec<String>> = Vec::new();
-    let is_extern_ctrl =
-        matches!(op_kind, Operation::Control(cid) if program.controls[*cid].body.is_none());
+    let is_extern_ctrl = uses_host_abi(program, op_kind);
 
     for alt in &contract {
         let mut alt_slots = Vec::new();
@@ -4779,9 +4796,12 @@ fn emit_operation_call(
 
     match op_kind {
         Operation::AwaitNext(_, _) => unreachable!("handled before allocating output slots"),
-        Operation::AwaitControl(cid) if program.controls[*cid].body.is_none() => {
+        Operation::AwaitControl(cid)
+            if program.controls[*cid].is_cancellable()
+                || (program.controls[*cid].body.is_none() && program.controls[*cid].faults) =>
+        {
             return Err(format!(
-                "the native backend does not yet support await of `{}`",
+                "the native backend does not yet support a cancellable or faulting host await of `{}`",
                 program.controls[*cid].name
             ));
         }
@@ -4876,7 +4896,9 @@ fn emit_operation_call(
             };
 
             let tag_reg = em.fresh_reg();
-            if matches!(op_kind, Operation::AwaitControl(_)) {
+            if is_extern && matches!(op_kind, Operation::AwaitControl(_)) {
+                host_wait::emit_await(em, *cid, &call_args, &tag_reg);
+            } else if matches!(op_kind, Operation::AwaitControl(_)) {
                 // [E-Await] Bind the inputs and the caller's result slots before
                 // the turn ends. The frame lives until the continuation returns.
                 let ty = format!("%vn2.await.{cid}");
@@ -5506,7 +5528,9 @@ pub fn emit_llvm(program: &Program, usize_bits: u32) -> Result<String, String> {
     emit_await_continuations(&mut body_out, program, &term_tys, usize_bits, &awaited);
     emit_program_bodies(&mut body_out, program, &mut reg, &term_tys, usize_bits)?;
 
-    if !awaited.is_empty() || reg.has_task_sets {
+    let host_waits = host_wait::targets(program);
+    host_wait::emit_support(&mut decls_out, program, &host_waits, usize_bits, false);
+    if !host_waits.is_empty() || !awaited.is_empty() || reg.has_task_sets {
         let _ = writeln!(decls_out, "declare i64 @vn2_pick_turn(i64)");
     }
     let mut type_out = String::new();
@@ -6816,7 +6840,9 @@ pub fn emit_native_harness_llvm(
 
     let mut h_tmp = 0usize;
     let mut ext_code = String::new();
-    let picks_turns = !awaited.is_empty() || reg.has_task_sets;
+    let host_waits = host_wait::targets(program);
+    host_wait::emit_support(&mut ext_code, program, &host_waits, usize_bits, true);
+    let picks_turns = !host_waits.is_empty() || !awaited.is_empty() || reg.has_task_sets;
     if picks_turns {
         ext_code.push_str(
             "@vn2_turn_ptr = internal global ptr null

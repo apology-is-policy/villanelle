@@ -1,0 +1,70 @@
+// A root can receive either alternative of a host operation and use its payload
+// as the argument of a second operation. At most one operation is pending.
+extern async control fetch(key : usize, cached : bool)
+    ■ { found {value : usize, valid : bool} │ missing {} } uses io
+extern async control pulse() ■ { ok {} } uses io
+
+async control probe(key : usize, cached : bool) ■ { ok {value : usize} } uses io
+    ⊤ ▷ c := capture await fetch(key, cached)
+    ⊤ ▷ d : Δ outcome(c) ▸ found {value, valid} │ missing {}
+    d.missing ▷ ■ ok {0}
+    d.found ▷ b : ? valid
+    b.false ▷ ■ ok {1}
+    b.true ▷ q : Δ await fetch(value, false) ▸ found {next_value, use_it} │ missing {}
+    q.missing ▷ ■ ok {2}
+    q.found ▷ t : ? use_it
+    t.true ▷ ■ ok {next_value}
+    t.false ▷ ■ ok {3}
+
+control example() ■ { ok {value : usize} } uses io
+    ⊤ ▷ r : Δ run probe(4, true) ▸ ok {value}
+    r.ok ▷ ■ ok {value}
+
+async control unit() ■ { ok {} } uses io
+    ⊤ ▷ c := capture await pulse()
+    ⊤ ▷ d : Δ outcome(c) ▸ ok {}
+    d.ok ▷ ■ ok {}
+
+//! run example() with [fetch -> found {8, true}; fetch -> found {37, true}] => done ok {37} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> found {37, true}]
+//! run probe(5, false) with [fetch -> missing] => done ok {0} trace [fetch(5, false) -> missing]
+//! run probe(5, true) with [fetch -> found {8, false}] => done ok {1} trace [fetch(5, true) -> found {8, false}]
+//! run probe(6, true) with [fetch -> found {8, true}; fetch -> missing] => done ok {2} trace [fetch(6, true) -> found {8, true}; fetch(8, false) -> missing]
+//! run probe(6, true) with [fetch -> found {8, true}; fetch -> found {9, false}] => done ok {3} trace [fetch(6, true) -> found {8, true}; fetch(8, false) -> found {9, false}]
+//! run unit() with [pulse -> ok] => done ok trace [pulse() -> ok]
+
+// By-value inputs belong to the host at completion. A returned loan still
+// designates the owner's place after the root resumes.
+extern async control exchange(xs : [u32]) ■ { item {data : [u32]} } uses io
+extern async control access(cell : &~u32) ■ { slot {p : &~u32 ∈ cell} } uses io
+
+async control exchange_data(xs : [u32]) ■ { ok {result : [u32]} } uses io
+    ⊤ ▷ r : Δ await exchange(▾xs) ▸ item {data}
+    r.item ▷ ■ ok {▾data}
+
+async control update() ■ { ok {value : u32} } uses io
+    ⊤ ▷ ~value : u32 := 7
+    ⊤ ▷ r : Δ await access(&~value) ▸ slot {p}
+    r.slot ▷ p ← 41
+    ⊤ ▷ ■ ok {value}
+
+//! run exchange_data([9, 10]) with [exchange -> item {[12, 13, 14]}] => done ok {[12, 13, 14]} trace [exchange([9, 10]) -> item {[12, 13, 14]}]
+//! run update() with [access -> slot {&~cell} ~cell <- 32] => done ok {41} trace [access(7) -> slot {32}]
+
+// The waiting operation belongs to the inner run. The outer member waits
+// for that run to return before it can call the synchronous host.
+extern control sample() ■ { ok {} } uses io
+async control peer() ■ { ok {} } uses io
+    ⊤ ▷ p : Δ sample() ▸ ok {}
+    p.ok ▷ ■ ok {}
+
+async control outer() ■ { ok {value : usize} } uses io
+    ⊤ ▷ ~set : tasks⟨peer⟩ := tasks⟨peer⟩()
+    ⊤ ▷ spawn peer() into set
+    ⊤ ▷ r : Δ example() ▸ ok {value}
+    ⊤ ▷ a : Δ await next(set) ▸ ok {} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(set) ▸ ok {} │ empty {}
+    e.ok ▷ ⊥
+    e.empty ▷ ■ ok {value}
+
+//! run outer() with [fetch -> found {8, true}; fetch -> missing; sample -> ok] => done ok {2} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> missing; sample() -> ok]
