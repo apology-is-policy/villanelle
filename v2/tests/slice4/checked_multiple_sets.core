@@ -1,0 +1,83 @@
+// A packet carries an owned vector. A stamp carries the host's answer.
+// The three members enter the run in packet, stamp, packet order.
+extern control sample(mark : u32) ■ { ok {value : u32} } uses clock
+
+async control tick() ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+async control packet(xs : [u32], mark : u32, pause : bool) ■ { got {data : [u32]} } uses clock
+    ⊤ ▷ p : ? pause
+    p.true ▷ t : Δ await tick() ▸ ok {}
+    ⊤ ▷ s : Δ sample(mark) ▸ ok {seen}
+    ⊤ ▷ ■ got {▾xs}
+
+async control stamp(mark : u32) ■ { seen {value : u32} } uses clock
+    ⊤ ▷ s : Δ sample(mark) ▸ ok {value}
+    s.ok ▷ ■ seen {value}
+
+async control relay() ■ { ok {} } uses clock
+    ⊤ ▷ t : Δ await tick() ▸ ok {}
+    ⊤ ▷ s : Δ sample(8) ▸ ok {seen}
+    ⊤ ▷ ■ ok {}
+
+async control interleaved(pause : bool)
+    ■ { order {first : [u32], second : [u32], mark : u32, packets_left : usize, stamps_left : usize} } uses clock
+    ⊤ ▷ ~stamps : tasks⟨stamp⟩ := tasks⟨stamp⟩()
+    ⊤ ▷ ~packets : tasks⟨packet⟩ := tasks⟨packet⟩()
+    ⊤ ▷ spawn packet([11], 1, pause) into packets
+    ⊤ ▷ spawn stamp(2) into stamps
+    ⊤ ▷ spawn packet([33], 3, false) into packets
+    ⊤ ▷ a : Δ await next(stamps) ▸ seen {mark} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ s : Δ sample(7) ▸ ok {seen}
+    ⊤ ▷ packets_left : usize := count(packets)
+    ⊤ ▷ stamps_left : usize := count(stamps)
+    ⊤ ▷ b : Δ await next(stamps) ▸ seen {unused} │ empty {}
+    b.seen ▷ ⊥
+    ⊤ ▷ r : Δ await relay() ▸ ok {}
+    ⊤ ▷ c : Δ await next(packets) ▸ got {first} │ empty {}
+    c.empty ▷ ⊥
+    ⊤ ▷ d : Δ await next(packets) ▸ got {second} │ empty {}
+    d.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(packets) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ order {▾first, ▾second, mark, packets_left, stamps_left}
+
+control example() ■ { ok {mark : u32} } uses clock
+    ⊤ ▷ r : Δ run interleaved(true) ▸ order {first, second, mark, pending, stamps}
+    r.order ▷ ■ ok {mark}
+
+//! run interleaved(false) with [sample -> ok {10}; sample -> ok {20}; sample -> ok {70}; sample -> ok {80}; sample -> ok {30}] => done order {[11], [33], 20, 2, 0} trace [sample(1) -> ok {10}; sample(2) -> ok {20}; sample(7) -> ok {70}; sample(8) -> ok {80}; sample(3) -> ok {30}]
+//! run interleaved(true) with [sample -> ok {30}; sample -> ok {10}; sample -> ok {20}; sample -> ok {70}; sample -> ok {80}] turns [2, 0, 0, 0] => done order {[33], [11], 20, 2, 0} trace [sample(3) -> ok {30}; sample(1) -> ok {10}; sample(2) -> ok {20}; sample(7) -> ok {70}; sample(8) -> ok {80}]
+//! run interleaved(false) with [sample -> ok {20}; sample -> ok {70}; sample -> ok {30}; sample -> ok {80}; sample -> ok {10}] turns [1, 0, 0, 0, 2] => done order {[33], [11], 20, 2, 0} trace [sample(2) -> ok {20}; sample(7) -> ok {70}; sample(3) -> ok {30}; sample(8) -> ok {80}; sample(1) -> ok {10}]
+//! run interleaved(false) with [sample -> ok {20}; sample -> ok {70}; sample -> ok {30}; sample -> ok {80}; sample -> ok {10}] turns [1, 0, 2] => done order {[33], [11], 20, 2, 0} trace [sample(2) -> ok {20}; sample(7) -> ok {70}; sample(3) -> ok {30}; sample(8) -> ok {80}; sample(1) -> ok {10}]
+
+// Two sets can have the same producer. The inner set is created and
+// consumed on each iteration while the outer member remains undelivered.
+async control number(value : u32) ■ { got {v : u32} }
+    ⊤ ▷ ■ got {value}
+
+async control iterations(n : u32) ■ { ok {values : [u32], outer_value : u32} }
+    ⊤ ▷ ~outer : tasks⟨number⟩ := tasks⟨number⟩()
+    ⊤ ▷ spawn number(99) into outer
+    ⊤ ▷ ~values : [u32] := []
+    ⊤ ▷ l : ↻ collect(left : u32 := n) {
+        ⊤ ▷ end : ? left = 0
+        end.true ▷ □ finished {}
+        end.false ▷ ~inner : tasks⟨number⟩ := tasks⟨number⟩()
+        end.false ▷ spawn number(left) into inner
+        end.false ▷ a : Δ await next(inner) ▸ got {v} │ empty {}
+        a.empty ▷ ⊥
+        a.got ▷ p : Δ push(&~values, v) ▸ done {}
+        end.false ▷ b : Δ await next(inner) ▸ got {more} │ empty {}
+        b.got ▷ ⊥
+        end.false ▷ ↑ collect(left - 1)
+    } ▸ finished {}
+    ⊤ ▷ c : Δ await next(outer) ▸ got {outer_value} │ empty {}
+    c.empty ▷ ⊥
+    ⊤ ▷ d : Δ await next(outer) ▸ got {extra} │ empty {}
+    d.got ▷ ⊥
+    d.empty ▷ ■ ok {▾values, outer_value}
+
+//! run iterations(0) => done ok {[], 99}
+//! run iterations(3) turns [1] => done ok {[3, 2, 1], 99}

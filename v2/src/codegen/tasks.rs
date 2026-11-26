@@ -3,7 +3,7 @@
 use super::*;
 
 // Keep the common prefix in sync with %vn2.member_header in task_set.ll.
-const FIRST_INPUT: usize = 3;
+const FIRST_INPUT: usize = 4;
 
 #[derive(Clone, Copy)]
 pub(super) enum Frame {
@@ -11,14 +11,11 @@ pub(super) enum Frame {
     Nested,
 }
 
-fn sets(body: &ControlBody) -> impl Iterator<Item = (VarId, ControlId)> + '_ {
-    body.vars
-        .iter()
-        .enumerate()
-        .filter_map(|(slot, var)| match var.ty {
-            Type::Tasks(id, _) => Some((slot, id)),
-            _ => None,
-        })
+fn producers(body: &ControlBody) -> impl Iterator<Item = ControlId> + '_ {
+    body.vars.iter().filter_map(|var| match var.ty {
+        Type::Tasks(id, _) => Some(id),
+        _ => None,
+    })
 }
 
 pub(super) fn uses_sets(program: &Program) -> bool {
@@ -26,7 +23,7 @@ pub(super) fn uses_sets(program: &Program) -> bool {
         .controls
         .iter()
         .filter_map(|c| c.body.as_ref())
-        .any(|body| sets(body).next().is_some())
+        .any(|body| producers(body).next().is_some())
 }
 
 pub(super) fn emit_support<'a>(
@@ -38,33 +35,28 @@ pub(super) fn emit_support<'a>(
     let mut members = BTreeSet::new();
     for control in &program.controls {
         let Some(body) = &control.body else { continue };
-        let mut sets = sets(body);
-        let Some((_, member)) = sets.next() else {
+        let mut owned = producers(body).peekable();
+        if owned.peek().is_none() {
             continue;
-        };
-        let reason = if sets.next().is_some() {
-            Some("multiple task sets in one owner")
-        } else {
-            body.bodies
-                .iter()
-                .flat_map(|body| &body.statements)
-                .find_map(|s| match &s.command {
-                    Command::Cancel { .. } => Some("task set cancellation"),
-                    Command::Fault { .. }
-                    | Command::Boundary { .. }
-                    | Command::Supervise { .. } => {
-                        Some("a fault boundary or fault in a task-set owner")
+        }
+        let reason = body
+            .bodies
+            .iter()
+            .flat_map(|body| &body.statements)
+            .find_map(|s| match &s.command {
+                Command::Cancel { .. } => Some("task set cancellation"),
+                Command::Fault { .. } | Command::Boundary { .. } | Command::Supervise { .. } => {
+                    Some("a fault boundary or fault in a task-set owner")
+                }
+                _ => match operation(&s.command) {
+                    Some(Operation::Control(cid) | Operation::RunControl(cid))
+                        if program.controls[*cid].faults || term_tys[*cid].is_some() =>
+                    {
+                        Some("a faulting or terminating call in a task-set owner")
                     }
-                    _ => match operation(&s.command) {
-                        Some(Operation::Control(cid) | Operation::RunControl(cid))
-                            if program.controls[*cid].faults || term_tys[*cid].is_some() =>
-                        {
-                            Some("a faulting or terminating call in a task-set owner")
-                        }
-                        _ => None,
-                    },
-                })
-        };
+                    _ => None,
+                },
+            });
         if let Some(reason) = reason {
             return Err(format!(
                 "control `{}`: the native backend does not yet support {reason}",
@@ -72,7 +64,7 @@ pub(super) fn emit_support<'a>(
             ));
         }
         check_owner_awaits(program, control, body, term_tys)?;
-        members.insert(member);
+        members.extend(owned);
     }
     if members.is_empty() {
         return Ok(());
@@ -137,7 +129,7 @@ fn awaited_body<'a>(
             target.name
         ));
     };
-    if sets(body).next().is_some() {
+    if producers(body).next().is_some() {
         return Err(format!(
             "the native backend does not yet support task-set {role} `{caller}` awaiting `{}`, which creates a set",
             target.name
@@ -189,7 +181,7 @@ fn emit_member<'a>(
         .iter()
         .chain(member.contract.iter().flat_map(|alt| &alt.fields))
         .any(|p| program.contains_borrow_or_view(&p.ty));
-    if member.faults || term_tys[id].is_some() || uses_loans || sets(body).next().is_some() {
+    if member.faults || term_tys[id].is_some() || uses_loans || producers(body).next().is_some() {
         return Err(format!(
             "the native backend needs a nonfaulting task-set producer with owned or copy inputs and results and no task set of its own for `{}`",
             member.name
@@ -225,7 +217,7 @@ fn emit_member<'a>(
     Ok(())
 }
 
-// The queue link, resume index/result tag and storage flag precede the inputs,
+// The queue link, resume index/result tag, storage flag and set precede the inputs,
 // result destinations, and slots of the resumable body. Every resume gets
 // fresh SSA addresses for the same slots in this invocation of the owner.
 pub(super) fn emit_member_entry(
@@ -238,7 +230,7 @@ pub(super) fn emit_member_entry(
 ) -> Vec<String> {
     let member = &program.controls[id];
     let ty = format!("%vn2.member.{id}");
-    let mut fields = vec!["ptr".into(), "i32".into(), "i1".into()];
+    let mut fields = vec!["ptr".into(), "i32".into(), "i1".into(), "ptr".into()];
     fields.extend(
         member
             .parameters
@@ -391,21 +383,31 @@ fn pool(em: &mut IrEmitter<'_, '_>, set: VarId) -> String {
     ptr
 }
 
-/// Give the host a turn choice and pass the same set to the next activation.
-pub(super) fn choose_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) -> String {
+pub(super) fn init_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) {
+    if producers(body).next().is_some() {
+        em.slots
+            .push(("%local_scheduler".into(), "%vn2.scheduler".into()));
+        em.code
+            .push_str("  call fastcc void @vn2_scheduler_init(ptr %local_scheduler)\n");
+    }
+}
+
+/// A defined await in the same task inherits every ready child of its owner.
+pub(super) fn choose_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) -> &'static str {
     if !em.reg.has_task_sets {
         em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
-        return "null".into();
+        return "null";
     }
-    let peers = match sets(body).next() {
-        Some((slot, _)) => pool(em, slot),
-        None => "%owner_pool".to_string(),
+    let scheduler = if producers(body).next().is_some() {
+        "%local_scheduler"
+    } else {
+        "%owner_scheduler"
     };
     let _ = writeln!(
         em.code,
-        "  call fastcc void @vn2_choose_owner(ptr {peers}, i1 true)"
+        "  call fastcc void @vn2_choose_owner(ptr {scheduler}, ptr null)"
     );
-    peers
+    scheduler
 }
 
 fn field(em: &mut IrEmitter<'_, '_>, ty: &str, ptr: &str, index: usize) -> String {
@@ -428,7 +430,7 @@ pub(super) fn new_set(em: &mut IrEmitter<'_, '_>, member: ControlId) -> String {
 
 pub(super) fn count(em: &mut IrEmitter<'_, '_>, set: VarId) -> String {
     let ptr = pool(em, set);
-    let slot = field(em, "%vn2.pool", &ptr, 3);
+    let slot = field(em, "%vn2.pool", &ptr, 1);
     let total = em.fresh_reg();
     let _ = writeln!(em.code, "  {total} = load i64, ptr {slot}");
     if em.reg.usize_bits == 64 {
@@ -472,7 +474,7 @@ pub(super) fn spawn(
     };
     let _ = writeln!(
         em.code,
-        "  call fastcc void @vn2_spawn(ptr {ptr}, ptr {frame}, i1 {repeated}, i64 {max})"
+        "  call fastcc void @vn2_spawn(ptr %local_scheduler, ptr {ptr}, ptr {frame}, i1 {repeated}, i64 {max})"
     );
 }
 
@@ -488,7 +490,10 @@ pub(super) fn next(
     let empty_label = em.fresh_label("pool_empty");
     let member_label = em.fresh_label("pool_member");
     let join = em.fresh_label("pool_result");
-    let _ = writeln!(em.code, "  {frame} = call fastcc ptr @vn2_next(ptr {ptr})");
+    let _ = writeln!(
+        em.code,
+        "  {frame} = call fastcc ptr @vn2_next(ptr %local_scheduler, ptr {ptr})"
+    );
     let _ = writeln!(
         em.code,
         "  {empty} = icmp eq ptr {frame}, null\n  br i1 {empty}, label %{empty_label}, label %{member_label}"

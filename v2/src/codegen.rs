@@ -3945,7 +3945,7 @@ fn emit_body_unit<'a>(
         if let UnitKind::Control { id, .. } = unit
             && program.controls[id].is_async
         {
-            sig_parts.push("ptr %owner_pool".into());
+            sig_parts.push("ptr %owner_scheduler".into());
         }
         let _ = writeln!(
             out,
@@ -3971,6 +3971,8 @@ fn emit_body_unit<'a>(
                 .push((format!("%lex_fault_{bid}"), "%vn2.string".into()));
         }
     }
+
+    tasks::init_owner(&mut emitter, body);
 
     // Store entry parameters and zero remaining slots.
     for (idx, (pname, pty)) in params_sig.iter().enumerate() {
@@ -4890,10 +4892,10 @@ fn emit_operation_call(
                 if em.resume_points.is_some() {
                     tasks::await_in_member(em, *cid, &frame, &tag_reg);
                 } else {
-                    let peers = tasks::choose_owner(em, body);
+                    let scheduler = tasks::choose_owner(em, body);
                     let _ = writeln!(
                         em.code,
-                        "  {tag_reg} = call fastcc i32 @vn2_resume_{cid}(ptr {frame}, ptr {peers})"
+                        "  {tag_reg} = call fastcc i32 @vn2_resume_{cid}(ptr {frame}, ptr {scheduler})"
                     );
                 }
             } else if is_extern {
@@ -5679,7 +5681,7 @@ fn load_await_fields(out: &mut String, id: ControlId, fields: &[(String, String)
 }
 
 /// Enter an awaited control on its chosen turn with the bound operands and
-/// the set of the same owner task. Fresh runs start with a null set.
+/// its owner’s ready queue. A fresh run starts without inherited children.
 fn emit_await_continuations(
     out: &mut String,
     program: &Program,
@@ -5693,14 +5695,14 @@ fn emit_await_continuations(
         let _ = writeln!(out, "%vn2.await.{id} = type {{ {} }}", types.join(", "));
         let _ = writeln!(
             out,
-            "define internal fastcc i32 @vn2_resume_{id}(ptr %frame, ptr %owner_pool) nounwind {{"
+            "define internal fastcc i32 @vn2_resume_{id}(ptr %frame, ptr %owner_scheduler) nounwind {{"
         );
         load_await_fields(out, id, &fields);
         let mut arguments: Vec<_> = fields
             .iter()
             .map(|(ll, name)| format!("{ll} {name}"))
             .collect();
-        arguments.push("ptr %owner_pool".into());
+        arguments.push("ptr %owner_scheduler".into());
         let _ = writeln!(
             out,
             "  %tag = call fastcc i32 @vn2_ctrl_{id}({})",

@@ -10,6 +10,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const MULTIPLE_SETS: &str = include_str!("slice4/checked_multiple_sets.core");
 const REPEATED_SPAWN: &str = include_str!("slice4/checked_repeated_spawn.core");
 const ROOTS: &str = include_str!("slice4/checked_run.core");
 const AWAITS: &str = include_str!("slice4/checked_await.core");
@@ -148,6 +149,12 @@ fn repeated_spawn_stops_before_count_would_exceed_the_target_limit() {
             );
         }
     }
+}
+
+#[test]
+fn multiple_sets_deliver_only_the_requested_producers_results() {
+    // Eight packet vectors, three loop frames, and the collected number vector.
+    compare_native_runs(MULTIPLE_SETS, &["E-Spawn"], &[3, 3, 3, 3, 1, 4], 12);
 }
 
 #[test]
@@ -485,6 +492,58 @@ fn the_owner_receives_a_sibling_while_a_nested_member_is_suspended() {
     );
 }
 
+#[test]
+fn multiple_sets_offer_all_ready_members_in_spawn_order() {
+    // Two packets finish before the stamp. Neither wakes the waiting owner.
+    compare_sampled_example(
+        MULTIPLE_SETS,
+        "sets_waiting",
+        [2, 0, 0, 0],
+        &[
+            "ready 3",
+            "sample 3 at 1",
+            "ready 2",
+            "ready 2",
+            "sample 1 at 3",
+            "ready 1",
+            "sample 2 at 4",
+            "ready 1",
+            "sample 7 at 5",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+            "sample 8 at 8",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+        ],
+    );
+    // Both packets are still ready when the owner consumes the empty stamp set.
+    compare_sampled_example(
+        MULTIPLE_SETS,
+        "sets_drained",
+        [1, 0, 0, 2],
+        &[
+            "ready 3",
+            "sample 2 at 1",
+            "ready 3",
+            "sample 7 at 2",
+            "ready 3",
+            "ready 3",
+            "sample 3 at 4",
+            "ready 2",
+            "ready 2",
+            "sample 8 at 6",
+            "ready 2",
+            "ready 1",
+            "ready 1",
+            "sample 1 at 9",
+            "ready 1",
+            "ready 1",
+        ],
+    );
+}
+
 fn compare_sampled_example(source: &str, name: &str, choices: [usize; 4], calls: &[&str]) {
     const DRIVER: &str = r#"
 #include "module.h"
@@ -638,7 +697,8 @@ async control owner() ■ { ok {} }
             .replace("turns [1] => done ok", "with [read -> ok] turns [1] => done ok trace [read() -> ok]"), "await of extern `read` in task-set member"),
         (base.replace("async control idle() ■ { ok {} }", "async control unit() ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control idle() ■ { ok {} }\n    ⊤ ▷ ~set : tasks⟨unit⟩ := tasks⟨unit⟩()\n    ⊤ ▷ n : Δ await next(set) ▸ ok {} │ empty {}\n    n.ok ▷ ⊥")
             .replace("child(value : usize) ■ { ok {} }", &format!("child(value : usize) ■ {{ ok {{}} }}\n    {suspend}")), "task-set member `child` awaiting `idle`, which creates a set"),
-        (base.replace(next_owner, &format!("{new_set}\n    {next_owner}")), "multiple task sets"),
+        (base.replace("async control owner", "async control borrower(value : &usize) ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control owner")
+            .replace(next_owner, &format!("⊤ ▷ ~other : tasks⟨borrower⟩ := tasks⟨borrower⟩()\n    ⊤ ▷ spawn borrower(&v) into other\n    ⊤ ▷ a : Δ await next(other) ▸ ok {{}} │ empty {{}}\n    a.empty ▷ ⊥\n    ⊤ ▷ b : Δ await next(other) ▸ ok {{}} │ empty {{}}\n    b.ok ▷ ⊥\n    {next_owner}")), "owned or copy inputs and results and no task set of its own for `borrower`"),
         (base.replace(spawn, &format!("⊤ ▷ l : ↻ once() {{\n        {spawn}\n        ⊤ ▷ □ added {{}}\n    }} ▸ added {{}}")).replace("value : usize", "value : &usize").replace("child(v)", "child(&v)"), "owned or copy inputs"),
         (base.replace("value : usize", "value : &usize").replace("child(v)", "child(&v)"), "owned or copy inputs"),
         (base.replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} } faults").replace("owner() ■ { ok {} }", "owner() ■ { ok {} } faults"), "nonfaulting"),

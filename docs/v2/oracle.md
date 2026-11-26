@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.11). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.12). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2293,7 +2293,8 @@ selection or moving it after the continuation changes the transcript.
 
 ### 18.6 Native spawn and delivery of nonsuspending members, 25 November 2026
 
-A set has two queues. A top-level `spawn` binds the arguments in an activation
+The single-set implementation used two queues. Section 18.12 shares the ready
+queue across sets. A top-level `spawn` binds the arguments in an activation
 in the owner's stack frame and appends it to the ready queue. At `await next`,
 the C host receives the number of ready tasks. The owner is first when it can
 receive a completed member or observe an empty set. The ready children follow
@@ -2372,15 +2373,15 @@ owner local across an await.
 ### 18.9 Nested defined awaits in the set owner, 26 November 2026
 
 Each defined await binds its operands and gives the host a turn choice before
-the callee starts. The owner passes its set into each awaited activation.
-At the next await, the host can select a child of that same set. Result
+the callee starts. Each awaited activation inherits its owner’s ready children.
+At the next await, the host can select one of those children. Result
 slots and borrowed locals stay live during the child's turn. A separate `run`
 starts a fresh root. The outer children become eligible again when execution
 returns to the outer run and reaches another await.
 
-The internal async entry takes the set as an argument. The set records its
-producer's resume function. A public C entry and a fresh run start with a
-null set. The native backend follows the owner's await calls to check that
+The internal async entry takes a pointer to the owner’s scheduler. Each set
+records its producer's resume function. A public C entry and a fresh run
+start without inherited children. The native backend follows the owner's await calls to check that
 their targets are defined, have no set of their own and cannot fault or
 terminate the run. Section 18.10 extends nested suspension to a spawned member.
 
@@ -2442,6 +2443,30 @@ each. A separate test lowers the emitted count limit to four and three.
 The fourth spawn fits at four and reaches the trap at three. Both
 interpreters run the same program at both limits.
 
+### 18.12 Scheduling across sets in one owner, 26 November 2026
+
+All ready members of the owner enter one queue in spawn order. A yielding
+member retains its position. Each member carries its originating set, which
+supplies the producer entry and receives the completed frame. Each set keeps
+its own completion queue, undelivered count and spare frame.
+
+At a defined await the host can select the owner or any ready member. At
+`await next(s)`, the owner becomes eligible when `s` is empty or has a
+completion. A different set's members can run and finish while the owner
+waits. Delivery takes the oldest completion of `s`. Consuming an empty set
+leaves the members of other sets eligible, including through a nested
+defined await. A fresh `run` still starts with its own root.
+
+From `v2/`, run `vn2 test tests/slice4/checked_multiple_sets.core` and
+`cargo test --test backend_slice4 multiple_sets`. In `interleaved` two
+packets return vectors and a stamp returns the host's sampled turn. When
+both packets finish before the stamp, the C host sees the owner first
+become eligible after the stamp finishes on turn 4. When the stamp
+finishes first, the host can still select either packet at the await that
+consumes the empty stamp set. In `iterations(3)` the owner consumes and
+recreates a second set of the same producer three times before receiving
+the outer value of 99.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2453,7 +2478,8 @@ interpreters run the same program at both limits.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs multiple sets, loans, host waits, cancellation, member faults, capacity and
+- **Later work.** Slice 4 still needs sets created in members and awaited callees, loans at
+  spawn and delivery, host waits, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
