@@ -1,0 +1,76 @@
+// Both workers can be parked in the same control, each on its own set.
+extern control sample(mark : u32) ■ { ok {value : u32} } uses clock
+
+async control packet(mark : u32, xs : [u32]) ■ { got {data : [u32]} } uses clock
+    ⊤ ▷ p : Δ sample(mark) ▸ ok {turn}
+    p.ok ▷ ■ got {▾xs}
+
+async control collect(mark : u32, xs : [u32]) ■ { got {data : [u32]} } uses clock
+    ⊤ ▷ ~set : tasks⟨packet⟩ := tasks⟨packet⟩()
+    ⊤ ▷ spawn packet(mark, ▾xs) into set
+    ⊤ ▷ a : Δ await next(set) ▸ got {data} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(set) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ got {▾data}
+
+async control worker(mark : u32, xs : [u32]) ■ { got {data : [u32], turn : u32} } uses clock
+    ⊤ ▷ c := capture await collect(mark, ▾xs)
+    ⊤ ▷ a : Δ outcome(▾c) ▸ got {data}
+    ⊤ ▷ p : Δ sample(9) ▸ ok {turn}
+    p.ok ▷ ■ got {▾data, turn}
+
+async control pair() ■ { order {first : [u32], second : [u32], turn : u32} } uses clock
+    ⊤ ▷ ~set : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(1, [11]) into set
+    ⊤ ▷ spawn worker(2, [22]) into set
+    ⊤ ▷ a : Δ await next(set) ▸ got {first, turn} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(set) ▸ got {second, seen} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(set) ▸ got {extra, k} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ order {▾first, ▾second, turn}
+
+control example() ■ { ok {mark : u32} } uses clock
+    ⊤ ▷ p : Δ run pair() ▸ order {first, second, turn}
+    p.order ▷ ■ ok {turn}
+
+//! run pair() with [sample -> ok {10}; sample -> ok {19}; sample -> ok {20}; sample -> ok {29}] => done order {[11], [22], 19} trace [sample(1) -> ok {10}; sample(9) -> ok {19}; sample(2) -> ok {20}; sample(9) -> ok {29}]
+//! run pair() with [sample -> ok {20}; sample -> ok {29}; sample -> ok {10}; sample -> ok {19}] turns [0, 0, 0, 0, 1] => done order {[22], [11], 29} trace [sample(2) -> ok {20}; sample(9) -> ok {29}; sample(1) -> ok {10}; sample(9) -> ok {19}]
+
+// Every nonempty level keeps a child across its recursive await. Its child
+// may finish before control comes back from the deeper activation.
+async control level(n : u32) ■ { ok {value : u32} }
+    ⊤ ▷ ■ ok {n}
+
+async control descend(depth : u32) ■ { path {values : [u32]} }
+    ⊤ ▷ ~set : tasks⟨level⟩ := tasks⟨level⟩()
+    ⊤ ▷ ~values : [u32] := []
+    ⊤ ▷ z : ? depth = 0
+    z.false ▷ spawn level(depth) into set
+    z.false ▷ r : Δ await descend(depth - 1) ▸ path {prior}
+    r.path ▷ values ← ▾prior
+    z.false ▷ a : Δ await next(set) ▸ ok {n} │ empty {}
+    a.empty ▷ ⊥
+    a.ok ▷ p : Δ push(&~values, n) ▸ done {}
+    ⊤ ▷ e : Δ await next(set) ▸ ok {extra} │ empty {}
+    e.ok ▷ ⊥
+    e.empty ▷ ■ path {▾values}
+
+async control walk(depth : u32) ■ { path {values : [u32]} }
+    ⊤ ▷ r : Δ await descend(depth) ▸ path {values}
+    r.path ▷ ■ path {▾values}
+
+async control recursive(depth : u32) ■ { path {values : [u32]} }
+    ⊤ ▷ ~set : tasks⟨walk⟩ := tasks⟨walk⟩()
+    ⊤ ▷ spawn walk(depth) into set
+    ⊤ ▷ a : Δ await next(set) ▸ path {values} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(set) ▸ path {extra} │ empty {}
+    e.path ▷ ⊥
+    e.empty ▷ ■ path {▾values}
+
+//! run recursive(0) => done path {[]}
+//! run recursive(3) => done path {[1, 2, 3]}
+//! run recursive(3) turns [0, 0, 1, 0, 1, 0, 1] => done path {[1, 2, 3]}

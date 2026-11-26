@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.16). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.17). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2563,6 +2563,27 @@ turn. In `twins`, two recursive producers return paths of different lengths
 in either completion order. In `borrow_after_empty` the member yields on an
 empty set and returns a reference to its owner's local.
 
+### 18.17 Task sets in a callee awaited by a member, 26 November 2026
+
+A defined await extends the same task. The callee keeps its own resume point,
+locals and sets. When it waits for a child, the scheduler parks the spawned
+member to which that activation belongs. A completion in the requested set
+wakes that member. On its selected turn it resumes at the innermost pending
+await. When the callee returns, the caller continues on that turn.
+
+From `v2/`, run `vn2 test tests/slice4/checked_nested_member_set.core` and
+`cargo test --test backend_slice4 nested_member_sets`. In `pair`, two workers
+wait in separate invocations of `collect`, whose only suspension points are
+`await next`. At the fifth offer both workers are blocked and their two
+children are ready. Choosing the second child delivers `[22]` before `[11]`.
+Choosing the first reverses the order. The linked C host checks every offer
+and the turn on which each worker continues after its captured await.
+
+In `recursive(3)` three invocations of `descend` each keep a child and a set
+across a recursive await. The deepest activation drains an empty set. Two
+schedules return `[1, 2, 3]`, including one in which each child finishes
+before the deeper call returns.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2574,8 +2595,7 @@ empty set and returns a reference to its owner's local.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs sets created by the awaited callees of spawned members,
-  host waits, cancellation, member faults, capacity and
+- **Later work.** Slice 4 still needs host waits, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).

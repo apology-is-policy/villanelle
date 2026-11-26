@@ -79,13 +79,7 @@ pub(super) fn emit_support<'a>(
         while let Some(callee) = pending.pop() {
             let target = &program.controls[callee];
             let body = awaited_body(target, "member", &member.name)?;
-            if producers(body).next().is_some() {
-                return Err(format!(
-                    "the native backend does not yet support task-set member `{}` awaiting `{}`, which creates a set",
-                    member.name, target.name
-                ));
-            }
-            if awaits(body).next().is_some() && nested.insert(callee) {
+            if needs_activation(body) && nested.insert(callee) {
                 pending.extend(awaits(body));
             }
         }
@@ -123,6 +117,11 @@ fn awaits(body: &ControlBody) -> impl Iterator<Item = ControlId> + '_ {
             Some(Operation::AwaitControl(callee)) => Some(*callee),
             _ => None,
         })
+}
+
+// A member gives up its turn both at a defined await and at await next.
+fn needs_activation(body: &ControlBody) -> bool {
+    awaits(body).next().is_some() || producers(body).next().is_some()
 }
 
 fn awaited_body<'a>(
@@ -184,7 +183,7 @@ fn emit_member<'a>(
         ));
     }
 
-    if awaits(body).next().is_some() || producers(body).next().is_some() {
+    if needs_activation(body) {
         return emit_body_unit(
             out,
             program,
@@ -244,7 +243,7 @@ pub(super) fn emit_member_entry(
     let _ = writeln!(out, "{ty} = type {{ {} }}", fields.join(", "));
     let _ = writeln!(
         out,
-        "define internal fastcc i32 @vn2_member_{id}(ptr %frame, ptr %task_scheduler) nounwind {{\nentry:"
+        "define internal fastcc i32 @vn2_member_{id}(ptr %task_member, ptr %task_scheduler) nounwind {{\nentry:"
     );
     let mut args: Vec<_> = member
         .parameters
@@ -258,17 +257,17 @@ pub(super) fn emit_member_entry(
             let name = format!("%out_{alt}_{field}");
             let _ = writeln!(
                 out,
-                "  {name} = getelementptr {ty}, ptr %frame, i32 0, i32 {index}"
+                "  {name} = getelementptr {ty}, ptr %task_member, i32 0, i32 {index}"
             );
             args.push(format!("ptr {name}"));
             index += 1;
         }
     }
-    emit_local_addresses(out, &ty, "%frame", locals_start, slots);
+    emit_local_addresses(out, &ty, "%task_member", locals_start, slots);
     if !resume_points.is_empty() {
         let _ = writeln!(
             out,
-            "  %member_state = getelementptr {ty}, ptr %frame, i32 0, i32 1"
+            "  %member_state = getelementptr {ty}, ptr %task_member, i32 0, i32 1"
         );
         emit_resume_switch(out, resume_points);
     }
@@ -277,7 +276,7 @@ pub(super) fn emit_member_entry(
         let ll = &fields[index];
         let _ = writeln!(
             out,
-            "  %in_{i} = getelementptr {ty}, ptr %frame, i32 0, i32 {index}\n  %p{i} = load {ll}, ptr %in_{i}"
+            "  %in_{i} = getelementptr {ty}, ptr %task_member, i32 0, i32 {index}\n  %p{i} = load {ll}, ptr %in_{i}"
         );
     }
     args
@@ -324,7 +323,7 @@ pub(super) fn emit_nested_entry(
     );
     let _ = writeln!(
         out,
-        "define internal fastcc i32 @vn2_nested_{id}(ptr %frame, ptr %member_state) nounwind {{\nentry:"
+        "define internal fastcc i32 @vn2_nested_{id}(ptr %frame, ptr %member_state, ptr %task_member, ptr %task_scheduler) nounwind {{\nentry:"
     );
     load_await_fields(out, id, bound);
     emit_local_addresses(out, &ty, "%member_state", 1, slots);
@@ -333,11 +332,12 @@ pub(super) fn emit_nested_entry(
 
 // The bound arguments live in the caller. A callee that can itself suspend
 // needs its own PC and locals until it returns, including on a recursive edge.
+// All activations of this task park and wake the same scheduler member.
 pub(super) fn await_in_member(em: &mut IrEmitter<'_, '_>, id: ControlId, frame: &str, tag: &str) {
     let nested = em.program.controls[id]
         .body
         .as_ref()
-        .is_some_and(|body| awaits(body).next().is_some());
+        .is_some_and(needs_activation);
     let activation = nested.then(|| {
         let slot = em.alloc_temp("ptr");
         let ptr = em.fresh_reg();
@@ -364,7 +364,7 @@ pub(super) fn await_in_member(em: &mut IrEmitter<'_, '_>, id: ControlId, frame: 
         let done = em.fresh_label("nested_done");
         let _ = writeln!(
             em.code,
-            "  {ptr} = load ptr, ptr {slot}\n  {tag} = call fastcc i32 @vn2_nested_{id}(ptr {frame}, ptr {ptr})"
+            "  {ptr} = load ptr, ptr {slot}\n  {tag} = call fastcc i32 @vn2_nested_{id}(ptr {frame}, ptr {ptr}, ptr %task_member, ptr %task_scheduler)"
         );
         let _ = writeln!(
             em.code,
@@ -500,7 +500,7 @@ pub(super) fn next(
         let _ = writeln!(em.code, "  store i32 {pc}, ptr %member_state");
         let _ = writeln!(
             em.code,
-            "  call fastcc void @vn2_wait_member(ptr %task_scheduler, ptr %frame, ptr {awaited})\n  ret i32 -3\n{resume}:"
+            "  call fastcc void @vn2_wait_member(ptr %task_scheduler, ptr %task_member, ptr {awaited})\n  ret i32 -3\n{resume}:"
         );
         pool(em, set)
     } else {
