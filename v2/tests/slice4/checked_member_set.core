@@ -1,0 +1,98 @@
+// Finishing a side packet cannot wake a parent waiting for its wanted packet.
+extern control sample(mark : u32) ■ { ok {value : u32} } uses clock
+
+async control packet(mark : u32, xs : [u32]) ■ { got {data : [u32], turn : u32} } uses clock
+    ⊤ ▷ p : Δ sample(mark) ▸ ok {seen}
+    p.ok ▷ ■ got {▾xs, seen}
+
+async control parent(xs : [u32]) ■ { got {data : [u32], second : [u32], side : [u32], turn : u32} } uses clock
+    ⊤ ▷ ~side : tasks⟨packet⟩ := tasks⟨packet⟩()
+    ⊤ ▷ ~wanted : tasks⟨packet⟩ := tasks⟨packet⟩()
+    ⊤ ▷ spawn packet(7, [70]) into side
+    ⊤ ▷ spawn packet(2, ▾xs) into wanted
+    ⊤ ▷ spawn packet(4, [44]) into wanted
+    ⊤ ▷ a : Δ await next(wanted) ▸ got {data, turn} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ s : Δ sample(3) ▸ ok {seen}
+    ⊤ ▷ w : Δ await next(wanted) ▸ got {second, k} │ empty {}
+    w.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(wanted) ▸ got {extra, x} │ empty {}
+    b.got ▷ ⊥
+    ⊤ ▷ c : Δ await next(side) ▸ got {other, y} │ empty {}
+    c.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(side) ▸ got {last, z} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ got {▾data, ▾second, ▾other, turn}
+
+async control owner() ■ { ok {peer : [u32], wanted : [u32], second : [u32], side : [u32], turn : u32} } uses clock
+    ⊤ ▷ ~parents : tasks⟨parent⟩ := tasks⟨parent⟩()
+    ⊤ ▷ ~peers : tasks⟨packet⟩ := tasks⟨packet⟩()
+    ⊤ ▷ spawn parent([22]) into parents
+    ⊤ ▷ spawn packet(1, [11]) into peers
+    ⊤ ▷ a : Δ await next(peers) ▸ got {peer, p} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ s : Δ sample(9) ▸ ok {seen}
+    ⊤ ▷ b : Δ await next(peers) ▸ got {extra, x} │ empty {}
+    b.got ▷ ⊥
+    ⊤ ▷ c : Δ await next(parents) ▸ got {wanted, second, side, turn} │ empty {}
+    c.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(parents) ▸ got {last, more, other, y} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {▾peer, ▾wanted, ▾second, ▾side, turn}
+
+control example() ■ { ok {mark : u32} } uses clock
+    ⊤ ▷ r : Δ run owner() ▸ ok {peer, wanted, second, side, turn}
+    r.ok ▷ ■ ok {turn}
+
+//! run owner() with [sample -> ok {10}; sample -> ok {90}; sample -> ok {70}; sample -> ok {20}; sample -> ok {30}; sample -> ok {40}] => done ok {[11], [22], [44], [70], 20} trace [sample(1) -> ok {10}; sample(9) -> ok {90}; sample(7) -> ok {70}; sample(2) -> ok {20}; sample(3) -> ok {30}; sample(4) -> ok {40}]
+//! run owner() with [sample -> ok {40}; sample -> ok {20}; sample -> ok {30}; sample -> ok {10}; sample -> ok {90}; sample -> ok {70}] turns [0, 3, 3] => done ok {[11], [44], [22], [70], 40} trace [sample(4) -> ok {40}; sample(2) -> ok {20}; sample(3) -> ok {30}; sample(1) -> ok {10}; sample(9) -> ok {90}; sample(7) -> ok {70}]
+
+// A child can spawn the same producer. Every set, including an empty leaf,
+// passes the turn on next and drains before its frame returns.
+async control tree(depth : u32) ■ { got {data : [u32]} }
+    ⊤ ▷ ~children : tasks⟨tree⟩ := tasks⟨tree⟩()
+    ⊤ ▷ ~levels : [u32] := []
+    ⊤ ▷ b : ? depth = 0
+    b.false ▷ spawn tree(depth - 1) into children
+    b.false ▷ a : Δ await next(children) ▸ got {prior} │ empty {}
+    a.empty ▷ ⊥
+    a.got ▷ levels ← ▾prior
+    ⊤ ▷ e : Δ await next(children) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    ⊤ ▷ p : Δ push(&~levels, depth) ▸ done {}
+    ⊤ ▷ ■ got {▾levels}
+
+async control twins() ■ { got {first : [u32], second : [u32]} }
+    ⊤ ▷ ~parents : tasks⟨tree⟩ := tasks⟨tree⟩()
+    ⊤ ▷ spawn tree(1) into parents
+    ⊤ ▷ spawn tree(2) into parents
+    ⊤ ▷ a : Δ await next(parents) ▸ got {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(parents) ▸ got {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(parents) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ got {▾first, ▾second}
+
+//! run tree(0) => done got {[0]}
+//! run tree(3) => done got {[0, 1, 2, 3]}
+//! run twins() => done got {[0, 1], [0, 1, 2]}
+//! run twins() turns [1, 1, 1, 1, 1, 1, 1, 1] => done got {[0, 1, 2], [0, 1]}
+
+async control lend(r : &u32) ■ { item {out : &u32 ∈ r} }
+    ⊤ ▷ ~children : tasks⟨tree⟩ := tasks⟨tree⟩()
+    ⊤ ▷ e : Δ await next(children) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ item {r}
+
+async control borrow_after_empty() ■ { ok {value : u32} }
+    ⊤ ▷ value : u32 := 53
+    ⊤ ▷ ~set : tasks⟨lend⟩ := tasks⟨lend⟩()
+    ⊤ ▷ spawn lend(&value) into set
+    ⊤ ▷ a : Δ await next(set) ▸ item {loan} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(set) ▸ item {extra} │ empty {}
+    e.item ▷ ⊥
+    e.empty ▷ ■ ok {loan}
+
+//! run borrow_after_empty() => done ok {53}

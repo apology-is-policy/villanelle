@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.15). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.16). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2537,6 +2537,32 @@ callers receive their own vectors. `outer(true)` enters the same inner
 control through a fresh run. In `collect(2)` three recursive activations
 drain distinct sets of the same producer and return `[0, 1, 2]`.
 
+### 18.16 A spawned member waits for its children, 26 November 2026
+
+A nonfaulting spawned member can own sets. At `await next(s)` it saves
+where to resume and gives up its turn. If `s` is empty or has a completion,
+the member stays eligible. Otherwise the set records the member waiting
+for it. The scheduler counts eligible members and skips blocked ones when
+applying the host's index in spawn order. The first completion in `s` clears
+its waiter and makes the member eligible in its original position. Delivery
+takes place on the parent's selected turn, in completion order.
+
+A child spawned once by a member can use space in that member's frame when
+the child owns no sets. A repeated spawn takes separate storage. So does
+a member's child if the child owns sets. That keeps recursive frame layouts finite.
+Each set can reuse one delivered heap frame and frees it on the empty arm.
+
+From `v2/`, run `vn2 test tests/slice4/checked_member_set.core` and
+`cargo test --test backend_slice4 member_owned_sets`. The parent in
+`owner` waits for the two packets in `wanted`. A peer and a side packet can
+finish while it waits. One schedule delivers `[22]` then `[44]`. Another
+finishes both wanted packets before the parent runs again, delivers them
+in the opposite order, and wakes the parent once. In each run the side set
+delivers `[70]`. The linked C host checks every ready count and sampled
+turn. In `twins`, two recursive producers return paths of different lengths
+in either completion order. In `borrow_after_empty` the member yields on an
+empty set and returns a reference to its owner's local.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2548,7 +2574,7 @@ drain distinct sets of the same producer and return `[0, 1, 2]`.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs sets created by spawned members or by their awaited callees,
+- **Later work.** Slice 4 still needs sets created by the awaited callees of spawned members,
   host waits, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list

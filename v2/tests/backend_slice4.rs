@@ -10,6 +10,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const MEMBER_SET: &str = include_str!("slice4/checked_member_set.core");
 const AWAITED_SET: &str = include_str!("slice4/checked_awaited_set.core");
 const MULTIPLE_SETS: &str = include_str!("slice4/checked_multiple_sets.core");
 const REPEATED_SPAWN: &str = include_str!("slice4/checked_repeated_spawn.core");
@@ -172,6 +173,12 @@ fn repeated_spawn_stops_before_count_would_exceed_the_target_limit() {
             );
         }
     }
+}
+
+#[test]
+fn member_owned_sets_deliver_to_each_parent_in_completion_order() {
+    // Eight packet vectors, six tree vectors, and eight recursive child frames.
+    compare_native_runs(MEMBER_SET, &["E-Spawn"], &[5, 5, 0, 3, 5, 5, 1], 22);
 }
 
 #[test]
@@ -522,6 +529,66 @@ fn the_owner_receives_a_sibling_while_a_nested_member_is_suspended() {
 }
 
 #[test]
+fn member_owned_sets_offer_only_ready_parents_in_spawn_order() {
+    // The peer and side packet finish while the parent waits for its wanted set.
+    compare_sampled_example(
+        MEMBER_SET,
+        "member_set_wait",
+        [0, 0, 0, 0],
+        &[
+            "ready 2",
+            "ready 4",
+            "sample 1 at 2",
+            "ready 4",
+            "sample 9 at 3",
+            "ready 4",
+            "ready 3",
+            "sample 7 at 5",
+            "ready 2",
+            "sample 2 at 6",
+            "ready 2",
+            "sample 3 at 7",
+            "ready 1",
+            "sample 4 at 8",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+        ],
+    );
+    // Two completions in the same set wake the parent once, in its old position.
+    compare_sampled_example(
+        MEMBER_SET,
+        "member_set_wake",
+        [0, 3, 3, 0],
+        &[
+            "ready 2",
+            "ready 4",
+            "sample 4 at 2",
+            "ready 4",
+            "sample 2 at 3",
+            "ready 3",
+            "sample 3 at 4",
+            "ready 3",
+            "ready 3",
+            "ready 2",
+            "sample 1 at 7",
+            "ready 2",
+            "sample 9 at 8",
+            "ready 2",
+            "ready 1",
+            "sample 7 at 10",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+        ],
+    );
+}
+
+#[test]
 fn awaited_set_owners_offer_inner_and_outer_members_in_spawn_order() {
     // At the inner next, the outer packet can finish without waking the owner.
     compare_sampled_example(
@@ -770,7 +837,8 @@ async control owner() ■ { ok {} }
         (base.replace("async control idle() ■ { ok {} }", "async control unit() ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control idle() ■ { ok {} }\n    ⊤ ▷ ~set : tasks⟨unit⟩ := tasks⟨unit⟩()\n    ⊤ ▷ n : Δ await next(set) ▸ ok {} │ empty {}\n    n.ok ▷ ⊥")
             .replace("child(value : usize) ■ { ok {} }", &format!("child(value : usize) ■ {{ ok {{}} }}\n    {suspend}")), "task-set member `child` awaiting `idle`, which creates a set"),
         (base.replace("async control owner", &format!("async control borrower(value : &usize) ■ {{ ok {{loan : &usize ∈ value}} }}\n    {new_set}\n    ⊤ ▷ ■ ok {{value}}\n\nasync control owner"))
-            .replace(next_owner, &format!("⊤ ▷ ~other : tasks⟨borrower⟩ := tasks⟨borrower⟩()\n    ⊤ ▷ spawn borrower(&v) into other\n    ⊤ ▷ a : Δ await next(other) ▸ ok {{loan}} │ empty {{}}\n    a.empty ▷ ⊥\n    ⊤ ▷ b : Δ await next(other) ▸ ok {{extra}} │ empty {{}}\n    b.ok ▷ ⊥\n    {next_owner}")), "no task set of its own for `borrower`"),
+            .replace("⊤ ▷ q : Δ await next(other)", "⊤ ▷ cancel other\n    ⊤ ▷ q : Δ await next(other)")
+            .replace(next_owner, &format!("⊤ ▷ ~other : tasks⟨borrower⟩ := tasks⟨borrower⟩()\n    ⊤ ▷ spawn borrower(&v) into other\n    ⊤ ▷ a : Δ await next(other) ▸ ok {{loan}} │ empty {{}}\n    a.empty ▷ ⊥\n    ⊤ ▷ b : Δ await next(other) ▸ ok {{extra}} │ empty {{}}\n    b.ok ▷ ⊥\n    {next_owner}")), "control `borrower`: the native backend does not yet support task set cancellation"),
         (base.replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} } faults").replace("owner() ■ { ok {} }", "owner() ■ { ok {} } faults"), "nonfaulting"),
     ] {
         let (program, specs) = script::native_runs(&source).unwrap();

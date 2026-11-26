@@ -1,11 +1,11 @@
 ; A queue holds its head and the address of the link to fill on append.
-; One ready queue and count serve all sets in the run. Each set holds
-; its own completion queue, undelivered count, producer entry and spare frame.
+; The scheduler lists unfinished members in spawn order and counts ready ones.
+; A pool holds its completion queue, count, producer, spare frame and waiter.
 %vn2.queue = type { ptr, ptr }
 %vn2.scheduler = type { %vn2.queue, i64 }
-%vn2.pool = type { %vn2.queue, i64, ptr, ptr }
-; next link, resume index/result tag, heap flag, originating set
-%vn2.member_header = type { ptr, i32, i1, ptr }
+%vn2.pool = type { %vn2.queue, i64, ptr, ptr, ptr }
+; next link, resume index/result tag, heap flag, blocked flag, originating set
+%vn2.member_header = type { ptr, i32, i1, i1, ptr }
 
 declare void @llvm.trap()
 
@@ -50,11 +50,16 @@ entry:
 seek:
   %link = phi ptr [ %queue, %entry ], [ %member, %advance ]
   %i = phi i64 [ %index, %entry ], [ %less, %advance ]
-  %found = icmp eq i64 %i, 0
+  %member = load ptr, ptr %link
+  %flag = getelementptr %vn2.member_header, ptr %member, i32 0, i32 3
+  %blocked = load i1, ptr %flag
+  %ready = xor i1 %blocked, true
+  %first = icmp eq i64 %i, 0
+  %found = and i1 %ready, %first
   br i1 %found, label %return, label %advance
 advance:
-  %member = load ptr, ptr %link
-  %less = sub i64 %i, 1
+  %step = zext i1 %ready to i64
+  %less = sub i64 %i, %step
   br label %seek
 return:
   ret ptr %link
@@ -110,7 +115,9 @@ append:
   store i32 0, ptr %state
   %storage = getelementptr %vn2.member_header, ptr %member, i32 0, i32 2
   store i1 %heap, ptr %storage
-  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 3
+  %flag = getelementptr %vn2.member_header, ptr %member, i32 0, i32 3
+  store i1 false, ptr %flag
+  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
   store ptr %pool, ptr %set_slot
   call fastcc void @vn2_append(ptr %scheduler, ptr %member)
   %ready = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 1
@@ -119,6 +126,36 @@ append:
   %nt = add i64 %t, 1
   store i64 %nr, ptr %ready
   store i64 %nt, ptr %total
+  ret void
+}
+
+define internal fastcc i1 @vn2_can_deliver(ptr %pool) {
+  %head = load ptr, ptr %pool
+  %has_done = icmp ne ptr %head, null
+  %total = getelementptr %vn2.pool, ptr %pool, i32 0, i32 1
+  %t = load i64, ptr %total
+  %empty = icmp eq i64 %t, 0
+  %can_deliver = or i1 %empty, %has_done
+  ret i1 %can_deliver
+}
+
+; Only the task that owns a set can wait for its next completion. Leave a
+; blocked member in its original position and exclude it from turn offers.
+define internal fastcc void @vn2_wait_member(ptr %scheduler, ptr %member, ptr %pool) {
+entry:
+  %eligible = call fastcc i1 @vn2_can_deliver(ptr %pool)
+  br i1 %eligible, label %yield, label %block
+block:
+  %waiter = getelementptr %vn2.pool, ptr %pool, i32 0, i32 4
+  store ptr %member, ptr %waiter
+  %flag = getelementptr %vn2.member_header, ptr %member, i32 0, i32 3
+  store i1 true, ptr %flag
+  %ready = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 1
+  %r = load i64, ptr %ready
+  %nr = sub i64 %r, 1
+  store i64 %nr, ptr %ready
+  br label %yield
+yield:
   ret void
 }
 
@@ -140,12 +177,7 @@ active:
 choose:
   br i1 %defined_await, label %offer, label %waiting_next
 waiting_next:
-  %head = load ptr, ptr %awaited_set
-  %has_done = icmp ne ptr %head, null
-  %total = getelementptr %vn2.pool, ptr %awaited_set, i32 0, i32 1
-  %t = load i64, ptr %total
-  %empty = icmp eq i64 %t, 0
-  %can_deliver = or i1 %empty, %has_done
+  %can_deliver = call fastcc i1 @vn2_can_deliver(ptr %awaited_set)
   br label %offer
 offer:
   %owner = phi i1 [ true, %choose ], [ %can_deliver, %waiting_next ]
@@ -160,11 +192,11 @@ child:
   %i = sub i64 %index, %offset
   %link = call fastcc ptr @vn2_link_at(ptr %scheduler, i64 %i)
   %member = load ptr, ptr %link
-  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 3
+  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
   %pool = load ptr, ptr %set_slot
   %entry_slot = getelementptr %vn2.pool, ptr %pool, i32 0, i32 2
   %resume = load ptr, ptr %entry_slot
-  %tag = call fastcc i32 %resume(ptr %member)
+  %tag = call fastcc i32 %resume(ptr %member, ptr %scheduler)
   ; -3 gives up the turn. A nonnegative alternative finishes the member.
   %yielded = icmp eq i32 %tag, -3
   br i1 %yielded, label %choose, label %finished
@@ -172,16 +204,27 @@ finished:
   call fastcc ptr @vn2_unlink(ptr %scheduler, ptr %link)
   %result = getelementptr %vn2.member_header, ptr %member, i32 0, i32 1
   store i32 %tag, ptr %result
-  %nr = sub i64 %r, 1
-  store i64 %nr, ptr %ready
   call fastcc void @vn2_append(ptr %pool, ptr %member)
+  %waiter_slot = getelementptr %vn2.pool, ptr %pool, i32 0, i32 4
+  %waiter = load ptr, ptr %waiter_slot
+  %waiting = icmp ne ptr %waiter, null
+  br i1 %waiting, label %wake, label %retire
+wake:
+  ; One task leaves the ready count and one enters it.
+  store ptr null, ptr %waiter_slot
+  %flag = getelementptr %vn2.member_header, ptr %waiter, i32 0, i32 3
+  store i1 false, ptr %flag
+  br label %choose
+retire:
+  %current = load i64, ptr %ready
+  %nr = sub i64 %current, 1
+  store i64 %nr, ptr %ready
   br label %choose
 selected:
   ret void
 }
 
-define internal fastcc ptr @vn2_next(ptr %scheduler, ptr %pool) {
-  call fastcc void @vn2_choose_owner(ptr %scheduler, ptr %pool)
+define internal fastcc ptr @vn2_take_result(ptr %pool) {
   %total = getelementptr %vn2.pool, ptr %pool, i32 0, i32 1
   %t = load i64, ptr %total
   %empty = icmp eq i64 %t, 0

@@ -1,9 +1,9 @@
-//! Native task sets. A top-level spawn has storage in the owner's activation.
-//! A loop takes a distinct frame for each outstanding member.
+//! Native task sets. Single-execution spawns can use the owner's activation.
+//! Repeated spawns and recursively nested owners use separate member frames.
 use super::*;
 
 // Keep the common prefix in sync with %vn2.member_header in task_set.ll.
-const FIRST_INPUT: usize = 4;
+const FIRST_INPUT: usize = 5;
 
 #[derive(Clone, Copy)]
 pub(super) enum Frame {
@@ -177,14 +177,14 @@ fn emit_member<'a>(
         .body
         .as_ref()
         .expect("[W10] requires a defined producer");
-    if member.faults || term_tys[id].is_some() || producers(body).next().is_some() {
+    if member.faults || term_tys[id].is_some() {
         return Err(format!(
-            "the native backend needs a nonfaulting task-set producer with no task set of its own for `{}`",
+            "the native backend needs a nonfaulting task-set producer for `{}`",
             member.name
         ));
     }
 
-    if awaits(body).next().is_some() {
+    if awaits(body).next().is_some() || producers(body).next().is_some() {
         return emit_body_unit(
             out,
             program,
@@ -213,8 +213,7 @@ fn emit_member<'a>(
     Ok(())
 }
 
-// The queue link, resume index/result tag, storage flag and set precede the inputs,
-// result destinations, and slots of the resumable body. Every resume gets
+// The common header precedes the inputs, result destinations and local slots. Every resume gets
 // fresh SSA addresses for the same slots in this invocation of the owner.
 pub(super) fn emit_member_entry(
     out: &mut String,
@@ -226,7 +225,13 @@ pub(super) fn emit_member_entry(
 ) -> Vec<String> {
     let member = &program.controls[id];
     let ty = format!("%vn2.member.{id}");
-    let mut fields = vec!["ptr".into(), "i32".into(), "i1".into(), "ptr".into()];
+    let mut fields = vec![
+        "ptr".into(),
+        "i32".into(),
+        "i1".into(),
+        "i1".into(),
+        "ptr".into(),
+    ];
     fields.extend(
         member
             .parameters
@@ -239,7 +244,7 @@ pub(super) fn emit_member_entry(
     let _ = writeln!(out, "{ty} = type {{ {} }}", fields.join(", "));
     let _ = writeln!(
         out,
-        "define internal fastcc i32 @vn2_member_{id}(ptr %frame) nounwind {{\nentry:"
+        "define internal fastcc i32 @vn2_member_{id}(ptr %frame, ptr %task_scheduler) nounwind {{\nentry:"
     );
     let mut args: Vec<_> = member
         .parameters
@@ -380,7 +385,7 @@ fn pool(em: &mut IrEmitter<'_, '_>, set: VarId) -> String {
 }
 
 pub(super) fn init_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) {
-    if producers(body).next().is_some() {
+    if em.resume_points.is_none() && producers(body).next().is_some() {
         em.slots
             .push(("%root_scheduler".into(), "%vn2.scheduler".into()));
         em.code
@@ -448,7 +453,15 @@ pub(super) fn spawn(
     let ty = format!("%vn2.member.{id}");
     let values = em.emit_exprs_ordered(args, &VarAccess::ControlSlots(body));
     let ptr = pool(em, set);
-    let frame = if repeated {
+    // A member frame can contain a leaf child inline. Give a nested owner
+    // separate storage so even recursive spawns have finite frame layouts.
+    let child = &em.program.controls[id];
+    let heap_frame = repeated
+        || (em.resume_points.is_some()
+            && producers(child.body.as_ref().expect("defined producer"))
+                .next()
+                .is_some());
+    let frame = if heap_frame {
         let frame = em.fresh_reg();
         let _ = writeln!(
             em.code,
@@ -470,7 +483,7 @@ pub(super) fn spawn(
     };
     let _ = writeln!(
         em.code,
-        "  call fastcc void @vn2_spawn(ptr %task_scheduler, ptr {ptr}, ptr {frame}, i1 {repeated}, i64 {max})"
+        "  call fastcc void @vn2_spawn(ptr %task_scheduler, ptr {ptr}, ptr {frame}, i1 {heap_frame}, i64 {max})"
     );
 }
 
@@ -479,7 +492,24 @@ pub(super) fn next(
     set: VarId,
     id: ControlId,
 ) -> (String, Vec<Vec<String>>) {
-    let ptr = pool(em, set);
+    let awaited = pool(em, set);
+    let ptr = if let Some(points) = &mut em.resume_points {
+        let pc = points.len() + 1;
+        let resume = format!("member_next_{pc}");
+        points.push(resume.clone());
+        let _ = writeln!(em.code, "  store i32 {pc}, ptr %member_state");
+        let _ = writeln!(
+            em.code,
+            "  call fastcc void @vn2_wait_member(ptr %task_scheduler, ptr %frame, ptr {awaited})\n  ret i32 -3\n{resume}:"
+        );
+        pool(em, set)
+    } else {
+        let _ = writeln!(
+            em.code,
+            "  call fastcc void @vn2_choose_owner(ptr %task_scheduler, ptr {awaited})"
+        );
+        awaited
+    };
     let ty = format!("%vn2.member.{id}");
     let frame = em.fresh_reg();
     let empty = em.fresh_reg();
@@ -488,7 +518,7 @@ pub(super) fn next(
     let join = em.fresh_label("pool_result");
     let _ = writeln!(
         em.code,
-        "  {frame} = call fastcc ptr @vn2_next(ptr %task_scheduler, ptr {ptr})"
+        "  {frame} = call fastcc ptr @vn2_take_result(ptr {ptr})"
     );
     let _ = writeln!(
         em.code,
