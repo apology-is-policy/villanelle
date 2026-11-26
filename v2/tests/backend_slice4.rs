@@ -92,6 +92,17 @@ fn spawned_members_run_on_the_chosen_turn_and_keep_their_payloads() {
 }
 
 #[test]
+fn borrowed_spawn_inputs_keep_the_owner_places_across_turns() {
+    // Only the two simultaneous loop members need heap frames.
+    compare_native_runs(
+        include_str!("slice4/checked_borrowed_spawn.core"),
+        &["E-Spawn"],
+        &[2, 2, 1, 2],
+        2,
+    );
+}
+
+#[test]
 fn repeated_spawns_preserve_each_member_until_its_payload_is_delivered() {
     // The alternating run visits its spawn four times and needs one heap frame.
     compare_native_runs(REPEATED_SPAWN, &["E-Spawn"], &[0, 1, 4, 4, 2, 4], 29);
@@ -697,10 +708,11 @@ async control owner() ■ { ok {} }
             .replace("turns [1] => done ok", "with [read -> ok] turns [1] => done ok trace [read() -> ok]"), "await of extern `read` in task-set member"),
         (base.replace("async control idle() ■ { ok {} }", "async control unit() ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control idle() ■ { ok {} }\n    ⊤ ▷ ~set : tasks⟨unit⟩ := tasks⟨unit⟩()\n    ⊤ ▷ n : Δ await next(set) ▸ ok {} │ empty {}\n    n.ok ▷ ⊥")
             .replace("child(value : usize) ■ { ok {} }", &format!("child(value : usize) ■ {{ ok {{}} }}\n    {suspend}")), "task-set member `child` awaiting `idle`, which creates a set"),
-        (base.replace("async control owner", "async control borrower(value : &usize) ■ { ok {} }\n    ⊤ ▷ ■ ok {}\n\nasync control owner")
-            .replace(next_owner, &format!("⊤ ▷ ~other : tasks⟨borrower⟩ := tasks⟨borrower⟩()\n    ⊤ ▷ spawn borrower(&v) into other\n    ⊤ ▷ a : Δ await next(other) ▸ ok {{}} │ empty {{}}\n    a.empty ▷ ⊥\n    ⊤ ▷ b : Δ await next(other) ▸ ok {{}} │ empty {{}}\n    b.ok ▷ ⊥\n    {next_owner}")), "owned or copy inputs and results and no task set of its own for `borrower`"),
-        (base.replace(spawn, &format!("⊤ ▷ l : ↻ once() {{\n        {spawn}\n        ⊤ ▷ □ added {{}}\n    }} ▸ added {{}}")).replace("value : usize", "value : &usize").replace("child(v)", "child(&v)"), "owned or copy inputs"),
-        (base.replace("value : usize", "value : &usize").replace("child(v)", "child(&v)"), "owned or copy inputs"),
+        (base.replace("async control owner", "async control borrower(value : &usize) ■ { ok {loan : &usize ∈ value} }\n    ⊤ ▷ ■ ok {value}\n\nasync control owner")
+            .replace(next_owner, &format!("⊤ ▷ ~other : tasks⟨borrower⟩ := tasks⟨borrower⟩()\n    ⊤ ▷ spawn borrower(&v) into other\n    ⊤ ▷ a : Δ await next(other) ▸ ok {{loan}} │ empty {{}}\n    a.empty ▷ ⊥\n    ⊤ ▷ b : Δ await next(other) ▸ ok {{extra}} │ empty {{}}\n    b.ok ▷ ⊥\n    {next_owner}")), "owned or copy results and no task set of its own for `borrower`"),
+        (base.replace(spawn, &format!("⊤ ▷ l : ↻ once() {{\n        {spawn}\n        ⊤ ▷ □ added {{}}\n    }} ▸ added {{}}"))
+            .replace("child(value : usize) ■ { ok {} }\n    ⊤ ▷ ■ ok {}", "child(value : &usize) ■ { ok {loan : &usize ∈ value} }\n    ⊤ ▷ ■ ok {value}")
+            .replace("child(v)", "child(&v)").replace("next(pool) ▸ ok {}", "next(pool) ▸ ok {loan}"), "owned or copy results"),
         (base.replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} } faults").replace("owner() ■ { ok {} }", "owner() ■ { ok {} } faults"), "nonfaulting"),
     ] {
         let (program, specs) = script::native_runs(&source).unwrap();

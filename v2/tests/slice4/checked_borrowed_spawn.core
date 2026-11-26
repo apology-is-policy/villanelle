@@ -1,0 +1,79 @@
+// Both members borrow places in the owner's record. Their completion order
+// can change while each destination still belongs to the same member.
+struct cells {left : u32, right : u32, first : u32, second : u32}
+
+async control copy_after(source : &u32, dest : &~u32) ■ { copied {was : u32, now : u32} }
+    ⊤ ▷ was : u32 := dest
+    ⊤ ▷ dest ← source
+    ⊤ ▷ ■ copied {was, dest}
+
+async control worker(source : &u32, dest : &~u32) ■ { copied {was : u32, now : u32} }
+    ⊤ ▷ r : Δ await copy_after(source, dest) ▸ copied {was, now}
+    r.copied ▷ ■ copied {was, now}
+
+async control pair(left : u32, right : u32)
+    ■ { ok {a : u32, b : u32, c : u32, d : u32, first : u32, second : u32} }
+    ⊤ ▷ ~x : cells := cells {left, right, 1, 2}
+    ⊤ ▷ ~pool : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(&x.left, &~x.first) into pool
+    ⊤ ▷ spawn worker(&x.right, &~x.second) into pool
+    ⊤ ▷ p : Δ await next(pool) ▸ copied {a, b} │ empty {}
+    p.empty ▷ ⊥
+    ⊤ ▷ q : Δ await next(pool) ▸ copied {c, d} │ empty {}
+    q.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ copied {unused, other} │ empty {}
+    e.copied ▷ ⊥
+    e.empty ▷ ■ ok {a, b, c, d, x.first, x.second}
+
+//! run pair(11, 22) => done ok {1, 11, 2, 22, 11, 22}
+//! run pair(31, 42) turns [0, 1, 1] => done ok {2, 42, 1, 31, 31, 42}
+
+view struct ports {source : &u32, dest : &~u32}
+
+async control direct(p : ports) ■ { done {} }
+    ⊤ ▷ p.dest ← p.source
+    ⊤ ▷ ■ done {}
+
+async control relay(source : &u32, dest : &~u32) ■ { ok {} }
+    ⊤ ▷ ~pool : tasks⟨direct⟩ := tasks⟨direct⟩()
+    ⊤ ▷ spawn direct(ports {source, dest}) into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ done {} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(pool) ▸ done {} │ empty {}
+    b.done ▷ ⊥
+    b.empty ▷ ■ ok {}
+
+control forwarded() ■ { ok {value : u32} }
+    ⊤ ▷ source : u32 := 73
+    ⊤ ▷ ~dest : u32 := 5
+    ⊤ ▷ r : Δ run relay(&source, &~dest) ▸ ok {}
+    r.ok ▷ ■ ok {dest}
+
+//! run forwarded() => done ok {73}
+
+async control read(source : &u32) ■ { got {value : u32} }
+    ⊤ ▷ ■ got {source}
+
+async control repeated(source : &u32) ■ { ok {first : u32, second : u32} }
+    ⊤ ▷ ~pool : tasks⟨read⟩ := tasks⟨read⟩()
+    ⊤ ▷ f : ↻ fill(i : usize := 0) {
+        ⊢ i ≤ 2 ∧ count(pool) = i
+        ⊤ ▷ end : ? i ≥ 2
+        end.true ▷ □ full {}
+        end.false ▷ spawn read(source) into pool
+        end.false ▷ ↑ fill(i + 1)
+    } ▸ full {}
+    ⊤ ▷ a : Δ await next(pool) ▸ got {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(pool) ▸ got {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {first, second}
+
+control heap_members() ■ { ok {first : u32, second : u32} }
+    ⊤ ▷ v : u32 := 97
+    ⊤ ▷ a : Δ run repeated(&v) ▸ ok {first, second}
+    a.ok ▷ ■ ok {first, second}
+
+//! run heap_members() => done ok {97, 97}

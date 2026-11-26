@@ -176,14 +176,14 @@ fn emit_member<'a>(
         .body
         .as_ref()
         .expect("[W10] requires a defined producer");
-    let uses_loans = member
-        .parameters
+    let lends_result = member
+        .contract
         .iter()
-        .chain(member.contract.iter().flat_map(|alt| &alt.fields))
+        .flat_map(|alt| &alt.fields)
         .any(|p| program.contains_borrow_or_view(&p.ty));
-    if member.faults || term_tys[id].is_some() || uses_loans || producers(body).next().is_some() {
+    if member.faults || term_tys[id].is_some() || lends_result || producers(body).next().is_some() {
         return Err(format!(
-            "the native backend needs a nonfaulting task-set producer with owned or copy inputs and results and no task set of its own for `{}`",
+            "the native backend needs a nonfaulting task-set producer with owned or copy results and no task set of its own for `{}`",
             member.name
         ));
     }

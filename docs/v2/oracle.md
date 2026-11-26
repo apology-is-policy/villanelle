@@ -4,7 +4,7 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.12). The oracle of slice 1 and its
+roots, defined awaits with one ready task, and task sets whose owners and members can yield at a defined await (sections 18.4 to 18.13). The oracle of slice 1 and its
 conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
@@ -2309,7 +2309,7 @@ body. Each site runs at most once per invocation. Section 18.11 covers
 spawns inside loops.
 Decisions on `await next` can repeat in a loop. Section 18.6 covers producers
 that finish in one turn. Section 18.7 extends this to defined awaits. A
-producer takes and returns owned or copy values and lets no fault escape.
+producer at that checkpoint took and returned owned or copy values and let no fault escape. Section 18.13 adds borrowed inputs.
 Section 18.8 covers defined awaits in the owner. Host waits, cancellation,
 faulting calls and fault boundaries in an owner still give diagnostics. A synchronous call that starts a nested run uses a
 separate invocation. The scripted native host consumes one `turns` choice
@@ -2467,6 +2467,29 @@ consumes the empty stamp set. In `iterations(3)` the owner consumes and
 recreates a second set of the same producer three times before receiving
 the outer value of 99.
 
+### 18.13 Borrowed spawn inputs, 26 November 2026
+
+A spawned member stores the address of each borrowed place in its frame.
+A view argument carries the addresses of its borrowed fields. A member can
+forward those borrows to a defined callee at an await. The checker holds the
+loans in the set until the owner consumes it on the empty arm ([TK3]).
+
+From `v2/`, run `vn2 test tests/slice4/checked_borrowed_spawn.core` and
+`cargo test --test backend_slice4 borrowed_spawn_inputs`. In `pair`, each
+member borrows two different fields of the owner's record. Its callee reads
+the destination's old value and writes the source value through the exclusive
+borrow. The owner observes both writes after draining the set. The second
+schedule delivers the second member first. The other two runs pass borrows
+in a view to a nonsuspending member and forward the same shared borrow to
+two outstanding loop members. The four runs allocate two loop frames per
+batch and leave no allocations live at any exit.
+
+The paired checker test
+`a_task_set_holds_shared_and_exclusive_loans_until_drained_tk3` exercises
+the owner writing a shared lender or reading an exclusive lender. Each
+conflict is rejected and gets stuck in the oracle. Moving that access
+after the drain is accepted and the oracle reaches the owner's exit.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2478,8 +2501,8 @@ the outer value of 99.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs sets created in members and awaited callees, loans at
-  spawn and delivery, host waits, cancellation, member faults, capacity and
+- **Later work.** Slice 4 still needs sets created in members and awaited callees, borrowed
+  results at delivery, host waits, cancellation, member faults, capacity and
   generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
