@@ -348,6 +348,7 @@ pub control run_slice3_mut_and_loops(use_a: bool)
     let specs = vec![
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "run_slice3_shared_views".to_string(),
             arguments: vec![],
             arithmetic: false,
@@ -355,6 +356,7 @@ pub control run_slice3_mut_and_loops(use_a: bool)
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "run_slice3_mut_and_loops".to_string(),
             arguments: vec![Value::Bool(true)],
             arithmetic: false,
@@ -362,6 +364,7 @@ pub control run_slice3_mut_and_loops(use_a: bool)
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "run_slice3_mut_and_loops".to_string(),
             arguments: vec![Value::Bool(false)],
             arithmetic: false,
@@ -479,6 +482,7 @@ fn slice_three_surface_programs_agree_across_oracle_erased_expanded_and_native()
             vec![
                 NativeRunSpec {
                     turns: Vec::new(),
+                    waiting: Vec::new(),
                     entry: "borrow_basics".to_string(),
                     arguments: vec![],
                     arithmetic: false,
@@ -486,6 +490,7 @@ fn slice_three_surface_programs_agree_across_oracle_erased_expanded_and_native()
                 },
                 NativeRunSpec {
                     turns: Vec::new(),
+                    waiting: Vec::new(),
                     entry: "variant_borrows".to_string(),
                     arguments: vec![],
                     arithmetic: false,
@@ -493,6 +498,7 @@ fn slice_three_surface_programs_agree_across_oracle_erased_expanded_and_native()
                 },
                 NativeRunSpec {
                     turns: Vec::new(),
+                    waiting: Vec::new(),
                     entry: "first_long".to_string(),
                     arguments: vec![Value::Vector(vec![
                         Value::String("elm".to_string()),
@@ -504,6 +510,7 @@ fn slice_three_surface_programs_agree_across_oracle_erased_expanded_and_native()
                 },
                 NativeRunSpec {
                     turns: Vec::new(),
+                    waiting: Vec::new(),
                     entry: "first_long".to_string(),
                     arguments: vec![Value::Vector(vec![
                         Value::String("elm".to_string()),
@@ -514,6 +521,7 @@ fn slice_three_surface_programs_agree_across_oracle_erased_expanded_and_native()
                 },
                 NativeRunSpec {
                     turns: Vec::new(),
+                    waiting: Vec::new(),
                     entry: "map_borrows".to_string(),
                     arguments: vec![
                         Value::Map(
@@ -531,6 +539,7 @@ fn slice_three_surface_programs_agree_across_oracle_erased_expanded_and_native()
                 },
                 NativeRunSpec {
                     turns: Vec::new(),
+                    waiting: Vec::new(),
                     entry: "map_borrows".to_string(),
                     arguments: vec![
                         Value::Map(
@@ -554,6 +563,7 @@ fn slice_three_surface_programs_agree_across_oracle_erased_expanded_and_native()
             vec![
                 NativeRunSpec {
                     turns: Vec::new(),
+                    waiting: Vec::new(),
                     entry: "exercise_views".to_string(),
                     arguments: vec![],
                     arithmetic: false,
@@ -561,6 +571,7 @@ fn slice_three_surface_programs_agree_across_oracle_erased_expanded_and_native()
                 },
                 NativeRunSpec {
                     turns: Vec::new(),
+                    waiting: Vec::new(),
                     entry: "find_ge".to_string(),
                     arguments: vec![
                         Value::Vector(vec![u32_val(3), u32_val(7), u32_val(12)]),
@@ -571,6 +582,7 @@ fn slice_three_surface_programs_agree_across_oracle_erased_expanded_and_native()
                 },
                 NativeRunSpec {
                     turns: Vec::new(),
+                    waiting: Vec::new(),
                     entry: "find_ge".to_string(),
                     arguments: vec![
                         Value::Vector(vec![u32_val(3), u32_val(7), u32_val(12)]),
@@ -581,6 +593,7 @@ fn slice_three_surface_programs_agree_across_oracle_erased_expanded_and_native()
                 },
                 NativeRunSpec {
                     turns: Vec::new(),
+                    waiting: Vec::new(),
                     entry: "find_ge".to_string(),
                     arguments: vec![Value::Vector(vec![]), u32_val(1)],
                     arithmetic: false,
@@ -610,6 +623,7 @@ fn slice_three_core_programs_agree_natively() {
     let borrows_specs = vec![
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "widest".to_string(),
             arguments: vec![
                 Value::String("alder".to_string()),
@@ -620,6 +634,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "widest".to_string(),
             arguments: vec![
                 Value::String("elm".to_string()),
@@ -630,6 +645,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "valid_tag_trace".to_string(),
             arguments: vec![],
             arithmetic: false,
@@ -637,6 +653,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "disjoint_fields".to_string(),
             arguments: vec![],
             arithmetic: false,
@@ -644,6 +661,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "disjoint_elements".to_string(),
             arguments: vec![],
             arithmetic: false,
@@ -651,6 +669,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "reborrow_and_pick".to_string(),
             arguments: vec![],
             arithmetic: false,
@@ -664,6 +683,7 @@ fn slice_three_core_programs_agree_natively() {
     let views_specs = vec![
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "use_views".to_string(),
             arguments: vec![],
             arithmetic: false,
@@ -671,6 +691,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "test_tail_and_operands".to_string(),
             arguments: vec![],
             arithmetic: false,
@@ -678,6 +699,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "variant_shared_and_mut".to_string(),
             arguments: vec![],
             arithmetic: false,
@@ -685,6 +707,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "lookup_map".to_string(),
             arguments: vec![
                 Value::Map(
@@ -702,6 +725,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "lookup_map".to_string(),
             arguments: vec![
                 Value::Map(
@@ -719,6 +743,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "loop_borrow_search".to_string(),
             arguments: vec![Value::Vector(vec![
                 Value::String("a".to_string()),
@@ -730,6 +755,7 @@ fn slice_three_core_programs_agree_natively() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "loop_borrow_search".to_string(),
             arguments: vec![Value::Vector(vec![
                 Value::String("a".to_string()),
@@ -766,6 +792,7 @@ pub control call_host_borrows(m: &string ⇀ string, b: &bool) ■ out {found: b
     let ext_specs = vec![
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "call_host_borrows".to_string(),
             arguments: vec![
                 Value::Map(
@@ -789,6 +816,7 @@ pub control call_host_borrows(m: &string ⇀ string, b: &bool) ■ out {found: b
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "call_host_borrows".to_string(),
             arguments: vec![Value::Map(Default::default()), Value::Bool(false)],
             arithmetic: false,

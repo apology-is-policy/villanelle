@@ -7,7 +7,7 @@ IR backend. Slice 4 has an oracle, a checker, and native code for defined
 roots, direct runs of nonfaulting and noncancellable host operations, and
 task sets whose owners and members can yield at a defined await. Roots and members can
 wait for the host in their own activations or in a callee (sections 18.4 to
-18.21). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
+18.22). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
 lists the defects. Sections 8 to 18 describe what the code does and which
@@ -2114,8 +2114,9 @@ ended in `host-failed`.
 
 Limits of the instrumented profile: the host sets the flag of the root of
 the innermost run only, where [E-Cancel] lets it set that of any root.
-The native harness omits directives with explicit turns, waiting order,
-cancellation or capacity. Section 18.4 records the native comparisons.
+At this checkpoint the native harness omitted explicit turns, waiting order,
+cancellation and capacity. Sections 18.4 to 18.22 record the subsequent
+native comparisons, including replay of both scheduling choices.
 
 ### 18.2 The first task-checker checkpoint, 25 November 2026
 
@@ -2698,6 +2699,29 @@ on the stack. For overlapping waits, the scheduler allocates temporary
 arrays for the host handles and corresponding members and releases them
 before calling the selected completion.
 
+### 18.22 Replaying choices among pending host operations, 27 November 2026
+
+A native run keeps separate positions in its `turns` and `waiting` lists.
+When the scheduler offers pending operations, the scripted host consumes
+one waiting index, even for a single operation. The scheduler reduces the
+index modulo the number offered. When the list runs out, the scripted
+host selects the first pending operation whose control matches the next
+answer, or the first operation if there is no match. An explicit selection
+takes precedence even if the next answer then fails. Both lists start
+afresh at each run in a batch.
+
+From `v2/`, run `vn2 test tests/slice4/e_turn.core
+tests/slice4/checked_waiting_choices.core` and
+`cargo test --test backend_slice4 waiting_choices`. The seventh turn
+directive completes two reads in the specified order. In the new fixture,
+a lone operation consumes the first item of `waiting [0, 5]`. The next
+offer holds the root's stamp and the reads from members 11 and 22. Index 5
+selects member 22. The next scripted answer selects member 11, ahead of
+the pending stamp. A linked C host checks the identity and order of the
+handles on all four offers and returns the same trace and payload. A
+separate test selects the stamp when the answer belongs to a read and
+checks the three events recorded before the host failure.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2709,8 +2733,7 @@ before calling the selected completion.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs native replay of explicit `waiting` choices,
-  cancellation, faulting host operations, member faults, capacity and generated
+- **Later work.** Slice 4 still needs native cancellation, faulting host operations, member faults, capacity and generated
   task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).

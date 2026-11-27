@@ -1,0 +1,39 @@
+// The initial stamp is the only pending operation. Later, stamp(9) and
+// both reads wait together. Starting a read is visible through enter.
+extern async control stamp(key : u32) ■ { ok {mark : u32} } uses io
+extern async control read_value(key : u32) ■ { ok {value : u32} } uses io
+extern control enter(key : u32) ■ { ok {} } uses io
+
+async control reader(key : u32) ■ { got {id : u32, value : u32} } uses io
+    ⊤ ▷ i : Δ enter(key) ▸ ok {}
+    ⊤ ▷ r : Δ await read_value(key) ▸ ok {value}
+    r.ok ▷ ■ got {key, value}
+
+async control collect() ■ { ok {mark : u32, a : u32, x : u32, b : u32, y : u32} } uses io
+    ⊤ ▷ s : Δ await stamp(0) ▸ ok {seed}
+    ⊤ ▷ ~pool : tasks⟨reader⟩ := tasks⟨reader⟩()
+    ⊤ ▷ spawn reader(11) into pool
+    ⊤ ▷ spawn reader(22) into pool
+    ⊤ ▷ t : Δ await stamp(seed) ▸ ok {mark}
+    ⊤ ▷ a : Δ await next(pool) ▸ got {first, x} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(pool) ▸ got {second, y} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra, z} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {mark, first, x, second, y}
+
+control example() ■ { ok {mark : u32, a : u32, x : u32, b : u32, y : u32} } uses io
+    ⊤ ▷ d : Δ run collect() ▸ ok {mark, a, x, b, y}
+    d.ok ▷ ■ ok {mark, a, x, b, y}
+
+// The singleton consumes choice 0. Choice 5 selects index 2 of three.
+// When the choices run out, the next scripted answer selects read_value(11).
+//! run example() with [stamp -> ok {9}; enter -> ok; enter -> ok; read_value -> ok {220}; read_value -> ok {110}; stamp -> ok {90}] turns [0, 1] waiting [0, 5] => done ok {90, 22, 220, 11, 110} trace [stamp(0) -> ok {9}; enter(22) -> ok; enter(11) -> ok; read_value(22) -> ok {220}; read_value(11) -> ok {110}; stamp(9) -> ok {90}]
+
+// Select the root first, then index 1 of two members. Two unused choices
+// remain when the run ends. The next run has its own empty waiting schedule.
+//! run example() with [stamp -> ok {9}; enter -> ok; enter -> ok; stamp -> ok {90}; read_value -> ok {220}; read_value -> ok {110}] turns [0, 1] waiting [7, 3, 3, 0, 0, 2] => done ok {90, 22, 220, 11, 110} trace [stamp(0) -> ok {9}; enter(22) -> ok; enter(11) -> ok; stamp(9) -> ok {90}; read_value(22) -> ok {220}; read_value(11) -> ok {110}]
+//! run example() with [stamp -> ok {9}; enter -> ok; enter -> ok; read_value -> ok {110}; stamp -> ok {90}; read_value -> ok {220}] => done ok {90, 11, 110, 22, 220} trace [stamp(0) -> ok {9}; enter(11) -> ok; enter(22) -> ok; read_value(11) -> ok {110}; stamp(9) -> ok {90}; read_value(22) -> ok {220}]
+
+//! run example() with [stamp -> ok {9}; enter -> ok; enter -> ok; read_value -> ok {110}; read_value -> ok {220}; stamp -> ok {90}] turns [0, 1] waiting [0, 4, 1] => done ok {90, 11, 110, 22, 220} trace [stamp(0) -> ok {9}; enter(22) -> ok; enter(11) -> ok; read_value(11) -> ok {110}; read_value(22) -> ok {220}; stamp(9) -> ok {90}]

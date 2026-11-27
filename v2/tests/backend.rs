@@ -186,6 +186,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
     let spend_specs = vec![
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "spend".to_string(),
             arguments: vec![Value::Int(Int::from_u64(10)), Value::Int(Int::from_u64(4))],
             arithmetic: true,
@@ -193,6 +194,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "spend".to_string(),
             arguments: vec![Value::Int(Int::from_u64(4)), Value::Int(Int::from_u64(10))],
             arithmetic: true,
@@ -200,6 +202,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "spend_plain".to_string(),
             arguments: vec![Value::Int(Int::from_u64(10)), Value::Int(Int::from_u64(4))],
             arithmetic: true,
@@ -207,6 +210,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "spend_plain".to_string(),
             arguments: vec![Value::Int(Int::from_u64(4)), Value::Int(Int::from_u64(10))],
             arithmetic: true,
@@ -221,6 +225,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
     let show_specs = vec![
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "show_file".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -235,6 +240,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "show_file".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -292,6 +298,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
     let groups_specs = vec![
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "inspect".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -306,6 +313,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "inspect".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -320,6 +328,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "inspect".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -334,6 +343,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "inspect".to_string(),
             arguments: vec![Value::Int(Int::from_u64(1))],
             arithmetic: false,
@@ -356,6 +366,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
     let loops_specs = vec![
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "step_search".to_string(),
             arguments: vec![
                 Value::Int(Int::from_u64(0)),
@@ -392,6 +403,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "sum_and_trim".to_string(),
             arguments: vec![Value::Int(Int::from_u64(4))],
             arithmetic: false,
@@ -406,6 +418,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
         },
         NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: "sum_and_trim".to_string(),
             arguments: vec![Value::Int(Int::from_u64(4))],
             arithmetic: false,
@@ -505,6 +518,7 @@ fn the_expansion_and_the_compiled_code_agree(
         );
         specs.push(NativeRunSpec {
             turns: Vec::new(),
+            waiting: Vec::new(),
             entry: ended.entry,
             arguments: ended.arguments,
             arithmetic: false,

@@ -156,7 +156,7 @@ pub(super) fn emit_support(
     }
 }
 
-/// Script::pick_waiting chooses the first descriptor that can consume the next answer.
+/// Explicit choices precede Script::pick_waiting, which matches the next answer.
 pub(super) fn emit_script_picker(out: &mut String, controls: &[i64]) {
     let ids = controls
         .iter()
@@ -169,8 +169,17 @@ pub(super) fn emit_script_picker(out: &mut String, controls: &[i64]) {
         controls.len()
     );
     out.push_str(
-        "define i64 @vn2_pick_waiting(ptr %states, i64 %count) {
+        "@vn2_wait_choices = internal global %vn2.choices zeroinitializer
+
+define i64 @vn2_pick_waiting(ptr %states, i64 %count) {
 entry:
+  %choice_ptr = call ptr @vn2_take_choice(ptr @vn2_wait_choices)
+  %exhausted = icmp eq ptr %choice_ptr, null
+  br i1 %exhausted, label %fallback, label %scripted
+scripted:
+  %choice = load i64, ptr %choice_ptr
+  ret i64 %choice
+fallback:
   %pos = load i64, ptr @script_pos
   %end = load i64, ptr @script_end
   %empty = icmp eq i64 %pos, %end

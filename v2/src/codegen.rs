@@ -50,6 +50,8 @@ pub struct NativeRunSpec {
     pub arithmetic: bool,
     /// Ready-task indices offered by the host, then zero after the script ends.
     pub turns: Vec<usize>,
+    /// Pending-operation indices, then selection by the next scripted answer.
+    pub waiting: Vec<usize>,
     pub answers: Vec<(String, Answer)>,
 }
 
@@ -6784,6 +6786,36 @@ fn register_print_type(reg: &mut RuntimeRegistry<'_>, ty: &Type, used: &mut BTre
     }
 }
 
+/// Initialize one schedule for this run, including when its predecessor left unused choices.
+fn emit_run_choices(
+    globals: &mut String,
+    main: &mut String,
+    kind: &str,
+    run: usize,
+    choices: &[usize],
+) {
+    let initial = if choices.is_empty() {
+        "zeroinitializer".to_owned()
+    } else {
+        let len = choices.len();
+        let values = choices
+            .iter()
+            .map(|i| format!("i64 {i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let name = format!("@vn2_{kind}_choices_{run}");
+        let _ = writeln!(
+            globals,
+            "{name} = private constant [{len} x i64] [{values}]"
+        );
+        format!("{{ ptr {name}, i64 {len} }}")
+    };
+    let _ = writeln!(
+        main,
+        "  store %vn2.choices {initial}, ptr @vn2_{kind}_choices"
+    );
+}
+
 /// Emits a complete runnable LLVM IR program that executes `specs` natively
 /// and prints each run's trace and outcome in Villanelle syntax.
 pub fn emit_native_harness_llvm(
@@ -6843,28 +6875,45 @@ pub fn emit_native_harness_llvm(
     let mut ext_code = String::new();
     let host_waits = host_wait::targets(program);
     host_wait::emit_support(&mut ext_code, program, &host_waits, usize_bits, true);
+    let picks_turns = has_control_await(program) || reg.has_task_sets;
+    if picks_turns || !host_waits.is_empty() {
+        ext_code.push_str(
+            "%vn2.choices = type { ptr, i64 }
+
+define internal ptr @vn2_take_choice(ptr %cursor) {
+  %count = getelementptr %vn2.choices, ptr %cursor, i32 0, i32 1
+  %left = load i64, ptr %count
+  %empty = icmp eq i64 %left, 0
+  br i1 %empty, label %exhausted, label %take
+exhausted:
+  ret ptr null
+take:
+  %slot = load ptr, ptr %cursor
+  %next = getelementptr i64, ptr %slot, i64 1
+  %remaining = sub i64 %left, 1
+  store ptr %next, ptr %cursor
+  store i64 %remaining, ptr %count
+  ret ptr %slot
+}
+
+",
+        );
+    }
     if !host_waits.is_empty() {
         host_wait::emit_script_picker(&mut ext_code, &flat_ctrl_ids);
     }
-    let picks_turns = has_control_await(program) || reg.has_task_sets;
     if picks_turns {
         ext_code.push_str(
-            "@vn2_turn_ptr = internal global ptr null
-@vn2_turn_left = internal global i64 0
+            "@vn2_turn_choices = internal global %vn2.choices zeroinitializer
 
 define i64 @vn2_pick_turn(i64 %ready_count) {
-  %left = load i64, ptr @vn2_turn_left
-  %default = icmp eq i64 %left, 0
-  br i1 %default, label %first, label %scripted
+  %slot = call ptr @vn2_take_choice(ptr @vn2_turn_choices)
+  %empty = icmp eq ptr %slot, null
+  br i1 %empty, label %first, label %scripted
 first:
   ret i64 0
 scripted:
-  %ptr = load ptr, ptr @vn2_turn_ptr
-  %choice = load i64, ptr %ptr
-  %next = getelementptr i64, ptr %ptr, i64 1
-  %remaining = sub i64 %left, 1
-  store ptr %next, ptr @vn2_turn_ptr
-  store i64 %remaining, ptr @vn2_turn_left
+  %choice = load i64, ptr %slot
   ret i64 %choice
 }
 
@@ -7209,24 +7258,10 @@ scripted:
     let _ = writeln!(main_out, "entry:");
     for (run_idx, spec) in specs.iter().enumerate() {
         if picks_turns {
-            let len = spec.turns.len();
-            let _ = writeln!(main_out, "  store i64 {len}, ptr @vn2_turn_left");
-            if len > 0 {
-                let choices = spec
-                    .turns
-                    .iter()
-                    .map(|i| format!("i64 {i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let _ = writeln!(
-                    ext_code,
-                    "@vn2_turns_{run_idx} = private constant [{len} x i64] [{choices}]"
-                );
-                let _ = writeln!(
-                    main_out,
-                    "  store ptr @vn2_turns_{run_idx}, ptr @vn2_turn_ptr"
-                );
-            }
+            emit_run_choices(&mut ext_code, &mut main_out, "turn", run_idx, &spec.turns);
+        }
+        if !host_waits.is_empty() {
+            emit_run_choices(&mut ext_code, &mut main_out, "wait", run_idx, &spec.waiting);
         }
         let (start, end) = run_offsets[run_idx];
         let _ = writeln!(main_out, "  store i64 {start}, ptr @script_pos");

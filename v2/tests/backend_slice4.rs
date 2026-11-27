@@ -1,7 +1,8 @@
 //! Native defined roots, awaits, and scheduling of task-set members.
 use std::{collections::VecDeque, fs, process::Command};
 use villanelle_v2::codegen::{
-    emit_c_header, emit_llvm, emit_native_harness_llvm, run_native_counted, run_native_ir,
+    NativeRunSpec, emit_c_header, emit_llvm, emit_native_harness_llvm, run_native_counted,
+    run_native_ir,
 };
 use villanelle_v2::differential::{Verdict, compare};
 use villanelle_v2::host::{Answer, Host, Scheduled, Script};
@@ -10,6 +11,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const WAITING_CHOICES: &str = include_str!("slice4/checked_waiting_choices.core");
 const MEMBER_HOST_WAIT: &str = include_str!("slice4/checked_member_host_wait.core");
 const OWNER_HOST_WAIT: &str = include_str!("slice4/checked_owner_host_wait.core");
 const HOST_RUN: &str = include_str!("slice4/checked_host_run.core");
@@ -25,6 +27,15 @@ const NESTED_MEMBER: &str = include_str!("slice4/checked_nested_member_await.cor
 const NESTED_OWNER: &str = include_str!("slice4/checked_nested_owner_await.core");
 const MEMBER_AWAIT: &str = include_str!("slice4/checked_member_await.core");
 
+fn scheduled_host(spec: &NativeRunSpec) -> Scheduled<Script> {
+    let mut host = Scheduled::new(Script {
+        answers: spec.answers.iter().cloned().collect(),
+    });
+    host.turns = spec.turns.iter().copied().collect();
+    host.waiting = spec.waiting.iter().copied().collect();
+    host
+}
+
 fn compare_native_runs(source: &str, rules: &[&str], counts: &[u64], allocations: u64) {
     let (program, runs) = script::native_runs(source).unwrap();
     check::check(&program).unwrap().revalidate().unwrap();
@@ -37,10 +48,7 @@ fn compare_native_runs(source: &str, rules: &[&str], counts: &[u64], allocations
     for bits in [32, 64] {
         let mut expected = Vec::new();
         for (spec, &count) in runs.iter().zip(counts) {
-            let mut host = Scheduled::new(Script {
-                answers: spec.answers.iter().cloned().collect(),
-            });
-            host.turns = spec.turns.iter().copied().collect();
+            let mut host = scheduled_host(spec);
             let comparison = compare(
                 &program,
                 &spec.entry,
@@ -98,6 +106,159 @@ fn direct_host_runs_return_the_selected_payload_to_the_caller() {
                 .contains("@vn2_pick_turn")
         );
     }
+}
+
+#[test]
+fn waiting_choices_replay_all_turn_fixture_directives() {
+    compare_native_runs(
+        include_str!("slice4/e_turn.core"),
+        &["E-AwaitHost"],
+        &[2, 2, 0, 0, 1, 2, 2],
+        4,
+    );
+}
+
+#[test]
+fn waiting_choices_handle_three_candidates_and_reset_between_runs() {
+    compare_native_runs(WAITING_CHOICES, &["E-AwaitHost"], &[4; 4], 8);
+}
+
+#[test]
+fn waiting_choices_reject_an_answer_for_a_different_operation() {
+    let (program, runs) = script::native_runs(WAITING_CHOICES).unwrap();
+    let mut spec = runs[0].clone();
+    // Select stamp(9) while the next answer belongs to read_value.
+    spec.waiting = vec![0, 0];
+    for bits in [32, 64] {
+        let config = Config::with_usize_bits(bits);
+        let original = oracle::run(
+            &program,
+            &spec.entry,
+            vec![],
+            &mut scheduled_host(&spec),
+            &config,
+        );
+        let erased = erased::run(
+            &program,
+            &spec.entry,
+            vec![],
+            &mut scheduled_host(&spec),
+            &config,
+        );
+        assert!(matches!(original.end, oracle::End::HostFailed(_)));
+        assert!(matches!(erased.end, erased::End::HostFailed(_)));
+        assert_eq!(erased.trace, original.trace);
+        assert_eq!(
+            original
+                .trace
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "stamp(0) -> ok {9}",
+                "enter(22) -> ok {}",
+                "enter(11) -> ok {}"
+            ]
+        );
+        for opt in [0, 2] {
+            let batch =
+                run_native_counted(&program, std::slice::from_ref(&spec), bits, opt).unwrap();
+            let [(erased::End::HostFailed(_), trace)] = batch.runs.as_slice() else {
+                panic!("expected one failed host, got {:?}", batch.runs);
+            };
+            assert_eq!(trace, &original.trace);
+        }
+    }
+}
+
+#[test]
+fn waiting_choices_use_the_same_pending_handles_in_a_linked_host() {
+    const DRIVER: &str = r#"
+#include "module.h"
+#include <stdio.h>
+#include <stdlib.h>
+static const uint32_t offers[][3] = {{0}, {9, 11, 22}, {9, 11}, {9}};
+static const unsigned counts[] = {1, 3, 2, 1};
+static const unsigned picks[] = {0, 5, 1, 0};
+static unsigned offer, turn;
+static void *selected;
+void vn2_start_stamp(struct vn2_wait_stamp *r) {
+    if (r->host_state) abort();
+    r->host_state = &r->in_key;
+}
+void vn2_start_read_value(struct vn2_wait_read_value *r) {
+    if (r->host_state) abort();
+    r->host_state = &r->in_key;
+}
+uint64_t vn2_pick_turn(uint64_t n) {
+    if (!n) abort();
+    return turn++ == 1;
+}
+uint64_t vn2_pick_waiting(void *const *states, uint64_t n) {
+    if (offer >= 4 || n != counts[offer] || selected) abort();
+    for (unsigned i = 0; i < n; ++i) {
+        if (!states[i] || *(uint32_t *)states[i] != offers[offer][i]) abort();
+    }
+    unsigned choice = picks[offer++];
+    selected = states[choice % n];
+    return choice;
+}
+int32_t vn2_complete_stamp(struct vn2_wait_stamp *r) {
+    if (selected != &r->in_key || r->host_state != selected) abort();
+    selected = NULL;
+    *r->out_0_ok_0 = r->in_key ? 90 : 9;
+    printf("stamp(%u) -> ok {%u}\n", (unsigned)r->in_key, (unsigned)*r->out_0_ok_0);
+    return VN2_STAMP_OK;
+}
+int32_t vn2_complete_read_value(struct vn2_wait_read_value *r) {
+    if (selected != &r->in_key || r->host_state != selected) abort();
+    selected = NULL;
+    *r->out_0_ok_0 = r->in_key * 10;
+    printf("read_value(%u) -> ok {%u}\n", (unsigned)r->in_key, (unsigned)*r->out_0_ok_0);
+    return VN2_READ_VALUE_OK;
+}
+int32_t vn2_ext_enter(uint32_t key) {
+    printf("enter(%u) -> ok {}\n", (unsigned)key);
+    return VN2_ENTER_OK;
+}
+int main(void) {
+    uint32_t mark, a, x, b, y;
+    if (vn2_call_example(&mark, &a, &x, &b, &y) != VN2_EXAMPLE_OK || offer != 4 || selected)
+        return 1;
+    printf("done ok {%u, %u, %u, %u, %u}\n", (unsigned)mark, (unsigned)a, (unsigned)x,
+           (unsigned)b, (unsigned)y);
+    return 0;
+}
+"#;
+    let (_, runs) = script::native_runs(WAITING_CHOICES).unwrap();
+    let spec = &runs[0];
+    compare_c_host(
+        WAITING_CHOICES,
+        "waiting_choices",
+        DRIVER,
+        |program, config| {
+            let result = compare(
+                program,
+                &spec.entry,
+                spec.arguments.clone(),
+                &mut scheduled_host(spec),
+                config,
+            );
+            assert_eq!(result.verdict, Verdict::Same);
+            assert_eq!(
+                result.oracle.end.to_string(),
+                "done ok {90, 22, 220, 11, 110}"
+            );
+            let mut observed: Vec<_> = result
+                .oracle
+                .trace
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            observed.push(result.oracle.end.to_string());
+            observed
+        },
+    );
 }
 
 #[test]
