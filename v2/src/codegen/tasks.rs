@@ -3,7 +3,7 @@
 use super::*;
 
 // Keep the common prefix in sync with %vn2.member_header in task_set.ll.
-const FIRST_INPUT: usize = 5;
+const FIRST_INPUT: usize = 6;
 
 #[derive(Clone, Copy)]
 pub(super) enum Frame {
@@ -71,6 +71,9 @@ pub(super) fn emit_support<'a>(
     }
     reg.needed_libc = true;
     out.push_str(include_str!("task_set.ll"));
+    if !host_wait::targets(program).is_empty() {
+        out.push_str(include_str!("task_host.ll"));
+    }
     let mut nested = BTreeSet::new();
     for id in members {
         let member = &program.controls[id];
@@ -78,12 +81,15 @@ pub(super) fn emit_support<'a>(
         let mut pending: Vec<_> = awaits(member.body.as_ref().unwrap()).collect();
         while let Some(callee) = pending.pop() {
             let target = &program.controls[callee];
-            let body = target.body.as_ref().ok_or_else(|| {
-                format!(
-                    "the native backend does not yet support await of extern `{}` in task-set member `{}`",
-                    target.name, member.name
-                )
-            })?;
+            let Some(body) = &target.body else {
+                if target.is_cancellable() || target.faults {
+                    return Err(format!(
+                        "the native backend does not yet support a cancellable or faulting host await of `{}` in task-set member `{}`",
+                        target.name, member.name
+                    ));
+                }
+                continue;
+            };
             if needs_activation(body) && nested.insert(callee) {
                 pending.extend(awaits(body));
             }
@@ -228,6 +234,7 @@ pub(super) fn emit_member_entry(
         "i32".into(),
         "i1".into(),
         "i1".into(),
+        "ptr".into(),
         "ptr".into(),
     ];
     fields.extend(

@@ -5,10 +5,9 @@ the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
 roots, direct runs of nonfaulting and noncancellable host operations, and
-task sets whose owners and members can yield at a defined await. A root can
-also wait for the host while its members take turns (sections 18.4 to 18.20).
-The oracle of slice 1 and its
-conformance suite (sections 1 to 7) are qualified. Everything described from
+task sets whose owners and members can yield at a defined await. Roots and members can
+wait for the host in their own activations or in a callee (sections 18.4 to
+18.21). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
 lists the defects. Sections 8 to 18 describe what the code does and which
@@ -2654,7 +2653,7 @@ starts the bound request immediately ([E-AwaitHost]). Until it completes,
 the ready choices contain only eligible members of that run ([E-Turn]).
 A member can yield, spawn a child, wait for it and wake on its completion.
 The scheduler checks the ready count after every turn. Once that count is
-zero, `vn2_pick_waiting` sees the sole pending operation. The host completes
+zero, `vn2_pick_waiting` sees the sole pending operation in this example. The host completes
 it, then `vn2_pick_turn(1)` offers the root its turn. Finished members stay
 in their sets until their owner takes their results.
 
@@ -2672,6 +2671,33 @@ that calls `ping(55)`. The child wakes its parent, which drains the set and
 finishes. Both interpreters and compiled code record `ping` before the host
 completion of `fetch(8, false)`.
 
+### 18.21 A spawned member waits for the host, 27 November 2026
+
+A member that awaits a noncancellable, nonfaulting extern starts the bound
+request and gives up its turn ([E-AwaitHost]). Its activation retains the
+request, operands and result slots. Once the run has no ready task, the
+host sees the pending root first, if any, then waiting members in spawn
+order ([E-Turn]). The host selects an index modulo the number of operations
+offered. Completion fills the selected activation's slots and makes its
+task ready. The member can await again before it exits. An owner blocked
+on that set can take the member's result only after the exit ([E-Next]).
+
+Run `vn2 test tests/slice4/checked_member_host_wait.core` and
+`cargo test --test backend_slice4 member_host_wait` from `v2/`.
+In `owner`, the member resumes between two requests and its owner eventually
+receives 37. In `nested`, a callee in the member transfers an owned vector
+to the host and returns its replacement. In `overlap`, the root and member
+wait on different controls. The scripted host chooses the first pending
+control matching the next answer, just as the interpreter does.
+
+In `pair`, two members wait for the same control. A linked C host starts
+member 22 first, receives the handles for 11 and 22 in spawn order, and
+chooses index 3 modulo 2. It completes 22, offers the resumed member and
+then its owner a turn, and finally completes 11. A single candidate fits
+on the stack. For overlapping waits, the scheduler allocates temporary
+arrays for the host handles and corresponding members and releases them
+before calling the selected completion.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2683,8 +2709,9 @@ completion of `fetch(8, false)`.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs host waits in spawned members, multiple pending operations, cancellation, faulting host operations, member faults, capacity and
-  generated task programs in the native comparison.
+- **Later work.** Slice 4 still needs native replay of explicit `waiting` choices,
+  cancellation, faulting host operations, member faults, capacity and generated
+  task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
   Each is brought up to date when its slice is requalified.

@@ -1,0 +1,93 @@
+// One spawned member waits twice. Between completions only the member can
+// resume. Its owner cannot take the result until the member exits.
+extern async control fetch(key : usize, cached : bool)
+    ■ { found {value : usize, valid : bool} │ missing {} } uses io
+
+async control worker(key : usize) ■ { got {value : usize} } uses io
+    ⊤ ▷ c := capture await fetch(key, true)
+    ⊤ ▷ a : Δ outcome(c) ▸ found {next_key, valid} │ missing {}
+    a.missing ▷ ■ got {0}
+    a.found ▷ q : ? valid
+    q.false ▷ ■ got {1}
+    q.true ▷ b : Δ await fetch(next_key, false) ▸ found {value, use_it} │ missing {}
+    b.missing ▷ ■ got {2}
+    b.found ▷ r : ? use_it
+    r.false ▷ ■ got {3}
+    r.true ▷ ■ got {value}
+
+async control owner() ■ { ok {value : usize} } uses io
+    ⊤ ▷ ~pool : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(4) into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ got {value} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {value}
+
+control example() ■ { ok {value : usize} } uses io
+    ⊤ ▷ d : Δ run owner() ▸ ok {value}
+    d.ok ▷ ■ ok {value}
+
+//! run owner() with [fetch -> found {8, true}; fetch -> found {37, true}] => done ok {37} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> found {37, true}]
+//! run owner() with [fetch -> missing] => done ok {0} trace [fetch(4, true) -> missing]
+//! run owner() with [fetch -> found {8, false}] => done ok {1} trace [fetch(4, true) -> found {8, false}]
+//! run owner() with [fetch -> found {8, true}; fetch -> missing] => done ok {2} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> missing]
+//! run owner() with [fetch -> found {8, true}; fetch -> found {37, false}] => done ok {3} trace [fetch(4, true) -> found {8, true}; fetch(8, false) -> found {37, false}]
+
+// Both members call the same host control. Turn choice can start the younger
+// member first. The pending list still follows spawn order.
+async control pair() ■ { ok {first : usize, second : usize} } uses io
+    ⊤ ▷ ~pool : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(11) into pool
+    ⊤ ▷ spawn worker(22) into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ got {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(pool) ▸ got {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {first, second}
+
+control run_pair() ■ { ok {first : usize, second : usize} } uses io
+    ⊤ ▷ p : Δ run pair() ▸ ok {first, second}
+    p.ok ▷ ■ ok {first, second}
+
+//! run pair() with [fetch -> found {44, false}; fetch -> missing] turns [1] => done ok {1, 0} trace [fetch(11, true) -> found {44, false}; fetch(22, true) -> missing]
+
+// The request and its owned input are in a callee of the member.
+extern async control exchange(xs : [u32]) ■ { item {data : [u32]} } uses io
+async control replace(xs : [u32]) ■ { got {data : [u32]} } uses io
+    ⊤ ▷ r := capture await exchange(▾xs)
+    ⊤ ▷ d : Δ outcome(▾r) ▸ item {data}
+    d.item ▷ ■ got {▾data}
+
+async control relay(xs : [u32]) ■ { got {data : [u32]} } uses io
+    ⊤ ▷ d : Δ await replace(▾xs) ▸ got {data}
+    d.got ▷ ■ got {▾data}
+
+async control nested() ■ { ok {result : [u32]} } uses io
+    ⊤ ▷ ~pool : tasks⟨relay⟩ := tasks⟨relay⟩()
+    ⊤ ▷ spawn relay([4, 5]) into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ got {data} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {▾data}
+
+//! run nested() with [exchange -> item {[8, 9, 10]}] => done ok {[8, 9, 10]} trace [exchange([4, 5]) -> item {[8, 9, 10]}]
+
+// The owner and member can be waiting together. The host can complete either
+// first. The selected task alone resumes with that request's result.
+extern async control pulse() ■ { ok {mark : usize} } uses io
+async control overlap() ■ { ok {mark : usize, value : usize} } uses io
+    ⊤ ▷ ~pool : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(4) into pool
+    ⊤ ▷ p : Δ await pulse() ▸ ok {mark}
+    ⊤ ▷ a : Δ await next(pool) ▸ got {value} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {mark, value}
+
+//! run overlap() with [pulse -> ok {90}; fetch -> missing] => done ok {90, 0} trace [pulse() -> ok {90}; fetch(4, true) -> missing]
+//! run overlap() with [fetch -> found {8, true}; pulse -> ok {91}; fetch -> found {37, true}] => done ok {91, 37} trace [fetch(4, true) -> found {8, true}; pulse() -> ok {91}; fetch(8, false) -> found {37, true}]

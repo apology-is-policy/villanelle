@@ -2,10 +2,11 @@
 ; The scheduler lists unfinished members in spawn order and counts ready ones.
 ; A pool holds its completion queue, count, producer, spare frame and waiter.
 %vn2.queue = type { ptr, ptr }
-%vn2.scheduler = type { %vn2.queue, i64 }
+; Unfinished members, ready count, host-waiting member count, idle callback.
+%vn2.scheduler = type { %vn2.queue, i64, i64, ptr }
 %vn2.pool = type { %vn2.queue, i64, ptr, ptr, ptr }
-; next link, resume index/result tag, heap flag, blocked flag, originating set
-%vn2.member_header = type { ptr, i32, i1, i1, ptr }
+; Next link, resume index/result tag, heap flag, blocked flag, originating set, host wait.
+%vn2.member_header = type { ptr, i32, i1, i1, ptr, ptr }
 
 declare void @llvm.trap()
 
@@ -119,6 +120,8 @@ append:
   store i1 false, ptr %flag
   %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
   store ptr %pool, ptr %set_slot
+  %wait = getelementptr %vn2.member_header, ptr %member, i32 0, i32 5
+  store ptr null, ptr %wait
   call fastcc void @vn2_append(ptr %scheduler, ptr %member)
   %ready = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 1
   %r = load i64, ptr %ready
@@ -139,6 +142,16 @@ define internal fastcc i1 @vn2_can_deliver(ptr %pool) {
   ret i1 %can_deliver
 }
 
+define internal fastcc void @vn2_block_member(ptr %scheduler, ptr %member) {
+  %flag = getelementptr %vn2.member_header, ptr %member, i32 0, i32 3
+  store i1 true, ptr %flag
+  %ready = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 1
+  %r = load i64, ptr %ready
+  %nr = sub i64 %r, 1
+  store i64 %nr, ptr %ready
+  ret void
+}
+
 ; Only the task that owns a set can wait for its next completion. Leave a
 ; blocked member in its original position and exclude it from turn offers.
 define internal fastcc void @vn2_wait_member(ptr %scheduler, ptr %member, ptr %pool) {
@@ -148,12 +161,7 @@ entry:
 block:
   %waiter = getelementptr %vn2.pool, ptr %pool, i32 0, i32 4
   store ptr %member, ptr %waiter
-  %flag = getelementptr %vn2.member_header, ptr %member, i32 0, i32 3
-  store i1 true, ptr %flag
-  %ready = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 1
-  %r = load i64, ptr %ready
-  %nr = sub i64 %r, 1
-  store i64 %nr, ptr %ready
+  call fastcc void @vn2_block_member(ptr %scheduler, ptr %member)
   br label %yield
 yield:
   ret void
@@ -244,6 +252,15 @@ offer:
   %r = load i64, ptr %ready
   %offset = zext i1 %owner to i64
   %offered = add i64 %r, %offset
+  %idle = icmp eq i64 %offered, 0
+  br i1 %idle, label %host, label %pick
+host:
+  ; With the owner blocked and no ready member, a member is waiting for the host.
+  %callback = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 3
+  %poll = load ptr, ptr %callback
+  call fastcc i1 %poll(ptr %scheduler, ptr null)
+  br label %choose
+pick:
   %choice = call i64 @vn2_pick_turn(i64 %offered)
   %index = urem i64 %choice, %offered
   %take_owner = icmp ult i64 %index, %offset

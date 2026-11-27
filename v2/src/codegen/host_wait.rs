@@ -1,4 +1,4 @@
-//! A single pending host operation in an await or a direct run ([E-AwaitHost], [E-Run]).
+//! Bound host requests and their completion in an await or a direct run ([E-AwaitHost], [E-Run]).
 use super::*;
 
 pub(super) fn targets(program: &Program) -> BTreeSet<ControlId> {
@@ -42,10 +42,11 @@ pub(super) fn emit_header(
 // The request and all its input and result slots outlive the pending operation.
 pub(super) fn emit_request(
     em: &mut IrEmitter<'_, '_>,
+    body: &ControlBody,
     id: ControlId,
     args: &[String],
     tag: &str,
-    scheduler: Option<&str>,
+    awaits: bool,
 ) {
     let ty = format!("%vn2.wait.{id}");
     let request = em.alloc_temp(&ty);
@@ -60,21 +61,48 @@ pub(super) fn emit_request(
     }
     let name = &em.program.controls[id].name;
     let _ = writeln!(em.code, "  call void @vn2_start_{name}(ptr {request})");
-    if let Some(scheduler) = scheduler {
+    if awaits && em.resume_points.is_some() {
+        let wait = em.alloc_temp("%vn2.pending");
+        let points = em.resume_points.as_mut().unwrap();
+        let pc = points.len() + 1;
+        let resume = format!("member_host_{pc}");
+        points.push(resume.clone());
         let _ = writeln!(
             em.code,
-            "  call fastcc void @vn2_run_ready_members(ptr {scheduler})"
+            "  call fastcc void @vn2_park_host(ptr %task_scheduler, ptr %task_member, ptr {wait}, ptr {request}, ptr @vn2_complete_{name})"
+        );
+        let _ = writeln!(
+            em.code,
+            "  store i32 {pc}, ptr %member_state\n  ret i32 -3\n{resume}:"
+        );
+        let slot = em.fresh_reg();
+        let _ = writeln!(
+            em.code,
+            "  {slot} = getelementptr %vn2.pending, ptr {wait}, i32 0, i32 2\n  {tag} = load i32, ptr {slot}"
+        );
+        return;
+    }
+
+    if awaits && em.reg.has_task_sets {
+        let scheduler = tasks::owner_scheduler(body);
+        let _ = writeln!(
+            em.code,
+            "  call fastcc void @vn2_wait_for_root(ptr {scheduler}, ptr {request})"
+        );
+    } else {
+        // host_state is the first field, so its address is the one-element list.
+        let _ = writeln!(
+            em.code,
+            "  call i64 @vn2_pick_waiting(ptr {request}, i64 1)"
         );
     }
-    // host_state is the first field, so its address is the one-element list.
-    let _ = writeln!(
-        em.code,
-        "  call i64 @vn2_pick_waiting(ptr {request}, i64 1)"
-    );
     let _ = writeln!(
         em.code,
         "  {tag} = call i32 @vn2_complete_{name}(ptr {request})"
     );
+    if awaits {
+        em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
+    }
 }
 
 pub(super) fn emit_support(
@@ -87,10 +115,7 @@ pub(super) fn emit_support(
     if ids.is_empty() {
         return;
     }
-    if scripted {
-        // With one pending operation the scripted host always selects index zero.
-        out.push_str("define i64 @vn2_pick_waiting(ptr %states, i64 %count) {\n  ret i64 0\n}\n");
-    } else {
+    if !scripted {
         out.push_str("declare i64 @vn2_pick_waiting(ptr, i64)\n");
     }
     for &id in ids {
@@ -111,7 +136,7 @@ pub(super) fn emit_support(
         // Bind this invocation at start. Consume its scripted answer only on completion.
         let _ = writeln!(
             out,
-            "define void @vn2_start_{name}(ptr %request) {{\n  store ptr %request, ptr %request\n  ret void\n}}"
+            "@vn2_script_host_{id} = private constant i64 {id}\ndefine void @vn2_start_{name}(ptr %request) {{\n  store ptr @vn2_script_host_{id}, ptr %request\n  ret void\n}}"
         );
         let _ = writeln!(out, "define i32 @vn2_complete_{name}(ptr %request) {{");
         let mut args = Vec::new();
@@ -129,4 +154,49 @@ pub(super) fn emit_support(
             args.join(", ")
         );
     }
+}
+
+/// Script::pick_waiting chooses the first descriptor that can consume the next answer.
+pub(super) fn emit_script_picker(out: &mut String, controls: &[i64]) {
+    let ids = controls
+        .iter()
+        .map(|id| format!("i64 {id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        out,
+        "@vn2_script_controls = private constant [{} x i64] [{ids}]",
+        controls.len()
+    );
+    out.push_str(
+        "define i64 @vn2_pick_waiting(ptr %states, i64 %count) {
+entry:
+  %pos = load i64, ptr @script_pos
+  %end = load i64, ptr @script_end
+  %empty = icmp eq i64 %pos, %end
+  %one = icmp eq i64 %count, 1
+  %default = or i1 %empty, %one
+  br i1 %default, label %first, label %lookup
+lookup:
+  %slot = getelementptr i64, ptr @vn2_script_controls, i64 %pos
+  %wanted = load i64, ptr %slot
+  br label %scan
+scan:
+  %i = phi i64 [ 0, %lookup ], [ %next, %advance ]
+  %addr = getelementptr ptr, ptr %states, i64 %i
+  %state = load ptr, ptr %addr
+  %id = load i64, ptr %state
+  %match = icmp eq i64 %id, %wanted
+  br i1 %match, label %found, label %advance
+advance:
+  %next = add i64 %i, 1
+  %last = icmp eq i64 %next, %count
+  br i1 %last, label %first, label %scan
+found:
+  ret i64 %i
+first:
+  ret i64 0
+}
+",
+    );
 }

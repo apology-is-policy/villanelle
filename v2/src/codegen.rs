@@ -4898,14 +4898,7 @@ fn emit_operation_call(
             let tag_reg = em.fresh_reg();
             let awaits = matches!(op_kind, Operation::AwaitControl(_));
             if is_extern && (awaits || matches!(op_kind, Operation::RunControl(_))) {
-                let scheduler =
-                    (awaits && em.reg.has_task_sets).then(|| tasks::owner_scheduler(body));
-                host_wait::emit_request(em, *cid, &call_args, &tag_reg, scheduler);
-                // An await makes the root ready. A direct extern run ends here,
-                // and its caller continues on the turn that entered the run.
-                if awaits {
-                    em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
-                }
+                host_wait::emit_request(em, body, *cid, &call_args, &tag_reg, awaits);
             } else if awaits {
                 // [E-Await] Bind the inputs and the caller's result slots before
                 // the turn ends. The frame lives until the continuation returns.
@@ -6850,6 +6843,9 @@ pub fn emit_native_harness_llvm(
     let mut ext_code = String::new();
     let host_waits = host_wait::targets(program);
     host_wait::emit_support(&mut ext_code, program, &host_waits, usize_bits, true);
+    if !host_waits.is_empty() {
+        host_wait::emit_script_picker(&mut ext_code, &flat_ctrl_ids);
+    }
     let picks_turns = has_control_await(program) || reg.has_task_sets;
     if picks_turns {
         ext_code.push_str(

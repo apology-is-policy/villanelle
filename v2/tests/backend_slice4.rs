@@ -10,6 +10,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const MEMBER_HOST_WAIT: &str = include_str!("slice4/checked_member_host_wait.core");
 const OWNER_HOST_WAIT: &str = include_str!("slice4/checked_owner_host_wait.core");
 const HOST_RUN: &str = include_str!("slice4/checked_host_run.core");
 const HOST_WAIT: &str = include_str!("slice4/checked_host_wait.core");
@@ -97,6 +98,18 @@ fn direct_host_runs_return_the_selected_payload_to_the_caller() {
                 .contains("@vn2_pick_turn")
         );
     }
+}
+
+#[test]
+fn member_host_wait_delivers_to_the_parked_activation() {
+    // Two vectors and one nested activation. Four simultaneous-wait offers
+    // need a temporary pair of arrays. A single request needs no allocation.
+    compare_native_runs(
+        MEMBER_HOST_WAIT,
+        &["E-AwaitHost"],
+        &[2, 1, 1, 2, 2, 2, 1, 2, 3],
+        7,
+    );
 }
 
 #[test]
@@ -375,6 +388,150 @@ fn direct_host_runs_finish_before_the_outer_tasks_are_offered() {
             "ready 1",
         ],
     );
+}
+
+#[test]
+fn member_host_wait_resumes_the_member_before_its_owner() {
+    let (source, _) = MEMBER_HOST_WAIT
+        .split_once("extern async control exchange(")
+        .unwrap();
+    compare_fetch_host(
+        source,
+        "member_host_wait",
+        &[1, 2],
+        &[
+            "ready 1",
+            "waiting 4 true",
+            "complete 4 true",
+            "ready 1",
+            "waiting 8 false",
+            "complete 8 false",
+            "ready 1",
+            "ready 1",
+            "ready 1",
+        ],
+    );
+}
+
+#[test]
+fn member_host_wait_offers_pending_operations_in_spawn_order() {
+    #[derive(Default)]
+    struct PairHost(Vec<String>);
+    impl Host for PairHost {
+        fn pick_turn(&mut self, ready: usize) -> usize {
+            self.0.push(format!("ready {ready}"));
+            ready - 1
+        }
+        fn pick_waiting(&mut self, waiting: &[(&Control, &[Value])]) -> usize {
+            let mut line = "waiting".to_owned();
+            for (control, args) in waiting {
+                assert_eq!(control.name, "fetch");
+                let [Value::Int(key), Value::Bool(true)] = args else {
+                    panic!("unexpected pending request {args:?}")
+                };
+                line.push_str(&format!(" {key}"));
+            }
+            self.0.push(line);
+            3
+        }
+        fn call(
+            &mut self,
+            control: &Control,
+            args: &[Value],
+            _: &Config,
+        ) -> Result<Answer, String> {
+            assert_eq!(control.name, "fetch");
+            let [Value::Int(key), Value::Bool(true)] = args else {
+                panic!("unexpected completion {args:?}")
+            };
+            self.0.push(format!("complete {key}"));
+            let (alternative, payload) = if key == &Int::from_u64(22) {
+                (
+                    "found",
+                    vec![Value::Int(Int::from_u64(44)), Value::Bool(false)],
+                )
+            } else {
+                ("missing", vec![])
+            };
+            Ok(Answer {
+                alternative: alternative.into(),
+                payload,
+                writes: vec![],
+            })
+        }
+    }
+    const DRIVER: &str = r#"
+#include "module.h"
+#include <stdio.h>
+#include <stdlib.h>
+static unsigned starts;
+static struct vn2_wait_fetch *selected;
+void vn2_start_fetch(struct vn2_wait_fetch *r) {
+    if (r->host_state || !r->in_cached || r->in_key != (starts++ ? 11 : 22)) abort();
+    r->host_state = r;
+}
+uint64_t vn2_pick_turn(uint64_t n) {
+    printf("ready %u\n", (unsigned)n);
+    return n - 1;
+}
+uint64_t vn2_pick_waiting(void *const *states, uint64_t n) {
+    if (!n || n > 2 || selected) abort();
+    printf("waiting");
+    for (unsigned i = 0; i < n; ++i) {
+        struct vn2_wait_fetch *r = states[i];
+        printf(" %u", (unsigned)r->in_key);
+    }
+    puts("");
+    selected = states[3 % n];
+    return 3;
+}
+int32_t vn2_complete_fetch(struct vn2_wait_fetch *r) {
+    if (selected != r || r->host_state != r) abort();
+    selected = NULL;
+    printf("complete %u\n", (unsigned)r->in_key);
+    if (r->in_key == 11) return VN2_FETCH_MISSING;
+    *r->out_0_found_0 = 44;
+    *r->out_0_found_1 = 0;
+    return VN2_FETCH_FOUND;
+}
+int main(void) {
+    struct vn2_wait_fetch a, b;
+    if (vn2_call_run_pair(&a.in_key, &b.in_key) != VN2_RUN_PAIR_OK || starts != 2) return 1;
+    printf("done ok {%u, %u}\n", (unsigned)a.in_key, (unsigned)b.in_key);
+    return 0;
+}
+"#;
+    let (source, _) = MEMBER_HOST_WAIT
+        .split_once("extern async control exchange(")
+        .unwrap();
+    compare_c_host(source, "member_host_pair", DRIVER, |program, config| {
+        let mut host = PairHost::default();
+        let original = oracle::run(program, "run_pair", vec![], &mut host, config);
+        let mut erased_host = PairHost::default();
+        let erased = erased::run(program, "run_pair", vec![], &mut erased_host, config);
+        assert_eq!(erased.trace, original.trace);
+        assert_eq!(erased.end.to_string(), original.end.to_string());
+        assert_eq!(erased_host.0, host.0);
+        assert_eq!(
+            host.0,
+            [
+                "ready 2",
+                "ready 1",
+                "waiting 11 22",
+                "complete 22",
+                "ready 1",
+                "ready 1",
+                "waiting 11",
+                "complete 11",
+                "ready 1",
+                "ready 1",
+                "ready 1",
+            ]
+        );
+        assert_eq!(original.end.to_string(), "done ok {1, 0}");
+        host.0.push(original.end.to_string());
+        host.0
+    });
 }
 
 #[test]
@@ -1117,6 +1274,19 @@ async control owner() ■ { ok {} }
         .replace(next_owner, &format!("{suspend}\n    {next_owner}"));
     compare_native_runs(&owner_wait, &["E-AwaitHost"], &[1], 0);
     compare_native_runs(&callee_wait, &["E-AwaitHost"], &[1], 0);
+    let member_wait = with_read.replace(
+        "child(value : usize) ■ { ok {} }",
+        &format!("child(value : usize) ■ {{ ok {{}} }} uses io\n    {await_read}"),
+    );
+    let shared_wait = callee_wait
+        .replace(
+            "child(value : usize) ■ { ok {} }",
+            &format!("child(value : usize) ■ {{ ok {{}} }} uses io\n    {suspend}"),
+        )
+        .replace("with [read -> ok]", "with [read -> ok; read -> ok]")
+        .replace("trace [read() -> ok]", "trace [read() -> ok; read() -> ok]");
+    compare_native_runs(&member_wait, &["E-AwaitHost"], &[1], 0);
+    compare_native_runs(&shared_wait, &["E-AwaitHost"], &[2], 2);
     for (source, reason) in [
         (base.replace("async control idle() ■ { ok {} }", &format!("async control idle() ■ {{ ok {{}} }}\n    {new_set}"))
             .replace("⊤ ▷ q : Δ await next(other)", "⊤ ▷ cancel other\n    ⊤ ▷ q : Δ await next(other)")
@@ -1129,16 +1299,14 @@ async control owner() ■ { ok {} }
         (owner_wait.replace("read() ■ { ok {} } uses io", "read() ■ { ok {} } faults uses io")
             .replace("owner() ■ { ok {} } uses io", "owner() ■ { ok {} } faults uses io"),
             "cancellable or faulting host await of `read` in task-set owner"),
-        (callee_wait.replace("child(value : usize) ■ { ok {} }",
-            &format!("child(value : usize) ■ {{ ok {{}} }} uses io\n    {suspend}"))
-            .replace("with [read -> ok]", "with [read -> ok; read -> ok]")
-            .replace("trace [read() -> ok]", "trace [read() -> ok; read() -> ok]"),
-            "await of extern `read` in task-set member"),
+        (member_wait.replace("read() ■ { ok {} }", "read() ■ { ok {} │ cancelled {} }")
+            .replace("await read() ▸ ok {}", "await read() ▸ ok {} │ cancelled {}"),
+            "cancellable or faulting host await of `read` in task-set member"),
+        (member_wait.replace("read() ■ { ok {} } uses io", "read() ■ { ok {} } faults uses io")
+            .replace("child(value : usize) ■ { ok {} } uses io", "child(value : usize) ■ { ok {} } faults uses io")
+            .replace("owner() ■ { ok {} } uses io", "owner() ■ { ok {} } faults uses io"),
+            "cancellable or faulting host await of `read` in task-set member"),
         (indirect.replace("⊤ ▷ q : Δ await next(other)", "⊤ ▷ cancel other\n    ⊤ ▷ q : Δ await next(other)"), "control `idle`: the native backend does not yet support task set cancellation"),
-        (base.replace("async control child", "extern async control read() ■ { ok {} } uses io\n\nasync control child")
-            .replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} } uses io\n    ⊤ ▷ w : Δ await read() ▸ ok {}")
-            .replace("owner() ■ { ok {} }", "owner() ■ { ok {} } uses io")
-            .replace("turns [1] => done ok", "with [read -> ok] turns [1] => done ok trace [read() -> ok]"), "await of extern `read` in task-set member"),
         (base.replace("async control owner", &format!("async control borrower(value : &usize) ■ {{ ok {{loan : &usize ∈ value}} }}\n    {new_set}\n    ⊤ ▷ ■ ok {{value}}\n\nasync control owner"))
             .replace("⊤ ▷ q : Δ await next(other)", "⊤ ▷ cancel other\n    ⊤ ▷ q : Δ await next(other)")
             .replace(next_owner, &format!("⊤ ▷ ~other : tasks⟨borrower⟩ := tasks⟨borrower⟩()\n    ⊤ ▷ spawn borrower(&v) into other\n    ⊤ ▷ a : Δ await next(other) ▸ ok {{loan}} │ empty {{}}\n    a.empty ▷ ⊥\n    ⊤ ▷ b : Δ await next(other) ▸ ok {{extra}} │ empty {{}}\n    b.ok ▷ ⊥\n    {next_owner}")), "control `borrower`: the native backend does not yet support task set cancellation"),
