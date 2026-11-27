@@ -7,7 +7,7 @@ IR backend. Slice 4 has an oracle, a checker, and native code for defined
 roots, direct runs of nonfaulting and noncancellable host operations, and
 task sets whose owners and members can yield at a defined await. Roots and members can
 wait for the host in their own activations or in a callee (sections 18.4 to
-18.22). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
+18.23). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
 lists the defects. Sections 8 to 18 describe what the code does and which
@@ -2722,6 +2722,42 @@ handles on all four offers and returns the same trace and payload. A
 separate test selects the stamp when the answer belongs to a read and
 checks the three events recorded before the host failure.
 
+### 18.23 Cancellation at a host await in a single root, 27 November 2026
+
+In a module with a cancellable host await, the native scheduler asks
+`vn2_should_cancel_root(turn)` whether the host requests cancellation of
+the innermost root. Turns start at one and count both ready-task and
+pending-host selections. A nonzero answer sets the flag. Once it is set,
+turns continue to count and the host receives no further cancellation
+queries for that root. A nested language run inherits the flag and shares
+the count. Its caller regains its own flag at return. A fresh C entry
+starts its own count and flag, including when called from a host callback.
+The native test harness accepts `cancel_at` on the same terms as the oracle.
+
+For a nonfaulting, cancellable await in a defined root running alone,
+the typed inputs and result slots are bound before testing the flag.
+A flag already set releases the by-value arguments under [E-Unwind]. The
+root receives `cancelled` and gives up its turn. The host sees no request.
+Otherwise `vn2_start_hold(request)` can retain its handle in `host_state`.
+Until completion, the runtime owns the by-value arguments. The host keeps
+the input and result-slot bindings intact. If the next scheduling turn
+sets the flag, `vn2_withdraw_hold(request)` detaches that same handle
+before the runtime releases the arguments. Withdrawal produces no host
+event. The root is ready for selection on that turn. A normal completion
+transfers the by-value arguments to the host and delivers the selected
+alternative, including when the host itself selects `cancelled`.
+
+From `v2/`, run `vn2 test tests/slice4/checked_root_cancel.core` and
+`cargo test --test backend_slice4 root_cancel`. The root lends an exclusive
+cell and gives the operation a lease and a vector. Cancellation leaves
+the cell at 7 and releases the lease. A completion writes 9 to the cell
+and returns 37. A linked C host checks the callbacks and the ready turn
+on both paths. It also reenters the module and makes a one-shot request
+inside a nested run. Three directives count earlier member and host turns
+before starting an independent root. A cancellable await in a task-set
+owner or member and a direct run of a cancellable extern still receive
+native diagnostics.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2733,8 +2769,9 @@ checks the three events recorded before the host failure.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs native cancellation, faulting host operations, member faults, capacity and generated
-  task programs in the native comparison.
+- **Later work.** Slice 4 still needs cancellable awaits alongside other tasks,
+  direct cancellable host runs, set cancellation, faulting host operations,
+  member faults, capacity and generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
   Each is brought up to date when its slice is requalified.

@@ -337,6 +337,7 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
                             NativeRunSpec {
                                 turns: Vec::new(),
                                 waiting: Vec::new(),
+                                cancel_at_turn: None,
                                 entry: entry.clone(),
                                 arguments: arguments.clone(),
                                 arithmetic: false,

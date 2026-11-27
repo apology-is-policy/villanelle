@@ -219,6 +219,7 @@ check:
   %empty = icmp eq i64 %count, 0
   br i1 %empty, label %done, label %offer
 offer:
+  call fastcc i1 @vn2_poll_cancel()
   %choice = call i64 @vn2_pick_turn(i64 %count)
   %index = urem i64 %choice, %count
   call fastcc void @vn2_step_member(ptr %scheduler, i64 %index)
@@ -236,6 +237,7 @@ entry:
   %inactive = icmp eq ptr %scheduler, null
   br i1 %inactive, label %alone, label %active
 alone:
+  call fastcc i1 @vn2_poll_cancel()
   call i64 @vn2_pick_turn(i64 1)
   ret void
 active:
@@ -261,6 +263,7 @@ host:
   call fastcc i1 %poll(ptr %scheduler, ptr null)
   br label %choose
 pick:
+  call fastcc i1 @vn2_poll_cancel()
   %choice = call i64 @vn2_pick_turn(i64 %offered)
   %index = urem i64 %choice, %offered
   %take_owner = icmp ult i64 %index, %offset

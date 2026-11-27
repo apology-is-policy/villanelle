@@ -11,6 +11,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const ROOT_CANCEL: &str = include_str!("slice4/checked_root_cancel.core");
 const WAITING_CHOICES: &str = include_str!("slice4/checked_waiting_choices.core");
 const MEMBER_HOST_WAIT: &str = include_str!("slice4/checked_member_host_wait.core");
 const OWNER_HOST_WAIT: &str = include_str!("slice4/checked_owner_host_wait.core");
@@ -33,6 +34,7 @@ fn scheduled_host(spec: &NativeRunSpec) -> Scheduled<Script> {
     });
     host.turns = spec.turns.iter().copied().collect();
     host.waiting = spec.waiting.iter().copied().collect();
+    host.cancel_at_turn = spec.cancel_at_turn;
     host
 }
 
@@ -106,6 +108,192 @@ fn direct_host_runs_return_the_selected_payload_to_the_caller() {
                 .contains("@vn2_pick_turn")
         );
     }
+}
+
+fn single_root_cancel_source() -> &'static str {
+    ROOT_CANCEL
+        .split_once("extern async control ping()")
+        .unwrap()
+        .0
+}
+
+#[test]
+fn root_cancel_counts_member_turns_before_a_nested_run() {
+    compare_native_runs(
+        ROOT_CANCEL,
+        &["E-AwaitHost"],
+        &[1, 2, 1, 1, 1, 1, 2, 3, 2],
+        9,
+    );
+}
+
+#[test]
+fn root_cancel_before_issue_and_during_wait_release_the_arguments() {
+    // Withdrawal counts E-AwaitHost once at issue and again at withdrawal.
+    compare_native_runs(
+        single_root_cancel_source(),
+        &["E-AwaitHost"],
+        &[1, 2, 1, 1, 1, 1],
+        6,
+    );
+}
+
+#[test]
+fn root_cancel_c_host_observes_start_withdrawal_release_and_resumption() {
+    const DRIVER: &str = r#"
+#include "module.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static unsigned scenario, at, reentered;
+static char calls[48];
+static size_t count;
+static struct vn2_wait_hold *pending;
+static void record(char event) {
+    if (count + 1 >= sizeof calls) abort();
+    calls[count++] = event;
+    calls[count] = 0;
+}
+uint8_t vn2_should_cancel_root(uint64_t turn) {
+    if (!turn || turn > 9) abort();
+    record((char)('0' + turn));
+    return !reentered && turn == at;
+}
+uint64_t vn2_pick_turn(uint64_t n) {
+    if (n != 1) abort();
+    record('R');
+    return 0;
+}
+int32_t vn2_ext_open_lease(uint32_t id, void **out) {
+    if (id != 3 || pending) abort();
+    record('O');
+    // A fresh call from C starts at turn one, even inside a cancelled root.
+    reentered = 1;
+    if (vn2_call_checkpoint() != VN2_CHECKPOINT_OK) abort();
+    reentered = 0;
+    *out = (void *)(uintptr_t)id;
+    puts("open_lease(3) -> ok {lease#3}");
+    return VN2_OPEN_LEASE_OK;
+}
+static void check_inputs(struct vn2_wait_hold *r) {
+    const uint32_t *data = r->in_xs->data;
+    if ((uintptr_t)r->in_l != 3 || r->in_xs->len != 2 || data[0] != 4 ||
+        data[1] != 8 || *r->in_cell != 7) abort();
+}
+void vn2_start_hold(struct vn2_wait_hold *r) {
+    if (pending || r->host_state) abort();
+    check_inputs(r);
+    r->host_state = pending = r;
+    record('S');
+}
+void vn2_withdraw_hold(struct vn2_wait_hold *r) {
+    if (!pending || r != pending || r->host_state != pending) abort();
+    check_inputs(r);
+    pending = NULL;
+    record('X');
+}
+void vn2_release_lease(void *handle) {
+    if ((uintptr_t)handle != 3 || pending) abort();
+    record('L');
+    puts("lease.release(lease#3) -> released {}");
+}
+uint64_t vn2_pick_waiting(void *const *states, uint64_t n) {
+    if (n != 1 || !pending || states[0] != pending) abort();
+    record('W');
+    return 0;
+}
+int32_t vn2_complete_hold(struct vn2_wait_hold *r) {
+    if (!pending || r != pending || r->host_state != pending) abort();
+    check_inputs(r);
+    pending = NULL;
+    record('C');
+    free(r->in_xs->data);
+    if (scenario == 3) {
+        puts("hold(lease#3, [4, 8], 7) -> cancelled {}");
+        return VN2_HOLD_CANCELLED;
+    }
+    puts("hold(lease#3, [4, 8], 7) -> done {37}");
+    *r->out_0_done_0 = 37;
+    *r->in_cell = 9;
+    return VN2_HOLD_DONE;
+}
+int main(void) {
+    const unsigned turns[] = {1, 2, 3, 0, 1, 1};
+    const char *expected[] = {
+        "1RO1RLR", "1RO1RS2XLR", "1RO1RS2WC3R", "1RO1RS2WC3R",
+        "1RRO1RLR", "1R2R3RO1RS4WC5R"
+    };
+    for (scenario = 0; scenario < 6; ++scenario) {
+        count = 0;
+        at = turns[scenario];
+        uint32_t *values = malloc(2 * sizeof *values);
+        if (!values) abort();
+        values[0] = 4;
+        values[1] = 8;
+        vn2_vec input = {values, 2, 2};
+        uint32_t v = 0, cell = 0, stopped = 0;
+        int32_t tag;
+        if (scenario == 4) tag = vn2_call_inherit(&input, &v, &cell, &stopped);
+        else if (scenario == 5) tag = vn2_call_after_inner(&input, &v, &cell, &stopped);
+        else tag = vn2_call_example(&input, &v, &cell, &stopped);
+        if (pending || strcmp(calls, expected[scenario])) {
+            fprintf(stderr, "scenario %u: expected %s, got %s\n", scenario, expected[scenario], calls);
+            return 1;
+        }
+        if (tag == VN2_EXAMPLE_OK) printf("done ok {%u, %u}\n", (unsigned)v, (unsigned)cell);
+        else if (tag == VN2_EXAMPLE_STOPPED) printf("done stopped {%u}\n", (unsigned)stopped);
+        else return 1;
+    }
+    return 0;
+}
+"#;
+    struct OneShot {
+        script: Script,
+        at: Option<u64>,
+    }
+    impl Host for OneShot {
+        fn should_cancel_root(&mut self, turn: u64) -> bool {
+            self.at == Some(turn)
+        }
+        fn call(
+            &mut self,
+            control: &Control,
+            args: &[Value],
+            config: &Config,
+        ) -> Result<Answer, String> {
+            self.script.call(control, args, config)
+        }
+    }
+    let (_, runs) = script::native_runs(single_root_cancel_source()).unwrap();
+    compare_c_host(
+        single_root_cancel_source(),
+        "root_cancel",
+        DRIVER,
+        |program, config| {
+            let mut expected = Vec::new();
+            for (spec, at) in runs
+                .iter()
+                .zip([Some(1), Some(2), Some(3), None, Some(1), Some(1)])
+            {
+                let mut host = OneShot {
+                    script: scheduled_host(spec).inner,
+                    at,
+                };
+                let result = compare(
+                    program,
+                    &spec.entry,
+                    spec.arguments.clone(),
+                    &mut host,
+                    config,
+                );
+                assert_eq!(result.verdict, Verdict::Same);
+                assert!(matches!(result.oracle.end, oracle::End::Done { .. }));
+                expected.extend(result.oracle.trace.iter().map(ToString::to_string));
+                expected.push(result.oracle.end.to_string());
+            }
+            expected
+        },
+    );
 }
 
 #[test]
@@ -437,6 +625,20 @@ fn nested_member_awaits_keep_each_invocations_payload_and_resume_point() {
 
 #[test]
 fn native_compilation_reports_operations_that_need_a_scheduler() {
+    // The former refusal of a captured cancellable await now runs natively.
+    compare_native_runs(
+        r#"
+extern async control tick() ■ { ok {} │ cancelled {} } uses io
+async control waits() ■ { ok {} } uses io
+    ⊤ ▷ r := capture await tick()
+    ⊤ ▷ d : Δ outcome(r) ▸ ok {} │ cancelled {}
+    ⊤ ▷ ■ ok {}
+//! run waits() with [tick -> ok] => done ok trace [tick() -> ok]
+"#,
+        &["E-AwaitHost"],
+        &[1],
+        0,
+    );
     // Put supported entries first. Both emitters compile the whole module.
     for (decls, reason) in [
         (
@@ -459,17 +661,6 @@ control bridge2() ■ { ok {} } faults uses io
 //! run bridge2() with [tick -> ok] => done ok trace [tick() -> ok]
 "#,
             "faulting host run of `tick`",
-        ),
-        (
-            r#"
-extern async control tick() ■ { ok {} │ cancelled {} } uses io
-async control waits() ■ { ok {} } uses io
-    ⊤ ▷ r := capture await tick()
-    ⊤ ▷ d : Δ outcome(r) ▸ ok {} │ cancelled {}
-    ⊤ ▷ ■ ok {}
-//! run waits() with [tick -> ok] => done ok trace [tick() -> ok]
-"#,
-            "cancellable or faulting host await of `tick`",
         ),
         (
             r#"
@@ -1358,7 +1549,12 @@ fn compare_c_host(
                 String::from_utf8_lossy(&build.stderr)
             );
             let run = Command::new(dir.join("driver")).output().unwrap();
-            assert!(run.status.success(), "{:?}", run.status);
+            assert!(
+                run.status.success(),
+                "{:?}: {}",
+                run.status,
+                String::from_utf8_lossy(&run.stderr)
+            );
             assert_eq!(
                 String::from_utf8(run.stdout)
                     .unwrap()

@@ -26,6 +26,7 @@ entry:
   %alone = icmp eq i64 %n, 0
   br i1 %alone, label %root_only, label %members
 root_only:
+  call fastcc i1 @vn2_poll_cancel()
   call i64 @vn2_pick_waiting(ptr %root, i64 1)
   ret i1 true
 members:
@@ -78,6 +79,7 @@ advance:
   %full = icmp eq i64 %next, %count
   br i1 %full, label %pick, label %scan
 pick:
+  call fastcc i1 @vn2_poll_cancel()
   %choice = call i64 @vn2_pick_waiting(ptr %states, i64 %count)
   %index = urem i64 %choice, %count
   %chosen_slot = getelementptr ptr, ptr %frames, i64 %index
@@ -117,6 +119,7 @@ entry:
   %alone = icmp eq ptr %scheduler, null
   br i1 %alone, label %root_only, label %active
 root_only:
+  call fastcc i1 @vn2_poll_cancel()
   call i64 @vn2_pick_waiting(ptr %request, i64 1)
   ret void
 active:

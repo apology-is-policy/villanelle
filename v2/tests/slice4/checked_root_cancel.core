@@ -1,0 +1,77 @@
+// A defined await gives up the root's turn before it binds the host request.
+// The owned lease and vector move on either path. The borrowed cell stays live.
+extern resource lease on fault release
+extern control open_lease(id : u32) ■ { ok {l : lease} } uses io
+extern async control hold(l : lease, xs : [u32], cell : &~u32)
+    ■ { done {v : u32} │ cancelled {} } uses io
+
+async control pause() ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+async control work(xs : [u32]) ■ { ok {v : u32, cell : u32} │ stopped {cell : u32} } uses io
+    ⊤ ▷ p : Δ await pause() ▸ ok {}
+    ⊤ ▷ ~cell : u32 := 7
+    ⊤ ▷ o : Δ open_lease(3) ▸ ok {l}
+    o.ok ▷ w : Δ await hold(l, ▾xs, &~cell) ▸ done {v} │ cancelled {}
+    w.done ▷ ■ ok {v, cell}
+    w.cancelled ▷ ■ stopped {cell}
+
+control example(xs : [u32]) ■ { ok {v : u32, cell : u32} │ stopped {cell : u32} } uses io
+    ⊤ ▷ d : Δ run work(▾xs) ▸ ok {v, cell} │ stopped {unchanged}
+    d.ok ▷ ■ ok {v, cell}
+    d.stopped ▷ ■ stopped {unchanged}
+
+// The first turn selects the ready root at pause. The second can withdraw
+// a started hold. The third comes after completion and leaves its result intact.
+//! run example([4, 8]) with [open_lease -> ok {lease#3}] cancel_at 1 => done stopped {7} trace [open_lease(3) -> ok {lease#3}; lease.release(lease#3) -> released]
+//! run example([4, 8]) with [open_lease -> ok {lease#3}] cancel_at 2 => done stopped {7} trace [open_lease(3) -> ok {lease#3}; lease.release(lease#3) -> released]
+//! run example([4, 8]) with [open_lease -> ok {lease#3}; hold -> done {37} ~cell <- 9] cancel_at 3 => done ok {37, 9} trace [open_lease(3) -> ok {lease#3}; hold(lease#3, [4, 8], 7) -> done {37}]
+//! run example([4, 8]) with [open_lease -> ok {lease#3}; hold -> cancelled] => done stopped {7} trace [open_lease(3) -> ok {lease#3}; hold(lease#3, [4, 8], 7) -> cancelled]
+
+// A nested run inherits an existing cancellation. A cancellation first
+// requested inside that run belongs to its root when control returns.
+async control checkpoint() ■ { ok {} }
+    ⊤ ▷ p : Δ await pause() ▸ ok {}
+    p.ok ▷ ■ ok {}
+
+control checkpoint_run() ■ { ok {} }
+    ⊤ ▷ d : Δ run checkpoint() ▸ ok {}
+    d.ok ▷ ■ ok {}
+
+async control inherit(xs : [u32]) ■ { ok {v : u32, cell : u32} │ stopped {cell : u32} } uses io
+    ⊤ ▷ p : Δ await pause() ▸ ok {}
+    ⊤ ▷ d : Δ example(▾xs) ▸ ok {v, cell} │ stopped {unchanged}
+    d.ok ▷ ■ ok {v, cell}
+    d.stopped ▷ ■ stopped {unchanged}
+
+async control after_inner(xs : [u32]) ■ { ok {v : u32, cell : u32} │ stopped {cell : u32} } uses io
+    ⊤ ▷ p : Δ checkpoint_run() ▸ ok {}
+    ⊤ ▷ d : Δ await work(▾xs) ▸ ok {v, cell} │ stopped {unchanged}
+    d.ok ▷ ■ ok {v, cell}
+    d.stopped ▷ ■ stopped {unchanged}
+
+//! run inherit([4, 8]) with [open_lease -> ok {lease#3}] cancel_at 1 => done stopped {7} trace [open_lease(3) -> ok {lease#3}; lease.release(lease#3) -> released]
+//! run after_inner([4, 8]) with [open_lease -> ok {lease#3}; hold -> done {37} ~cell <- 9] => done ok {37, 9} trace [open_lease(3) -> ok {lease#3}; hold(lease#3, [4, 8], 7) -> done {37}]
+
+// A separate owner drains a member before starting an independent run of work.
+extern async control ping() ■ { ok {} } uses io
+async control peer() ■ { ok {} } uses io
+    ⊤ ▷ p : Δ await ping() ▸ ok {}
+    p.ok ▷ ■ ok {}
+
+async control after_peer(xs : [u32]) ■ { ok {v : u32, cell : u32} │ stopped {cell : u32} } uses io
+    ⊤ ▷ ~pool : tasks⟨peer⟩ := tasks⟨peer⟩()
+    ⊤ ▷ spawn peer() into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ ok {} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ ok {} │ empty {}
+    e.ok ▷ ⊥
+    e.empty ▷ d : Δ example(▾xs) ▸ ok {v, cell} │ stopped {unchanged}
+    d.ok ▷ ■ ok {v, cell}
+    d.stopped ▷ ■ stopped {unchanged}
+
+// The member takes turns 1 and 3. Its ping completes on turn 2, and the
+// owner takes turns 4 and 5 at next. Turn 6 is inside work at pause.
+//! run after_peer([4, 8]) with [ping -> ok; open_lease -> ok {lease#3}] cancel_at 2 => done stopped {7} trace [ping() -> ok; open_lease(3) -> ok {lease#3}; lease.release(lease#3) -> released]
+//! run after_peer([4, 8]) with [ping -> ok; open_lease -> ok {lease#3}] cancel_at 7 => done stopped {7} trace [ping() -> ok; open_lease(3) -> ok {lease#3}; lease.release(lease#3) -> released]
+//! run after_peer([4, 8]) with [ping -> ok; open_lease -> ok {lease#3}; hold -> done {37} ~cell <- 9] cancel_at 8 => done ok {37, 9} trace [ping() -> ok; open_lease(3) -> ok {lease#3}; hold(lease#3, [4, 8], 7) -> done {37}]

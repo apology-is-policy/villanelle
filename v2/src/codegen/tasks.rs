@@ -410,6 +410,7 @@ pub(super) fn owner_scheduler(body: &ControlBody) -> &'static str {
 /// A defined await in the same task inherits every ready child of its owner.
 pub(super) fn choose_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) -> &'static str {
     if !em.reg.has_task_sets {
+        root_cancel::poll(em);
         em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
         return "null";
     }

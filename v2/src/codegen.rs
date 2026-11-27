@@ -25,6 +25,7 @@
 //!   statement is ended by the formulas of that statement.
 
 mod host_wait;
+mod root_cancel;
 mod tasks;
 
 use crate::erased;
@@ -52,6 +53,8 @@ pub struct NativeRunSpec {
     pub turns: Vec<usize>,
     /// Pending-operation indices, then selection by the next scripted answer.
     pub waiting: Vec<usize>,
+    /// First scheduling turn at which the host requests cancellation of the active root.
+    pub cancel_at_turn: Option<u64>,
     pub answers: Vec<(String, Answer)>,
 }
 
@@ -845,6 +848,9 @@ pub fn emit_c_header(program: &Program, usize_bits: u32) -> String {
         });
 
     let host_waits = host_wait::targets(program);
+    if root_cancel::needed(program) {
+        out.push_str("uint8_t vn2_should_cancel_root(uint64_t turn);\n");
+    }
     if !host_waits.is_empty() {
         let _ = writeln!(
             out,
@@ -1018,6 +1024,7 @@ struct RuntimeRegistry<'a> {
     registered_maps: Vec<(Type, Type)>,
     map_ids: HashMap<(Type, Type), usize>,
     has_task_sets: bool,
+    has_root_cancel: bool,
     needed_libc: bool,
     needed_str: bool,
     needed_vec_grow: bool,
@@ -1042,6 +1049,7 @@ impl<'a> RuntimeRegistry<'a> {
             registered_maps: Vec::new(),
             map_ids: HashMap::new(),
             has_task_sets: tasks::uses_sets(program),
+            has_root_cancel: root_cancel::needed(program),
             needed_libc: false,
             needed_str: false,
             needed_vec_grow: false,
@@ -4801,7 +4809,9 @@ fn emit_operation_call(
         Operation::AwaitNext(_, _) => unreachable!("handled before allocating output slots"),
         Operation::AwaitControl(cid) | Operation::RunControl(cid)
             if is_extern_ctrl
-                && (program.controls[*cid].is_cancellable() || program.controls[*cid].faults) =>
+                && (program.controls[*cid].faults
+                    || (matches!(op_kind, Operation::RunControl(_))
+                        && program.controls[*cid].is_cancellable())) =>
         {
             let kind = if matches!(op_kind, Operation::RunControl(_)) {
                 "run"
@@ -4899,6 +4909,14 @@ fn emit_operation_call(
 
             let tag_reg = em.fresh_reg();
             let awaits = matches!(op_kind, Operation::AwaitControl(_));
+            let caller_flag =
+                if em.reg.has_root_cancel && matches!(op_kind, Operation::RunControl(_)) {
+                    let flag = em.fresh_reg();
+                    let _ = writeln!(em.code, "  {flag} = load i1, ptr @vn2_root_cancelled");
+                    Some(flag)
+                } else {
+                    None
+                };
             if is_extern && (awaits || matches!(op_kind, Operation::RunControl(_))) {
                 host_wait::emit_request(em, body, *cid, &call_args, &tag_reg, awaits);
             } else if awaits {
@@ -4939,6 +4957,10 @@ fn emit_operation_call(
                     "  {tag_reg} = call fastcc i32 @vn2_ctrl_{cid}({})",
                     call_args.join(", ")
                 );
+            }
+
+            if let Some(flag) = caller_flag {
+                let _ = writeln!(em.code, "  store i1 {flag}, ptr @vn2_root_cancelled");
             }
 
             if fslot.is_some() || tslot.is_some() {
@@ -5533,6 +5555,7 @@ pub fn emit_llvm(program: &Program, usize_bits: u32) -> Result<String, String> {
 
     let host_waits = host_wait::targets(program);
     host_wait::emit_support(&mut decls_out, program, &host_waits, usize_bits, false);
+    root_cancel::emit_support(&mut decls_out, &mut reg, &host_waits, false);
     if has_control_await(program) || reg.has_task_sets {
         let _ = writeln!(decls_out, "declare i64 @vn2_pick_turn(i64)");
     }
@@ -5664,6 +5687,7 @@ fn emit_program_bodies<'a>(
                 control,
                 term_tys[id].as_ref(),
                 usize_bits,
+                reg.has_root_cancel,
             );
         }
     }
@@ -5789,6 +5813,7 @@ fn emit_control_c_wrapper(
     control: &Control,
     term_ty: Option<&Type>,
     usize_bits: u32,
+    tracks_cancel: bool,
 ) {
     let mut c_params = Vec::new();
     for (idx, param) in control.parameters.iter().enumerate() {
@@ -5817,6 +5842,9 @@ fn emit_control_c_wrapper(
     );
     let _ = writeln!(out, "entry:");
 
+    if tracks_cancel {
+        out.push_str("  %saved_turn = load i64, ptr @vn2_turn_number\n  %saved_cancel = load i1, ptr @vn2_root_cancelled\n  store i64 0, ptr @vn2_turn_number\n  store i1 false, ptr @vn2_root_cancelled\n");
+    }
     let mut internal_args = Vec::new();
     let mut bool_outs = Vec::new();
     let mut bool_ref_writebacks = Vec::new();
@@ -5888,6 +5916,9 @@ fn emit_control_c_wrapper(
         internal_args.join(", ")
     );
 
+    if tracks_cancel {
+        out.push_str("  store i64 %saved_turn, ptr @vn2_turn_number\n  store i1 %saved_cancel, ptr @vn2_root_cancelled\n");
+    }
     for idx in bool_ref_writebacks {
         let _ = writeln!(out, "  %bw_b_{idx} = load i1, ptr %br_tmp_{idx}");
         let _ = writeln!(out, "  %bw_i_{idx} = zext i1 %bw_b_{idx} to i8");
@@ -6875,6 +6906,7 @@ pub fn emit_native_harness_llvm(
     let mut ext_code = String::new();
     let host_waits = host_wait::targets(program);
     host_wait::emit_support(&mut ext_code, program, &host_waits, usize_bits, true);
+    root_cancel::emit_support(&mut ext_code, &mut reg, &host_waits, true);
     let picks_turns = has_control_await(program) || reg.has_task_sets;
     if picks_turns || !host_waits.is_empty() {
         ext_code.push_str(
@@ -7257,6 +7289,18 @@ scripted:
     let _ = writeln!(main_out, "define i32 @main() nounwind {{");
     let _ = writeln!(main_out, "entry:");
     for (run_idx, spec) in specs.iter().enumerate() {
+        if reg.has_root_cancel {
+            let _ = writeln!(
+                main_out,
+                "  store i64 0, ptr @vn2_turn_number\n  store i1 false, ptr @vn2_root_cancelled"
+            );
+            let _ = writeln!(
+                main_out,
+                "  store i1 {}, ptr @vn2_cancel_scheduled\n  store i64 {}, ptr @vn2_cancel_at",
+                spec.cancel_at_turn.is_some(),
+                spec.cancel_at_turn.unwrap_or(0)
+            );
+        }
         if picks_turns {
             emit_run_choices(&mut ext_code, &mut main_out, "turn", run_idx, &spec.turns);
         }

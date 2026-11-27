@@ -1079,8 +1079,8 @@ fn call_of(program: &Program, raw_spec: &RawRunSpec) -> Result<Call, String> {
 /// The runs of the directives of a core text file as the compiled program
 /// takes them: the entry, its arguments and the answers of the script, in the
 /// order of the file. A run is left out where compiled code has no behavior
-/// to compare: one that expects a stuck state or a host that fails, one with
-/// a cancellation schedule, and one with another configuration than the default.
+/// to compare: one that expects a stuck state or a host that fails, or one with
+/// another configuration than the default.
 pub fn native_runs(source: &str) -> Result<(Program, Vec<NativeRunSpec>), String> {
     let directives = directives(source)?;
     let tree = text::parse(source).map_err(|error| error.to_string())?;
@@ -1095,7 +1095,6 @@ pub fn native_runs(source: &str) -> Result<(Program, Vec<NativeRunSpec>), String
             RawExpect::Done { .. } | RawExpect::Faulted(_) | RawExpect::Terminated(_)
         );
         if !ends
-            || raw_spec.cancel_at_turn.is_some()
             || raw_spec.config.usize_max != Config::default().usize_max
             || raw_spec.config.capacity.is_some()
         {
@@ -1109,6 +1108,7 @@ pub fn native_runs(source: &str) -> Result<(Program, Vec<NativeRunSpec>), String
             arithmetic: raw_spec.arithmetic,
             turns: raw_spec.turns.clone(),
             waiting: raw_spec.waiting.clone(),
+            cancel_at_turn: raw_spec.cancel_at_turn,
             answers,
         });
     }

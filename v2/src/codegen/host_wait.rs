@@ -31,6 +31,13 @@ pub(super) fn emit_header(
         let _ = writeln!(out, "    {field};");
     }
     let _ = writeln!(out, "}};");
+    if control.is_cancellable() {
+        let _ = writeln!(
+            out,
+            "void vn2_withdraw_{}({request} *request);",
+            control.name
+        );
+    }
     let _ = writeln!(out, "void vn2_start_{}({request} *request);", control.name);
     let _ = writeln!(
         out,
@@ -58,6 +65,13 @@ pub(super) fn emit_request(
             em.code,
             "  {field} = getelementptr {ty}, ptr {request}, i32 0, i32 {index}\n  store {arg}, ptr {field}"
         );
+    }
+    if awaits && em.program.controls[id].is_cancellable() {
+        let _ = writeln!(
+            em.code,
+            "  {tag} = call fastcc i32 @vn2_await_host_{id}(ptr {request})"
+        );
+        return;
     }
     let name = &em.program.controls[id].name;
     let _ = writeln!(em.code, "  call void @vn2_start_{name}(ptr {request})");
@@ -90,6 +104,7 @@ pub(super) fn emit_request(
             "  call fastcc void @vn2_wait_for_root(ptr {scheduler}, ptr {request})"
         );
     } else {
+        root_cancel::poll(em);
         // host_state is the first field, so its address is the one-element list.
         let _ = writeln!(
             em.code,
@@ -101,6 +116,7 @@ pub(super) fn emit_request(
         "  {tag} = call i32 @vn2_complete_{name}(ptr {request})"
     );
     if awaits {
+        root_cancel::poll(em);
         em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
     }
 }
@@ -126,6 +142,17 @@ pub(super) fn emit_support(
         let mut layout = vec!["ptr".to_owned()];
         layout.extend_from_slice(&fields);
         let _ = writeln!(out, "{ty} = type {{ {} }}", layout.join(", "));
+        if control.is_cancellable() {
+            if scripted {
+                // A script consumes its answer only at completion. It holds no external state.
+                let _ = writeln!(
+                    out,
+                    "define void @vn2_withdraw_{name}(ptr %request) {{ ret void }}"
+                );
+            } else {
+                let _ = writeln!(out, "declare void @vn2_withdraw_{name}(ptr)");
+            }
+        }
         if !scripted {
             let _ = writeln!(
                 out,
