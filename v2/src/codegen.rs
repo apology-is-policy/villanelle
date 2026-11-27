@@ -4898,7 +4898,9 @@ fn emit_operation_call(
             let tag_reg = em.fresh_reg();
             let awaits = matches!(op_kind, Operation::AwaitControl(_));
             if is_extern && (awaits || matches!(op_kind, Operation::RunControl(_))) {
-                host_wait::emit_request(em, *cid, &call_args, &tag_reg);
+                let scheduler =
+                    (awaits && em.reg.has_task_sets).then(|| tasks::owner_scheduler(body));
+                host_wait::emit_request(em, *cid, &call_args, &tag_reg, scheduler);
                 // An await makes the root ready. A direct extern run ends here,
                 // and its caller continues on the turn that entered the run.
                 if awaits {

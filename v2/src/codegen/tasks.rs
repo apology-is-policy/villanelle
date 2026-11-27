@@ -78,7 +78,12 @@ pub(super) fn emit_support<'a>(
         let mut pending: Vec<_> = awaits(member.body.as_ref().unwrap()).collect();
         while let Some(callee) = pending.pop() {
             let target = &program.controls[callee];
-            let body = awaited_body(target, "member", &member.name)?;
+            let body = target.body.as_ref().ok_or_else(|| {
+                format!(
+                    "the native backend does not yet support await of extern `{}` in task-set member `{}`",
+                    target.name, member.name
+                )
+            })?;
             if needs_activation(body) && nested.insert(callee) {
                 pending.extend(awaits(body));
             }
@@ -124,20 +129,6 @@ fn needs_activation(body: &ControlBody) -> bool {
     awaits(body).next().is_some() || producers(body).next().is_some()
 }
 
-fn awaited_body<'a>(
-    target: &'a Control,
-    role: &str,
-    caller: &str,
-) -> Result<&'a ControlBody, String> {
-    let Some(body) = &target.body else {
-        return Err(format!(
-            "the native backend does not yet support await of extern `{}` in task-set {role} `{caller}`",
-            target.name
-        ));
-    };
-    Ok(body)
-}
-
 // Follow only await edges. A nested run has its own ready tasks.
 fn check_owner_awaits(
     program: &Program,
@@ -152,7 +143,15 @@ fn check_owner_awaits(
             continue;
         }
         let target = &program.controls[id];
-        let body = awaited_body(target, "owner", &owner.name)?;
+        let Some(body) = &target.body else {
+            if target.is_cancellable() || target.faults {
+                return Err(format!(
+                    "the native backend does not yet support a cancellable or faulting host await of `{}` in task-set owner `{}`",
+                    target.name, owner.name
+                ));
+            }
+            continue;
+        };
         if target.faults || term_tys[id].is_some() {
             return Err(format!(
                 "await of `{}` from `{}`: the native backend does not yet support a faulting or terminating call in a task-set owner",
@@ -393,17 +392,21 @@ pub(super) fn init_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) {
     }
 }
 
+pub(super) fn owner_scheduler(body: &ControlBody) -> &'static str {
+    if producers(body).next().is_some() {
+        "%task_scheduler"
+    } else {
+        "%owner_scheduler"
+    }
+}
+
 /// A defined await in the same task inherits every ready child of its owner.
 pub(super) fn choose_owner(em: &mut IrEmitter<'_, '_>, body: &ControlBody) -> &'static str {
     if !em.reg.has_task_sets {
         em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
         return "null";
     }
-    let scheduler = if producers(body).next().is_some() {
-        "%task_scheduler"
-    } else {
-        "%owner_scheduler"
-    };
+    let scheduler = owner_scheduler(body);
     let _ = writeln!(
         em.code,
         "  call fastcc void @vn2_choose_owner(ptr {scheduler}, ptr null)"

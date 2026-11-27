@@ -40,8 +40,13 @@ pub(super) fn emit_header(
 }
 
 // The request and all its input and result slots outlive the pending operation.
-// Task-set paths still go through the guards in tasks::emit_support.
-pub(super) fn emit_request(em: &mut IrEmitter<'_, '_>, id: ControlId, args: &[String], tag: &str) {
+pub(super) fn emit_request(
+    em: &mut IrEmitter<'_, '_>,
+    id: ControlId,
+    args: &[String],
+    tag: &str,
+    scheduler: Option<&str>,
+) {
     let ty = format!("%vn2.wait.{id}");
     let request = em.alloc_temp(&ty);
     let _ = writeln!(em.code, "  store ptr null, ptr {request}");
@@ -54,8 +59,14 @@ pub(super) fn emit_request(em: &mut IrEmitter<'_, '_>, id: ControlId, args: &[St
         );
     }
     let name = &em.program.controls[id].name;
-    // host_state is the first field, so its address is the one-element list.
     let _ = writeln!(em.code, "  call void @vn2_start_{name}(ptr {request})");
+    if let Some(scheduler) = scheduler {
+        let _ = writeln!(
+            em.code,
+            "  call fastcc void @vn2_run_ready_members(ptr {scheduler})"
+        );
+    }
+    // host_state is the first field, so its address is the one-element list.
     let _ = writeln!(
         em.code,
         "  call i64 @vn2_pick_waiting(ptr {request}, i64 1)"

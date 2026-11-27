@@ -159,6 +159,66 @@ yield:
   ret void
 }
 
+; Run one eligible member through its next yield or completion.
+define internal fastcc void @vn2_step_member(ptr %scheduler, i64 %index) {
+entry:
+  %link = call fastcc ptr @vn2_link_at(ptr %scheduler, i64 %index)
+  %member = load ptr, ptr %link
+  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
+  %pool = load ptr, ptr %set_slot
+  %entry_slot = getelementptr %vn2.pool, ptr %pool, i32 0, i32 2
+  %resume = load ptr, ptr %entry_slot
+  %tag = call fastcc i32 %resume(ptr %member, ptr %scheduler)
+  ; -3 gives up the turn. A nonnegative alternative finishes the member.
+  %yielded = icmp eq i32 %tag, -3
+  br i1 %yielded, label %done, label %finished
+finished:
+  call fastcc ptr @vn2_unlink(ptr %scheduler, ptr %link)
+  %result = getelementptr %vn2.member_header, ptr %member, i32 0, i32 1
+  store i32 %tag, ptr %result
+  call fastcc void @vn2_append(ptr %pool, ptr %member)
+  %waiter_slot = getelementptr %vn2.pool, ptr %pool, i32 0, i32 4
+  %waiter = load ptr, ptr %waiter_slot
+  %waiting = icmp ne ptr %waiter, null
+  br i1 %waiting, label %wake, label %retire
+wake:
+  ; One task leaves the ready count and one enters it.
+  store ptr null, ptr %waiter_slot
+  %flag = getelementptr %vn2.member_header, ptr %waiter, i32 0, i32 3
+  store i1 false, ptr %flag
+  br label %done
+retire:
+  %ready = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 1
+  %current = load i64, ptr %ready
+  %nr = sub i64 %current, 1
+  store i64 %nr, ptr %ready
+  br label %done
+done:
+  ret void
+}
+
+; With the root waiting for the host, only members can take a turn.
+; Each step can spawn, block, wake or finish a member. Recount before offering.
+define internal fastcc void @vn2_run_ready_members(ptr %scheduler) {
+entry:
+  %alone = icmp eq ptr %scheduler, null
+  br i1 %alone, label %done, label %active
+active:
+  %ready = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 1
+  br label %check
+check:
+  %count = load i64, ptr %ready
+  %empty = icmp eq i64 %count, 0
+  br i1 %empty, label %done, label %offer
+offer:
+  %choice = call i64 @vn2_pick_turn(i64 %count)
+  %index = urem i64 %choice, %count
+  call fastcc void @vn2_step_member(ptr %scheduler, i64 %index)
+  br label %check
+done:
+  ret void
+}
+
 ; The owner is task zero whenever it is ready. Children follow in spawn
 ; order. A finished member stays counted until delivered by await next.
 ; At a defined await the owner is ready even with outstanding children.
@@ -190,35 +250,7 @@ offer:
   br i1 %take_owner, label %selected, label %child
 child:
   %i = sub i64 %index, %offset
-  %link = call fastcc ptr @vn2_link_at(ptr %scheduler, i64 %i)
-  %member = load ptr, ptr %link
-  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
-  %pool = load ptr, ptr %set_slot
-  %entry_slot = getelementptr %vn2.pool, ptr %pool, i32 0, i32 2
-  %resume = load ptr, ptr %entry_slot
-  %tag = call fastcc i32 %resume(ptr %member, ptr %scheduler)
-  ; -3 gives up the turn. A nonnegative alternative finishes the member.
-  %yielded = icmp eq i32 %tag, -3
-  br i1 %yielded, label %choose, label %finished
-finished:
-  call fastcc ptr @vn2_unlink(ptr %scheduler, ptr %link)
-  %result = getelementptr %vn2.member_header, ptr %member, i32 0, i32 1
-  store i32 %tag, ptr %result
-  call fastcc void @vn2_append(ptr %pool, ptr %member)
-  %waiter_slot = getelementptr %vn2.pool, ptr %pool, i32 0, i32 4
-  %waiter = load ptr, ptr %waiter_slot
-  %waiting = icmp ne ptr %waiter, null
-  br i1 %waiting, label %wake, label %retire
-wake:
-  ; One task leaves the ready count and one enters it.
-  store ptr null, ptr %waiter_slot
-  %flag = getelementptr %vn2.member_header, ptr %waiter, i32 0, i32 3
-  store i1 false, ptr %flag
-  br label %choose
-retire:
-  %current = load i64, ptr %ready
-  %nr = sub i64 %current, 1
-  store i64 %nr, ptr %ready
+  call fastcc void @vn2_step_member(ptr %scheduler, i64 %i)
   br label %choose
 selected:
   ret void

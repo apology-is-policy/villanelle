@@ -1,0 +1,73 @@
+// A suspended owner stays out of the ready set. Both members yield once
+// and finish before the host can complete fetch.
+extern async control fetch(key : usize, cached : bool)
+    ■ { found {value : usize, valid : bool} │ missing {} } uses io
+
+async control tag(n : usize) ■ { got {value : usize} }
+    ⊤ ▷ ■ got {n}
+
+async control worker(n : usize) ■ { got {value : usize} }
+    ⊤ ▷ d : Δ await tag(n) ▸ got {value}
+    d.got ▷ ■ got {value}
+
+async control collect() ■ { ok {value : usize, first : usize, second : usize, pending : usize} } uses io
+    ⊤ ▷ ~pool : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(11) into pool
+    ⊤ ▷ spawn worker(22) into pool
+    ⊤ ▷ reply := capture await fetch(4, false)
+    ⊤ ▷ pending : usize := count(pool)
+    ⊤ ▷ a : Δ await next(pool) ▸ got {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(pool) ▸ got {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    ⊤ ▷ r : Δ outcome(reply) ▸ found {value, valid} │ missing {}
+    r.missing ▷ ■ ok {0, first, second, pending}
+    r.found ▷ d : ? valid
+    d.false ▷ ■ ok {1, first, second, pending}
+    d.true ▷ ■ ok {value, first, second, pending}
+
+control example() ■ { ok {value : usize} } uses io
+    ⊤ ▷ d : Δ run collect() ▸ ok {value, first, second, pending}
+    d.ok ▷ ■ ok {value}
+
+//! run collect() with [fetch -> found {37, true}] => done ok {37, 11, 22, 2} trace [fetch(4, false) -> found {37, true}]
+//! run collect() with [fetch -> found {37, true}] turns [1, 1] => done ok {37, 22, 11, 2} trace [fetch(4, false) -> found {37, true}]
+//! run collect() with [fetch -> missing] turns [1, 0, 1] => done ok {0, 22, 11, 2} trace [fetch(4, false) -> missing]
+//! run collect() with [fetch -> found {37, false}] => done ok {1, 11, 22, 2} trace [fetch(4, false) -> found {37, false}]
+
+// Even a callee without its own set inherits the owner's ready members.
+// The parent waits for its child and wakes again during the same host wait.
+extern control ping(n : usize) ■ { ok {} } uses io
+
+async control marked(n : usize) ■ { got {value : usize} } uses io
+    ⊤ ▷ d : Δ ping(n) ▸ ok {}
+    d.ok ▷ ■ got {n}
+
+async control parent() ■ { got {value : usize} } uses io
+    ⊤ ▷ ~children : tasks⟨marked⟩ := tasks⟨marked⟩()
+    ⊤ ▷ spawn marked(55) into children
+    ⊤ ▷ a : Δ await next(children) ▸ got {value} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(children) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ got {value}
+
+async control relay() ■ { ok {value : usize} } uses io
+    ⊤ ▷ d : Δ await fetch(8, false) ▸ found {value, valid} │ missing {}
+    d.missing ▷ ■ ok {0}
+    d.found ▷ ■ ok {value}
+
+async control inherited() ■ { ok {reply : usize, child : usize} } uses io
+    ⊤ ▷ ~pool : tasks⟨parent⟩ := tasks⟨parent⟩()
+    ⊤ ▷ spawn parent() into pool
+    ⊤ ▷ h : Δ await relay() ▸ ok {reply}
+    ⊤ ▷ a : Δ await next(pool) ▸ got {child} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {reply, child}
+
+//! run inherited() with [ping -> ok; fetch -> found {73, true}] => done ok {73, 55} trace [ping(55) -> ok; fetch(8, false) -> found {73, true}]
+//! run inherited() with [ping -> ok; fetch -> missing] turns [1, 1, 1, 1] => done ok {0, 55} trace [ping(55) -> ok; fetch(8, false) -> missing]
