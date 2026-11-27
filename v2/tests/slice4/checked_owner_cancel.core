@@ -1,0 +1,82 @@
+// The root waits while a child is ready or parked on a noncancellable request.
+extern resource lease on fault release
+extern control acquire() ■ { ok {l : lease} } uses io
+extern control mark(n : u32) ■ { ok {} } uses io
+extern async control hold(l : lease, xs : [u32], cell : &~u32)
+    ■ { done {code : u32} │ cancelled {} } uses io
+extern async control ping() ■ { ok {} } uses io
+
+async control pause() ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+async control child(park : bool) ■ { ok {} } uses io
+    ⊤ ▷ m : Δ mark(11) ▸ ok {}
+    ⊤ ▷ d : ? park
+    d.true ▷ p : Δ await ping() ▸ ok {}
+    ⊤ ▷ ■ ok {}
+
+async control owner(xs : [u32], early : bool, park : bool) ■ { ok {cell : u32} } uses io
+    ⊤ ▷ ~pool : tasks⟨child⟩ := tasks⟨child⟩()
+    ⊤ ▷ spawn child(park) into pool
+    ⊤ ▷ d : ? early
+    d.true ▷ p : Δ await pause() ▸ ok {}
+    ⊤ ▷ ~cell : u32 := 7
+    ⊤ ▷ a : Δ acquire() ▸ ok {l}
+    a.ok ▷ h : Δ await hold(l, ▾xs, &~cell) ▸ done {code} │ cancelled {}
+    h.cancelled ▷ m : Δ mark(cell) ▸ ok {}
+    h.done ▷ n : Δ mark(code) ▸ ok {}
+    ⊤ ▷ c : Δ await next(pool) ▸ ok {} │ empty {}
+    c.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ ok {} │ empty {}
+    e.ok ▷ ⊥
+    e.empty ▷ ■ ok {cell}
+
+// A fresh run after the owner makes its last scheduling turn observable to a C host.
+async control tail() ■ { ok {} }
+    ⊤ ▷ p : Δ await pause() ▸ ok {}
+    p.ok ▷ ■ ok {}
+
+control example(xs : [u32], early : bool, park : bool) ■ { ok {cell : u32} } uses io
+    ⊤ ▷ a : Δ run owner(▾xs, early, park) ▸ ok {cell}
+    ⊤ ▷ b : Δ run tail() ▸ ok {}
+    b.ok ▷ ■ ok {cell}
+
+// An inherited cancellation releases the inputs before either ready task runs.
+//! run example([4, 8], true, false) with [acquire -> ok {lease#3}; mark -> ok; mark -> ok] cancel_at 1 turns [0, 1] => done ok {7} trace [acquire() -> ok {lease#3}; lease.release(lease#3) -> released; mark(11) -> ok; mark(7) -> ok]
+
+// A withdrawal makes the owner ready on the very turn that requested it.
+//! run example([4, 8], false, false) with [acquire -> ok {lease#3}; mark -> ok; mark -> ok] cancel_at 1 => done ok {7} trace [acquire() -> ok {lease#3}; lease.release(lease#3) -> released; mark(7) -> ok; mark(11) -> ok]
+//! run example([4, 8], false, false) with [acquire -> ok {lease#3}; mark -> ok; mark -> ok] cancel_at 1 turns [1] => done ok {7} trace [acquire() -> ok {lease#3}; lease.release(lease#3) -> released; mark(11) -> ok; mark(7) -> ok]
+
+// Both requests are pending. Cancellation withdraws only hold.
+//! run example([4, 8], false, true) with [acquire -> ok {lease#3}; mark -> ok; mark -> ok; ping -> ok] cancel_at 2 => done ok {7} trace [acquire() -> ok {lease#3}; mark(11) -> ok; lease.release(lease#3) -> released; mark(7) -> ok; ping() -> ok]
+
+// Complete the child's request first, then withdraw hold while the child is ready.
+//! run example([4, 8], false, true) with [acquire -> ok {lease#3}; mark -> ok; ping -> ok; mark -> ok] waiting [1] cancel_at 3 => done ok {7} trace [acquire() -> ok {lease#3}; mark(11) -> ok; ping() -> ok; lease.release(lease#3) -> released; mark(7) -> ok]
+
+// A late request cannot revoke the host's completed result and write.
+//! run example([4, 8], false, true) with [acquire -> ok {lease#3}; mark -> ok; hold -> done {37} ~cell <- 9; mark -> ok; ping -> ok] waiting [0] cancel_at 3 => done ok {9} trace [acquire() -> ok {lease#3}; mark(11) -> ok; hold(lease#3, [4, 8], 7) -> done {37}; mark(37) -> ok; ping() -> ok]
+//! run example([4, 8], false, false) with [acquire -> ok {lease#3}; mark -> ok; hold -> cancelled ~cell <- 13; mark -> ok] => done ok {13} trace [acquire() -> ok {lease#3}; mark(11) -> ok; hold(lease#3, [4, 8], 7) -> cancelled; mark(13) -> ok]
+
+// The callee owns no set. Its host await still shares the caller's ready child.
+async control relay(xs : [u32]) ■ { ok {cell : u32} } uses io
+    ⊤ ▷ ~cell : u32 := 7
+    ⊤ ▷ a : Δ acquire() ▸ ok {l}
+    a.ok ▷ reply := capture await hold(l, ▾xs, &~cell)
+    ⊤ ▷ d : Δ outcome(reply) ▸ done {code} │ cancelled {}
+    d.cancelled ▷ m : Δ mark(cell) ▸ ok {}
+    d.done ▷ n : Δ mark(code) ▸ ok {}
+    ⊤ ▷ ■ ok {cell}
+
+async control inherited(xs : [u32]) ■ { ok {cell : u32} } uses io
+    ⊤ ▷ ~pool : tasks⟨child⟩ := tasks⟨child⟩()
+    ⊤ ▷ spawn child(false) into pool
+    ⊤ ▷ r : Δ await relay(▾xs) ▸ ok {cell}
+    ⊤ ▷ c : Δ await next(pool) ▸ ok {} │ empty {}
+    c.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ ok {} │ empty {}
+    e.ok ▷ ⊥
+    e.empty ▷ ■ ok {cell}
+
+//! run inherited([4, 8]) with [acquire -> ok {lease#3}; mark -> ok; mark -> ok] cancel_at 2 turns [0, 1] => done ok {7} trace [acquire() -> ok {lease#3}; lease.release(lease#3) -> released; mark(11) -> ok; mark(7) -> ok]
+//! run inherited([4, 8]) with [acquire -> ok {lease#3}; mark -> ok; hold -> done {37} ~cell <- 9; mark -> ok] => done ok {9} trace [acquire() -> ok {lease#3}; mark(11) -> ok; hold(lease#3, [4, 8], 7) -> done {37}; mark(37) -> ok]

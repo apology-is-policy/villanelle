@@ -26,7 +26,6 @@ entry:
   %alone = icmp eq i64 %n, 0
   br i1 %alone, label %root_only, label %members
 root_only:
-  call fastcc i1 @vn2_poll_cancel()
   call i64 @vn2_pick_waiting(ptr %root, i64 1)
   ret i1 true
 members:
@@ -79,7 +78,6 @@ advance:
   %full = icmp eq i64 %next, %count
   br i1 %full, label %pick, label %scan
 pick:
-  call fastcc i1 @vn2_poll_cancel()
   %choice = call i64 @vn2_pick_waiting(ptr %states, i64 %count)
   %index = urem i64 %choice, %count
   %chosen_slot = getelementptr ptr, ptr %frames, i64 %index
@@ -114,18 +112,37 @@ done:
   ret i1 %root_chosen
 }
 
-define internal fastcc void @vn2_wait_for_root(ptr %scheduler, ptr %request) {
+; The caller has started the root request. At the start of each turn decide
+; withdrawal before offering ready members or any pending handle to the host.
+; True means the caller must withdraw and make the root ready in this turn.
+define internal fastcc i1 @vn2_wait_for_root(ptr %scheduler, ptr %request, i1 %cancellable) {
 entry:
   %alone = icmp eq ptr %scheduler, null
-  br i1 %alone, label %root_only, label %active
+  br label %turn
+turn:
+  %flag = call fastcc i1 @vn2_poll_cancel()
+  %stop = and i1 %cancellable, %flag
+  br i1 %stop, label %withdraw, label %waiting
+withdraw:
+  ret i1 true
+waiting:
+  br i1 %alone, label %root_only, label %members
 root_only:
-  call fastcc i1 @vn2_poll_cancel()
   call i64 @vn2_pick_waiting(ptr %request, i64 1)
-  ret void
-active:
-  call fastcc void @vn2_run_ready_members(ptr %scheduler)
+  ret i1 false
+members:
+  %ready = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 1
+  %count = load i64, ptr %ready
+  %idle = icmp eq i64 %count, 0
+  br i1 %idle, label %host, label %offer
+offer:
+  %choice = call i64 @vn2_pick_turn(i64 %count)
+  %index = urem i64 %choice, %count
+  call fastcc void @vn2_step_member(ptr %scheduler, i64 %index)
+  br label %turn
+host:
   %selected = call fastcc i1 @vn2_select_host(ptr %scheduler, ptr %request)
-  br i1 %selected, label %done, label %active
-done:
-  ret void
+  br i1 %selected, label %complete, label %turn
+complete:
+  ret i1 false
 }

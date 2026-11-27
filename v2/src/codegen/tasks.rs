@@ -150,9 +150,9 @@ fn check_owner_awaits(
         }
         let target = &program.controls[id];
         let Some(body) = &target.body else {
-            if target.is_cancellable() || target.faults {
+            if target.faults {
                 return Err(format!(
-                    "the native backend does not yet support a cancellable or faulting host await of `{}` in task-set owner `{}`",
+                    "the native backend does not yet support a faulting host await of `{}` in task-set owner `{}`",
                     target.name, owner.name
                 ));
             }

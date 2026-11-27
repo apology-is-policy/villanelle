@@ -79,7 +79,7 @@ pub(super) fn poll(em: &mut IrEmitter<'_, '_>) {
     }
 }
 
-/// A single host operation, either awaited by a root running alone or run directly.
+/// A host operation bound by a root await or a direct run.
 /// The request fields already hold the operands and result slots. The runtime
 /// retains the by-value operands until completion transfers them to the host.
 fn emit_request(out: &mut String, reg: &mut RuntimeRegistry<'_>, id: ControlId, awaits: bool) {
@@ -92,15 +92,22 @@ fn emit_request(out: &mut String, reg: &mut RuntimeRegistry<'_>, id: ControlId, 
         .iter()
         .position(|a| a.name == "cancelled")
         .unwrap();
+    let scheduled = awaits && reg.has_task_sets;
+    let scheduler_arg = if scheduled { ", ptr %scheduler" } else { "" };
+    let wait = if scheduled {
+        "@vn2_wait_for_root(ptr %scheduler, ptr %request, i1 true)"
+    } else {
+        "@vn2_poll_cancel()"
+    };
     let _ = writeln!(
         out,
-        "define internal fastcc i32 @vn2_{kind}_host_{id}(ptr %request) {{
+        "define internal fastcc i32 @vn2_{kind}_host_{id}(ptr %request{scheduler_arg}) {{
 entry:
   %flag = load i1, ptr @vn2_root_cancelled
   br i1 %flag, label %release, label %start
 start:
   call void @vn2_start_{name}(ptr %request)
-  %requested = call fastcc i1 @vn2_poll_cancel()
+  %requested = call fastcc i1 {wait}
   br i1 %requested, label %withdraw, label %complete
 withdraw:
   call void @vn2_withdraw_{name}(ptr %request)
@@ -134,16 +141,23 @@ release:"
     } else {
         let _ = writeln!(out, "  ret i32 {cancelled_tag}");
     }
+    out.push_str("complete:\n");
+    if !scheduled {
+        out.push_str("  call i64 @vn2_pick_waiting(ptr %request, i64 1)\n");
+    }
     let _ = writeln!(
         out,
-        "complete:
-  call i64 @vn2_pick_waiting(ptr %request, i64 1)
-  %completed = call i32 @vn2_complete_{name}(ptr %request)"
+        "  %completed = call i32 @vn2_complete_{name}(ptr %request)"
     );
     if !awaits {
         out.push_str("  ret i32 %completed\n}\n");
         return;
     }
+    let choose = if scheduled {
+        "call fastcc void @vn2_choose_owner_polled(ptr %scheduler, ptr null)"
+    } else {
+        "call i64 @vn2_pick_turn(i64 1)"
+    };
     let _ = writeln!(
         out,
         "  br label %next_turn
@@ -153,7 +167,7 @@ next_turn:
   br label %resume
 resume:
   %tag = phi i32 [ {cancelled_tag}, %release ], [ %result, %next_turn ]
-  call i64 @vn2_pick_turn(i64 1)
+  {choose}
   ret i32 %tag
 }}"
     );

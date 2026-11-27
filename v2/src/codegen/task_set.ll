@@ -205,39 +205,23 @@ done:
   ret void
 }
 
-; With the root waiting for the host, only members can take a turn.
-; Each step can spawn, block, wake or finish a member. Recount before offering.
-define internal fastcc void @vn2_run_ready_members(ptr %scheduler) {
-entry:
-  %alone = icmp eq ptr %scheduler, null
-  br i1 %alone, label %done, label %active
-active:
-  %ready = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 1
-  br label %check
-check:
-  %count = load i64, ptr %ready
-  %empty = icmp eq i64 %count, 0
-  br i1 %empty, label %done, label %offer
-offer:
-  call fastcc i1 @vn2_poll_cancel()
-  %choice = call i64 @vn2_pick_turn(i64 %count)
-  %index = urem i64 %choice, %count
-  call fastcc void @vn2_step_member(ptr %scheduler, i64 %index)
-  br label %check
-done:
-  ret void
-}
-
 ; The owner is task zero whenever it is ready. Children follow in spawn
 ; order. A finished member stays counted until delivered by await next.
 ; At a defined await the owner is ready even with outstanding children.
 ; At await next it is ready only when a result or empty can be delivered.
 define internal fastcc void @vn2_choose_owner(ptr %scheduler, ptr %awaited_set) {
+  call fastcc i1 @vn2_poll_cancel()
+  call fastcc void @vn2_choose_owner_polled(ptr %scheduler, ptr %awaited_set)
+  ret void
+}
+
+; A withdrawal has already polled this turn. Only poll again after a member
+; runs or a host completion ends the turn.
+define internal fastcc void @vn2_choose_owner_polled(ptr %scheduler, ptr %awaited_set) {
 entry:
   %inactive = icmp eq ptr %scheduler, null
   br i1 %inactive, label %alone, label %active
 alone:
-  call fastcc i1 @vn2_poll_cancel()
   call i64 @vn2_pick_turn(i64 1)
   ret void
 active:
@@ -261,9 +245,8 @@ host:
   %callback = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 3
   %poll = load ptr, ptr %callback
   call fastcc i1 %poll(ptr %scheduler, ptr null)
-  br label %choose
+  br label %next_turn
 pick:
-  call fastcc i1 @vn2_poll_cancel()
   %choice = call i64 @vn2_pick_turn(i64 %offered)
   %index = urem i64 %choice, %offered
   %take_owner = icmp ult i64 %index, %offset
@@ -271,6 +254,9 @@ pick:
 child:
   %i = sub i64 %index, %offset
   call fastcc void @vn2_step_member(ptr %scheduler, i64 %i)
+  br label %next_turn
+next_turn:
+  call fastcc i1 @vn2_poll_cancel()
   br label %choose
 selected:
   ret void

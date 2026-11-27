@@ -7,7 +7,7 @@ IR backend. Slice 4 has an oracle, a checker, and native code for defined
 roots, direct runs of nonfaulting host operations, and
 task sets whose owners and members can yield at a defined await. Roots and members can
 wait for the host in their own activations or in a callee (sections 18.4 to
-18.24). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
+18.25). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
 lists the defects. Sections 8 to 18 describe what the code does and which
@@ -2781,6 +2781,29 @@ an await of the same control: completion there offers the root a ready
 turn. The LLVM module and C header for the direct-only program have no
 reference to `vn2_pick_turn`.
 
+### 18.25 Cancellable host awaits in a set owner, 27 November 2026
+
+At the start of each scheduling turn, the native scheduler polls for
+root cancellation before choosing a ready task or a pending host request
+([E-Turn], [E-Cancel]). If the root has an outstanding cancellable await,
+the host withdraws that request and the runtime releases the arguments
+given by value. The owner joins its ready children on that same turn,
+with the owner first and the children in spawn order. A child waiting on
+a noncancellable operation keeps its request. A callee awaited by the
+owner shares this scheduler.
+
+If the root was already cancelled when it reached the await, it releases
+its arguments before yielding. If the host completed the operation on an
+earlier turn, its writes and selected alternative survive a later
+cancellation. In each case the root resumes only when the host selects it.
+
+From `v2/`, run `vn2 test tests/slice4/checked_owner_cancel.core` and
+`cargo test --test backend_slice4 owner_cancel`. The linked C host checks
+the bound lease, vector and exclusive borrow at withdrawal. It picks
+each of the two ready tasks first in separate runs. When a second request
+is pending, it checks the handles offered and which operation completes.
+A fresh run after the owner checks the next turn number.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2792,7 +2815,7 @@ reference to `vn2_pick_turn`.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs cancellable awaits alongside other tasks,
+- **Later work.** Slice 4 still needs cancellable host awaits in spawned members,
   set cancellation, faulting host operations,
   member faults, capacity and generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list

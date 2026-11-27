@@ -68,9 +68,14 @@ pub(super) fn emit_request(
     }
     if em.program.controls[id].is_cancellable() {
         let kind = if awaits { "await" } else { "run" };
+        let scheduler = if awaits && em.reg.has_task_sets {
+            format!(", ptr {}", tasks::owner_scheduler(body))
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             em.code,
-            "  {tag} = call fastcc i32 @vn2_{kind}_host_{id}(ptr {request})"
+            "  {tag} = call fastcc i32 @vn2_{kind}_host_{id}(ptr {request}{scheduler})"
         );
         return;
     }
@@ -102,7 +107,7 @@ pub(super) fn emit_request(
         let scheduler = tasks::owner_scheduler(body);
         let _ = writeln!(
             em.code,
-            "  call fastcc void @vn2_wait_for_root(ptr {scheduler}, ptr {request})"
+            "  call fastcc i1 @vn2_wait_for_root(ptr {scheduler}, ptr {request}, i1 false)"
         );
     } else {
         root_cancel::poll(em);

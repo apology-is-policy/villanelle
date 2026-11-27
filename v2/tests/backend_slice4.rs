@@ -11,6 +11,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const OWNER_CANCEL: &str = include_str!("slice4/checked_owner_cancel.core");
 const CANCEL_RUN: &str = include_str!("slice4/checked_cancel_run.core");
 const ROOT_CANCEL: &str = include_str!("slice4/checked_root_cancel.core");
 const WAITING_CHOICES: &str = include_str!("slice4/checked_waiting_choices.core");
@@ -109,6 +110,187 @@ fn direct_host_runs_return_the_selected_payload_to_the_caller() {
                 .contains("@vn2_pick_turn")
         );
     }
+}
+
+#[test]
+fn owner_cancel_with_ready_and_waiting_members_matches_both_interpreters() {
+    // One vector per invocation and a two-request waiting list in the two
+    // schedules where the host chooses between hold and ping.
+    compare_native_runs(OWNER_CANCEL, &["E-Spawn"], &[1; 9], 11);
+}
+
+#[test]
+fn owner_cancel_replays_the_checked_host_await_rule_examples() {
+    // The rest of the rule file intentionally violates a precondition and an effect allowance.
+    let (checked, _) = include_str!("slice4/e_await_host.core")
+        .split_once("// The precondition and the allowance")
+        .unwrap();
+    compare_native_runs(checked, &["E-Run"], &[1; 6], 0);
+}
+
+#[test]
+fn owner_cancel_c_host_checks_withdrawal_before_the_ready_choice() {
+    const DRIVER: &str = r#"
+#include "module.h"
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static struct vn2_wait_hold *hold;
+static struct vn2_wait_ping *ping;
+static int hold_token, ping_token;
+static void *selected;
+static unsigned scenario, ready_picks;
+static const char *expected;
+
+static void observe(const char *event) {
+    size_t n = strlen(event);
+    if (strncmp(expected, event, n) || expected[n] != ' ') {
+        fprintf(stderr, "scenario %u: saw %s, expected %s\n", scenario, event, expected);
+        exit(1);
+    }
+    expected += n + 1;
+}
+uint8_t vn2_should_cancel_root(uint64_t turn) {
+    const unsigned at[] = {1, 1, 1, 2, 3, 3, 0, 2, 0};
+    char event[32];
+    snprintf(event, sizeof event, "poll%" PRIu64, turn);
+    observe(event);
+    return at[scenario] && turn >= at[scenario];
+}
+uint64_t vn2_pick_turn(uint64_t count) {
+    if (count != 1 && count != 2) abort();
+    observe(count == 2 ? "ready2" : "ready1");
+    ++ready_picks;
+    return ((scenario == 0 || scenario == 7) && ready_picks == 2) || (scenario == 2 && ready_picks == 1);
+}
+uint64_t vn2_pick_waiting(void *const *states, uint64_t n) {
+    if (selected || !n || n != (uint64_t)((hold != NULL) + (ping != NULL))) abort();
+    if (hold && states[0] != &hold_token) abort();
+    if (ping && states[n-1] != &ping_token) abort();
+    observe(n == 2 ? "both" : (hold ? "only_hold" : "only_ping"));
+    uint64_t i = n == 2 && scenario == 4;
+    selected = states[i];
+    return i;
+}
+int32_t vn2_ext_acquire(void **out) {
+    observe("acquire");
+    *out = (void *)(uintptr_t)3;
+    puts("acquire() -> ok {lease#3}");
+    return VN2_ACQUIRE_OK;
+}
+int32_t vn2_ext_mark(uint32_t n) {
+    observe("mark");
+    printf("mark(%u) -> ok {}\n", (unsigned)n);
+    return VN2_MARK_OK;
+}
+static void check_args(struct vn2_wait_hold *r) {
+    if ((uintptr_t)r->in_l != 3 || r->in_xs->len != 2 || *r->in_cell != 7) abort();
+    const uint32_t *xs = r->in_xs->data;
+    if (xs[0] != 4 || xs[1] != 8) abort();
+}
+void vn2_start_hold(struct vn2_wait_hold *r) {
+    observe("start");
+    if (hold || r->host_state) abort();
+    check_args(r);
+    hold = r;
+    r->host_state = &hold_token;
+}
+void vn2_withdraw_hold(struct vn2_wait_hold *r) {
+    observe("withdraw");
+    if (selected || r != hold || r->host_state != &hold_token) abort();
+    check_args(r);
+    hold = NULL;
+}
+void vn2_release_lease(void *l) {
+    observe("release");
+    if (hold || (uintptr_t)l != 3) abort();
+    puts("lease.release(lease#3) -> released {}");
+}
+int32_t vn2_complete_hold(struct vn2_wait_hold *r) {
+    observe("complete");
+    if (r != hold || selected != &hold_token || r->host_state != selected) abort();
+    check_args(r);
+    hold = selected = NULL;
+    free(r->in_xs->data);
+    if (scenario == 6) {
+        *r->in_cell = 13;
+        puts("hold(lease#3, [4, 8], 7) -> cancelled {}");
+        return VN2_HOLD_CANCELLED;
+    }
+    *r->in_cell = 9;
+    *r->out_0_done_0 = 37;
+    puts("hold(lease#3, [4, 8], 7) -> done {37}");
+    return VN2_HOLD_DONE;
+}
+void vn2_start_ping(struct vn2_wait_ping *r) {
+    observe("start_ping");
+    if (ping || r->host_state) abort();
+    ping = r;
+    r->host_state = &ping_token;
+}
+int32_t vn2_complete_ping(struct vn2_wait_ping *r) {
+    observe("complete_ping");
+    if (r != ping || selected != &ping_token || r->host_state != selected) abort();
+    ping = selected = NULL;
+    puts("ping() -> ok {}");
+    return VN2_PING_OK;
+}
+int main(void) {
+    const char *cases[] = {
+        "poll1 ready2 acquire release ready2 mark ready1 mark ready1 ready1 poll6 ready1 ",
+        "acquire start poll1 withdraw release ready2 mark ready1 mark ready1 ready1 poll5 ready1 ",
+        "acquire start poll1 withdraw release ready2 mark ready1 mark ready1 ready1 poll5 ready1 ",
+        "acquire start poll1 ready1 mark start_ping poll2 withdraw release ready1 mark "
+        "only_ping complete_ping ready1 ready1 ready1 poll7 ready1 ",
+        "acquire start poll1 ready1 mark start_ping poll2 both complete_ping poll3 withdraw "
+        "release ready2 mark ready1 ready1 ready1 poll7 ready1 ",
+        "acquire start poll1 ready1 mark start_ping poll2 both complete poll3 ready1 mark "
+        "only_ping complete_ping ready1 ready1 ready1 poll8 ready1 ",
+        "acquire start poll1 ready1 mark poll2 only_hold complete poll3 ready1 mark "
+        "poll4 ready1 poll5 ready1 poll6 ready1 ",
+        "poll1 ready2 acquire start poll2 withdraw release ready2 mark ready1 mark ready1 ready1 ",
+        "poll1 ready2 acquire start poll2 ready1 mark poll3 only_hold complete poll4 ready1 mark "
+        "poll5 ready1 poll6 ready1 "
+    };
+    for (scenario = 0; scenario < sizeof cases / sizeof *cases; ++scenario) {
+        expected = cases[scenario];
+        ready_picks = 0;
+        uint32_t *xs = malloc(2 * sizeof *xs);
+        if (!xs) abort();
+        xs[0] = 4;
+        xs[1] = 8;
+        vn2_vec input = {xs, 2, 2};
+        uint32_t cell;
+        if (scenario >= 7) {
+            if (vn2_call_inherited(&input, &cell) != VN2_INHERITED_OK) return 1;
+        } else if (vn2_call_example(&input, scenario == 0, scenario >= 3 && scenario <= 5,
+                                    &cell) != VN2_EXAMPLE_OK) return 1;
+        if (*expected || hold || ping || selected) return 1;
+        printf("done ok {%u}\n", (unsigned)cell);
+    }
+    return 0;
+}
+"#;
+    let (_, runs) = script::native_runs(OWNER_CANCEL).unwrap();
+    compare_c_host(OWNER_CANCEL, "owner_cancel", DRIVER, |program, config| {
+        let mut expected = Vec::new();
+        for spec in &runs {
+            let result = compare(
+                program,
+                &spec.entry,
+                spec.arguments.clone(),
+                &mut scheduled_host(spec),
+                config,
+            );
+            assert_eq!(result.verdict, Verdict::Same);
+            assert!(matches!(result.oracle.end, oracle::End::Done { .. }));
+            expected.extend(result.oracle.trace.iter().map(ToString::to_string));
+            expected.push(result.oracle.end.to_string());
+        }
+        expected
+    });
 }
 
 #[test]
@@ -1830,18 +2012,22 @@ async control owner() ■ { ok {} }
         .replace("trace [read() -> ok]", "trace [read() -> ok; read() -> ok]");
     compare_native_runs(&member_wait, &["E-AwaitHost"], &[1], 0);
     compare_native_runs(&shared_wait, &["E-AwaitHost"], &[2], 2);
+    let cancellable_callee = callee_wait
+        .replace("read() ■ { ok {} }", "read() ■ { ok {} │ cancelled {} }")
+        .replace(
+            "await read() ▸ ok {}",
+            "await read() ▸ ok {} │ cancelled {}",
+        );
+    compare_native_runs(&cancellable_callee, &["E-AwaitHost"], &[1], 0);
     for (source, reason) in [
         (base.replace("async control idle() ■ { ok {} }", &format!("async control idle() ■ {{ ok {{}} }}\n    {new_set}"))
             .replace("⊤ ▷ q : Δ await next(other)", "⊤ ▷ cancel other\n    ⊤ ▷ q : Δ await next(other)")
             .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "control `idle`: the native backend does not yet support task set cancellation"),
         (base.replace("async control idle() ■ { ok {} }", "async control idle() ■ { ok {} } faults")
             .replace("async control owner() ■ { ok {} }", &format!("async control owner() ■ {{ ok {{}} }} faults\n    {suspend}")), "a faulting or terminating call in a task-set owner"),
-        (callee_wait.replace("read() ■ { ok {} }", "read() ■ { ok {} │ cancelled {} }")
-            .replace("await read() ▸ ok {}", "await read() ▸ ok {} │ cancelled {}"),
-            "cancellable or faulting host await of `read` in task-set owner"),
         (owner_wait.replace("read() ■ { ok {} } uses io", "read() ■ { ok {} } faults uses io")
             .replace("owner() ■ { ok {} } uses io", "owner() ■ { ok {} } faults uses io"),
-            "cancellable or faulting host await of `read` in task-set owner"),
+            "faulting host await of `read` in task-set owner"),
         (member_wait.replace("read() ■ { ok {} }", "read() ■ { ok {} │ cancelled {} }")
             .replace("await read() ▸ ok {}", "await read() ▸ ok {} │ cancelled {}"),
             "cancellable or faulting host await of `read` in task-set member"),
