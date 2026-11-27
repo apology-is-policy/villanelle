@@ -1,19 +1,24 @@
 //! Cancellation of the innermost native run at a scheduling turn ([E-Cancel]).
 use super::*;
 
-pub(super) fn needed(program: &Program) -> bool {
-    operations(program).any(|op| {
-        matches!(op, Operation::AwaitControl(id)
-        if program.controls[*id].body.is_none() && program.controls[*id].is_cancellable())
+fn requests(program: &Program) -> impl Iterator<Item = (ControlId, bool)> + '_ {
+    operations(program).filter_map(|op| {
+        let (id, awaits) = match *op {
+            Operation::AwaitControl(id) => (id, true),
+            Operation::RunControl(id) => (id, false),
+            _ => return None,
+        };
+        program.controls[id]
+            .is_cancellable()
+            .then_some((id, awaits))
     })
 }
 
-pub(super) fn emit_support(
-    out: &mut String,
-    reg: &mut RuntimeRegistry<'_>,
-    waits: &BTreeSet<ControlId>,
-    scripted: bool,
-) {
+pub(super) fn needed(program: &Program) -> bool {
+    requests(program).next().is_some()
+}
+
+pub(super) fn emit_support(out: &mut String, reg: &mut RuntimeRegistry<'_>, scripted: bool) {
     if !reg.has_root_cancel {
         if reg.has_task_sets {
             // The shared scheduler has no observable cancellation in this module.
@@ -63,10 +68,8 @@ ask:
 }
 ",
     );
-    for &id in waits {
-        if reg.program.controls[id].is_cancellable() {
-            emit_await(out, reg, id);
-        }
+    for (id, awaits) in requests(reg.program).collect::<BTreeSet<_>>() {
+        emit_request(out, reg, id, awaits);
     }
 }
 
@@ -76,10 +79,11 @@ pub(super) fn poll(em: &mut IrEmitter<'_, '_>) {
     }
 }
 
-/// A cancellable host await in a defined root with no outstanding members.
+/// A single host operation, either awaited by a root running alone or run directly.
 /// The request fields already hold the operands and result slots. The runtime
 /// retains the by-value operands until completion transfers them to the host.
-fn emit_await(out: &mut String, reg: &mut RuntimeRegistry<'_>, id: ControlId) {
+fn emit_request(out: &mut String, reg: &mut RuntimeRegistry<'_>, id: ControlId, awaits: bool) {
+    let kind = if awaits { "await" } else { "run" };
     let program = reg.program;
     let control = &program.controls[id];
     let name = &control.name;
@@ -90,7 +94,7 @@ fn emit_await(out: &mut String, reg: &mut RuntimeRegistry<'_>, id: ControlId) {
         .unwrap();
     let _ = writeln!(
         out,
-        "define internal fastcc i32 @vn2_await_host_{id}(ptr %request) {{
+        "define internal fastcc i32 @vn2_{kind}_host_{id}(ptr %request) {{
 entry:
   %flag = load i1, ptr @vn2_root_cancelled
   br i1 %flag, label %release, label %start
@@ -122,15 +126,27 @@ release:"
         }
     }
     out.push_str(&em.code);
-    // Withdrawal makes the root ready in the very turn that requested it.
-    // An already cancelled await gives up its current turn before continuing.
+    // A direct run ends in the caller's turn on release or completion.
+    // An await must offer its task a ready turn. Withdrawal already polled
+    // for cancellation in that turn; an early cancellation or completion did not.
+    if awaits {
+        out.push_str("  br i1 %flag, label %next_turn, label %resume\n");
+    } else {
+        let _ = writeln!(out, "  ret i32 {cancelled_tag}");
+    }
     let _ = writeln!(
         out,
-        "  br i1 %flag, label %next_turn, label %resume
-complete:
+        "complete:
   call i64 @vn2_pick_waiting(ptr %request, i64 1)
-  %completed = call i32 @vn2_complete_{name}(ptr %request)
-  br label %next_turn
+  %completed = call i32 @vn2_complete_{name}(ptr %request)"
+    );
+    if !awaits {
+        out.push_str("  ret i32 %completed\n}\n");
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "  br label %next_turn
 next_turn:
   %result = phi i32 [ {cancelled_tag}, %release ], [ %completed, %complete ]
   call fastcc i1 @vn2_poll_cancel()

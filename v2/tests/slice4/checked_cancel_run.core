@@ -1,0 +1,66 @@
+// A direct run returns to its synchronous caller. The next visible action
+// is the caller's mark on both the completion and cancellation paths.
+extern resource lease on fault release
+extern control acquire(id : u32) ■ { ok {l : lease} } uses io
+extern control mark(value : u32) ■ { ok {} } uses io
+extern async control finish(l : lease, xs : [u32], cell : &~u32)
+    ■ { cancelled {} │ value {code : u32} } uses io
+
+control once(id : u32, xs : [u32]) ■ { ok {code : u32, cell : u32} } uses io
+    ⊤ ▷ ~cell : u32 := 7
+    ⊤ ▷ a : Δ acquire(id) ▸ ok {l}
+    a.ok ▷ result := capture run finish(l, ▾xs, &~cell)
+    ⊤ ▷ d : Δ outcome(result) ▸ cancelled {} │ value {code}
+    d.cancelled ▷ m : Δ mark(cell) ▸ ok {}
+    m.ok ▷ ■ ok {0, cell}
+    d.value ▷ n : Δ mark(code) ▸ ok {}
+    n.ok ▷ ■ ok {code, cell}
+
+//! run once(3, [4, 8]) with [acquire -> ok {lease#3}; finish -> value {37} ~cell <- 9; mark -> ok] => done ok {37, 9} trace [acquire(3) -> ok {lease#3}; finish(lease#3, [4, 8], 7) -> value {37}; mark(37) -> ok]
+//! run once(3, [4, 8]) with [acquire -> ok {lease#3}; finish -> cancelled ~cell <- 13; mark -> ok] => done ok {0, 13} trace [acquire(3) -> ok {lease#3}; finish(lease#3, [4, 8], 7) -> cancelled; mark(13) -> ok]
+//! run once(3, [4, 8]) with [acquire -> ok {lease#3}; mark -> ok] cancel_at 1 => done ok {0, 7} trace [acquire(3) -> ok {lease#3}; lease.release(lease#3) -> released; mark(7) -> ok]
+
+control twice(a : [u32], b : [u32]) ■ { ok {first : u32, second : u32} } uses io
+    ⊤ ▷ r : Δ once(3, ▾a) ▸ ok {first, x}
+    ⊤ ▷ s : Δ once(4, ▾b) ▸ ok {second, y}
+    s.ok ▷ ■ ok {first, second}
+
+// The second direct run starts in the same caller turn as the first.
+//! run twice([4, 8], [5, 9]) with [acquire -> ok {lease#3}; finish -> value {37}; mark -> ok; acquire -> ok {lease#4}; mark -> ok] cancel_at 2 => done ok {37, 0} trace [acquire(3) -> ok {lease#3}; finish(lease#3, [4, 8], 7) -> value {37}; mark(37) -> ok; acquire(4) -> ok {lease#4}; lease.release(lease#4) -> released; mark(7) -> ok]
+//! run twice([4, 8], [5, 9]) with [acquire -> ok {lease#3}; mark -> ok; acquire -> ok {lease#4}; mark -> ok] cancel_at 1 => done ok {0, 0} trace [acquire(3) -> ok {lease#3}; lease.release(lease#3) -> released; mark(7) -> ok; acquire(4) -> ok {lease#4}; lease.release(lease#4) -> released; mark(7) -> ok]
+
+async control pause() ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+async control peer() ■ { ok {} } uses io
+    ⊤ ▷ m : Δ mark(99) ▸ ok {}
+    m.ok ▷ ■ ok {}
+
+async control outer(a : [u32], b : [u32], yield_first : bool) ■ { ok {first : u32, second : u32} } uses io
+    ⊤ ▷ ~pool : tasks⟨peer⟩ := tasks⟨peer⟩()
+    ⊤ ▷ spawn peer() into pool
+    ⊤ ▷ y : ? yield_first
+    y.true ▷ p : Δ await pause() ▸ ok {}
+    ⊤ ▷ r : Δ twice(▾a, ▾b) ▸ ok {first, second}
+    ⊤ ▷ s : Δ await next(pool) ▸ ok {} │ empty {}
+    s.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ ok {} │ empty {}
+    e.ok ▷ ⊥
+    e.empty ▷ ■ ok {first, second}
+
+// With the owner already cancelled, both direct runs release their inputs
+// and the ready peer first runs after the two marks.
+//! run outer([4, 8], [5, 9], true) with [acquire -> ok {lease#3}; mark -> ok; acquire -> ok {lease#4}; mark -> ok; mark -> ok] cancel_at 1 => done ok {0, 0} trace [acquire(3) -> ok {lease#3}; lease.release(lease#3) -> released; mark(7) -> ok; acquire(4) -> ok {lease#4}; lease.release(lease#4) -> released; mark(7) -> ok; mark(99) -> ok]
+//! run outer([4, 8], [5, 9], false) with [acquire -> ok {lease#3}; finish -> value {37}; mark -> ok; acquire -> ok {lease#4}; mark -> ok; mark -> ok] cancel_at 2 => done ok {37, 0} trace [acquire(3) -> ok {lease#3}; finish(lease#3, [4, 8], 7) -> value {37}; mark(37) -> ok; acquire(4) -> ok {lease#4}; lease.release(lease#4) -> released; mark(7) -> ok; mark(99) -> ok]
+
+//! run outer([4, 8], [5, 9], false) with [acquire -> ok {lease#3}; finish -> cancelled ~cell <- 13; mark -> ok; acquire -> ok {lease#4}; finish -> value {47} ~cell <- 9; mark -> ok; mark -> ok] => done ok {0, 47} trace [acquire(3) -> ok {lease#3}; finish(lease#3, [4, 8], 7) -> cancelled; mark(13) -> ok; acquire(4) -> ok {lease#4}; finish(lease#4, [5, 9], 7) -> value {47}; mark(47) -> ok; mark(99) -> ok]
+
+// The same external control also has an await site with a ready turn on return.
+async control wait_once(xs : [u32]) ■ { ok {code : u32} } uses io
+    ⊤ ▷ ~cell : u32 := 7
+    ⊤ ▷ a : Δ acquire(3) ▸ ok {l}
+    a.ok ▷ w : Δ await finish(l, ▾xs, &~cell) ▸ cancelled {} │ value {code}
+    w.cancelled ▷ ■ ok {0}
+    w.value ▷ ■ ok {code}
+
+//! run wait_once([4, 8]) with [acquire -> ok {lease#3}; finish -> value {37}] => done ok {37} trace [acquire(3) -> ok {lease#3}; finish(lease#3, [4, 8], 7) -> value {37}]

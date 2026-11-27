@@ -4808,10 +4808,7 @@ fn emit_operation_call(
     match op_kind {
         Operation::AwaitNext(_, _) => unreachable!("handled before allocating output slots"),
         Operation::AwaitControl(cid) | Operation::RunControl(cid)
-            if is_extern_ctrl
-                && (program.controls[*cid].faults
-                    || (matches!(op_kind, Operation::RunControl(_))
-                        && program.controls[*cid].is_cancellable())) =>
+            if is_extern_ctrl && program.controls[*cid].faults =>
         {
             let kind = if matches!(op_kind, Operation::RunControl(_)) {
                 "run"
@@ -4819,7 +4816,7 @@ fn emit_operation_call(
                 "await"
             };
             return Err(format!(
-                "the native backend does not yet support a cancellable or faulting host {kind} of `{}`",
+                "the native backend does not yet support a faulting host {kind} of `{}`",
                 program.controls[*cid].name
             ));
         }
@@ -5555,7 +5552,7 @@ pub fn emit_llvm(program: &Program, usize_bits: u32) -> Result<String, String> {
 
     let host_waits = host_wait::targets(program);
     host_wait::emit_support(&mut decls_out, program, &host_waits, usize_bits, false);
-    root_cancel::emit_support(&mut decls_out, &mut reg, &host_waits, false);
+    root_cancel::emit_support(&mut decls_out, &mut reg, false);
     if has_control_await(program) || reg.has_task_sets {
         let _ = writeln!(decls_out, "declare i64 @vn2_pick_turn(i64)");
     }
@@ -6906,7 +6903,7 @@ pub fn emit_native_harness_llvm(
     let mut ext_code = String::new();
     let host_waits = host_wait::targets(program);
     host_wait::emit_support(&mut ext_code, program, &host_waits, usize_bits, true);
-    root_cancel::emit_support(&mut ext_code, &mut reg, &host_waits, true);
+    root_cancel::emit_support(&mut ext_code, &mut reg, true);
     let picks_turns = has_control_await(program) || reg.has_task_sets;
     if picks_turns || !host_waits.is_empty() {
         ext_code.push_str(

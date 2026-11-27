@@ -66,10 +66,11 @@ pub(super) fn emit_request(
             "  {field} = getelementptr {ty}, ptr {request}, i32 0, i32 {index}\n  store {arg}, ptr {field}"
         );
     }
-    if awaits && em.program.controls[id].is_cancellable() {
+    if em.program.controls[id].is_cancellable() {
+        let kind = if awaits { "await" } else { "run" };
         let _ = writeln!(
             em.code,
-            "  {tag} = call fastcc i32 @vn2_await_host_{id}(ptr {request})"
+            "  {tag} = call fastcc i32 @vn2_{kind}_host_{id}(ptr {request})"
         );
         return;
     }

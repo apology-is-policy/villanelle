@@ -11,6 +11,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const CANCEL_RUN: &str = include_str!("slice4/checked_cancel_run.core");
 const ROOT_CANCEL: &str = include_str!("slice4/checked_root_cancel.core");
 const WAITING_CHOICES: &str = include_str!("slice4/checked_waiting_choices.core");
 const MEMBER_HOST_WAIT: &str = include_str!("slice4/checked_member_host_wait.core");
@@ -108,6 +109,188 @@ fn direct_host_runs_return_the_selected_payload_to_the_caller() {
                 .contains("@vn2_pick_turn")
         );
     }
+}
+
+#[test]
+fn cancel_run_compiles_without_a_ready_task_callback() {
+    let (source, _) = CANCEL_RUN.split_once("async control pause()").unwrap();
+    compare_native_runs(source, &["E-Run"], &[1, 1, 1, 2, 2], 7);
+    let program = load(source).unwrap();
+    for bits in [32, 64] {
+        assert!(!emit_c_header(&program, bits).contains("vn2_pick_turn"));
+        assert!(
+            !emit_llvm(&program, bits)
+                .unwrap()
+                .contains("@vn2_pick_turn")
+        );
+    }
+}
+
+#[test]
+fn cancel_run_preserves_its_caller_and_coexists_with_await() {
+    compare_native_runs(CANCEL_RUN, &["E-Run"], &[1, 1, 1, 2, 2, 2, 2, 2, 0], 14);
+}
+
+#[test]
+fn cancel_run_c_host_checks_the_callers_turn_after_release_and_completion() {
+    const DRIVER: &str = r#"
+#include "module.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static struct vn2_wait_finish *pending;
+static const char *expected;
+static unsigned scenario, polls;
+static void observe(const char *event) {
+    size_t len = strlen(event);
+    if (strncmp(expected, event, len) || expected[len] != ' ') {
+        fprintf(stderr, "scenario %u: saw %s, expected %s\n", scenario, event, expected);
+        exit(1);
+    }
+    expected += len + 1;
+}
+uint8_t vn2_should_cancel_root(uint64_t turn) {
+    observe("poll");
+    if (turn != ++polls) abort();
+    return scenario < 2 && turn == 1;
+}
+uint64_t vn2_pick_turn(uint64_t n) {
+    if (n != 1 && n != 2) abort();
+    observe(n == 2 ? "ready2" : "ready1");
+    return 0;
+}
+int32_t vn2_ext_acquire(uint32_t id, void **out) {
+    observe("acquire");
+    *out = (void *)(uintptr_t)id;
+    printf("acquire(%u) -> ok {lease#%u}\n", (unsigned)id, (unsigned)id);
+    return VN2_ACQUIRE_OK;
+}
+int32_t vn2_ext_mark(uint32_t value) {
+    observe("mark");
+    printf("mark(%u) -> ok {}\n", (unsigned)value);
+    return VN2_MARK_OK;
+}
+static void check_bound(struct vn2_wait_finish *r) {
+    uintptr_t id = (uintptr_t)r->in_l;
+    const uint32_t *xs = r->in_xs->data;
+    if ((id != 3 && id != 4) || r->in_xs->len != 2 || xs[0] != id + 1 ||
+        xs[1] != id + 5 || *r->in_cell != 7) abort();
+}
+void vn2_start_finish(struct vn2_wait_finish *r) {
+    observe("start");
+    if (pending || r->host_state) abort();
+    check_bound(r);
+    r->host_state = pending = r;
+}
+uint64_t vn2_pick_waiting(void *const *states, uint64_t n) {
+    observe("waiting");
+    if (n != 1 || !pending || states[0] != pending) abort();
+    return 0;
+}
+void vn2_withdraw_finish(struct vn2_wait_finish *r) {
+    observe("withdraw");
+    if (!pending || pending != r || r->host_state != r) abort();
+    check_bound(r);
+    pending = NULL;
+}
+void vn2_release_lease(void *handle) {
+    observe("release");
+    if (pending) abort();
+    printf("lease.release(lease#%u) -> released {}\n", (unsigned)(uintptr_t)handle);
+}
+int32_t vn2_complete_finish(struct vn2_wait_finish *r) {
+    observe("complete");
+    if (!pending || pending != r || r->host_state != r) abort();
+    check_bound(r);
+    pending = NULL;
+    unsigned id = (unsigned)(uintptr_t)r->in_l;
+    const uint32_t *xs = r->in_xs->data;
+    printf("finish(lease#%u, [%u, %u], %u) -> ", id, (unsigned)xs[0], (unsigned)xs[1],
+           (unsigned)*r->in_cell);
+    free(r->in_xs->data);
+    if (scenario == 2 && id == 3) {
+        *r->in_cell = 13;
+        puts("cancelled {}");
+        return VN2_FINISH_CANCELLED;
+    }
+    *r->in_cell = 9;
+    *r->out_1_value_0 = 10 * id + 7;
+    printf("value {%u}\n", (unsigned)*r->out_1_value_0);
+    return VN2_FINISH_VALUE;
+}
+static vn2_vec data(uint32_t first) {
+    uint32_t *xs = malloc(2 * sizeof *xs);
+    if (!xs) abort();
+    xs[0] = first;
+    xs[1] = first + 4;
+    return (vn2_vec){xs, 2, 2};
+}
+int main(void) {
+    const char *cases[] = {
+        "poll ready2 acquire release mark acquire release mark ready1 mark ready1 ready1 ",
+        "acquire start poll withdraw release mark acquire start poll waiting complete mark "
+        "poll ready1 mark poll ready1 poll ready1 ",
+        "acquire start poll waiting complete mark acquire start poll waiting complete mark "
+        "poll ready1 mark poll ready1 poll ready1 ",
+        "acquire start poll waiting complete poll ready1 "
+    };
+    for (scenario = 0; scenario < 4; ++scenario) {
+        expected = cases[scenario];
+        polls = 0;
+        vn2_vec a = data(4);
+        uint32_t first, second;
+        if (scenario == 3) {
+            if (vn2_call_wait_once(&a, &first) != VN2_WAIT_ONCE_OK) return 1;
+            printf("done ok {%u}\n", (unsigned)first);
+        } else {
+            vn2_vec b = data(5);
+            if (vn2_call_outer(&a, &b, scenario == 0, &first, &second) != VN2_OUTER_OK) return 1;
+            printf("done ok {%u, %u}\n", (unsigned)first, (unsigned)second);
+        }
+        if (pending || *expected) return 1;
+    }
+    return 0;
+}
+"#;
+    let (_, runs) = script::native_runs(CANCEL_RUN).unwrap();
+    let inherited = runs
+        .iter()
+        .find(|s| s.entry == "outer" && s.cancel_at_turn == Some(1))
+        .unwrap();
+    let completed = runs
+        .iter()
+        .find(|s| s.entry == "outer" && s.cancel_at_turn.is_none())
+        .unwrap();
+    let awaited = runs.iter().find(|s| s.entry == "wait_once").unwrap();
+    let mut withdrawn = completed.clone();
+    // Withdraw the first finish. A one-shot request lets the second finish complete.
+    assert_eq!(withdrawn.answers.remove(1).0, "finish");
+    compare_c_host(CANCEL_RUN, "cancel_run", DRIVER, |program, config| {
+        let mut expected = Vec::new();
+        for (spec, first_turn) in [
+            (inherited, true),
+            (&withdrawn, true),
+            (completed, false),
+            (awaited, false),
+        ] {
+            let mut host = scheduled_host(spec);
+            host.cancel_at_turn = None;
+            host.cancel_decisions.push_back(first_turn);
+            let result = compare(
+                program,
+                &spec.entry,
+                spec.arguments.clone(),
+                &mut host,
+                config,
+            );
+            assert_eq!(result.verdict, Verdict::Same);
+            assert!(matches!(result.oracle.end, oracle::End::Done { .. }));
+            expected.extend(result.oracle.trace.iter().map(ToString::to_string));
+            expected.push(result.oracle.end.to_string());
+        }
+        expected
+    });
 }
 
 fn single_root_cancel_source() -> &'static str {
@@ -639,18 +822,21 @@ async control waits() ■ { ok {} } uses io
         &[1],
         0,
     );
-    // Put supported entries first. Both emitters compile the whole module.
-    for (decls, reason) in [
-        (
-            r#"
+    // The former refusal of a direct cancellable run also executes.
+    compare_native_runs(
+        r#"
 extern async control tick() ■ { ok {} │ cancelled {} } uses io
 control bridge2() ■ { ok {} } uses io
     ⊤ ▷ r : Δ run tick() ▸ ok {} │ cancelled {}
     ⊤ ▷ ■ ok {}
 //! run bridge2() with [tick -> ok] => done ok trace [tick() -> ok]
 "#,
-            "cancellable or faulting host run of `tick`",
-        ),
+        &["E-Run"],
+        &[1],
+        0,
+    );
+    // Put supported entries first. Both emitters compile the whole module.
+    for (decls, reason) in [
         (
             r#"
 extern async control tick() ■ { ok {} } faults uses io

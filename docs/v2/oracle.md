@@ -4,10 +4,10 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, direct runs of nonfaulting and noncancellable host operations, and
+roots, direct runs of nonfaulting host operations, and
 task sets whose owners and members can yield at a defined await. Roots and members can
 wait for the host in their own activations or in a callee (sections 18.4 to
-18.23). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
+18.24). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
 lists the defects. Sections 8 to 18 describe what the code does and which
@@ -2754,9 +2754,32 @@ the cell at 7 and releases the lease. A completion writes 9 to the cell
 and returns 37. A linked C host checks the callbacks and the ready turn
 on both paths. It also reenters the module and makes a one-shot request
 inside a nested run. Three directives count earlier member and host turns
-before starting an independent root. A cancellable await in a task-set
-owner or member and a direct run of a cancellable extern still receive
-native diagnostics.
+before starting an independent root. At this checkpoint the backend still
+diagnosed a cancellable await in a task-set owner or member and a direct
+run of a cancellable extern.
+
+### 18.24 Direct runs of cancellable host operations, 27 November 2026
+
+The root of `run finish(...)` has no activation ([E-Run]). Once the
+operands are bound, an inherited cancellation releases the by-value
+arguments and returns `cancelled` immediately. Otherwise the host starts
+the request. On the next scheduling turn, cancellation withdraws the
+bound request before its arguments are released. If the host completes
+the operation instead, it consumes the by-value inputs and supplies the
+alternative, writes and payload. All three paths return to the caller in
+its current turn. Other ready tasks of the caller's run wait until it
+yields. The inner run's cancellation flag ends with that run.
+
+From `v2/`, run `vn2 test tests/slice4/checked_cancel_run.core` and
+`cargo test --test backend_slice4 cancel_run`. The fixture puts a
+`cancelled` tag first in the contract. The completion that selects it
+writes 13 through an exclusive borrow and produces a host event. A
+withdrawal leaves the cell at 7 and produces the lease-release event.
+The C test requests cancellation once, so the second of two direct
+runs can finish normally before a ready sibling runs. It also exercises
+an await of the same control: completion there offers the root a ready
+turn. The LLVM module and C header for the direct-only program have no
+reference to `vn2_pick_turn`.
 
 ## 19. What is open
 
@@ -2770,7 +2793,7 @@ native diagnostics.
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
 - **Later work.** Slice 4 still needs cancellable awaits alongside other tasks,
-  direct cancellable host runs, set cancellation, faulting host operations,
+  set cancellation, faulting host operations,
   member faults, capacity and generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).
