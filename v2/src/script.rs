@@ -2,7 +2,7 @@
 
 use crate::codegen::NativeRunSpec;
 use crate::differential::{Verdict, compare};
-use crate::host::{Answer, Arithmetic, Host, Scheduled, Script};
+use crate::host::{Answer, Arithmetic, Completion, Host, Scheduled, Script};
 use crate::int::Int;
 use crate::oracle::{Config, End, Event, RuntimeStep, Value};
 use crate::typed::{BorrowMode, Control, Program, Type};
@@ -463,7 +463,7 @@ pub(crate) fn parse_native_event(program: &Program, text: &str) -> Result<Event,
     reader.need("(")?;
     let raw_args = reader.values(")")?;
     reader.need("->")?;
-    let (alternative, raw_payload) = reader.outcome()?;
+    let raw_completion = reader.completion()?;
     if reader.at != reader.pieces.len() {
         return Err("trailing tokens in native event".to_string());
     }
@@ -476,20 +476,16 @@ pub(crate) fn parse_native_event(program: &Program, text: &str) -> Result<Event,
             resolve_raw_value_typed(program, a, exp_ty)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let alt_fields = ctrl_ref.and_then(|c| c.contract.iter().find(|a| a.name == alternative));
-    let payload = raw_payload
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let exp_ty = alt_fields.and_then(|a| a.fields.get(i).map(|f| &f.ty));
-            resolve_raw_value_typed(program, p, exp_ty)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let completion = raw_completion.resolve(|alternative, i, value| {
+        let field = ctrl_ref
+            .and_then(|c| c.contract.iter().find(|a| a.name == alternative))
+            .and_then(|a| a.fields.get(i));
+        resolve_raw_value_typed(program, value, field.map(|f| &f.ty))
+    })?;
     Ok(Event {
         control,
         arguments,
-        alternative,
-        payload,
+        completion,
     })
 }
 
@@ -732,6 +728,20 @@ impl Reader {
         Ok(out)
     }
 
+    fn completion(&mut self) -> Result<Completion<RawValue>, String> {
+        if self.peek_word() == Some("fault")
+            && matches!(self.pieces.get(self.at + 1), Some(Piece::Str(_)))
+        {
+            self.at += 1;
+            return Ok(Completion::Fault(self.string_lit("a host fault message")?));
+        }
+        let (alternative, payload) = self.outcome()?;
+        Ok(Completion::Returned {
+            alternative,
+            payload,
+        })
+    }
+
     /// `alternative [{values}]`
     fn outcome(&mut self) -> Result<(String, Vec<RawValue>), String> {
         let alternative = self.word("an alternative")?;
@@ -745,7 +755,29 @@ impl Reader {
 }
 
 /// An answer of a script as a directive writes it.
-type RawAnswer = (String, String, Vec<RawValue>, Vec<(String, RawValue)>);
+type RawAnswer = (String, Completion<RawValue>, Vec<(String, RawValue)>);
+
+impl Completion<RawValue> {
+    fn resolve(
+        &self,
+        mut value: impl FnMut(&str, usize, &RawValue) -> Result<Value, String>,
+    ) -> Result<Completion<Value>, String> {
+        match self {
+            Self::Fault(message) => Ok(Completion::Fault(message.clone())),
+            Self::Returned {
+                alternative,
+                payload,
+            } => Ok(Completion::Returned {
+                alternative: alternative.clone(),
+                payload: payload
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| value(alternative, i, v))
+                    .collect::<Result<_, _>>()?,
+            }),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 enum RawExpect {
@@ -804,8 +836,7 @@ impl std::fmt::Display for Expect {
 struct RawEvent {
     control: String,
     arguments: Vec<RawValue>,
-    alternative: String,
-    payload: Vec<RawValue>,
+    completion: Completion<RawValue>,
 }
 
 #[derive(Clone, Debug)]
@@ -815,8 +846,8 @@ struct RawRunSpec {
     entry: String,
     arguments: Vec<RawValue>,
     arithmetic: bool,
-    /// Each answer: the control, the alternative, the payload, and what the
-    /// host leaves behind parameters lent exclusively (`~x <- v`).
+    /// Each answer names the control, its completion, and any writes behind
+    /// parameters lent exclusively (`~x <- v`).
     answers: Vec<RawAnswer>,
     turns: Vec<usize>,
     /// Which waiting operation the host completes, each time no task is
@@ -895,14 +926,14 @@ fn directive(line: usize, text: &str) -> Result<Directive, String> {
                     }
                     let control = reader.word("a control")?;
                     reader.need("->")?;
-                    let (alternative, payload) = reader.outcome()?;
+                    let completion = reader.completion()?;
                     let mut writes = Vec::new();
                     while reader.mark("~") {
                         let parameter = reader.word("a parameter")?;
                         reader.need("<-")?;
                         writes.push((parameter, reader.value()?));
                     }
-                    spec.answers.push((control, alternative, payload, writes));
+                    spec.answers.push((control, completion, writes));
                 }
             }
             "turns" => {
@@ -989,12 +1020,11 @@ fn directive(line: usize, text: &str) -> Result<Directive, String> {
             reader.need("(")?;
             let arguments = reader.values(")")?;
             reader.need("->")?;
-            let (alternative, payload) = reader.outcome()?;
+            let completion = reader.completion()?;
             events.push(RawEvent {
                 control,
                 arguments,
-                alternative,
-                payload,
+                completion,
             });
         }
         spec.trace = Some(events);
@@ -1041,15 +1071,13 @@ fn call_of(program: &Program, raw_spec: &RawRunSpec) -> Result<Call, String> {
         .map(|v| resolve_raw_value(program, v))
         .collect::<Result<Vec<_>, _>>()?;
     let mut answers = Vec::with_capacity(raw_spec.answers.len());
-    for (ctrl, alt, raw_payload, raw_writes) in &raw_spec.answers {
+    for (ctrl, raw_completion, raw_writes) in &raw_spec.answers {
         let answered = program
             .controls
             .iter()
             .find(|control| control.name == *ctrl);
-        let payload = raw_payload
-            .iter()
-            .map(|v| resolve_answer_value(program, answered, v))
-            .collect::<Result<Vec<_>, _>>()?;
+        let completion =
+            raw_completion.resolve(|_, _, v| resolve_answer_value(program, answered, v))?;
         let mut writes = Vec::with_capacity(raw_writes.len());
         for (parameter, raw) in raw_writes {
             let found = answered.and_then(|control| {
@@ -1064,14 +1092,7 @@ fn call_of(program: &Program, raw_spec: &RawRunSpec) -> Result<Call, String> {
             };
             writes.push((index, resolve_raw_value_typed(program, raw, Some(ty))?));
         }
-        answers.push((
-            ctrl.clone(),
-            Answer {
-                alternative: alt.clone(),
-                payload,
-                writes,
-            },
-        ));
+        answers.push((ctrl.clone(), Answer { completion, writes }));
     }
     Ok((arguments, answers))
 }
@@ -1349,17 +1370,14 @@ fn check_with(source: &str, is_surface: bool) -> Report {
                         .iter()
                         .map(|v| resolve_raw_value(&program, v))
                         .collect::<Result<Vec<_>, _>>();
-                    let pay = re
-                        .payload
-                        .iter()
-                        .map(|v| resolve_raw_value(&program, v))
-                        .collect::<Result<Vec<_>, _>>();
-                    match (args, pay) {
-                        (Ok(a), Ok(p)) => evs.push(Event {
+                    let completion = re
+                        .completion
+                        .resolve(|_, _, v| resolve_raw_value(&program, v));
+                    match (args, completion) {
+                        (Ok(arguments), Ok(completion)) => evs.push(Event {
                             control: re.control.clone(),
-                            arguments: a,
-                            alternative: re.alternative.clone(),
-                            payload: p,
+                            arguments,
+                            completion,
                         }),
                         (Err(e), _) | (_, Err(e)) => {
                             err_msg = Some(e);

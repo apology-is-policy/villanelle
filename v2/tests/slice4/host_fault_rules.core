@@ -1,0 +1,63 @@
+extern control sync(cell : &~u32) ■ { ok {} } faults uses io
+extern async control io_step(cell : &~u32) ■ { ok {} } faults uses io
+extern async control reliable() ■ { ok {} } uses io
+extern control pure(cell : &~u32) ■ { ok {} } faults
+
+control sync_fault() ■ { ok {} } faults uses io
+    ⊤ ▷ ~cell : u32 := 6
+    ⊤ ▷ d : Δ sync(&~cell) ▸ ok {}
+    d.ok ▷ ■ ok {}
+
+//! run sync_fault() with [sync -> fault "sync" ~cell <- 8] => faulted "sync" trace [sync(6) -> fault "sync"]
+//! run sync_fault() with [sync -> fault "sync" ~cell <- true] => violation trace []
+
+async control awaiting() ■ { ok {} } faults uses io
+    ⊤ ▷ ~cell : u32 := 6
+    ⊤ ▷ d := capture await io_step(&~cell)
+    ⊤ ▷ h : Δ outcome(d) ▸ ok {}
+    h.ok ▷ ■ ok {}
+
+//! run awaiting() with [io_step -> fault "wait" ~cell <- 8] => faulted "wait" trace [io_step(6) -> fault "wait"]
+//! run awaiting() with [io_step -> ok ~cell <- 8] => done ok trace [io_step(6) -> ok]
+//! run awaiting() with [io_step -> fault {"wait"}] => violation trace []
+//! run awaiting() => host-failed trace []
+
+async control family() ■ { ok {} } faults uses io
+    ⊤ ▷ ~pool : tasks⟨awaiting⟩ := tasks⟨awaiting⟩()
+    ⊤ ▷ spawn awaiting() into pool
+    ⊤ ▷ lp : ↻ drain() {
+            ⊤ ▷ n : Δ await next(pool) ▸ ok {} │ empty {}
+            n.ok ▷ ↑ drain()
+            n.empty ▷ □ finished {}
+        } ▸ finished {}
+    ⊤ ▷ ■ ok {}
+
+//! run family() with [io_step -> fault "child"] => faulted "child" trace [io_step(6) -> fault "child"]
+
+control unfaithful() ■ { ok {} } faults uses io
+    ⊤ ▷ d : Δ run reliable() ▸ ok {}
+    d.ok ▷ ■ ok {}
+
+//! run unfaithful() with [reliable -> fault "wrong permission"] => violation trace []
+
+control pure_twice() ■ { ok {} }
+    ⊤ ▷ lp : ↻ twice(~i : u32 := 0) {
+            ⊤ ▷ t : ? i < 2
+            t.false ▷ □ finished {}
+            ⊤ ▷ i ← i + 1
+            ⊤ ▷ ~cell : u32 := 3
+            ⊤ ▷ b : boundary {
+                    ⊤ ▷ d : Δ pure(&~cell) ▸ ok {}
+                } contingency (m : string) {
+                    ⊤ ▷ recover ↑ twice
+                }
+            ⊤ ▷ ↑ twice(i)
+        } ▸ finished {}
+    ⊤ ▷ ■ ok {}
+
+// Equal inputs to a pure host operation have the same completion.
+//! run pure_twice() with [pure -> fault "same" ~cell <- 5; pure -> fault "same" ~cell <- 5] => done ok trace []
+//! run pure_twice() with [pure -> fault "first"; pure -> fault "other"] => violation trace []
+//! run pure_twice() with [pure -> ok; pure -> fault "other"] => violation trace []
+//! run pure_twice() with [pure -> fault "first"; pure -> ok] => violation trace []
+//! run pure_twice() with [pure -> fault "same" ~cell <- 5; pure -> fault "same" ~cell <- 6] => violation trace []

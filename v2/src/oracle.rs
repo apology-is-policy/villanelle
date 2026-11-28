@@ -5,7 +5,7 @@
 //! is meant to exclude. Each rule below carries the name of its clause, and
 //! each way of being stuck carries its number from the table of section 6.10.
 
-use crate::host::Host;
+use crate::host::{Completion, Host};
 use crate::int::Int;
 use crate::syntax::escape_string;
 use crate::typed::{
@@ -373,20 +373,19 @@ impl Config {
 pub struct Event {
     pub control: String,
     pub arguments: Vec<Value>,
-    pub alternative: String,
-    pub payload: Vec<Value>,
+    pub completion: Completion<Value>,
 }
 
 impl fmt::Display for Event {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{}({}) -> {} {{{}}}",
-            self.control,
-            list(&self.arguments),
-            self.alternative,
-            list(&self.payload)
-        )
+        write!(formatter, "{}({}) -> ", self.control, list(&self.arguments))?;
+        match &self.completion {
+            Completion::Returned {
+                alternative,
+                payload,
+            } => write!(formatter, "{alternative} {{{}}}", list(payload)),
+            Completion::Fault(message) => write!(formatter, "fault \"{}\"", escape_string(message)),
+        }
     }
 }
 
@@ -806,6 +805,7 @@ struct TaskSet {
 }
 
 enum TaskState {
+    HostFault(String),
     Ready,
     WaitingHost {
         callee: ControlId,
@@ -1558,7 +1558,7 @@ impl Evaluator<'_> {
 
 /// What a pure extern control gave: the alternative, the payload and the
 /// values of its parameters at completion ([E-Extern], RO11).
-type Given = (usize, Vec<Value>, Vec<Value>);
+type Given = (Completion<Value>, Vec<Value>);
 
 struct Machine<'a> {
     program: &'a Program,
@@ -1591,6 +1591,7 @@ struct Machine<'a> {
 
 /// What a step of the host leads to.
 enum Answered {
+    Fault(String),
     Completed(usize, Vec<Value>),
     Ended(End),
 }
@@ -2625,8 +2626,10 @@ impl<'a> Machine<'a> {
                     self.trace.push(Event {
                         control: format!("{name}.release"),
                         arguments: vec![value.clone()],
-                        alternative: "released".to_string(),
-                        payload: Vec::new(),
+                        completion: Completion::Returned {
+                            alternative: "released".to_string(),
+                            payload: Vec::new(),
+                        },
                     });
                 }
                 Ok(())
@@ -2729,7 +2732,10 @@ impl<'a> Machine<'a> {
                 }
             }
             TaskState::Stopped => return Ok(()),
-            TaskState::Ready | TaskState::WaitingNext { .. } | TaskState::WaitingRun => {}
+            TaskState::HostFault(_)
+            | TaskState::Ready
+            | TaskState::WaitingNext { .. }
+            | TaskState::WaitingRun => {}
         }
         let mut stack = std::mem::take(&mut self.tasks[tid].stack);
         while let Some(act) = stack.pop() {
@@ -2849,15 +2855,33 @@ impl<'a> Machine<'a> {
         alternative: usize,
         payload: Vec<Value>,
     ) -> Result<(), Fail> {
+        self.resume_run_caller(tid);
+        self.complete(alternative, payload)?;
+        self.count("E-Done");
+        Ok(())
+    }
+
+    fn resume_run_caller(&mut self, tid: usize) {
         let finished_run = self.runs.pop().expect("the run of an extern root");
         debug_assert_eq!(finished_run.root_task, tid);
         self.tasks[tid].state = TaskState::Stopped;
         let caller = finished_run.caller_task.expect("a run has a caller");
         self.activate_task(caller);
         self.locate();
-        self.complete(alternative, payload)?;
-        self.count("E-Done");
-        Ok(())
+    }
+
+    fn receive_host_fault(&mut self, message: String) -> Result<Option<End>, Fail> {
+        if !self.current_permits_faults() {
+            return fail(
+                8,
+                "E-Unwind",
+                format!(
+                    "a host fault reached `{}`, which does not permit `faults` and has no enclosing boundary",
+                    self.current_name()
+                ),
+            );
+        }
+        self.unwind(message)
     }
 
     /// Withdraws any `WaitingHost` cancellable operation in the innermost run
@@ -3361,65 +3385,79 @@ impl<'a> Machine<'a> {
         }
         self.check_effects(&callee.uses, &callee.name)?;
 
-        // [E-Resource]: track resources passed by value vs by borrow.
-        let mut consumed_resources = Vec::new();
-        for (arg, param) in concrete_args.iter().zip(&callee.parameters) {
-            let mut arg_res = Vec::new();
-            collect_resources(arg, &mut arg_res);
-            for &(rid, handle_id) in &arg_res {
-                if !self
-                    .resources
-                    .get(&(rid, handle_id))
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    return fail(
-                        5,
-                        "E-Resource",
-                        format!(
-                            "resource `{}#{handle_id}` passed to `{}` is not open",
-                            self.program.resources[rid].name, callee.name
-                        ),
-                    );
-                }
-            }
-            if !matches!(param.ty, Type::Ref(_, _)) {
-                consumed_resources.extend(arg_res);
-            }
-        }
+        let consumed_resources = self.consumed_resources(id, &concrete_args)?;
+        self.host_completion(id, &arguments, concrete_args, consumed_resources)
+    }
 
-        let mut answer = match self.host.call(callee, &concrete_args, self.config) {
+    fn host_completion(
+        &mut self,
+        id: ControlId,
+        arguments: &[Value],
+        concrete_args: Vec<Value>,
+        consumed_resources: Vec<(ResourceId, u64)>,
+    ) -> Result<Answered, Fail> {
+        let callee = &self.program.controls[id];
+        let answer = match self.host.call(callee, &concrete_args, self.config) {
             Ok(answer) => answer,
             Err(detail) => return Ok(Answered::Ended(End::HostFailed(detail))),
         };
         let violation = |detail: String| Ok(Answered::Ended(End::HostViolation(detail)));
-        let Some(index) = callee
-            .contract
-            .iter()
-            .position(|entry| entry.name == answer.alternative)
-        else {
+        let (name, mut payload) = match answer.completion {
+            Completion::Returned {
+                alternative,
+                payload,
+            } => (alternative, payload),
+            Completion::Fault(message) => {
+                if !callee.faults {
+                    return violation(format!(
+                        "host fault from `{}` without `faults`",
+                        callee.name
+                    ));
+                }
+                let completed =
+                    match self.host_writes(id, arguments, &concrete_args, answer.writes)? {
+                        Ok(values) => values,
+                        Err(detail) => return violation(detail),
+                    };
+                if !consumed_resources.is_empty() {
+                    for resource in consumed_resources {
+                        self.resources.insert(resource, false);
+                    }
+                    self.count("E-Resource");
+                }
+                if let Err(detail) = self.observe_host(
+                    id,
+                    concrete_args,
+                    Completion::Fault(message.clone()),
+                    completed,
+                ) {
+                    return violation(detail);
+                }
+                return Ok(Answered::Fault(message));
+            }
+        };
+        let Some(index) = callee.contract.iter().position(|entry| entry.name == name) else {
             return violation(format!(
                 "`{}` answered `{}`, which its contract does not list",
-                callee.name, answer.alternative
+                callee.name, name
             ));
         };
-        let writes = std::mem::take(&mut answer.writes);
-        let completed = match self.host_writes(id, &arguments, &concrete_args, writes)? {
+        let writes = answer.writes;
+        let completed = match self.host_writes(id, arguments, &concrete_args, writes)? {
             Ok(completed) => completed,
             Err(detail) => return violation(detail),
         };
         let alternative = &callee.contract[index];
-        for (value, field) in answer.payload.iter_mut().zip(&alternative.fields) {
-            if let Err(detail) = self.lend(&arguments, value, &field.ty) {
+        for (value, field) in payload.iter_mut().zip(&alternative.fields) {
+            if let Err(detail) = self.lend(arguments, value, &field.ty) {
                 return violation(format!(
                     "`{}` answered `{}` with {detail} in `{}`",
-                    callee.name, answer.alternative, field.name
+                    callee.name, name, field.name
                 ));
             }
         }
-        let typed = answer.payload.len() == alternative.fields.len()
-            && answer
-                .payload
+        let typed = payload.len() == alternative.fields.len()
+            && payload
                 .iter()
                 .zip(&alternative.fields)
                 .all(|(value, field)| self.config.fits_in_program(self.program, value, &field.ty));
@@ -3427,8 +3465,8 @@ impl<'a> Machine<'a> {
             return violation(format!(
                 "`{}` answered `{} {{{}}}`, which is not a payload of that alternative",
                 callee.name,
-                answer.alternative,
-                list(&answer.payload)
+                name,
+                list(&payload)
             ));
         }
 
@@ -3445,7 +3483,7 @@ impl<'a> Machine<'a> {
             }
         }
         let mut all_payload_refs: Vec<(BorrowMode, RuntimePlace, TagId)> = Vec::new();
-        for (val, field) in answer.payload.iter().zip(&alternative.fields) {
+        for (val, field) in payload.iter().zip(&alternative.fields) {
             if self.program.contains_borrow_or_view(&field.ty) {
                 let mut frefs = Vec::new();
                 collect_refs(val, &mut frefs);
@@ -3500,7 +3538,7 @@ impl<'a> Machine<'a> {
             self.resources.insert((rid, handle_id), false);
         }
         let mut returned_resources = Vec::new();
-        for val in &answer.payload {
+        for val in &payload {
             collect_resources(val, &mut returned_resources);
         }
         for &(rid, handle_id) in &returned_resources {
@@ -3521,8 +3559,8 @@ impl<'a> Machine<'a> {
             self.count("E-Resource");
         }
 
-        let mut concrete_payload = Vec::with_capacity(answer.payload.len());
-        for val in &answer.payload {
+        let mut concrete_payload = Vec::with_capacity(payload.len());
+        for val in &payload {
             concrete_payload.push(self.deref_formula(val)?);
         }
         if let Some(condition) = &alternative.condition {
@@ -3535,21 +3573,39 @@ impl<'a> Machine<'a> {
                 return violation(format!(
                     "`{}` answered `{} {{{}}}` for ({}), and the condition of the alternative is false",
                     callee.name,
-                    answer.alternative,
+                    name,
                     list(&concrete_payload),
                     list(&concrete_args)
                 ));
             }
         }
+        let result = Completion::Returned {
+            alternative: name,
+            payload: concrete_payload,
+        };
+        if let Err(detail) = self.observe_host(id, concrete_args, result, completed) {
+            return violation(detail);
+        }
+        Ok(Answered::Completed(index, payload))
+    }
+
+    fn observe_host(
+        &mut self,
+        id: ControlId,
+        arguments: Vec<Value>,
+        completion: Completion<Value>,
+        completed: Vec<Value>,
+    ) -> Result<(), String> {
+        let callee = &self.program.controls[id];
         if callee.is_pure(self.program) {
-            let key = (id, concrete_args.clone());
-            let given = (index, concrete_payload.clone(), completed);
+            let key = (id, arguments);
+            let given = (completion, completed);
             match self.answers.get(&key) {
                 Some(earlier) if *earlier != given => {
-                    return violation(format!(
+                    return Err(format!(
                         "`{}` has no effect and answered ({}) in two ways",
                         callee.name,
-                        list(&concrete_args)
+                        list(&key.1)
                     ));
                 }
                 Some(_) => {}
@@ -3560,13 +3616,12 @@ impl<'a> Machine<'a> {
         } else {
             self.trace.push(Event {
                 control: callee.name.clone(),
-                arguments: concrete_args,
-                alternative: answer.alternative.clone(),
-                payload: concrete_payload,
+                arguments,
+                completion,
             });
         }
         self.count("E-Extern");
-        Ok(Answered::Completed(index, answer.payload))
+        Ok(())
     }
 
     fn execute_builtin(
@@ -3744,8 +3799,10 @@ impl<'a> Machine<'a> {
                 self.trace.push(Event {
                     control: "emit".to_string(),
                     arguments: vec![text],
-                    alternative: "done".to_string(),
-                    payload: Vec::new(),
+                    completion: Completion::Returned {
+                        alternative: "done".to_string(),
+                        payload: Vec::new(),
+                    },
                 });
                 self.count("E-Extern");
                 Ok((0, Vec::new()))
@@ -4158,6 +4215,7 @@ impl<'a> Machine<'a> {
             } => {
                 if let Some(answered) = self.execute_operation(operation, arguments)? {
                     match answered {
+                        Answered::Fault(message) => return self.receive_host_fault(message),
                         Answered::Ended(end) => return Ok(Some(end)),
                         Answered::Completed(alternative, payload) => {
                             self.complete(alternative, payload)?;
@@ -4220,6 +4278,7 @@ impl<'a> Machine<'a> {
             } => {
                 if let Some(answered) = self.execute_operation(op_kind, arguments)? {
                     match answered {
+                        Answered::Fault(message) => return self.receive_host_fault(message),
                         Answered::Ended(end) => return Ok(Some(end)),
                         Answered::Completed(alternative, payload) => {
                             self.complete(alternative, payload)?;
@@ -4762,189 +4821,23 @@ impl<'a> Machine<'a> {
             self.locate();
         }
 
-        let callee_ctrl = &self.program.controls[callee];
-        let mut answer = match self.host.call(callee_ctrl, &concrete_args, self.config) {
-            Ok(answer) => answer,
-            Err(detail) => {
+        match self.host_completion(callee, &arguments, concrete_args, consumed_resources)? {
+            Answered::Ended(end) => return Ok(Some(end)),
+            Answered::Fault(message) if extern_root => {
+                self.resume_run_caller(tid);
+                return self.receive_host_fault(message);
+            }
+            Answered::Fault(message) => {
                 self.tasks[tid].stack = std::mem::take(&mut self.stack);
-                return Ok(Some(End::HostFailed(detail)));
+                self.tasks[tid].state = TaskState::HostFault(message);
+                return Ok(None);
             }
-        };
-        let finish_violation = |machine: &mut Machine<'_>, detail: String| {
-            machine.tasks[tid].stack = std::mem::take(&mut machine.stack);
-            Ok(Some(End::HostViolation(detail)))
-        };
-        let Some(index) = callee_ctrl
-            .contract
-            .iter()
-            .position(|entry| entry.name == answer.alternative)
-        else {
-            let detail = format!(
-                "`{}` answered `{}`, which its contract does not list",
-                callee_ctrl.name, answer.alternative
-            );
-            return finish_violation(self, detail);
-        };
-        let writes = std::mem::take(&mut answer.writes);
-        let completed = match self.host_writes(callee, &arguments, &concrete_args, writes)? {
-            Ok(completed) => completed,
-            Err(detail) => return finish_violation(self, detail),
-        };
-        let callee_ctrl = &self.program.controls[callee];
-        let alternative = &callee_ctrl.contract[index];
-        for (value, field) in answer.payload.iter_mut().zip(&alternative.fields) {
-            if let Err(detail) = self.lend(&arguments, value, &field.ty) {
-                let detail = format!(
-                    "`{}` answered `{}` with {detail} in `{}`",
-                    callee_ctrl.name, answer.alternative, field.name
-                );
-                return finish_violation(self, detail);
+            Answered::Completed(index, payload) if extern_root => {
+                self.finish_extern_root(tid, index, payload)?;
+                return Ok(None);
             }
+            Answered::Completed(index, payload) => self.complete(index, payload)?,
         }
-        let typed = answer.payload.len() == alternative.fields.len()
-            && answer
-                .payload
-                .iter()
-                .zip(&alternative.fields)
-                .all(|(value, field)| self.config.fits_in_program(self.program, value, &field.ty));
-        if !typed {
-            let detail = format!(
-                "`{}` answered `{} {{{}}}`, which is not a payload of that alternative",
-                callee_ctrl.name,
-                answer.alternative,
-                list(&answer.payload)
-            );
-            return finish_violation(self, detail);
-        }
-
-        // [E-Host]: validate returned borrows/views against declared origins.
-        fn collect_refs(v: &Value, out: &mut Vec<(BorrowMode, RuntimePlace, TagId)>) {
-            match v {
-                Value::Ref { mode, place, tag } => out.push((*mode, place.clone(), *tag)),
-                Value::Struct { fields, .. } => {
-                    for f in fields {
-                        collect_refs(f, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut all_payload_refs = Vec::new();
-        for (val, field) in answer.payload.iter().zip(&alternative.fields) {
-            if self.program.contains_borrow_or_view(&field.ty) {
-                let mut frefs = Vec::new();
-                collect_refs(val, &mut frefs);
-                if frefs.is_empty() && matches!(field.ty, Type::Ref(_, _)) {
-                    let detail = format!(
-                        "`{}` answered a non-borrow value for borrowed payload `{}`",
-                        callee_ctrl.name, field.name
-                    );
-                    return finish_violation(self, detail);
-                }
-                let mut allowed_sources = Vec::new();
-                for &oidx in &field.origins {
-                    collect_refs(&arguments[oidx], &mut allowed_sources);
-                }
-                for (rmode, rplace, rtag) in &frefs {
-                    if !self.tags.is_alive(*rtag) {
-                        let detail = format!(
-                            "`{}` returned a dead borrow in `{}`",
-                            callee_ctrl.name, field.name
-                        );
-                        return finish_violation(self, detail);
-                    }
-                    let anc = self.tags.ancestors(*rtag);
-                    let valid_origin = allowed_sources
-                        .iter()
-                        .any(|(_, aplace, atag)| anc.contains(atag) && aplace.contains(rplace));
-                    if !valid_origin {
-                        let detail = format!(
-                            "`{}` returned a borrow in `{}` not derived from its declared origins",
-                            callee_ctrl.name, field.name
-                        );
-                        return finish_violation(self, detail);
-                    }
-                    all_payload_refs.push((*rmode, rplace.clone(), *rtag));
-                }
-            }
-        }
-        for i in 0..all_payload_refs.len() {
-            for j in (i + 1)..all_payload_refs.len() {
-                let (m1, p1, _) = &all_payload_refs[i];
-                let (m2, p2, _) = &all_payload_refs[j];
-                if (*m1 == BorrowMode::Exclusive || *m2 == BorrowMode::Exclusive) && p1.overlaps(p2)
-                {
-                    let detail = format!(
-                        "`{}` returned overlapping exclusive borrows in its payload",
-                        callee_ctrl.name
-                    );
-                    return finish_violation(self, detail);
-                }
-            }
-        }
-
-        // [E-Resource]: update resource table.
-        for &(rid, handle_id) in &consumed_resources {
-            self.resources.insert((rid, handle_id), false);
-        }
-        let mut returned_resources = Vec::new();
-        for val in &answer.payload {
-            collect_resources(val, &mut returned_resources);
-        }
-        for &(rid, handle_id) in &returned_resources {
-            if consumed_resources.contains(&(rid, handle_id)) {
-                self.resources.insert((rid, handle_id), true);
-            } else if let std::collections::btree_map::Entry::Vacant(e) =
-                self.resources.entry((rid, handle_id))
-            {
-                e.insert(true);
-            } else {
-                let detail = format!(
-                    "`{}` returned an already-used resource handle `{}#{handle_id}`",
-                    callee_ctrl.name, self.program.resources[rid].name
-                );
-                return finish_violation(self, detail);
-            }
-        }
-        if !consumed_resources.is_empty() || !returned_resources.is_empty() {
-            self.count("E-Resource");
-        }
-
-        let mut concrete_payload = Vec::with_capacity(answer.payload.len());
-        for val in &answer.payload {
-            concrete_payload.push(self.deref_formula(val)?);
-        }
-        if let Some(condition) = &alternative.condition {
-            let env = SignatureEnv {
-                parameters: &completed,
-                old_parameters: &concrete_args,
-                fields: &concrete_payload,
-            };
-            if !self.evaluator().holds(condition, &env)? {
-                let detail = format!(
-                    "`{}` answered `{} {{{}}}` for ({}), and the condition of the alternative is false",
-                    callee_ctrl.name,
-                    answer.alternative,
-                    list(&concrete_payload),
-                    list(&concrete_args)
-                );
-                return finish_violation(self, detail);
-            }
-        }
-        if !callee_ctrl.is_pure(self.program) {
-            self.trace.push(Event {
-                control: callee_ctrl.name.clone(),
-                arguments: concrete_args,
-                alternative: answer.alternative,
-                payload: concrete_payload,
-            });
-        }
-        self.count("E-Extern");
-        if extern_root {
-            self.finish_extern_root(tid, index, answer.payload)?;
-            return Ok(None);
-        }
-        self.complete(index, answer.payload)?;
         self.tasks[tid].stack = std::mem::take(&mut self.stack);
         self.tasks[tid].state = TaskState::Ready;
         Ok(None)
@@ -4971,7 +4864,7 @@ impl<'a> Machine<'a> {
         let mut ready = Vec::new();
         for &tid in &run_tasks {
             match self.tasks[tid].state {
-                TaskState::Ready => ready.push(tid),
+                TaskState::Ready | TaskState::HostFault(_) => ready.push(tid),
                 TaskState::WaitingNext { set_id, .. } => {
                     let set = &self.task_sets[set_id as usize];
                     if set.members.is_empty() || !set.done_queue.is_empty() {
@@ -4985,6 +4878,12 @@ impl<'a> Machine<'a> {
             let choice = self.host.pick_turn(ready.len()) % ready.len();
             let tid = ready[choice];
             self.count("E-Turn");
+            if let TaskState::HostFault(message) = &self.tasks[tid].state {
+                let message = message.clone();
+                self.activate_task(tid);
+                self.locate();
+                return self.receive_host_fault(message);
+            }
             if let TaskState::WaitingNext {
                 set_id,
                 set_var,

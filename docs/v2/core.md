@@ -558,15 +558,15 @@ The remaining commands end scopes and are given in sections 6.7 to 6.9.
   with result `done(a, v̄)`.
 
 **The host.** The world `W` holds the resource table, the event trace, and
-whatever state the host keeps. An extern control is a relation
-`host(W, f, v̄) ∋ (W′, a, v̄′, ū)`: given the world and the arguments it yields a new
-world, an alternative, a payload, and for each argument lent exclusively the
-value that the host leaves behind that borrow (the value it found there, if
-it writes nothing).
+whatever state the host keeps. On a normal completion the host relation
+`host(W, f, v̄) ∋ (W′, a, v̄′, ū)` yields a new world, an alternative, a
+payload and the values left behind the exclusive borrows (unchanged where
+the host writes nothing). For an extern declared `faults` the relation also
+admits `(W′, fault(message), ū)`.
 
 - **[E-Extern]** A decision on an extern control takes one step of the host
-  relation and appends the event `(f, v̄, a, v̄′)` to the trace when `f` has an
-  effect. If the precondition of `f` is false for `v̄`, stuck. A borrow that the
+  relation. On normal completion it appends the event `(f, v̄, a, v̄′)` to the
+  trace when `f` has an effect. If the precondition of `f` is false for `v̄`, stuck. A borrow that the
   host returns in a field `∈ ȳ` is a reborrow, by [B3], of a place within one of
   the arguments `ȳ`: the host names the argument and the place within what it
   lends, and the step makes the borrow, with a tag under the tag of that
@@ -579,6 +579,17 @@ it writes nothing).
   the write, and `old` of it before ([E-Formula]). Nothing is written behind an
   argument whose type has kind `must`: the host cannot complete an obligation in
   place.
+
+  A host may instead complete a call to an extern declared `faults` with a
+  fault message and its exclusive-borrow writes. The step applies the same
+  write checks. The host completes the arguments it took by value
+  ([E-Resource]). An effectful operation appends the event
+  `(f, v̄, fault(message))`, with the argument values at issue. No alternative
+  is selected and no payload is bound, including in a capture. The fault
+  reaches the caller at the call site under [E-Unwind]. A fault completion
+  for an extern without `faults` is a host violation. The consistency check
+  for a pure extern includes the choice of returning or faulting, the fault
+  message, and the values left behind exclusive borrows.
 - **[E-Host]** If the host yields an alternative outside the contract, a payload
   of the wrong type, a value behind an argument that is of the wrong type, that
   changes what an argument of kind `must` refers to, or that stands behind an
@@ -806,9 +817,10 @@ do: the activation that started a run waits at its `run` decision.
   allowance checked first: if the root is cancelled and `f` is cancellable,
   the root is `done(cancelled)` at once, the host is not asked, and the
   arguments given by value are released as [E-Unwind] releases them;
-  otherwise the host starts the operation. When the host completes it, the
-  root is `done(a, v̄′)`. When the root becomes cancelled while it waits and
-  `f` is cancellable, the host withdraws the operation, its arguments given by
+  otherwise the host starts the operation. A normal completion leaves the
+  root `done(a, v̄′)`. A host fault ends that run and reaches its caller at
+  the `run` decision in the same turn. When the root becomes cancelled while
+  it waits and `f` is cancellable, the host withdraws the operation, its arguments given by
   value are released in the same way, and the root is `done(cancelled)`.
 - **[E-Turn]** When no task of the innermost run has the turn, the host gives
   it to a task of that run that is `ready`. That task runs until it awaits,
@@ -828,9 +840,11 @@ do: the activation that started a run waits at its `run` decision.
   the arguments given by value are released as [E-Unwind] releases them, and
   the task gives up its turn and is `ready`. Otherwise the host starts the
   operation and the task is `waiting`. The host later completes it as in
-  [E-Extern]: the decision completes, its payload names are bound in the task's
-  scope, and the task is `ready`. If the task becomes cancelled while it waits
-  and `f` is cancellable, the host withdraws the operation and the task is
+  [E-Extern]. On a normal completion the payload names are bound in the
+  task's scope and the task is `ready`. On a fault completion the task is
+  `ready` with the fault pending at the await. When chosen it enters
+  [E-Unwind] before executing another statement. If the task becomes cancelled
+  while it waits and `f` is cancellable, the host withdraws the operation and the task is
   `ready` with `cancelled`. An operation that is withdrawn, here or by
   [E-Stop], has no completion and no event, and the arguments it was given by
   value are released as [E-Unwind] releases them.
@@ -1638,6 +1652,11 @@ them on 24 November 2026 and took the recommendation in each case.
 | RT1 | May `run` start an `extern async control` directly, and what happens to the arguments it was given by value when that run is cancelled? | **Yes, with a rule** ([E-Run], [TK4]). The root of such a run has no activation and waits for the operation as an awaiting task does; a cancelled root takes `cancelled` and its arguments given by value are released. Where the extern control is cancellable, those arguments have fault-releasable types. Synchronous code calls one host operation without a wrapper. The other choice was to admit only defined controls to `run`. |
 | RT3 | What happens at a `spawn` that would take `count` past `usize.max`, and at a `push` or an `insert` that would take `len` past it? | **The execution ends `exhausted`** ([E-Exhaust]). It is not stuck and not a fault: nothing is released and no contingency runs, as a process that runs out of storage is stopped. The host may end any step that makes a value so, which is how memory exhaustion is written. No program changes. The other choices were a proof obligation at every such step, which asks an invariant of every loop that grows a collection or a set, and a fault, which asks a permission of every control that cannot prove the bound. |
 
+On 28 November 2026 the author chose to let an extern declared `faults`
+deliver a Villanelle fault into its caller. It keeps responsibility for its
+by-value inputs. Exclusive writes remain visible, and an effectful call
+records the fault before the caller unwinds.
+
 ## 12. Changes after acceptance
 
 The author accepted this document on 20 November 2026. What changed afterwards,
@@ -1676,3 +1695,4 @@ and what asked for it:
 | 24 November 2026 | [E-Exhaust] (section 6.6): a step that makes a value or a task may end the execution with the final result `exhausted`, and does where a length or a count would pass `usize.max`. [E-Spawn], [TK6], sections 6.10 and 6.11, Theorem 2 and [R7] refer to it. | The same review (RT3) and the author's choice of 24 November (section 11). A loop that spawns without an await could give a set `usize.max + 1` members, and [TK6] and [A3] then had no valuation on a reachable history; `push` and `insert` had the same gap for `len`, and the prelude said only that memory exhaustion is not an outcome. |
 | 24 November 2026 | Theorem 4 is about decisions on controls that are not `async`, says why `await f` and `run f` are not expanded, and leaves out a decision in an `async` control on a control whose body contains `run`. | The same review (RT4). Putting the body of an awaited control in place drops the turn that [E-Await] gives up before its first statement, so a member that would have run first runs later, which is a different trace. The last exception was found by the test of the expansion of slice 4: the crate put the body of a synchronous control that runs an async one into the async control that called it, and [W10] refused the result. |
 | 25 November 2026 | [TK4] asks fault-releasable payloads of an `extern async control` where a task awaits it, and no longer where a `run` starts it. | The checker of slice 4. The root of a run of an extern control has no activation, and the `run` decision completes in a control that is not `async`, which is never stopped ([E-Run], section 6.12): no task holds the payload. The rule asked it of every `extern async control`, also of one that only synchronous code runs. |
+| 28 November 2026 | [E-Extern] admits a fault completion with exclusive writes and a fault event. [E-Run] and [E-AwaitHost] deliver the fault at the waiting call. | The direct host run in RB9 exposed a missing case in the host relation. The author chose fault propagation for externs declared `faults` (section 11). |

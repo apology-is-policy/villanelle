@@ -29,7 +29,7 @@ mod root_cancel;
 mod tasks;
 
 use crate::erased;
-use crate::host::Answer;
+use crate::host::{Answer, Completion};
 use crate::int::Int;
 use crate::oracle::{Event, HOST_SCOPE, RuntimePlace, RuntimeStep, Value};
 use crate::script;
@@ -4808,16 +4808,9 @@ fn emit_operation_call(
 
     match op_kind {
         Operation::AwaitNext(_, _) => unreachable!("handled before allocating output slots"),
-        Operation::AwaitControl(cid) | Operation::RunControl(cid)
-            if is_extern_ctrl && program.controls[*cid].faults =>
-        {
-            let kind = if matches!(op_kind, Operation::RunControl(_)) {
-                "run"
-            } else {
-                "await"
-            };
+        Operation::AwaitControl(cid) if is_extern_ctrl && program.controls[*cid].faults => {
             return Err(format!(
-                "the native backend does not yet support a faulting host {kind} of `{}`",
+                "the native backend does not yet support a faulting host await of `{}`",
                 program.controls[*cid].name
             ));
         }
@@ -7106,12 +7099,6 @@ scripted:
             let _ = writeln!(ext_code, "ans_{idx}:");
             let _ = writeln!(ext_code, "  %npos_{idx} = add i64 %pos, 1");
             let _ = writeln!(ext_code, "  store i64 %npos_{idx}, ptr @script_pos");
-            let alt_idx = control
-                .contract
-                .iter()
-                .position(|a| a.name == ans.alternative)
-                .expect("known alternative");
-            let alt = &control.contract[alt_idx];
             // The event holds the arguments as they were at the call, so
             // they are written out before the host writes behind any.
             if !pure {
@@ -7200,76 +7187,127 @@ scripted:
                 let _ = writeln!(ext_code, "  %hwv_{id} = load {ll}, ptr %hwn_{id}");
                 let _ = writeln!(ext_code, "  store {ll} %hwv_{id}, ptr {behind}");
             }
-            for (fi, (val, field)) in ans.payload.iter().zip(&alt.fields).enumerate() {
-                if field.ty == Type::Bool {
-                    let b = matches!(val, Value::Bool(true));
-                    let _ = writeln!(
-                        ext_code,
-                        "  store i8 {}, ptr %out_{alt_idx}_{fi}",
-                        i32::from(b)
-                    );
-                } else {
+            let tag = match &ans.completion {
+                Completion::Fault(message) => {
+                    if !control.faults {
+                        return Err(format!(
+                            "scripted fault for nonfaulting host control `{}`",
+                            control.name
+                        ));
+                    }
                     emit_harness_value_into(
                         &mut ext_code,
                         program,
                         &mut reg,
-                        val,
-                        &field.ty,
-                        &format!("%out_{alt_idx}_{fi}"),
+                        &Value::String(message.clone()),
+                        &Type::String,
+                        "%out_fault",
                         &mut h_tmp,
-                        Refs::Within(control),
+                        Refs::Nothing,
                     );
-                }
-            }
-            if !pure {
-                let alt_g = reg.str_literal_map[alt.name.as_bytes()].clone();
-                let _ = writeln!(
-                    ext_code,
-                    "  call i32 (ptr, ...) @printf(ptr @h_fmt_ev_mid, ptr {alt_g})"
-                );
-                let _ = writeln!(ext_code, "  call i32 @putchar(i32 32)");
-                let _ = writeln!(ext_code, "  call i32 @putchar(i32 123)");
-                for (fi, field) in alt.fields.iter().enumerate() {
-                    if fi > 0 {
-                        let _ = writeln!(ext_code, "  call i32 (ptr, ...) @printf(ptr @h_fmt_sep)");
+                    if !pure {
+                        let label = reg.intern_bytes(b"fault ");
+                        let _ = writeln!(
+                            ext_code,
+                            "  call i32 (ptr, ...) @printf(ptr @h_fmt_ev_mid, ptr {label})"
+                        );
+                        ext_code.push_str("  call void @vn2_print_escaped_str(ptr %out_fault)\n  call i32 @putchar(i32 10)\n");
                     }
-                    let ftid = reg.type_ids[field.ty.deref_type()];
-                    let out_p = format!("%out_{alt_idx}_{fi}");
-                    if matches!(field.ty, Type::Ref(_, _)) {
-                        let id = next_tmp(&mut h_tmp);
-                        let _ = writeln!(ext_code, "  %fvp_{id} = load ptr, ptr {out_p}");
-                        if *field.ty.deref_type() == Type::Bool {
-                            let _ = writeln!(ext_code, "  %fb8_{id} = load i8, ptr %fvp_{id}");
-                            let _ = writeln!(ext_code, "  %fb_{id} = icmp ne i8 %fb8_{id}, 0");
-                            let _ = writeln!(ext_code, "  %fbt_{id} = alloca i1");
-                            let _ = writeln!(ext_code, "  store i1 %fb_{id}, ptr %fbt_{id}");
+                    -1
+                }
+                Completion::Returned {
+                    alternative,
+                    payload,
+                } => {
+                    let alt_idx = control
+                        .contract
+                        .iter()
+                        .position(|a| a.name == *alternative)
+                        .expect("known alternative");
+                    let alt = &control.contract[alt_idx];
+                    for (fi, (val, field)) in payload.iter().zip(&alt.fields).enumerate() {
+                        if field.ty == Type::Bool {
+                            let b = matches!(val, Value::Bool(true));
                             let _ = writeln!(
                                 ext_code,
-                                "  call void @vn2_print_val_{ftid}(ptr %fbt_{id})"
+                                "  store i8 {}, ptr %out_{alt_idx}_{fi}",
+                                i32::from(b)
                             );
                         } else {
-                            let _ = writeln!(
-                                ext_code,
-                                "  call void @vn2_print_val_{ftid}(ptr %fvp_{id})"
+                            emit_harness_value_into(
+                                &mut ext_code,
+                                program,
+                                &mut reg,
+                                val,
+                                &field.ty,
+                                &format!("%out_{alt_idx}_{fi}"),
+                                &mut h_tmp,
+                                Refs::Within(control),
                             );
                         }
-                    } else if field.ty == Type::Bool {
-                        let id = h_tmp;
-                        h_tmp += 1;
-                        let _ = writeln!(ext_code, "  %fb8_{id} = load i8, ptr {out_p}");
-                        let _ = writeln!(ext_code, "  %fb_{id} = icmp ne i8 %fb8_{id}, 0");
-                        let _ = writeln!(ext_code, "  %fbt_{id} = alloca i1");
-                        let _ = writeln!(ext_code, "  store i1 %fb_{id}, ptr %fbt_{id}");
-                        let _ =
-                            writeln!(ext_code, "  call void @vn2_print_val_{ftid}(ptr %fbt_{id})");
-                    } else {
-                        let _ =
-                            writeln!(ext_code, "  call void @vn2_print_val_{ftid}(ptr {out_p})");
                     }
+                    if !pure {
+                        let alt_g = reg.str_literal_map[alt.name.as_bytes()].clone();
+                        let _ = writeln!(
+                            ext_code,
+                            "  call i32 (ptr, ...) @printf(ptr @h_fmt_ev_mid, ptr {alt_g})"
+                        );
+                        let _ = writeln!(ext_code, "  call i32 @putchar(i32 32)");
+                        let _ = writeln!(ext_code, "  call i32 @putchar(i32 123)");
+                        for (fi, field) in alt.fields.iter().enumerate() {
+                            if fi > 0 {
+                                let _ = writeln!(
+                                    ext_code,
+                                    "  call i32 (ptr, ...) @printf(ptr @h_fmt_sep)"
+                                );
+                            }
+                            let ftid = reg.type_ids[field.ty.deref_type()];
+                            let out_p = format!("%out_{alt_idx}_{fi}");
+                            if matches!(field.ty, Type::Ref(_, _)) {
+                                let id = next_tmp(&mut h_tmp);
+                                let _ = writeln!(ext_code, "  %fvp_{id} = load ptr, ptr {out_p}");
+                                if *field.ty.deref_type() == Type::Bool {
+                                    let _ =
+                                        writeln!(ext_code, "  %fb8_{id} = load i8, ptr %fvp_{id}");
+                                    let _ =
+                                        writeln!(ext_code, "  %fb_{id} = icmp ne i8 %fb8_{id}, 0");
+                                    let _ = writeln!(ext_code, "  %fbt_{id} = alloca i1");
+                                    let _ =
+                                        writeln!(ext_code, "  store i1 %fb_{id}, ptr %fbt_{id}");
+                                    let _ = writeln!(
+                                        ext_code,
+                                        "  call void @vn2_print_val_{ftid}(ptr %fbt_{id})"
+                                    );
+                                } else {
+                                    let _ = writeln!(
+                                        ext_code,
+                                        "  call void @vn2_print_val_{ftid}(ptr %fvp_{id})"
+                                    );
+                                }
+                            } else if field.ty == Type::Bool {
+                                let id = h_tmp;
+                                h_tmp += 1;
+                                let _ = writeln!(ext_code, "  %fb8_{id} = load i8, ptr {out_p}");
+                                let _ = writeln!(ext_code, "  %fb_{id} = icmp ne i8 %fb8_{id}, 0");
+                                let _ = writeln!(ext_code, "  %fbt_{id} = alloca i1");
+                                let _ = writeln!(ext_code, "  store i1 %fb_{id}, ptr %fbt_{id}");
+                                let _ = writeln!(
+                                    ext_code,
+                                    "  call void @vn2_print_val_{ftid}(ptr %fbt_{id})"
+                                );
+                            } else {
+                                let _ = writeln!(
+                                    ext_code,
+                                    "  call void @vn2_print_val_{ftid}(ptr {out_p})"
+                                );
+                            }
+                        }
+                        let _ = writeln!(ext_code, "  call i32 @putchar(i32 125)");
+                        let _ = writeln!(ext_code, "  call i32 @putchar(i32 10)");
+                    }
+                    alt_idx as i32
                 }
-                let _ = writeln!(ext_code, "  call i32 @putchar(i32 125)");
-                let _ = writeln!(ext_code, "  call i32 @putchar(i32 10)");
-            }
+            };
             // A host has consumed what it was given by value.
             for (pi, param) in control.parameters.iter().enumerate() {
                 if needs_drop(program, &param.ty) {
@@ -7278,7 +7316,7 @@ scripted:
                     let _ = writeln!(ext_code, "  call fastcc void @vn2_drop_{ptid}(ptr %p{pi})");
                 }
             }
-            let _ = writeln!(ext_code, "  ret i32 {alt_idx}");
+            let _ = writeln!(ext_code, "  ret i32 {tag}");
         }
         let _ = writeln!(ext_code, "}}\n");
     }

@@ -1,0 +1,48 @@
+extern resource lease on fault release
+extern control acquire(id : u32) ■ { ok {l : lease} } uses io
+extern control close(l : lease) ■ { ok {} } uses io
+contingent extern control note(m : &string) ■ { ok {} } uses io
+extern async control send(l : lease, xs : [u32], cell : &~u32)
+    ■ { ok {code : u32} │ cancelled {} } faults uses io
+
+control bridge(cell : &~u32) ■ { ok {v : u32} } faults uses io
+    ⊤ ▷ a : Δ acquire(1) ▸ ok {kept}
+    ⊤ ▷ b : Δ acquire(2) ▸ ok {sent}
+    b.ok ▷ reply := capture run send(▾sent, [3, 5], cell)
+    ⊤ ▷ c : Δ close(▾kept) ▸ ok {}
+    c.ok ▷ h : Δ outcome(reply) ▸ ok {v} │ cancelled {}
+    h.ok ▷ ■ ok {v}
+    h.cancelled ▷ ■ ok {0}
+
+control catch_fault() ■ { done {v : u32} } uses io
+    ⊤ ▷ ~cell : u32 := 7
+    ⊤ ▷ lp : ↻ attempt(~retried : bool := false) {
+            ⊤ ▷ t : ? retried
+            t.true ▷ □ finished {cell}
+            ⊤ ▷ retried ← true
+            ⊤ ▷ b : boundary {
+                    ⊤ ▷ d : Δ bridge(&~cell) ▸ ok {v}
+                    d.ok ▷ □ finished {v}
+                } contingency (m : string) {
+                    ⊤ ▷ a : Δ note(&m) ▸ ok {}
+                    a.ok ▷ recover ↑ attempt
+                }
+            ⊤ ▷ ⊥
+        } ▸ finished {result}
+    ⊤ ▷ ■ done {result}
+
+control escape() ■ { done {v : u32} } faults uses io
+    ⊤ ▷ ~cell : u32 := 7
+    ⊤ ▷ d : Δ bridge(&~cell) ▸ ok {v}
+    d.ok ▷ ■ done {v}
+
+// A return selects the alternative and the caller closes its own lease.
+//! run catch_fault() with [acquire -> ok {lease#1}; acquire -> ok {lease#2}; send -> ok {37} ~cell <- 12; close -> ok] => done done {37} trace [acquire(1) -> ok {lease#1}; acquire(2) -> ok {lease#2}; send(lease#2, [3, 5], 7) -> ok {37}; close(lease#1) -> ok]
+
+// A fault commits the write before the contingency. Only the caller's lease unwinds.
+//! run catch_fault() with [acquire -> ok {lease#1}; acquire -> ok {lease#2}; send -> fault "lost" ~cell <- 12; note -> ok] => done done {12} trace [acquire(1) -> ok {lease#1}; acquire(2) -> ok {lease#2}; send(lease#2, [3, 5], 7) -> fault "lost"; lease.release(lease#1) -> released; note("lost") -> ok]
+//! run escape() with [acquire -> ok {lease#1}; acquire -> ok {lease#2}; send -> fault "peer \"gone\""] => faulted "peer \"gone\"" trace [acquire(1) -> ok {lease#1}; acquire(2) -> ok {lease#2}; send(lease#2, [3, 5], 7) -> fault "peer \"gone\""; lease.release(lease#1) -> released]
+
+// Withdrawal releases the transferred lease. A host-selected cancelled completes it.
+//! run catch_fault() with [acquire -> ok {lease#1}; acquire -> ok {lease#2}; close -> ok] cancel_at 1 => done done {0} trace [acquire(1) -> ok {lease#1}; acquire(2) -> ok {lease#2}; lease.release(lease#2) -> released; close(lease#1) -> ok]
+//! run catch_fault() with [acquire -> ok {lease#1}; acquire -> ok {lease#2}; send -> cancelled ~cell <- 13; close -> ok] => done done {0} trace [acquire(1) -> ok {lease#1}; acquire(2) -> ok {lease#2}; send(lease#2, [3, 5], 7) -> cancelled; close(lease#1) -> ok]

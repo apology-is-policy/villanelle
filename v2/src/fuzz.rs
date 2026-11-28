@@ -26,7 +26,7 @@ use crate::counts::{self, Counts};
 use crate::differential::{Verdict, compare};
 use crate::erased;
 use crate::generate::{Coverage, entry_runs, valid, valid_borrows, valid_data};
-use crate::host::{Arithmetic, Seeded};
+use crate::host::{Arithmetic, Completion, Seeded};
 use crate::mutate::{Kind, mutate};
 use crate::oracle::{self, Config, End, HOST_SCOPE, RuntimeStep, Value};
 use crate::rng::{Rng, mix};
@@ -202,16 +202,19 @@ fn checked(report: &mut Report, source: &str, seconds: u64) -> Checked {
 fn answers(answers: &[(String, crate::host::Answer)]) -> String {
     let shown: Vec<String> = answers
         .iter()
-        .map(|(control, answer)| {
-            if answer.payload.is_empty() {
-                format!("{control} -> {}", answer.alternative)
-            } else {
-                format!(
-                    "{control} -> {} {{{}}}",
-                    answer.alternative,
-                    show(&answer.payload)
-                )
-            }
+        .map(|(control, answer)| match &answer.completion {
+            Completion::Returned {
+                alternative,
+                payload,
+            } if payload.is_empty() => format!("{control} -> {alternative}"),
+            Completion::Returned {
+                alternative,
+                payload,
+            } => format!("{control} -> {alternative} {{{}}}", show(payload)),
+            Completion::Fault(message) => format!(
+                "{control} -> fault \"{}\"",
+                crate::syntax::escape_string(message)
+            ),
         })
         .collect();
     shown.join("; ")
@@ -320,8 +323,10 @@ pub fn one(seed: u64, options: &Options, report: &mut Report) {
                 let outcome = compare(&program, &entry, arguments.clone(), &mut host, &config);
                 report.runs += 1;
                 for (_, answer) in &outcome.answers {
-                    for value in &answer.payload {
-                        note_places(value, &mut report.host_places);
+                    if let Completion::Returned { payload, .. } = &answer.completion {
+                        for value in payload {
+                            note_places(value, &mut report.host_places);
+                        }
                     }
                 }
                 report.rules.extend(outcome.oracle.rules.keys().copied());

@@ -11,6 +11,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const HOST_FAULT_RUN: &str = include_str!("slice4/checked_host_fault_run.core");
 const SET_CANCEL: &str = include_str!("slice4/checked_set_cancel.core");
 const MEMBER_CANCEL: &str = include_str!("slice4/checked_member_cancel.core");
 const OWNER_CANCEL: &str = include_str!("slice4/checked_owner_cancel.core");
@@ -122,6 +123,39 @@ fn member_cancel_resumes_the_bound_activation_on_a_ready_turn() {
         &["E-Spawn"],
         &[2, 2, 2, 2, 1, 1, 1, 1, 2],
         18,
+    );
+}
+
+#[test]
+fn host_fault_run_matches_writes_releases_and_the_boundary_message() {
+    // The host consumes the vector in four completions. Withdrawal releases the fifth.
+    compare_native_runs(HOST_FAULT_RUN, &["E-Run"], &[1; 5], 5);
+}
+
+#[test]
+fn host_fault_run_through_the_c_abi_transfers_an_owned_message() {
+    let (_, runs) = script::native_runs(HOST_FAULT_RUN).unwrap();
+    compare_c_host_abi(
+        HOST_FAULT_RUN,
+        "host_fault_run",
+        include_str!("host_fault_run.c"),
+        false,
+        |program, config| {
+            let mut expected = Vec::new();
+            for spec in &runs {
+                let result = compare(
+                    program,
+                    &spec.entry,
+                    spec.arguments.clone(),
+                    &mut scheduled_host(spec),
+                    config,
+                );
+                assert_eq!(result.verdict, Verdict::Same);
+                expected.extend(result.oracle.trace.iter().map(ToString::to_string));
+                expected.push(result.oracle.end.to_string());
+            }
+            expected
+        },
     );
 }
 
@@ -1117,44 +1151,41 @@ async control pool() ■ { ok {} }
         &[1],
         0,
     );
-    // Put supported entries first. Both emitters compile the whole module.
-    for (decls, reason) in [
-        (
-            r#"
+    compare_native_runs(
+        r#"
 extern async control tick() ■ { ok {} } faults uses io
 control bridge2() ■ { ok {} } faults uses io
     ⊤ ▷ r := capture run tick()
     ⊤ ▷ d : Δ outcome(r) ▸ ok {}
     d.ok ▷ ■ ok {}
 //! run bridge2() with [tick -> ok] => done ok trace [tick() -> ok]
+//! run bridge2() with [tick -> fault "offline"] => faulted "offline" trace [tick() -> fault "offline"]
 "#,
-            "faulting host run of `tick`",
-        ),
-        (
-            r#"
+        &["E-Run"],
+        &[1, 1],
+        0,
+    );
+    // Both emitters check the full module, including the unsupported await.
+    let decls = r#"
 extern async control tick() ■ { ok {} } faults uses io
 async control waits() ■ { ok {} } faults uses io
     ⊤ ▷ r : Δ await tick() ▸ ok {}
     r.ok ▷ ■ ok {}
 //! run waits() with [tick -> ok] => done ok trace [tick() -> ok]
-"#,
-            "faulting host await of `tick`",
-        ),
-    ] {
-        let source = format!("{ROOTS}\n{decls}");
-        let (program, specs) = script::native_runs(&source).unwrap();
-        check::check(&program).unwrap().revalidate().unwrap();
-        let report = script::check(&source);
-        assert!(report.failures.is_empty(), "{:?}", report.failures);
-        assert_eq!((report.runs, report.compared), (7, 7));
-        let error = emit_llvm(&program, 64).unwrap_err();
-        assert!(error.contains(reason), "{error}");
-        // Even a batch asking only for a supported entry sees the refusal.
-        assert_eq!(
-            run_native_counted(&program, &specs[..1], 64, 0).unwrap_err(),
-            error
-        );
-    }
+"#;
+    let source = format!("{ROOTS}\n{decls}");
+    let (program, specs) = script::native_runs(&source).unwrap();
+    check::check(&program).unwrap().revalidate().unwrap();
+    let report = script::check(&source);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!((report.runs, report.compared), (7, 7));
+    let error = emit_llvm(&program, 64).unwrap_err();
+    assert!(error.contains("faulting host await of `tick`"), "{error}");
+    // Even a batch asking only for a supported entry sees the refusal.
+    assert_eq!(
+        run_native_counted(&program, &specs[..1], 64, 0).unwrap_err(),
+        error
+    );
 }
 
 #[test]
@@ -1259,11 +1290,7 @@ fn member_host_wait_offers_pending_operations_in_spawn_order() {
             } else {
                 ("missing", vec![])
             };
-            Ok(Answer {
-                alternative: alternative.into(),
-                payload,
-                writes: vec![],
-            })
+            Ok(Answer::returned(alternative.into(), payload))
         }
     }
     const DRIVER: &str = r#"
@@ -1387,14 +1414,13 @@ fn compare_fetch_host(source: &str, name: &str, start_turns: &[u32], expected: &
                 panic!("expected fetch arguments")
             };
             self.0.push(format!("complete {key} {cached}"));
-            Ok(Answer {
-                alternative: "found".into(),
-                payload: vec![
+            Ok(Answer::returned(
+                "found".into(),
+                vec![
                     Value::Int(Int::from_u64(if *cached { 8 } else { 37 })),
                     Value::Bool(true),
                 ],
-                writes: vec![],
-            })
+            ))
         }
 
         fn pick_turn(&mut self, ready: usize) -> usize {
@@ -1489,11 +1515,10 @@ impl Host for TurnHost {
             panic!("bad sample arguments {args:?}")
         };
         self.calls.push(format!("sample {mark} at {}", self.turns));
-        Ok(Answer {
-            alternative: "ok".into(),
-            payload: vec![Value::Int(Int::from_u64(self.turns))],
-            writes: Vec::new(),
-        })
+        Ok(Answer::returned(
+            "ok".into(),
+            vec![Value::Int(Int::from_u64(self.turns))],
+        ))
     }
 }
 
@@ -1971,6 +1996,16 @@ fn compare_c_host(
     driver: &str,
     observations: impl Fn(&Program, &Config) -> Vec<String>,
 ) {
+    compare_c_host_abi(source, name, driver, true, observations);
+}
+
+fn compare_c_host_abi(
+    source: &str,
+    name: &str,
+    driver: &str,
+    ready_callback: bool,
+    observations: impl Fn(&Program, &Config) -> Vec<String>,
+) {
     let program = load(source).unwrap();
     let dir = std::env::temp_dir().join(format!("vn2_{name}_{}", std::process::id()));
     fs::create_dir(&dir).unwrap();
@@ -1979,7 +2014,10 @@ fn compare_c_host(
         let expected = observations(&program, &Config::with_usize_bits(bits));
         fs::write(dir.join("module.ll"), emit_llvm(&program, bits).unwrap()).unwrap();
         let header = emit_c_header(&program, bits);
-        assert!(header.contains("uint64_t vn2_pick_turn(uint64_t ready_count);"));
+        assert_eq!(
+            header.contains("uint64_t vn2_pick_turn(uint64_t ready_count);"),
+            ready_callback
+        );
         fs::write(dir.join("module.h"), header).unwrap();
         for optimization in ["-O0", "-O2"] {
             let build = Command::new("clang")

@@ -238,6 +238,22 @@ fn held_against_the_oracle(
 }
 
 #[test]
+fn a_host_fault_reaches_the_run_site_under_f1() {
+    let caller = r#"
+extern async control remote() ■ { ok {} } faults uses io
+control run_it() ■ { ok {} } faults uses io
+    ⊤ ▷ d : Δ run remote() ▸ ok {}
+    d.ok ▷ ■ ok {}
+//! run run_it() with [remote -> fault "offline"] => faulted "offline" trace [remote() -> fault "offline"]
+"#;
+    done_and_accepted("F1", caller);
+    let forbidden = caller
+        .replace("run_it() ■ { ok {} } faults", "run_it() ■ { ok {} }")
+        .replace("=> faulted \"offline\"", "=> stuck X8 E-Unwind");
+    stuck_and_rejected("F1", &forbidden);
+}
+
+#[test]
 fn the_rule_files_of_the_tasks_are_rejected_exactly_where_a_run_is_stuck() {
     let counts = held_against_the_oracle(&RULE_FILES, &ASKS_MORE, &STUCK_BY_ANOTHER);
     assert_eq!(counts, (18, 134));

@@ -1,9 +1,9 @@
 //! Hosts for the oracle.
 //!
-//! An extern control is a relation of the host: given the arguments it
-//! yields an alternative and a payload ([E-Extern]). The oracle checks every
-//! answer against the contract ([E-Host]), so a host here may be wrong; a
-//! wrong answer ends the run in `violation`, not in a stuck state.
+//! A host returns an alternative and payload or delivers a declared fault
+//! ([E-Extern]). Either completion can write through exclusive borrows.
+//! The oracle checks each answer against the contract ([E-Host]). An invalid
+//! answer ends the run in `violation`.
 
 use crate::int::Int;
 use crate::oracle::{Config, RuntimeStep, Value, signature_holds};
@@ -12,13 +12,33 @@ use crate::typed::{self, BorrowMode, Comparison, Control, Expr, IntType, Program
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Completion<T> {
+    Returned {
+        alternative: String,
+        payload: Vec<T>,
+    },
+    Fault(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Answer {
-    pub alternative: String,
-    pub payload: Vec<Value>,
+    pub completion: Completion<Value>,
     /// The values that the host leaves behind arguments it was lent
     /// exclusively, by the position of the argument ([E-Extern]). An
     /// argument that is not named keeps what it holds.
     pub writes: Vec<(usize, Value)>,
+}
+
+impl Answer {
+    pub fn returned(alternative: String, payload: Vec<Value>) -> Self {
+        Self {
+            completion: Completion::Returned {
+                alternative,
+                payload,
+            },
+            writes: Vec::new(),
+        }
+    }
 }
 
 pub trait Host {
@@ -204,17 +224,9 @@ fn checked(
     let result = Value::Int(result);
     Some(Ok(
         if matches!(field.ty, Type::Int(_)) && config.fits(&result, &field.ty) {
-            Answer {
-                alternative: fits.name.clone(),
-                payload: vec![result],
-                writes: Vec::new(),
-            }
+            Answer::returned(fits.name.clone(), vec![result])
         } else {
-            Answer {
-                alternative: fails.name.clone(),
-                payload: Vec::new(),
-                writes: Vec::new(),
-            }
+            Answer::returned(fails.name.clone(), Vec::new())
         },
     ))
 }
@@ -1195,8 +1207,10 @@ impl Host for Seeded<'_> {
             if valid {
                 self.next_res = res_counter;
                 return Ok(Answer {
-                    alternative: alternative.name.clone(),
-                    payload,
+                    completion: Completion::Returned {
+                        alternative: alternative.name.clone(),
+                        payload,
+                    },
                     writes,
                 });
             }

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use villanelle_v2::codegen::{NativeRunSpec, emit_c_header, emit_llvm, run_native_batch};
-use villanelle_v2::host::{Answer, Script};
+use villanelle_v2::host::{Answer, Completion, Script};
 use villanelle_v2::int::Int;
 use villanelle_v2::oracle::{Config, End, RuntimeStep, Value, run};
 use villanelle_v2::syntax::{Command as SynCommand, Declaration, Statement as SynStatement};
@@ -180,11 +180,7 @@ fn u32_val(v: u32) -> Value {
 }
 
 fn ans(alt: &str, payload: Vec<Value>) -> Answer {
-    Answer {
-        alternative: alt.to_string(),
-        payload,
-        writes: Vec::new(),
-    }
+    Answer::returned(alt.to_string(), payload)
 }
 
 #[test]
@@ -925,7 +921,7 @@ fn hosts_that_lend_from_and_write_behind_arguments_run_natively_ro6_ro11() {
             .filter(|spec| {
                 spec.answers
                     .iter()
-                    .any(|(_, a)| a.payload.iter().any(names_a_place))
+                    .any(|(_, a)| matches!(&a.completion, Completion::Returned { payload, .. } if payload.iter().any(names_a_place)))
             })
             .count();
         ran.push((name, specs.len(), writes, lends));

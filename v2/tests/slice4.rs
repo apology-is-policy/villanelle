@@ -556,11 +556,7 @@ control entry(x : u32) ■ { done {} │ cancelled {} } uses io.net
     let mut host = Scheduled::new(Script {
         answers: VecDeque::from([(
             "positive_io".to_string(),
-            Answer {
-                alternative: "done".to_string(),
-                payload: Vec::new(),
-                writes: Vec::new(),
-            },
+            Answer::returned("done".to_string(), Vec::new()),
         )]),
     });
     host.cancel_at_turn = Some(1);
@@ -578,6 +574,32 @@ control entry(x : u32) ■ { done {} │ cancelled {} } uses io.net
         }
         other => panic!("expected X7 E-Extern before cancel shortcut, got {other}"),
     }
+}
+
+#[test]
+fn an_awaited_host_fault_requires_a_ready_choice_before_unwinding() {
+    let program = villanelle_v2::load(include_str!("slice4/host_fault_rules.core")).unwrap();
+    let mut host = Scheduled::new(Script {
+        answers: VecDeque::from([(
+            "io_step".into(),
+            Answer {
+                completion: villanelle_v2::host::Completion::Fault("lost".into()),
+                writes: vec![],
+            },
+        )]),
+    });
+    host.waiting.push_back(0);
+    host.turns.push_back(0);
+    let result = villanelle_v2::differential::compare(
+        &program,
+        "awaiting",
+        vec![],
+        &mut host,
+        &Config::default(),
+    );
+    assert_eq!(result.verdict, villanelle_v2::differential::Verdict::Same);
+    assert!(matches!(result.oracle.end, End::Faulted(ref message) if message == "lost"));
+    assert!(host.waiting.is_empty() && host.turns.is_empty());
 }
 
 /// Theorem 4 covers plain decisions only (finding RT4): `await f` keeps the

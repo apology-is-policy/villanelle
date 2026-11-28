@@ -4,10 +4,10 @@ Status: **under requalification**, 23 November 2026. Phases 2, 3 and 4 of
 the [redesign plan](../redesign-plan.md). The crate holds code for slices 1 to
 3 through oracle, erased interpreter, checker, call expansion and typed LLVM
 IR backend. Slice 4 has an oracle, a checker, and native code for defined
-roots, direct runs of nonfaulting host operations, and
+roots, direct runs of host operations including fault completions, and
 task sets whose owners and members can yield at a defined await. Roots and members can
 wait for the host in their own activations or in a callee (sections 18.4 to
-18.27). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
+18.28). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
 lists the defects. Sections 8 to 18 describe what the code does and which
@@ -194,10 +194,11 @@ that is stuck.
 
 ## 5. Hosts
 
-An extern control is a step of the host: given the arguments, an alternative
-and a payload ([E-Extern]). The oracle checks each answer against the
-contract ([E-Host]): the alternative is listed, the payload has the types of
-its fields, the condition of the alternative is true, and a control without
+In a host step ([E-Extern]), the host can return an alternative and a payload
+or deliver a fault message if the extern declares `faults`. The oracle checks
+each answer against the contract ([E-Host]). On a return it checks the
+alternative, the field types and the condition of the alternative. On either
+completion it checks writes through exclusive borrows. A control without
 an effect gives the same answer to the same arguments. An answer that fails
 ends the run in `violation`. That is a fault of the trusted host and not a
 stuck state. A step of a control with an effect is recorded as an event.
@@ -269,8 +270,9 @@ among those that are ready, in the order of the run's tasks), `waiting [i,
 completes among those that wait), `cancel_at N` (the host sets the flag of
 the root of the innermost run at its `N`th turn), and `capacity N` (the
 largest length of a collection and count of a set that a step may make,
-[E-Exhaust]). In a scripted answer, `~x <- v` after the alternative and its payload is the
-value that the host leaves behind its parameter `x`. After
+[E-Exhaust]). A script can supply `fault "message"` to an extern that
+declares `faults`. After either completion, `~x <- v` gives the value that
+the host leaves behind its parameter `x`. After
 `=>` comes the expected end: `done` with the alternative and its payload,
 `faulted` with the message, `terminated` with the status of `terminate n`,
 `stuck` with the state and the clause, `exhausted`, `violation`,
@@ -2849,6 +2851,29 @@ call, a sibling's later completion or withdrawal, and preservation of a result
 already delivered by the host. The Rust tests also run the Rails lease example
 and compare a nested run started by a cancelled member.
 
+### 18.28 Direct runs of faulting host operations, 28 November 2026
+
+In a host script, `send -> fault "lost" ~cell <- 12` supplies a fault
+message and an exclusive write. The event records the arguments at issue
+and the message. A direct `run` resumes its caller in the same turn.
+The caller's own live resources unwind before its contingency runs.
+A host that completes a call owns the arguments taken by value. When
+the host withdraws a pending request, the runtime releases those arguments.
+
+At the C interface, the completion callback fills the bound `out_fault`
+string and returns `VN2_FAULT`. An owned string transfers to the boundary
+or to the caller receiving an escaping fault. In the linked host test
+the message uses heap storage. A caller that receives it frees the buffer.
+
+From `v2/`, run `vn2 test tests/slice4/{checked_host_fault_run,host_fault_rules}.core`
+and `cargo test --test backend_slice4 host_fault_run`. The C host checks
+the request identity, the transferred lease and vector, the preserved
+caller result slot on a fault, and the order of release and recovery.
+`cargo test --test checker_slice4 a_host_fault` checks permission at the
+run site. `cargo test --test slice4 an_awaited_host_fault` checks both
+interpreters select the waiting task before it unwinds at an await.
+The native emitter still diagnoses faulting host awaits.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2860,7 +2885,7 @@ and compare a nested run started by a cancelled member.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs faulting host operations,
+- **Later work.** Slice 4 still needs faulting host awaits,
   member faults, capacity and generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).

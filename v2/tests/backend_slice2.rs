@@ -190,11 +190,7 @@ fn res_val(name: &str, id: u64) -> Value {
 }
 
 fn ans(alt: &str, payload: Vec<Value>) -> Answer {
-    Answer {
-        alternative: alt.to_string(),
-        payload,
-        writes: Vec::new(),
-    }
+    Answer::returned(alt.to_string(), payload)
 }
 
 #[test]

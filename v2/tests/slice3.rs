@@ -692,11 +692,10 @@ control caller()
             _args: &[Value],
             _cfg: &Config,
         ) -> Result<Answer, String> {
-            Ok(Answer {
-                alternative: "ok".to_string(),
-                payload: vec![Value::Int(Int::from_u64(7))],
-                writes: Vec::new(),
-            })
+            Ok(Answer::returned(
+                "ok".to_string(),
+                vec![Value::Int(Int::from_u64(7))],
+            ))
         }
     }
     let res1 = oracle::run(
@@ -720,15 +719,14 @@ control caller()
             _args: &[Value],
             _cfg: &Config,
         ) -> Result<Answer, String> {
-            Ok(Answer {
-                alternative: "ok".to_string(),
-                payload: vec![Value::Ref {
+            Ok(Answer::returned(
+                "ok".to_string(),
+                vec![Value::Ref {
                     mode: BorrowMode::Shared,
                     place: RuntimePlace::root(999, 0),
                     tag: 999,
                 }],
-                writes: Vec::new(),
-            })
+            ))
         }
     }
     let res2 = oracle::run(

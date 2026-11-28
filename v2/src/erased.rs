@@ -16,7 +16,7 @@
 //! - **[R5]** Under a fault, resources declared `on fault release` are released
 //!   under the same condition.
 
-use crate::host::Host;
+use crate::host::{Completion, Host};
 use crate::int::Int;
 use crate::oracle::{
     Config, Event, HOST_SCOPE, RuntimePlace, RuntimeStep, ScopeId, TaskSetId, Value, lent_within,
@@ -1117,7 +1117,14 @@ fn lend(arguments: &[Value], value: Value) -> Result<Value, String> {
     }
 }
 
+enum HostStep {
+    Returned(usize, Vec<Value>),
+    Fault(String),
+    Failed(String),
+}
+
 enum TaskState {
+    HostFault(String),
     Ready,
     WaitingHost {
         callee: ControlId,
@@ -1853,8 +1860,10 @@ impl<'a> Machine<'a> {
                     self.trace.push(Event {
                         control: format!("{name}.release"),
                         arguments: vec![value.clone()],
-                        alternative: "released".to_string(),
-                        payload: Vec::new(),
+                        completion: Completion::Returned {
+                            alternative: "released".to_string(),
+                            payload: Vec::new(),
+                        },
                     });
                 }
             }
@@ -1937,7 +1946,8 @@ impl<'a> Machine<'a> {
                     self.release_value_resources(v);
                 }
             }
-            TaskState::Ready
+            TaskState::HostFault(_)
+            | TaskState::Ready
             | TaskState::WaitingNext { .. }
             | TaskState::WaitingRun
             | TaskState::Stopped => {}
@@ -1975,12 +1985,16 @@ impl<'a> Machine<'a> {
         alternative: usize,
         payload: &[Value],
     ) -> Result<(), String> {
+        self.resume_run_caller(tid);
+        self.complete(alternative, payload)
+    }
+
+    fn resume_run_caller(&mut self, tid: usize) {
         let finished_run = self.runs.pop().expect("the run of an extern root");
         debug_assert_eq!(finished_run.root_task, tid);
         self.tasks[tid].state = TaskState::Stopped;
         let caller = finished_run.caller_task.expect("a run has a caller");
         self.activate_task(caller);
-        self.complete(alternative, payload)
     }
 
     fn withdraw_cancelled_host_waits(&mut self) -> Result<(), String> {
@@ -2450,8 +2464,10 @@ impl<'a> Machine<'a> {
                 self.trace.push(Event {
                     control: "emit".to_string(),
                     arguments: vec![text],
-                    alternative: "done".to_string(),
-                    payload: Vec::new(),
+                    completion: Completion::Returned {
+                        alternative: "done".to_string(),
+                        payload: Vec::new(),
+                    },
                 });
                 Ok((0, Vec::new()))
             }
@@ -2465,7 +2481,6 @@ impl<'a> Machine<'a> {
         arguments: &[Expr],
     ) -> Result<Option<Result<(usize, Vec<Value>), End>>, String> {
         let program = self.program;
-        let arith = self.arith;
         match op_kind {
             Operation::Control(callee_id) => {
                 let values = self.eval_operands(arguments)?;
@@ -2478,47 +2493,11 @@ impl<'a> Machine<'a> {
                 for v in &values {
                     concrete_args.push(self.deref_value(v)?);
                 }
-                let answer = match self.host.call(callee, &concrete_args, self.config) {
-                    Ok(answer) => answer,
-                    Err(detail) => return Ok(Some(Err(End::HostFailed(detail)))),
-                };
-                let Some(index) = callee
-                    .contract
-                    .iter()
-                    .position(|entry| entry.name == answer.alternative)
-                else {
-                    return Err(format!(
-                        "`{}` answered `{}`, which its contract does not list",
-                        callee.name, answer.alternative
-                    ));
-                };
-                self.host_writes(*callee_id, &values, &answer.writes)?;
-                let fields = &callee.contract[index].fields;
-                if answer.payload.len() != fields.len() {
-                    return Err(format!(
-                        "`{}` answered a payload of the wrong shape",
-                        callee.name
-                    ));
+                match self.host_completion(*callee_id, &values, concrete_args)? {
+                    HostStep::Returned(index, payload) => Ok(Some(Ok((index, payload)))),
+                    HostStep::Fault(message) => Ok(self.trigger_unwind(message)?.map(Err)),
+                    HostStep::Failed(detail) => Ok(Some(Err(End::HostFailed(detail)))),
                 }
-                let payload: Vec<Value> = answer
-                    .payload
-                    .iter()
-                    .zip(fields)
-                    .map(|(value, field)| lend(&values, arith.normalize(value, &field.ty)))
-                    .collect::<Result<_, _>>()?;
-                if !callee.is_pure(program) {
-                    let mut concrete_payload = Vec::with_capacity(payload.len());
-                    for v in &payload {
-                        concrete_payload.push(self.deref_value(v)?);
-                    }
-                    self.trace.push(Event {
-                        control: callee.name.clone(),
-                        arguments: concrete_args,
-                        alternative: answer.alternative,
-                        payload: concrete_payload,
-                    });
-                }
-                Ok(Some(Ok((index, payload))))
             }
             Operation::AwaitControl(callee_id) => {
                 let values = self.eval_operands(arguments)?;
@@ -3087,36 +3066,85 @@ impl<'a> Machine<'a> {
         else {
             unreachable!();
         };
+        let root = self.tasks[tid].stack.is_empty();
+        match self.host_completion(callee, &arguments, concrete_args)? {
+            HostStep::Failed(detail) => return Ok(Some(End::HostFailed(detail))),
+            HostStep::Fault(message) if root => {
+                self.resume_run_caller(tid);
+                return self.trigger_unwind(message);
+            }
+            HostStep::Fault(message) => self.tasks[tid].state = TaskState::HostFault(message),
+            HostStep::Returned(index, payload) if root => {
+                self.finish_extern_root(tid, index, &payload)?
+            }
+            HostStep::Returned(index, payload) => {
+                self.stack = std::mem::take(&mut self.tasks[tid].stack);
+                self.current_task = tid;
+                self.complete(index, &payload)?;
+                self.tasks[tid].stack = std::mem::take(&mut self.stack);
+            }
+        }
+        Ok(None)
+    }
+
+    fn host_completion(
+        &mut self,
+        callee: ControlId,
+        arguments: &[Value],
+        concrete_args: Vec<Value>,
+    ) -> Result<HostStep, String> {
         let callee_ctrl = &self.program.controls[callee];
         let answer = match self.host.call(callee_ctrl, &concrete_args, self.config) {
             Ok(answer) => answer,
-            Err(detail) => return Ok(Some(End::HostFailed(detail))),
+            Err(detail) => return Ok(HostStep::Failed(detail)),
+        };
+        let (name, payload) = match answer.completion {
+            Completion::Returned {
+                alternative,
+                payload,
+            } => (alternative, payload),
+            Completion::Fault(message) => {
+                if !callee_ctrl.faults {
+                    return Err(format!(
+                        "host fault from {} without faults",
+                        callee_ctrl.name
+                    ));
+                }
+                self.host_writes(callee, arguments, &answer.writes)?;
+                if !callee_ctrl.is_pure(self.program) {
+                    self.trace.push(Event {
+                        control: callee_ctrl.name.clone(),
+                        arguments: concrete_args,
+                        completion: Completion::Fault(message.clone()),
+                    });
+                }
+                return Ok(HostStep::Fault(message));
+            }
         };
         let Some(index) = callee_ctrl
             .contract
             .iter()
-            .position(|entry| entry.name == answer.alternative)
+            .position(|entry| entry.name == name)
         else {
             return Err(format!(
                 "`{}` answered `{}`, which its contract does not list",
-                callee_ctrl.name, answer.alternative
+                callee_ctrl.name, name
             ));
         };
-        self.host_writes(callee, &arguments, &answer.writes)?;
+        self.host_writes(callee, arguments, &answer.writes)?;
         let callee_ctrl = &self.program.controls[callee];
         let fields = &callee_ctrl.contract[index].fields;
-        if answer.payload.len() != fields.len() {
+        if payload.len() != fields.len() {
             return Err(format!(
                 "`{}` answered a payload of the wrong shape",
                 callee_ctrl.name
             ));
         }
         let arith = self.arith;
-        let payload: Vec<Value> = answer
-            .payload
+        let payload: Vec<Value> = payload
             .iter()
             .zip(fields)
-            .map(|(value, field)| lend(&arguments, arith.normalize(value, &field.ty)))
+            .map(|(value, field)| lend(arguments, arith.normalize(value, &field.ty)))
             .collect::<Result<_, _>>()?;
         if !callee_ctrl.is_pure(self.program) {
             let mut concrete_payload = Vec::with_capacity(payload.len());
@@ -3126,21 +3154,13 @@ impl<'a> Machine<'a> {
             self.trace.push(Event {
                 control: callee_ctrl.name.clone(),
                 arguments: concrete_args,
-                alternative: answer.alternative,
-                payload: concrete_payload,
+                completion: Completion::Returned {
+                    alternative: name,
+                    payload: concrete_payload,
+                },
             });
         }
-        if self.tasks[tid].stack.is_empty() {
-            // The root of a run of an extern control ([E-Run]).
-            self.finish_extern_root(tid, index, &payload)?;
-            return Ok(None);
-        }
-        self.stack = std::mem::take(&mut self.tasks[tid].stack);
-        self.current_task = tid;
-        self.complete(index, &payload)?;
-        self.tasks[tid].stack = std::mem::take(&mut self.stack);
-        self.tasks[tid].state = TaskState::Ready;
-        Ok(None)
+        Ok(HostStep::Returned(index, payload))
     }
 
     fn step_scheduler(&mut self) -> Result<Option<End>, String> {
@@ -3162,7 +3182,7 @@ impl<'a> Machine<'a> {
         let mut ready = Vec::new();
         for &tid in &run_tasks {
             match self.tasks[tid].state {
-                TaskState::Ready => ready.push(tid),
+                TaskState::Ready | TaskState::HostFault(_) => ready.push(tid),
                 TaskState::WaitingNext { set_id, .. } => {
                     let set = &self.task_sets[set_id as usize];
                     if set.members.is_empty() || !set.done_queue.is_empty() {
@@ -3175,6 +3195,11 @@ impl<'a> Machine<'a> {
         if !ready.is_empty() {
             let choice = self.host.pick_turn(ready.len()) % ready.len();
             let tid = ready[choice];
+            if let TaskState::HostFault(message) = &self.tasks[tid].state {
+                let message = message.clone();
+                self.activate_task(tid);
+                return self.trigger_unwind(message);
+            }
             if let TaskState::WaitingNext { set_id, prod_id } = self.tasks[tid].state {
                 self.activate_task(tid);
                 if self.task_sets[set_id as usize].members.is_empty() {

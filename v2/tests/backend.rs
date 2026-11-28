@@ -236,11 +236,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             arithmetic: false,
             answers: vec![(
                 "open".to_string(),
-                Answer {
-                    alternative: "not_found".to_string(),
-                    payload: Vec::new(),
-                    writes: Vec::new(),
-                },
+                Answer::returned("not_found".to_string(), Vec::new()),
             )],
         },
         NativeRunSpec {
@@ -253,43 +249,23 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             answers: vec![
                 (
                     "open".to_string(),
-                    Answer {
-                        alternative: "opened".to_string(),
-                        payload: vec![Value::Int(Int::from_u64(10))],
-                        writes: Vec::new(),
-                    },
+                    Answer::returned("opened".to_string(), vec![Value::Int(Int::from_u64(10))]),
                 ),
                 (
                     "read".to_string(),
-                    Answer {
-                        alternative: "data".to_string(),
-                        payload: vec![Value::Int(Int::from_u64(42))],
-                        writes: Vec::new(),
-                    },
+                    Answer::returned("data".to_string(), vec![Value::Int(Int::from_u64(42))]),
                 ),
                 (
                     "close".to_string(),
-                    Answer {
-                        alternative: "closed".to_string(),
-                        payload: Vec::new(),
-                        writes: Vec::new(),
-                    },
+                    Answer::returned("closed".to_string(), Vec::new()),
                 ),
                 (
                     "decode".to_string(),
-                    Answer {
-                        alternative: "text".to_string(),
-                        payload: vec![Value::Int(Int::from_u64(42))],
-                        writes: Vec::new(),
-                    },
+                    Answer::returned("text".to_string(), vec![Value::Int(Int::from_u64(42))]),
                 ),
                 (
                     "emit".to_string(),
-                    Answer {
-                        alternative: "sent".to_string(),
-                        payload: Vec::new(),
-                        writes: Vec::new(),
-                    },
+                    Answer::returned("sent".to_string(), Vec::new()),
                 ),
             ],
         },
@@ -311,11 +287,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             arithmetic: false,
             answers: vec![(
                 "raw_load".to_string(),
-                Answer {
-                    alternative: "loaded".to_string(),
-                    payload: vec![Value::Int(Int::from_u64(9))],
-                    writes: Vec::new(),
-                },
+                Answer::returned("loaded".to_string(), vec![Value::Int(Int::from_u64(9))]),
             )],
         },
         NativeRunSpec {
@@ -327,11 +299,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             arithmetic: false,
             answers: vec![(
                 "raw_load".to_string(),
-                Answer {
-                    alternative: "missing".to_string(),
-                    payload: Vec::new(),
-                    writes: Vec::new(),
-                },
+                Answer::returned("missing".to_string(), Vec::new()),
             )],
         },
         NativeRunSpec {
@@ -343,11 +311,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             arithmetic: false,
             answers: vec![(
                 "raw_load".to_string(),
-                Answer {
-                    alternative: "invalid".to_string(),
-                    payload: vec![Value::Int(Int::from_u64(77))],
-                    writes: Vec::new(),
-                },
+                Answer::returned("invalid".to_string(), vec![Value::Int(Int::from_u64(77))]),
             )],
         },
         NativeRunSpec {
@@ -359,11 +323,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             arithmetic: false,
             answers: vec![(
                 "raw_load".to_string(),
-                Answer {
-                    alternative: "too_large".to_string(),
-                    payload: Vec::new(),
-                    writes: Vec::new(),
-                },
+                Answer::returned("too_large".to_string(), Vec::new()),
             )],
         },
     ];
@@ -388,27 +348,15 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             answers: vec![
                 (
                     "classify".to_string(),
-                    Answer {
-                        alternative: "equal".to_string(),
-                        payload: Vec::new(),
-                        writes: Vec::new(),
-                    },
+                    Answer::returned("equal".to_string(), Vec::new()),
                 ),
                 (
                     "classify".to_string(),
-                    Answer {
-                        alternative: "after".to_string(),
-                        payload: Vec::new(),
-                        writes: Vec::new(),
-                    },
+                    Answer::returned("after".to_string(), Vec::new()),
                 ),
                 (
                     "classify".to_string(),
-                    Answer {
-                        alternative: "before".to_string(),
-                        payload: Vec::new(),
-                        writes: Vec::new(),
-                    },
+                    Answer::returned("before".to_string(), Vec::new()),
                 ),
             ],
         },
@@ -421,11 +369,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             arithmetic: false,
             answers: vec![(
                 "classify".to_string(),
-                Answer {
-                    alternative: "after".to_string(),
-                    payload: Vec::new(),
-                    writes: Vec::new(),
-                },
+                Answer::returned("after".to_string(), Vec::new()),
             )],
         },
         NativeRunSpec {
@@ -437,11 +381,7 @@ fn native_backend_agrees_with_oracle_and_erased_on_rails_and_core_programs() {
             arithmetic: false,
             answers: vec![(
                 "classify".to_string(),
-                Answer {
-                    alternative: "equal".to_string(),
-                    payload: Vec::new(),
-                    writes: Vec::new(),
-                },
+                Answer::returned("equal".to_string(), Vec::new()),
             )],
         },
     ];
