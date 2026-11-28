@@ -1,0 +1,97 @@
+extern resource lease on fault release
+extern control acquire(id : u32) ■ { ok {l : lease} } uses io
+extern control mark(id : u32) ■ { ok {} } uses io
+extern async control hold(l : lease, cell : &~u32) ■ { value {code : u32} │ cancelled {} } uses io
+extern async control steady() ■ { ok {} } uses io
+
+async control worker(id : u32) ■ { got {v : u32} } uses io
+    ⊤ ▷ ~cell : u32 := id
+    ⊤ ▷ a : Δ acquire(id) ▸ ok {l}
+    a.ok ▷ reply := capture await hold(l, &~cell)
+    ⊤ ▷ m : Δ mark(cell) ▸ ok {}
+    ⊤ ▷ h : Δ outcome(reply) ▸ value {code} │ cancelled {}
+    h.cancelled ▷ ■ got {cell}
+    h.value ▷ ■ got {code}
+
+async control split() ■ { ok {first : u32, second : u32, sibling : u32} } uses io
+    ⊤ ▷ ~jobs : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ ~peer : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(1) into jobs
+    ⊤ ▷ spawn worker(2) into peer
+    ⊤ ▷ spawn worker(3) into jobs
+    ⊤ ▷ s : Δ await steady() ▸ ok {}
+    ⊤ ▷ cancel jobs
+    ⊤ ▷ cancel jobs
+    ⊤ ▷ m : Δ mark(9) ▸ ok {}
+    ⊤ ▷ a : Δ await next(jobs) ▸ got {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(jobs) ▸ got {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ c : Δ await next(jobs) ▸ got {extra} │ empty {}
+    c.got ▷ ⊥
+    ⊤ ▷ p : Δ await next(peer) ▸ got {sibling} │ empty {}
+    p.empty ▷ ⊥
+    ⊤ ▷ q : Δ await next(peer) ▸ got {unused} │ empty {}
+    q.got ▷ ⊥
+    q.empty ▷ ■ ok {first, second, sibling}
+
+// Issue in reverse order. Both current members release before mark(9).
+//! run split() with [acquire -> ok {lease#3}; acquire -> ok {lease#2}; acquire -> ok {lease#1}; steady -> ok; mark -> ok; mark -> ok; mark -> ok; hold -> value {72} ~cell <- 12; mark -> ok] turns [2, 1] => done ok {1, 3, 72} trace [acquire(3) -> ok {lease#3}; acquire(2) -> ok {lease#2}; acquire(1) -> ok {lease#1}; steady() -> ok; lease.release(lease#1) -> released; lease.release(lease#3) -> released; mark(9) -> ok; mark(1) -> ok; mark(3) -> ok; hold(lease#2, 2) -> value {72}; mark(12) -> ok]
+
+// The next turn cancels the root. The sibling's request is still pending.
+//! run split() with [acquire -> ok {lease#1}; acquire -> ok {lease#2}; acquire -> ok {lease#3}; steady -> ok; mark -> ok; mark -> ok; mark -> ok; mark -> ok] cancel_at 6 => done ok {1, 3, 2} trace [acquire(1) -> ok {lease#1}; acquire(2) -> ok {lease#2}; acquire(3) -> ok {lease#3}; steady() -> ok; lease.release(lease#1) -> released; lease.release(lease#3) -> released; mark(9) -> ok; lease.release(lease#2) -> released; mark(1) -> ok; mark(2) -> ok; mark(3) -> ok]
+
+// The first member has already finished. Its payload and write survive cancel.
+//! run split() with [acquire -> ok {lease#1}; acquire -> ok {lease#2}; acquire -> ok {lease#3}; hold -> value {71} ~cell <- 11; mark -> ok; steady -> ok; mark -> ok; mark -> ok; hold -> value {72} ~cell <- 12; mark -> ok] waiting [1, 0] => done ok {71, 3, 72} trace [acquire(1) -> ok {lease#1}; acquire(2) -> ok {lease#2}; acquire(3) -> ok {lease#3}; hold(lease#1, 1) -> value {71}; mark(11) -> ok; steady() -> ok; lease.release(lease#3) -> released; mark(9) -> ok; mark(3) -> ok; hold(lease#2, 2) -> value {72}; mark(12) -> ok]
+
+extern async control probe() ■ { ok {} │ cancelled {} } uses io
+
+control bridge() ■ { got {v : u32} } uses io
+    ⊤ ▷ p : Δ run probe() ▸ ok {} │ cancelled {}
+    p.ok ▷ ■ got {0}
+    p.cancelled ▷ ■ got {80}
+
+async control parent() ■ { got {v : u32, nested : u32} } uses io
+    ⊤ ▷ ~inner : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(1) into inner
+    ⊤ ▷ a : Δ await next(inner) ▸ got {v} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(inner) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ b : Δ bridge() ▸ got {w}
+    b.got ▷ ■ got {v, w}
+
+async control pause() ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+
+async control family() ■ { ok {v : u32, nested : u32} } uses io
+    ⊤ ▷ ~parents : tasks⟨parent⟩ := tasks⟨parent⟩()
+    ⊤ ▷ ~other : tasks⟨parent⟩ := tasks⟨parent⟩()
+    ⊤ ▷ spawn parent() into parents
+    ⊤ ▷ p : Δ await pause() ▸ ok {}
+    ⊤ ▷ cancel parents
+    ⊤ ▷ cancel other
+    ⊤ ▷ m : Δ mark(9) ▸ ok {}
+    ⊤ ▷ a : Δ await next(parents) ▸ got {v, w} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(parents) ▸ got {extra, extra_w} │ empty {}
+    e.got ▷ ⊥
+    ⊤ ▷ n : Δ await next(other) ▸ got {unused, unused_w} │ empty {}
+    n.got ▷ ⊥
+    n.empty ▷ ■ ok {v, w}
+
+// Cancel before the parent starts, then with its child already parked.
+//! run family() with [mark -> ok; acquire -> ok {lease#1}; mark -> ok] => done ok {1, 80} trace [mark(9) -> ok; acquire(1) -> ok {lease#1}; lease.release(lease#1) -> released; mark(1) -> ok]
+//! run family() with [acquire -> ok {lease#1}; mark -> ok; mark -> ok] turns [1, 1, 0] => done ok {1, 80} trace [acquire(1) -> ok {lease#1}; lease.release(lease#1) -> released; mark(9) -> ok; mark(1) -> ok]
+
+async control nested_split() ■ { ok {first : u32, second : u32, sibling : u32} } uses io
+    ⊤ ▷ ~owners : tasks⟨split⟩ := tasks⟨split⟩()
+    ⊤ ▷ spawn split() into owners
+    ⊤ ▷ a : Δ await next(owners) ▸ ok {first, second, sibling} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(owners) ▸ ok {x, y, z} │ empty {}
+    e.ok ▷ ⊥
+    e.empty ▷ ■ ok {first, second, sibling}
+
+// A spawned owner issues the same cancellation while its own parent waits.
+//! run nested_split() with [acquire -> ok {lease#3}; acquire -> ok {lease#2}; acquire -> ok {lease#1}; steady -> ok; mark -> ok; mark -> ok; mark -> ok; hold -> value {72} ~cell <- 12; mark -> ok] turns [0, 2, 1] => done ok {1, 3, 72} trace [acquire(3) -> ok {lease#3}; acquire(2) -> ok {lease#2}; acquire(1) -> ok {lease#1}; steady() -> ok; lease.release(lease#1) -> released; lease.release(lease#3) -> released; mark(9) -> ok; mark(1) -> ok; mark(3) -> ok; hold(lease#2, 2) -> value {72}; mark(12) -> ok]

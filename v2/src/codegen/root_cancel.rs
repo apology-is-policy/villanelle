@@ -19,6 +19,9 @@ pub(super) fn needed(program: &Program) -> bool {
 }
 
 pub(super) fn emit_support(out: &mut String, reg: &mut RuntimeRegistry<'_>, scripted: bool) {
+    if reg.has_root_cancel || reg.has_task_sets {
+        out.push_str("@vn2_root_cancelled = internal thread_local global i1 false\n");
+    }
     if !reg.has_root_cancel {
         if reg.has_task_sets {
             // The shared scheduler has no observable cancellation in this module.
@@ -51,7 +54,6 @@ define internal i8 @vn2_should_cancel_root(i64 %turn) {
     // the current flag and share the turn count, then restore the caller's flag.
     out.push_str(
         "@vn2_turn_number = internal thread_local global i64 0
-@vn2_root_cancelled = internal thread_local global i1 false
 define internal fastcc i1 @vn2_poll_cancel() {
   %previous = load i64, ptr @vn2_turn_number
   %turn = add i64 %previous, 1

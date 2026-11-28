@@ -3,7 +3,7 @@
 use super::*;
 
 // Keep the common prefix in sync with %vn2.member_header in task_set.ll.
-const FIRST_INPUT: usize = 6;
+const FIRST_INPUT: usize = 7;
 
 #[derive(Clone, Copy)]
 pub(super) enum Frame {
@@ -44,7 +44,6 @@ pub(super) fn emit_support<'a>(
             .iter()
             .flat_map(|body| &body.statements)
             .find_map(|s| match &s.command {
-                Command::Cancel { .. } => Some("task set cancellation"),
                 Command::Fault { .. } | Command::Boundary { .. } | Command::Supervise { .. } => {
                     Some("a fault boundary or fault in a task-set owner")
                 }
@@ -232,6 +231,7 @@ pub(super) fn emit_member_entry(
     let mut fields = vec![
         "ptr".into(),
         "i32".into(),
+        "i1".into(),
         "i1".into(),
         "i1".into(),
         "ptr".into(),
@@ -433,11 +433,24 @@ fn field(em: &mut IrEmitter<'_, '_>, ty: &str, ptr: &str, index: usize) -> Strin
 
 pub(super) fn new_set(em: &mut IrEmitter<'_, '_>, member: ControlId) -> String {
     let ptr = em.alloc_temp("%vn2.pool");
+    let owner_flag = if em.resume_points.is_some() {
+        field(em, "%vn2.member_header", "%task_member", 4)
+    } else {
+        "@vn2_uncancelled_owner".into()
+    };
     let _ = writeln!(
         em.code,
-        "  call fastcc void @vn2_pool_init(ptr {ptr}, ptr @vn2_member_{member})"
+        "  call fastcc void @vn2_pool_init(ptr {ptr}, ptr @vn2_member_{member}, ptr {owner_flag})"
     );
     ptr
+}
+
+pub(super) fn cancel(em: &mut IrEmitter<'_, '_>, set: VarId) {
+    let ptr = pool(em, set);
+    let _ = writeln!(
+        em.code,
+        "  call fastcc void @vn2_cancel_set(ptr %task_scheduler, ptr {ptr})"
+    );
 }
 
 pub(super) fn count(em: &mut IrEmitter<'_, '_>, set: VarId) -> String {

@@ -25,7 +25,7 @@ arm:
   store ptr @vn2_withdraw_members, ptr %sweep
   br label %park
 park:
-  %slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 5
+  %slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 6
   store ptr %wait, ptr %slot
   %waiting = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 2
   %n = load i64, ptr %waiting
@@ -40,7 +40,7 @@ park:
 define internal fastcc void @vn2_wake_host(ptr %scheduler, ptr %member, ptr %wait, i32 %tag) {
   %result = getelementptr %vn2.pending, ptr %wait, i32 0, i32 2
   store i32 %tag, ptr %result
-  %active_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 5
+  %active_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 6
   store ptr null, ptr %active_slot
   %flag = getelementptr %vn2.member_header, ptr %member, i32 0, i32 3
   store i1 false, ptr %flag
@@ -57,7 +57,7 @@ define internal fastcc void @vn2_wake_host(ptr %scheduler, ptr %member, ptr %wai
 
 ; Root withdrawal, if any, precedes this walk. Waking a member leaves it
 ; in spawn order. Its activation resumes only after a ready choice.
-define internal fastcc void @vn2_withdraw_members(ptr %scheduler) {
+define internal fastcc void @vn2_withdraw_members(ptr %scheduler, i1 %all) {
 entry:
   br label %scan
 scan:
@@ -66,10 +66,14 @@ scan:
   %end = icmp eq ptr %member, null
   br i1 %end, label %done, label %inspect
 inspect:
-  %slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 5
+  %slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 6
   %wait = load ptr, ptr %slot
   %parked = icmp ne ptr %wait, null
-  br i1 %parked, label %pending, label %advance
+  %flag = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
+  %local = load i1, ptr %flag
+  %affected = or i1 %all, %local
+  %withdraw_wait = and i1 %parked, %affected
+  br i1 %withdraw_wait, label %pending, label %advance
 pending:
   %fn = getelementptr %vn2.pending, ptr %wait, i32 0, i32 3
   %cancel = load ptr, ptr %fn
@@ -129,7 +133,7 @@ scan:
   %link = phi ptr [ %scheduler, %prepare ], [ %scheduler, %add_root ], [ %member, %advance ]
   %i = phi i64 [ %offset, %prepare ], [ %offset, %add_root ], [ %next, %advance ]
   %member = load ptr, ptr %link
-  %slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 5
+  %slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 6
   %wait = load ptr, ptr %slot
   %pending = icmp ne ptr %wait, null
   br i1 %pending, label %add_member, label %advance
@@ -159,7 +163,7 @@ dispatch:
   %root_chosen = icmp eq ptr %chosen, null
   br i1 %root_chosen, label %done, label %deliver
 deliver:
-  %active_slot = getelementptr %vn2.member_header, ptr %chosen, i32 0, i32 5
+  %active_slot = getelementptr %vn2.member_header, ptr %chosen, i32 0, i32 6
   %active = load ptr, ptr %active_slot
   %bound = load ptr, ptr %active
   %fn = getelementptr %vn2.pending, ptr %active, i32 0, i32 1

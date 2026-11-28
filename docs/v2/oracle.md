@@ -7,7 +7,7 @@ IR backend. Slice 4 has an oracle, a checker, and native code for defined
 roots, direct runs of nonfaulting host operations, and
 task sets whose owners and members can yield at a defined await. Roots and members can
 wait for the host in their own activations or in a callee (sections 18.4 to
-18.26). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
+18.27). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
 lists the defects. Sections 8 to 18 describe what the code does and which
@@ -2824,8 +2824,30 @@ From `v2/`, run `vn2 test tests/slice4/checked_member_cancel.core` and
 `cargo test --test backend_slice4 member_cancel`. The linked C host checks
 the request addresses, leases, vectors and exclusive borrows. It checks
 the full ready counts and which handles the host is offered, including
-when a noncancellable request belongs to a sibling. The rule-file
-comparison also exercises a grandchild while its parent awaits its result.
+when a noncancellable request belongs to a sibling. The rule-file test in
+section 18.27 exercises a grandchild while its parent awaits its result.
+
+### 18.27 Explicit cancellation of a task set, 28 November 2026
+
+`cancel pool` marks the current members. Their descendants inherit the flag,
+including a child that a cancelled parent spawns later. A later spawn into
+`pool` itself takes the flag of the owning task. Completed members keep their
+results until the owner collects them.
+
+The native scheduler keeps unfinished tasks in spawn order. Each set points
+to its owning member's cancellation flag, so visiting a parent before its
+children propagates an explicit cancellation in one walk. A second walk
+withdraws affected cancellable host requests and releases their by-value
+arguments in the same order. Both walks finish in the issuing task's turn.
+A subsequent choice offers the woken tasks in their original positions.
+Other sets retain their requests for completion or a later cancellation.
+
+From `v2/`, run `vn2 test tests/slice4/checked_set_cancel.core tests/slice4/e_cancel.core`
+and `cargo test --test backend_slice4 set_cancel`. The linked C host checks
+the bound request at each withdrawal, release before the owner's next host
+call, a sibling's later completion or withdrawal, and preservation of a result
+already delivered by the host. The Rust tests also run the Rails lease example
+and compare a nested run started by a cancelled member.
 
 ## 19. What is open
 
@@ -2838,7 +2860,7 @@ comparison also exercises a grandchild while its parent awaits its result.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs explicit set cancellation, faulting host operations,
+- **Later work.** Slice 4 still needs faulting host operations,
   member faults, capacity and generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).

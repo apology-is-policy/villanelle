@@ -1,12 +1,15 @@
 ; A queue holds its head and the address of the link to fill on append.
 ; The scheduler lists unfinished members in spawn order and counts ready ones.
-; A pool holds its completion queue, count, producer, spare frame and waiter.
+; A pool holds its completion queue, count, producer, spare frame, waiter and owning task's flag.
 %vn2.queue = type { ptr, ptr }
 ; Unfinished members, ready count, host-waiting member count, idle callback, pending withdrawal callback.
 %vn2.scheduler = type { %vn2.queue, i64, i64, ptr, ptr }
-%vn2.pool = type { %vn2.queue, i64, ptr, ptr, ptr }
-; Next link, resume index/result tag, heap flag, blocked flag, originating set, host wait.
-%vn2.member_header = type { ptr, i32, i1, i1, ptr, ptr }
+%vn2.pool = type { %vn2.queue, i64, ptr, ptr, ptr, ptr }
+; Next link, resume index/result tag, heap flag, blocked flag, cancellation flag, originating set, host wait.
+%vn2.member_header = type { ptr, i32, i1, i1, i1, ptr, ptr }
+
+; The run root observes its cancellation through @vn2_root_cancelled.
+@vn2_uncancelled_owner = private constant i1 false
 
 declare void @llvm.trap()
 
@@ -25,12 +28,14 @@ initialize:
   ret ptr %scheduler
 }
 
-define internal fastcc void @vn2_pool_init(ptr %pool, ptr %resume) {
+define internal fastcc void @vn2_pool_init(ptr %pool, ptr %resume, ptr %owner_flag) {
   store %vn2.pool zeroinitializer, ptr %pool
   %tail = getelementptr %vn2.queue, ptr %pool, i32 0, i32 1
   store ptr %pool, ptr %tail
   %entry_slot = getelementptr %vn2.pool, ptr %pool, i32 0, i32 2
   store ptr %resume, ptr %entry_slot
+  %owner = getelementptr %vn2.pool, ptr %pool, i32 0, i32 5
+  store ptr %owner_flag, ptr %owner
   ret void
 }
 
@@ -118,9 +123,14 @@ append:
   store i1 %heap, ptr %storage
   %flag = getelementptr %vn2.member_header, ptr %member, i32 0, i32 3
   store i1 false, ptr %flag
-  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
+  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 5
   store ptr %pool, ptr %set_slot
-  %wait = getelementptr %vn2.member_header, ptr %member, i32 0, i32 5
+  %owner = getelementptr %vn2.pool, ptr %pool, i32 0, i32 5
+  %owner_flag = load ptr, ptr %owner
+  %inherited = load i1, ptr %owner_flag
+  %cancelled = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
+  store i1 %inherited, ptr %cancelled
+  %wait = getelementptr %vn2.member_header, ptr %member, i32 0, i32 6
   store ptr null, ptr %wait
   call fastcc void @vn2_append(ptr %scheduler, ptr %member)
   %ready = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 1
@@ -172,11 +182,18 @@ define internal fastcc void @vn2_step_member(ptr %scheduler, i64 %index) {
 entry:
   %link = call fastcc ptr @vn2_link_at(ptr %scheduler, i64 %index)
   %member = load ptr, ptr %link
-  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
+  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 5
   %pool = load ptr, ptr %set_slot
   %entry_slot = getelementptr %vn2.pool, ptr %pool, i32 0, i32 2
   %resume = load ptr, ptr %entry_slot
+  ; A synchronous bridge in this turn may start a run that inherits the member's flag.
+  %saved = load i1, ptr @vn2_root_cancelled
+  %flag_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
+  %local = load i1, ptr %flag_slot
+  %effective = or i1 %saved, %local
+  store i1 %effective, ptr @vn2_root_cancelled
   %tag = call fastcc i32 %resume(ptr %member, ptr %scheduler)
+  store i1 %saved, ptr @vn2_root_cancelled
   ; -3 gives up the turn. A nonnegative alternative finishes the member.
   %yielded = icmp eq i32 %tag, -3
   br i1 %yielded, label %done, label %finished
@@ -205,6 +222,42 @@ done:
   ret void
 }
 
+; Parents precede their descendants in spawn order. Propagate their flags
+; in one pass, then withdraw affected waits before the owner continues.
+define internal fastcc void @vn2_cancel_set(ptr %scheduler, ptr %target) {
+entry:
+  br label %scan
+scan:
+  %link = phi ptr [ %scheduler, %entry ], [ %member, %visit ]
+  %member = load ptr, ptr %link
+  %end = icmp eq ptr %member, null
+  br i1 %end, label %pending, label %visit
+visit:
+  %set_slot = getelementptr %vn2.member_header, ptr %member, i32 0, i32 5
+  %pool = load ptr, ptr %set_slot
+  %direct = icmp eq ptr %pool, %target
+  %owner = getelementptr %vn2.pool, ptr %pool, i32 0, i32 5
+  %owner_flag = load ptr, ptr %owner
+  %inherited = load i1, ptr %owner_flag
+  %affected = or i1 %direct, %inherited
+  %flag = getelementptr %vn2.member_header, ptr %member, i32 0, i32 4
+  %previous = load i1, ptr %flag
+  %cancelled = or i1 %previous, %affected
+  store i1 %cancelled, ptr %flag
+  br label %scan
+pending:
+  %slot = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 4
+  %sweep = load ptr, ptr %slot
+  %armed = icmp ne ptr %sweep, null
+  br i1 %armed, label %withdraw, label %done
+withdraw:
+  ; Other sets may still have parked requests.
+  call fastcc void %sweep(ptr %scheduler, i1 false)
+  br label %done
+done:
+  ret void
+}
+
 ; Parking a cancellable request installs a callback. Once the root is
 ; cancelled, further member awaits release before issue, so scan only once.
 define internal fastcc void @vn2_cancel_parked(ptr %scheduler, i1 %cancelled) {
@@ -217,7 +270,7 @@ check:
   br i1 %armed, label %withdraw, label %done
 withdraw:
   store ptr null, ptr %slot
-  call fastcc void %sweep(ptr %scheduler)
+  call fastcc void %sweep(ptr %scheduler, i1 true)
   br label %done
 done:
   ret void

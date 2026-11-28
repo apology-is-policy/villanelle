@@ -11,6 +11,7 @@ use villanelle_v2::oracle::{self, Config, Value};
 use villanelle_v2::typed::{Control, Program};
 use villanelle_v2::{check, erased, load, script};
 
+const SET_CANCEL: &str = include_str!("slice4/checked_set_cancel.core");
 const MEMBER_CANCEL: &str = include_str!("slice4/checked_member_cancel.core");
 const OWNER_CANCEL: &str = include_str!("slice4/checked_owner_cancel.core");
 const CANCEL_RUN: &str = include_str!("slice4/checked_cancel_run.core");
@@ -125,42 +126,74 @@ fn member_cancel_resumes_the_bound_activation_on_a_ready_turn() {
 }
 
 #[test]
-fn member_cancel_reaches_a_grandchild_while_its_parent_waits() {
-    let rule = include_str!("slice4/e_cancel.core");
-    let (declarations, _) = rule
-        .split_once("// A member that waits is withdrawn")
+fn set_cancel_matches_current_members_and_their_descendants() {
+    // Waiting handles need one dynamic list in each split run, plus a second
+    // list when one child finishes before the root request completes.
+    // A spawned owner also offers its own wait alongside its three children.
+    compare_native_runs(SET_CANCEL, &["E-Cancel"], &[2; 6], 5);
+}
+
+#[test]
+fn set_cancel_replays_the_checked_rule_file() {
+    compare_native_runs(
+        include_str!("slice4/e_cancel.core"),
+        &["E-Cancel"],
+        &[1, 1, 1, 0, 0],
+        1,
+    );
+}
+
+#[test]
+fn set_cancel_runs_the_rails_lease_example() {
+    let rails = include_str!("slice4_surface/tasks_and_cancel.rails");
+    let (decls, _) = rails.split_once("async control voice(").unwrap();
+    let (_, tail) = rails.split_once("async control leased_worker(").unwrap();
+    let (example, _) = tail.split_once("async control failing_member(").unwrap();
+    let source = format!("{decls}async control leased_worker({example}");
+    let directive = source
+        .lines()
+        .find(|line| line.starts_with("//! run"))
         .unwrap();
-    let (_, family) = rule.split_once("async control grandchild").unwrap();
-    // The intervening controls issue an explicit set cancel.
-    let source = format!("{declarations}async control grandchild{family}");
-    compare_native_runs(&source, &["E-Spawn"], &[2, 2], 0);
+    let core = villanelle_v2::surface::elaborate(&source).unwrap().print();
+    compare_native_runs(&format!("{core}\n{directive}"), &["E-Cancel"], &[1], 1);
+}
+
+#[test]
+fn set_cancel_c_host_checks_selective_withdrawal_in_the_owners_turn() {
+    let (split, _) = SET_CANCEL
+        .split_once("extern async control probe(")
+        .unwrap();
+    compare_cancellation_host(split, "set_cancel", include_str!("host_set_cancel.c"));
 }
 
 #[test]
 fn member_cancel_c_host_checks_bound_handles_and_ready_choices() {
-    let (_, runs) = script::native_runs(MEMBER_CANCEL).unwrap();
-    compare_c_host(
+    compare_cancellation_host(
         MEMBER_CANCEL,
         "member_cancel",
         include_str!("host_member_cancel.c"),
-        |program, config| {
-            let mut expected = Vec::new();
-            for spec in &runs {
-                let result = compare(
-                    program,
-                    &spec.entry,
-                    spec.arguments.clone(),
-                    &mut scheduled_host(spec),
-                    config,
-                );
-                assert_eq!(result.verdict, Verdict::Same);
-                assert!(matches!(result.oracle.end, oracle::End::Done { .. }));
-                expected.extend(result.oracle.trace.iter().map(ToString::to_string));
-                expected.push(result.oracle.end.to_string());
-            }
-            expected
-        },
     );
+}
+
+fn compare_cancellation_host(source: &str, name: &str, driver: &str) {
+    let (_, runs) = script::native_runs(source).unwrap();
+    compare_c_host(source, name, driver, |program, config| {
+        let mut expected = Vec::new();
+        for spec in &runs {
+            let result = compare(
+                program,
+                &spec.entry,
+                spec.arguments.clone(),
+                &mut scheduled_host(spec),
+                config,
+            );
+            assert_eq!(result.verdict, Verdict::Same);
+            assert!(matches!(result.oracle.end, oracle::End::Done { .. }));
+            expected.extend(result.oracle.trace.iter().map(ToString::to_string));
+            expected.push(result.oracle.end.to_string());
+        }
+        expected
+    });
 }
 
 #[test]
@@ -1068,6 +1101,22 @@ control bridge2() ■ { ok {} } uses io
         &[1],
         0,
     );
+    compare_native_runs(
+        r#"
+async control member() ■ { ok {} }
+    ⊤ ▷ ■ ok {}
+async control pool() ■ { ok {} }
+    ⊤ ▷ ~x : tasks⟨member⟩ := tasks⟨member⟩()
+    ⊤ ▷ cancel x
+    ⊤ ▷ r : Δ await next(x) ▸ ok {} │ empty {}
+    r.ok ▷ ⊥
+    r.empty ▷ ■ ok {}
+//! run pool() => done ok
+"#,
+        &["E-Cancel"],
+        &[1],
+        0,
+    );
     // Put supported entries first. Both emitters compile the whole module.
     for (decls, reason) in [
         (
@@ -1090,20 +1139,6 @@ async control waits() ■ { ok {} } faults uses io
 //! run waits() with [tick -> ok] => done ok trace [tick() -> ok]
 "#,
             "faulting host await of `tick`",
-        ),
-        (
-            r#"
-async control member() ■ { ok {} }
-    ⊤ ▷ ■ ok {}
-async control pool() ■ { ok {} }
-    ⊤ ▷ ~x : tasks⟨member⟩ := tasks⟨member⟩()
-    ⊤ ▷ cancel x
-    ⊤ ▷ r : Δ await next(x) ▸ ok {} │ empty {}
-    r.ok ▷ ⊥
-    r.empty ▷ ■ ok {}
-//! run pool() => done ok
-"#,
-            "task set",
         ),
     ] {
         let source = format!("{ROOTS}\n{decls}");
@@ -2077,24 +2112,79 @@ async control owner() ■ { ok {} }
             "await read() ▸ ok {} │ cancelled {}",
         );
     compare_native_runs(&cancellable_member, &["E-AwaitHost"], &[1], 0);
+    let cancelling_set = new_set.replace("⊤ ▷ q :", "⊤ ▷ cancel other\n    ⊤ ▷ q :");
+    let awaited_cancel = idle_set
+        .replace(new_set, &cancelling_set)
+        .replace(next_owner, &format!("{suspend}\n    {next_owner}"));
+    let nested_cancel = indirect.replace(new_set, &cancelling_set);
+    let borrower = format!(
+        "async control borrower(value : &usize) ■ {{ ok {{loan : &usize ∈ value}} }}
+    {cancelling_set}
+    ⊤ ▷ ■ ok {{value}}"
+    );
+    let borrow_in_owner = "⊤ ▷ ~other : tasks⟨borrower⟩ := tasks⟨borrower⟩()
+    ⊤ ▷ spawn borrower(&v) into other
+    ⊤ ▷ a : Δ await next(other) ▸ ok {loan} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(other) ▸ ok {extra} │ empty {}
+    b.ok ▷ ⊥";
+    let borrowing_cancel = base
+        .replace(
+            "async control owner",
+            &format!("{borrower}\n\nasync control owner"),
+        )
+        .replace(next_owner, &format!("{borrow_in_owner}\n    {next_owner}"));
+    compare_native_runs(&awaited_cancel, &["E-Cancel"], &[1], 0);
+    compare_native_runs(&nested_cancel, &["E-Cancel"], &[1], 2);
+    compare_native_runs(&borrowing_cancel, &["E-Cancel"], &[1], 0);
     for (source, reason) in [
-        (base.replace("async control idle() ■ { ok {} }", &format!("async control idle() ■ {{ ok {{}} }}\n    {new_set}"))
-            .replace("⊤ ▷ q : Δ await next(other)", "⊤ ▷ cancel other\n    ⊤ ▷ q : Δ await next(other)")
-            .replace(next_owner, &format!("{suspend}\n    {next_owner}")), "control `idle`: the native backend does not yet support task set cancellation"),
-        (base.replace("async control idle() ■ { ok {} }", "async control idle() ■ { ok {} } faults")
-            .replace("async control owner() ■ { ok {} }", &format!("async control owner() ■ {{ ok {{}} }} faults\n    {suspend}")), "a faulting or terminating call in a task-set owner"),
-        (owner_wait.replace("read() ■ { ok {} } uses io", "read() ■ { ok {} } faults uses io")
-            .replace("owner() ■ { ok {} } uses io", "owner() ■ { ok {} } faults uses io"),
-            "faulting host await of `read` in task-set owner"),
-        (member_wait.replace("read() ■ { ok {} } uses io", "read() ■ { ok {} } faults uses io")
-            .replace("child(value : usize) ■ { ok {} } uses io", "child(value : usize) ■ { ok {} } faults uses io")
-            .replace("owner() ■ { ok {} } uses io", "owner() ■ { ok {} } faults uses io"),
-            "faulting host await of `read` in task-set member"),
-        (indirect.replace("⊤ ▷ q : Δ await next(other)", "⊤ ▷ cancel other\n    ⊤ ▷ q : Δ await next(other)"), "control `idle`: the native backend does not yet support task set cancellation"),
-        (base.replace("async control owner", &format!("async control borrower(value : &usize) ■ {{ ok {{loan : &usize ∈ value}} }}\n    {new_set}\n    ⊤ ▷ ■ ok {{value}}\n\nasync control owner"))
-            .replace("⊤ ▷ q : Δ await next(other)", "⊤ ▷ cancel other\n    ⊤ ▷ q : Δ await next(other)")
-            .replace(next_owner, &format!("⊤ ▷ ~other : tasks⟨borrower⟩ := tasks⟨borrower⟩()\n    ⊤ ▷ spawn borrower(&v) into other\n    ⊤ ▷ a : Δ await next(other) ▸ ok {{loan}} │ empty {{}}\n    a.empty ▷ ⊥\n    ⊤ ▷ b : Δ await next(other) ▸ ok {{extra}} │ empty {{}}\n    b.ok ▷ ⊥\n    {next_owner}")), "control `borrower`: the native backend does not yet support task set cancellation"),
-        (base.replace("child(value : usize) ■ { ok {} }", "child(value : usize) ■ { ok {} } faults").replace("owner() ■ { ok {} }", "owner() ■ { ok {} } faults"), "nonfaulting"),
+        (
+            base.replace(
+                "async control idle() ■ { ok {} }",
+                "async control idle() ■ { ok {} } faults",
+            )
+            .replace(
+                "async control owner() ■ { ok {} }",
+                &format!("async control owner() ■ {{ ok {{}} }} faults\n    {suspend}"),
+            ),
+            "a faulting or terminating call in a task-set owner",
+        ),
+        (
+            owner_wait
+                .replace(
+                    "read() ■ { ok {} } uses io",
+                    "read() ■ { ok {} } faults uses io",
+                )
+                .replace(
+                    "owner() ■ { ok {} } uses io",
+                    "owner() ■ { ok {} } faults uses io",
+                ),
+            "faulting host await of `read` in task-set owner",
+        ),
+        (
+            member_wait
+                .replace(
+                    "read() ■ { ok {} } uses io",
+                    "read() ■ { ok {} } faults uses io",
+                )
+                .replace(
+                    "child(value : usize) ■ { ok {} } uses io",
+                    "child(value : usize) ■ { ok {} } faults uses io",
+                )
+                .replace(
+                    "owner() ■ { ok {} } uses io",
+                    "owner() ■ { ok {} } faults uses io",
+                ),
+            "faulting host await of `read` in task-set member",
+        ),
+        (
+            base.replace(
+                "child(value : usize) ■ { ok {} }",
+                "child(value : usize) ■ { ok {} } faults",
+            )
+            .replace("owner() ■ { ok {} }", "owner() ■ { ok {} } faults"),
+            "nonfaulting",
+        ),
     ] {
         let (program, specs) = script::native_runs(&source).unwrap();
         check::check(&program).unwrap().revalidate().unwrap();
@@ -2103,6 +2193,9 @@ async control owner() ■ { ok {} }
         assert_eq!((report.runs, report.compared), (1, 1));
         let error = emit_llvm(&program, 64).unwrap_err();
         assert!(error.contains(reason), "{error}");
-        assert_eq!(run_native_counted(&program, &specs, 64, 0).unwrap_err(), error);
+        assert_eq!(
+            run_native_counted(&program, &specs, 64, 0).unwrap_err(),
+            error
+        );
     }
 }

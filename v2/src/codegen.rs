@@ -4220,8 +4220,9 @@ fn emit_body_unit<'a>(
                     tasks::spawn(&mut emitter, body, *set, *control, arguments, b_id != 0);
                     let _ = writeln!(emitter.code, "  br label %{next_lbl}");
                 }
-                Command::Cancel { .. } => {
-                    unreachable!("task set cancellation rejected before emission")
+                Command::Cancel { set } => {
+                    tasks::cancel(&mut emitter, *set);
+                    let _ = writeln!(emitter.code, "  br label %{next_lbl}");
                 }
                 Command::Bind { var, value } => {
                     let val = emitter.emit_expr(value, &VarAccess::ControlSlots(body));
