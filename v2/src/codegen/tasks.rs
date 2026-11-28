@@ -82,9 +82,9 @@ pub(super) fn emit_support<'a>(
         while let Some(callee) = pending.pop() {
             let target = &program.controls[callee];
             let Some(body) = &target.body else {
-                if target.is_cancellable() || target.faults {
+                if target.faults {
                     return Err(format!(
-                        "the native backend does not yet support a cancellable or faulting host await of `{}` in task-set member `{}`",
+                        "the native backend does not yet support a faulting host await of `{}` in task-set member `{}`",
                         target.name, member.name
                     ));
                 }

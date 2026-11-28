@@ -66,30 +66,24 @@ pub(super) fn emit_request(
             "  {field} = getelementptr {ty}, ptr {request}, i32 0, i32 {index}\n  store {arg}, ptr {field}"
         );
     }
-    if em.program.controls[id].is_cancellable() {
-        let kind = if awaits { "await" } else { "run" };
-        let scheduler = if awaits && em.reg.has_task_sets {
-            format!(", ptr {}", tasks::owner_scheduler(body))
-        } else {
-            String::new()
-        };
-        let _ = writeln!(
-            em.code,
-            "  {tag} = call fastcc i32 @vn2_{kind}_host_{id}(ptr {request}{scheduler})"
-        );
-        return;
-    }
+    let cancellable = em.program.controls[id].is_cancellable();
     let name = &em.program.controls[id].name;
-    let _ = writeln!(em.code, "  call void @vn2_start_{name}(ptr {request})");
     if awaits && em.resume_points.is_some() {
         let wait = em.alloc_temp("%vn2.pending");
         let points = em.resume_points.as_mut().unwrap();
         let pc = points.len() + 1;
         let resume = format!("member_host_{pc}");
         points.push(resume.clone());
+        let (cancel, flag) = if cancellable {
+            let flag = em.fresh_reg();
+            let _ = writeln!(em.code, "  {flag} = load i1, ptr @vn2_root_cancelled");
+            (format!("@vn2_cancel_host_{id}"), flag)
+        } else {
+            ("null".into(), "false".into())
+        };
         let _ = writeln!(
             em.code,
-            "  call fastcc void @vn2_park_host(ptr %task_scheduler, ptr %task_member, ptr {wait}, ptr {request}, ptr @vn2_complete_{name})"
+            "  call fastcc void @vn2_member_host(ptr %task_scheduler, ptr %task_member, ptr {wait}, ptr {request}, ptr @vn2_start_{name}, ptr @vn2_complete_{name}, ptr {cancel}, i1 {flag})"
         );
         let _ = writeln!(
             em.code,
@@ -103,6 +97,20 @@ pub(super) fn emit_request(
         return;
     }
 
+    if cancellable {
+        let kind = if awaits { "await" } else { "run" };
+        let scheduler = if awaits && em.reg.has_task_sets {
+            format!(", ptr {}", tasks::owner_scheduler(body))
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            em.code,
+            "  {tag} = call fastcc i32 @vn2_{kind}_host_{id}(ptr {request}{scheduler})"
+        );
+        return;
+    }
+    let _ = writeln!(em.code, "  call void @vn2_start_{name}(ptr {request})");
     if awaits && em.reg.has_task_sets {
         let scheduler = tasks::owner_scheduler(body);
         let _ = writeln!(
@@ -122,8 +130,7 @@ pub(super) fn emit_request(
         "  {tag} = call i32 @vn2_complete_{name}(ptr {request})"
     );
     if awaits {
-        root_cancel::poll(em);
-        em.code.push_str("  call i64 @vn2_pick_turn(i64 1)\n");
+        tasks::choose_owner(em, body);
     }
 }
 

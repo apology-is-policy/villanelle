@@ -2,8 +2,8 @@
 ; The scheduler lists unfinished members in spawn order and counts ready ones.
 ; A pool holds its completion queue, count, producer, spare frame and waiter.
 %vn2.queue = type { ptr, ptr }
-; Unfinished members, ready count, host-waiting member count, idle callback.
-%vn2.scheduler = type { %vn2.queue, i64, i64, ptr }
+; Unfinished members, ready count, host-waiting member count, idle callback, pending withdrawal callback.
+%vn2.scheduler = type { %vn2.queue, i64, i64, ptr, ptr }
 %vn2.pool = type { %vn2.queue, i64, ptr, ptr, ptr }
 ; Next link, resume index/result tag, heap flag, blocked flag, originating set, host wait.
 %vn2.member_header = type { ptr, i32, i1, i1, ptr, ptr }
@@ -205,19 +205,37 @@ done:
   ret void
 }
 
+; Parking a cancellable request installs a callback. Once the root is
+; cancelled, further member awaits release before issue, so scan only once.
+define internal fastcc void @vn2_cancel_parked(ptr %scheduler, i1 %cancelled) {
+entry:
+  br i1 %cancelled, label %check, label %done
+check:
+  %slot = getelementptr %vn2.scheduler, ptr %scheduler, i32 0, i32 4
+  %sweep = load ptr, ptr %slot
+  %armed = icmp ne ptr %sweep, null
+  br i1 %armed, label %withdraw, label %done
+withdraw:
+  store ptr null, ptr %slot
+  call fastcc void %sweep(ptr %scheduler)
+  br label %done
+done:
+  ret void
+}
+
 ; The owner is task zero whenever it is ready. Children follow in spawn
 ; order. A finished member stays counted until delivered by await next.
 ; At a defined await the owner is ready even with outstanding children.
 ; At await next it is ready only when a result or empty can be delivered.
 define internal fastcc void @vn2_choose_owner(ptr %scheduler, ptr %awaited_set) {
-  call fastcc i1 @vn2_poll_cancel()
-  call fastcc void @vn2_choose_owner_polled(ptr %scheduler, ptr %awaited_set)
+  %flag = call fastcc i1 @vn2_poll_cancel()
+  call fastcc void @vn2_choose_owner_polled(ptr %scheduler, ptr %awaited_set, i1 %flag)
   ret void
 }
 
 ; A withdrawal has already polled this turn. Only poll again after a member
 ; runs or a host completion ends the turn.
-define internal fastcc void @vn2_choose_owner_polled(ptr %scheduler, ptr %awaited_set) {
+define internal fastcc void @vn2_choose_owner_polled(ptr %scheduler, ptr %awaited_set, i1 %flag) {
 entry:
   %inactive = icmp eq ptr %scheduler, null
   br i1 %inactive, label %alone, label %active
@@ -229,6 +247,8 @@ active:
   %defined_await = icmp eq ptr %awaited_set, null
   br label %choose
 choose:
+  %cancelled = phi i1 [ %flag, %active ], [ %next_flag, %next_turn ]
+  call fastcc void @vn2_cancel_parked(ptr %scheduler, i1 %cancelled)
   br i1 %defined_await, label %offer, label %waiting_next
 waiting_next:
   %can_deliver = call fastcc i1 @vn2_can_deliver(ptr %awaited_set)
@@ -256,7 +276,7 @@ child:
   call fastcc void @vn2_step_member(ptr %scheduler, i64 %i)
   br label %next_turn
 next_turn:
-  call fastcc i1 @vn2_poll_cancel()
+  %next_flag = call fastcc i1 @vn2_poll_cancel()
   br label %choose
 selected:
   ret void

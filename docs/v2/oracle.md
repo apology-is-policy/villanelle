@@ -7,7 +7,7 @@ IR backend. Slice 4 has an oracle, a checker, and native code for defined
 roots, direct runs of nonfaulting host operations, and
 task sets whose owners and members can yield at a defined await. Roots and members can
 wait for the host in their own activations or in a callee (sections 18.4 to
-18.25). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
+18.26). The oracle of slice 1 and its conformance suite (sections 1 to 7) are qualified. Everything described from
 section 8 on was written on 21 and 22 November and is **draft**: the
 [review](review.md) of 23 November found that no slice meets its exit, and
 lists the defects. Sections 8 to 18 describe what the code does and which
@@ -2804,6 +2804,29 @@ each of the two ready tasks first in separate runs. When a second request
 is pending, it checks the handles offered and which operation completes.
 A fresh run after the owner checks the next turn number.
 
+### 18.26 Root cancellation of a spawned member’s host await, 28 November 2026
+
+A member that reaches a cancellable host await after root cancellation
+releases its by-value operands, records the `cancelled` alternative and
+gives up its turn. If the request was already pending, cancellation first
+withdraws it using the original bound request. The root’s own request is
+withdrawn first, then the members’ requests in spawn order, including
+requests bound in awaited callees. Each withdrawal releases that request’s
+operands before the next withdrawal. Noncancellable requests stay pending.
+
+The ready choice on the cancellation turn includes every member just
+woken. A member can finish before an older sibling even when its request
+was withdrawn second. An owner at `await next` can take the member’s
+result once the member exits. If the root completed its own host operation
+on the preceding turn, it competes with any newly ready members.
+
+From `v2/`, run `vn2 test tests/slice4/checked_member_cancel.core` and
+`cargo test --test backend_slice4 member_cancel`. The linked C host checks
+the request addresses, leases, vectors and exclusive borrows. It checks
+the full ready counts and which handles the host is offered, including
+when a noncancellable request belongs to a sibling. The rule-file
+comparison also exercises a grandchild while its parent awaits its result.
+
 ## 19. What is open
 
 - **Requalification.** No slice meets its exit. The [review](review.md)
@@ -2815,8 +2838,7 @@ A fresh run after the owner checks the next turn number.
   checker in slices 2 and 3, the double free in compiled code, a reader that
   reads the corpus, and a formatter that keeps comments. The work follows
   section 10 of the review, slice 1 first.
-- **Later work.** Slice 4 still needs cancellable host awaits in spawned members,
-  set cancellation, faulting host operations,
+- **Later work.** Slice 4 still needs explicit set cancellation, faulting host operations,
   member faults, capacity and generated task programs in the native comparison.
 - **This document.** Sections 3, 4 and 7 describe slice 1 only, and the list
   of choices below was not extended for slices 2 to 4 (review, RO9, RD3).

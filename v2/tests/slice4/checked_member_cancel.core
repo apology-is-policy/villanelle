@@ -1,0 +1,100 @@
+extern resource lease on fault release
+extern control acquire(id : u32) ■ { ok {l : lease} } uses io
+extern control mark(id : u32, cell : u32) ■ { ok {} } uses io
+extern async control hold(l : lease, xs : [u32], cell : &~u32)
+    ■ { value {code : u32} │ cancelled {} } uses io
+extern async control steady() ■ { ok {} } uses io
+
+async control worker(id : u32, xs : [u32]) ■ { got {v : u32} } uses io
+    ⊤ ▷ ~cell : u32 := id
+    ⊤ ▷ a : Δ acquire(id) ▸ ok {l}
+    a.ok ▷ reply := capture await hold(l, ▾xs, &~cell)
+    ⊤ ▷ m : Δ mark(id, cell) ▸ ok {}
+    ⊤ ▷ h : Δ outcome(reply) ▸ value {code} │ cancelled {}
+    h.cancelled ▷ ■ got {cell}
+    h.value ▷ ■ got {code}
+
+async control pair() ■ { ok {first : u32, second : u32} } uses io
+    ⊤ ▷ ~pool : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(1, [1, 8]) into pool
+    ⊤ ▷ spawn worker(2, [2, 8]) into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ got {first} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(pool) ▸ got {second} │ empty {}
+    b.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {first, second}
+
+// Each member inherits cancellation before issue, releases, and yields.
+//! run pair() with [acquire -> ok {lease#1}; acquire -> ok {lease#2}; mark -> ok; mark -> ok] turns [0, 1, 1] cancel_at 1 => done ok {2, 1} trace [acquire(1) -> ok {lease#1}; lease.release(lease#1) -> released; acquire(2) -> ok {lease#2}; lease.release(lease#2) -> released; mark(2, 2) -> ok; mark(1, 1) -> ok]
+
+// Start in reverse order. Withdraw in spawn order before either resumes.
+//! run pair() with [acquire -> ok {lease#2}; acquire -> ok {lease#1}; mark -> ok; mark -> ok] turns [1, 0, 1] cancel_at 3 => done ok {2, 1} trace [acquire(2) -> ok {lease#2}; acquire(1) -> ok {lease#1}; lease.release(lease#1) -> released; lease.release(lease#2) -> released; mark(2, 2) -> ok; mark(1, 1) -> ok]
+
+// Complete the younger request first. Its result and write survive cancellation.
+//! run pair() with [acquire -> ok {lease#1}; acquire -> ok {lease#2}; hold -> value {72} ~cell <- 12; mark -> ok; mark -> ok] waiting [1] cancel_at 4 => done ok {1, 72} trace [acquire(1) -> ok {lease#1}; acquire(2) -> ok {lease#2}; hold(lease#2, [2, 8], 2) -> value {72}; lease.release(lease#1) -> released; mark(1, 1) -> ok; mark(2, 12) -> ok]
+
+// Host-selected cancelled is a completion with a write.
+//! run pair() with [acquire -> ok {lease#1}; acquire -> ok {lease#2}; hold -> cancelled ~cell <- 11; mark -> ok; hold -> value {72} ~cell <- 12; mark -> ok] => done ok {11, 72} trace [acquire(1) -> ok {lease#1}; acquire(2) -> ok {lease#2}; hold(lease#1, [1, 8], 1) -> cancelled; mark(1, 11) -> ok; hold(lease#2, [2, 8], 2) -> value {72}; mark(2, 12) -> ok]
+
+async control together(root_wait : bool) ■ { ok {child : u32} } uses io
+    ⊤ ▷ ~pool : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ spawn worker(1, [1, 8]) into pool
+    ⊤ ▷ d : ? root_wait
+    d.true ▷ ~cell : u32 := 9
+    d.true ▷ a : Δ acquire(9) ▸ ok {l}
+    a.ok ▷ h : Δ await hold(l, [9, 8], &~cell) ▸ value {code} │ cancelled {}
+    d.false ▷ s : Δ await steady() ▸ ok {}
+    ⊤ ▷ m : Δ mark(9, 0) ▸ ok {}
+    ⊤ ▷ c : Δ await next(pool) ▸ got {child} │ empty {}
+    c.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {child}
+
+// The root releases first, then the child, before the child takes the turn.
+//! run together(true) with [acquire -> ok {lease#9}; acquire -> ok {lease#1}; mark -> ok; mark -> ok] turns [0, 1] cancel_at 2 => done ok {1} trace [acquire(9) -> ok {lease#9}; acquire(1) -> ok {lease#1}; lease.release(lease#9) -> released; lease.release(lease#1) -> released; mark(1, 1) -> ok; mark(9, 0) -> ok]
+
+// A noncancellable root keeps waiting, or completes before the cancellation poll.
+//! run together(false) with [acquire -> ok {lease#1}; mark -> ok; steady -> ok; mark -> ok] cancel_at 2 => done ok {1} trace [acquire(1) -> ok {lease#1}; lease.release(lease#1) -> released; mark(1, 1) -> ok; steady() -> ok; mark(9, 0) -> ok]
+//! run together(false) with [acquire -> ok {lease#1}; steady -> ok; mark -> ok; mark -> ok] waiting [0] turns [0, 1] cancel_at 3 => done ok {1} trace [acquire(1) -> ok {lease#1}; steady() -> ok; lease.release(lease#1) -> released; mark(1, 1) -> ok; mark(9, 0) -> ok]
+
+async control relay() ■ { got {v : u32} } uses io
+    ⊤ ▷ w : Δ await worker(1, [1, 8]) ▸ got {v}
+    w.got ▷ ■ got {v}
+
+async control nested() ■ { ok {v : u32} } uses io
+    ⊤ ▷ ~pool : tasks⟨relay⟩ := tasks⟨relay⟩()
+    ⊤ ▷ spawn relay() into pool
+    ⊤ ▷ a : Δ await next(pool) ▸ got {v} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(pool) ▸ got {extra} │ empty {}
+    e.got ▷ ⊥
+    e.empty ▷ ■ ok {v}
+
+// The request, arguments and result slot belong to the awaited activation.
+//! run nested() with [acquire -> ok {lease#1}; mark -> ok] cancel_at 3 => done ok {1} trace [acquire(1) -> ok {lease#1}; lease.release(lease#1) -> released; mark(1, 1) -> ok]
+
+async control listener() ■ { ok {} } uses io
+    ⊤ ▷ s : Δ await steady() ▸ ok {}
+    ⊤ ▷ m : Δ mark(0, 0) ▸ ok {}
+    m.ok ▷ ■ ok {}
+
+async control mixed() ■ { ok {v : u32} } uses io
+    ⊤ ▷ ~jobs : tasks⟨worker⟩ := tasks⟨worker⟩()
+    ⊤ ▷ ~other : tasks⟨listener⟩ := tasks⟨listener⟩()
+    ⊤ ▷ spawn worker(1, [1, 8]) into jobs
+    ⊤ ▷ spawn listener() into other
+    ⊤ ▷ a : Δ await next(jobs) ▸ got {v} │ empty {}
+    a.empty ▷ ⊥
+    ⊤ ▷ b : Δ await next(jobs) ▸ got {extra} │ empty {}
+    b.got ▷ ⊥
+    ⊤ ▷ c : Δ await next(other) ▸ ok {} │ empty {}
+    c.empty ▷ ⊥
+    ⊤ ▷ e : Δ await next(other) ▸ ok {} │ empty {}
+    e.ok ▷ ⊥
+    e.empty ▷ ■ ok {v}
+
+// Both members are parked. Only the cancellable request is withdrawn.
+//! run mixed() with [acquire -> ok {lease#1}; mark -> ok; steady -> ok; mark -> ok] cancel_at 3 => done ok {1} trace [acquire(1) -> ok {lease#1}; lease.release(lease#1) -> released; mark(1, 1) -> ok; steady() -> ok; mark(0, 0) -> ok]
